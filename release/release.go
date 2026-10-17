@@ -45,7 +45,7 @@ const (
 	// RepoID and OwnerID are GitHub's numeric ids of Repo and its owner (gh api repos/tacyhq/tacy: .id, .owner.id).
 	// Names can be reused; ids can't. Fulcio puts them in the signing certificate (OIDs 1.3.6.1.4.1.57264.1.15
 	// and .17).
-	RepoID  = "1421733570"
+	RepoID  = "1423086047"
 	OwnerID = "233153967"
 	// Workflow is the only workflow file that may sign a release.
 	Workflow = ".github/workflows/release.yml"

@@ -94,7 +94,7 @@ The verifier (`release/`) accepts a bundle only if all of these hold:
 | Issuer | `https://token.actions.githubusercontent.com` |
 | Certificate SAN | `https://github.com/tacyhq/tacy/.github/workflows/release.yml@refs/tags/vX.Y.Z` |
 | Source repository | `https://github.com/tacyhq/tacy`, ref `refs/tags/vX.Y.Z` (same tag) |
-| Repository and owner ids | `1421733570` and `233153967` (GitHub's numeric ids of tacyhq/tacy and tacyhq; certificate extensions `1.3.6.1.4.1.57264.1.15` and `.17`). Names can be taken again after a delete or rename, ids can't. |
+| Repository and owner ids | `1423086047` and `233153967` (GitHub's numeric ids of tacyhq/tacy and tacyhq; certificate extensions `1.3.6.1.4.1.57264.1.15` and `.17`). Names can be taken again after a delete or rename, ids can't. |
 | Build signer and build config | the SAN above (release.yml is the top-level workflow) |
 | Trigger, runner | `push` (of the tag), `github-hosted` |
 | Certificate | chains to Sigstore's Fulcio, has an embedded SCT, valid when the signature was logged |

@@ -24,8 +24,10 @@ if [ -n "$native" ]; then
 else
   image=$(grep -o 'golang:[^"]*@sha256:[0-9a-f]*' "$work/src/cmd/compose/main.go")
   echo "rebuilding $repo $tag ($commit) in $image"
-  docker run --rm -v "$work/src:/src" -w /src -e GOFLAGS=-mod=readonly "$image" \
-    go run ./cmd/compose --check $oci --manifest rebuilt.json --version "$tag" --commit "$commit"
+  # The container runs as root: give what it writes back to this user (else the cleanup can't remove it).
+  docker run --rm -v "$work/src:/src" -w /src -e GOFLAGS=-mod=readonly -e OWNER="$(id -u):$(id -g)" "$image" \
+    sh -c 'go run ./cmd/compose "$@"; rc=$?; chown -R "$OWNER" rebuilt.json rebuilt-oci 2>/dev/null; exit $rc' sh \
+    --check $oci --manifest rebuilt.json --version "$tag" --commit "$commit"
 fi
 if ! diff "$work/release.json" "$work/src/rebuilt.json"; then
   echo "MISMATCH: the rebuild differs from the published release.json (diff above)"

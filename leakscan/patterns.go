@@ -166,7 +166,8 @@ func hasAuthorization(b []byte) bool {
 const ws = `[\t\n\v\f\r \x{85}\x{A0}\x{1680}\x{2000}-\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}]`
 
 // patterns are IronClaw's defaults in upstream order, minus nearai_session (NEAR AI's own session ids) and
-// sandbox_credential_placeholder (IronClaw's icsbx_ placeholders), plus our placeholder format at the end.
+// sandbox_credential_placeholder (IronClaw's icsbx_ placeholders), plus our placeholder format and our siblings of
+// upstream's families at the end.
 //
 // Differences from upstream that come from the regex engines, all toward matching more:
 //   - Go's \b is ASCII, Rust's is Unicode. A Go boundary exists wherever a Rust one does (before or after an
@@ -228,6 +229,38 @@ var patterns = []pattern{
 	// carry them legitimately after exact-value redaction.
 	{Pattern: Pattern{"tacy_placeholder", Medium, Warn}, need: "{{",
 		re: re(`\{\{[A-Z][A-Z0-9_]{2,63}\}\}`)},
+
+	// Ours (not upstream, VM release 2): siblings of the families above that upstream doesn't cover. Each has a
+	// fixed prefix, so ordinary text doesn't match.
+	//
+	// Temporary (STS) AWS access key ids, the same shape as aws_access_key's long-term AKIA ids. Like that one,
+	// no word boundary on either side (a key glued to other text is still caught); a 16-character all-caps run
+	// after the word "ASIA" (ASIAPACIFICREGIONS...) also matches, which is rare and fails safe.
+	{Pattern: Pattern{"aws_temp_access_key", Critical, Block}, need: "ASIA",
+		re: re(`ASIA[0-9A-Z]{16}`)},
+	// OpenAI service-account and admin keys: the hyphen after the kind keeps openai_api_key from matching them.
+	{Pattern: Pattern{"openai_service_key", Critical, Block}, need: "sk-",
+		re: re(`\bsk-(?:svcacct|admin)-[A-Za-z0-9_-]{20,}`)},
+	{Pattern: Pattern{"anthropic_admin_key", Critical, Block}, need: "sk-ant-admin",
+		re: re(`\bsk-ant-admin\d{2}-[a-zA-Z0-9_-]{50,}`)},
+	// Stripe restricted keys and webhook signing secrets, next to stripe_api_key's secret keys.
+	{Pattern: Pattern{"stripe_restricted_key", Critical, Block}, need: "rk_",
+		re: re(`\brk_(?:live|test)_[a-zA-Z0-9]{24,}`)},
+	{Pattern: Pattern{"stripe_webhook_secret", High, Block}, need: "whsec_",
+		re: re(`\bwhsec_[a-zA-Z0-9+/]{32,}`)},
+	// Slack app-level tokens and token-rotation refresh tokens; slack_token covers xoxb/xoxa/xoxp/xoxr/xoxs.
+	{Pattern: Pattern{"slack_app_token", High, Block}, need: "xapp-",
+		re: re(`\bxapp-\d-[0-9a-zA-Z-]{20,}`)},
+	{Pattern: Pattern{"slack_refresh_token", High, Block}, need: "xoxe-",
+		re: re(`\bxoxe-\d-[0-9a-zA-Z-]{20,}`)},
+	// GitLab personal access tokens, next to github_token.
+	{Pattern: Pattern{"gitlab_token", Critical, Block}, need: "glpat-",
+		re: re(`\bglpat-[A-Za-z0-9_-]{20,}`)},
+	// Google OAuth client secrets and access tokens, next to google_api_key.
+	{Pattern: Pattern{"google_oauth_client_secret", High, Block}, need: "GOCSPX-",
+		re: re(`\bGOCSPX-[A-Za-z0-9_-]{24,}`)},
+	{Pattern: Pattern{"google_oauth_token", High, Block}, need: "ya29.",
+		re: re(`\bya29\.[0-9A-Za-z_-]{20,}`)},
 }
 
 func re(p string) *regexp.Regexp { return regexp.MustCompile(strings.ReplaceAll(p, `\s`, ws)) }

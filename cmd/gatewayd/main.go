@@ -10,7 +10,7 @@
 // unread (the bodies are EHBP-encrypted to agentd's key). It never connects to agentd any other way, and agentd
 // can't make it connect anywhere except through a typed request.
 //
-//	go run ./cmd/gatewayd --socket /run/tacy/agent/gateway.sock --agent-uid 0 --vault-socket /run/tacy/vault/vault.sock \
+//	go run ./cmd/gatewayd --socket /run/tacy/agent/gateway.sock --agent-uid 10003 --vault-socket /run/tacy/vault/vault.sock \
 //	    --listen :8080 --forward /run/tacy/agent/http.sock
 package main
 

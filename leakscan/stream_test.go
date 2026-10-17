@@ -26,6 +26,7 @@ func streamAll(in []byte, exact [][]byte, sizes []int) ([]byte, []Finding) {
 func TestStreamSplitEverywhere(t *testing.T) {
 	secret := []byte("tvly-test-not-a-real-key-0123456789")
 	for _, mid := range []string{fakeAWS, "AKIA%49OSFODNN7EXAMPLE", "AKIA%2549OSFODNN7EXAMPLE", b64("id=" + fakeAWS),
+		fakeAWSTemp, "ASIA%2549OSFODNN7EXAMPLE", b64("id=" + fakeAWSTemp),
 		entAll(fakeAWS, false), uescAll(fakeAWS), pem("RSA PRIVATE KEY", "MIIEowIBAAKCAQEA"), string(secret),
 		pctAll(string(secret))} {
 		in := []byte("head " + mid + " tail")

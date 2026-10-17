@@ -30,6 +30,19 @@ var (
 	fakeHex64      = strings.Repeat("0123456789abcdef", 4)
 	fakeBearer     = j("Bearer ", "abcdefghijklmnopqrstuvwxyz123456")
 	fakeAuthHeader = j("Authorization: ", "Basic ", "QUFBQUFBQUFBQUFBQUFBQUFBQUE=")
+
+	// Ours (VM release 2).
+	fakeAWSTemp       = j("ASIA", "IOSFODNN7EXAMPLE")
+	fakeOpenAISvc     = j("sk-", "svcacct-", strings.Repeat("aB3_", 6))
+	fakeOpenAIAdmin   = j("sk-", "admin-", strings.Repeat("aB3-", 6))
+	fakeAnthAdmin     = j("sk-ant-", "admin01-", strings.Repeat("aaaBBBccc0", 6))
+	fakeStripeRK      = j("rk_", "live", "_", "aAbBcCdDfFgGhHjJkKmMnNpPqQ")
+	fakeStripeWebhook = j("wh", "sec_", strings.Repeat("aB3+", 8))
+	fakeSlackApp      = j("xa", "pp-1-", "A0123456789-1234567890123-", strings.Repeat("0a", 16))
+	fakeSlackRefresh  = j("xo", "xe-1-", strings.Repeat("AbC0", 8))
+	fakeGitLab        = j("gl", "pat-", strings.Repeat("xY_9", 5))
+	fakeGoogleSecret  = j("GOC", "SPX-", strings.Repeat("aB3_", 7))
+	fakeGoogleToken   = j("ya", "29.", "a0Af", strings.Repeat("xY_9", 6))
 )
 
 func pem(label, body string) string {
@@ -48,8 +61,8 @@ func has(fs []Finding, id string) bool { return slices.Contains(ids(fs), id) }
 
 func TestPatternList(t *testing.T) {
 	ps := Patterns()
-	if len(ps) != 22 {
-		t.Fatalf("%d patterns, want 22 (21 upstream + tacy_placeholder)", len(ps))
+	if len(ps) != 32 {
+		t.Fatalf("%d patterns, want 32 (21 upstream + tacy_placeholder + 10 siblings)", len(ps))
 	}
 	seen := map[string]bool{}
 	for _, p := range ps {
@@ -103,6 +116,18 @@ func TestPatternsPositive(t *testing.T) {
 		{"groq_api_key", "GROQ_API_KEY=" + fakeGroq, Critical, Block},
 		{"high_entropy_hex", "digest " + fakeHex64, Medium, Warn},
 		{"tacy_placeholder", "Authorization: {{TAVILY_API_KEY}}", Medium, Warn},
+		{"aws_temp_access_key", "AWS_ACCESS_KEY_ID=" + fakeAWSTemp, Critical, Block},
+		{"aws_temp_access_key", `{"AccessKeyId":"` + fakeAWSTemp + `","SessionToken":"x"}`, Critical, Block},
+		{"openai_service_key", "OPENAI_API_KEY=" + fakeOpenAISvc, Critical, Block},
+		{"openai_service_key", "admin " + fakeOpenAIAdmin, Critical, Block},
+		{"anthropic_admin_key", "key " + fakeAnthAdmin, Critical, Block},
+		{"stripe_restricted_key", "STRIPE_KEY=" + fakeStripeRK, Critical, Block},
+		{"stripe_webhook_secret", "STRIPE_WEBHOOK_SECRET=" + fakeStripeWebhook, High, Block},
+		{"slack_app_token", "SLACK_APP_TOKEN=" + fakeSlackApp, High, Block},
+		{"slack_refresh_token", "refresh " + fakeSlackRefresh, High, Block},
+		{"gitlab_token", "GITLAB_TOKEN=" + fakeGitLab, Critical, Block},
+		{"google_oauth_client_secret", `"client_secret":"` + fakeGoogleSecret + `"`, High, Block},
+		{"google_oauth_token", "access_token=" + fakeGoogleToken, High, Block},
 	}
 	for _, c := range cases {
 		fs := Scan([]byte(c.in))
@@ -165,6 +190,26 @@ func TestPatternsNegative(t *testing.T) {
 		{"high_entropy_hex", strings.Repeat("a", 65)},
 		{"high_entropy_hex", "da39a3ee5e6b4b0d3255bfef95601890afd80709"}, // 40-hex git SHA
 		{"tacy_placeholder", "{{x}} and {{ name }} and {{AB}}"},
+		{"aws_temp_access_key", "ASIA12345678"},
+		{"aws_temp_access_key", "ASIA" + strings.Repeat("a", 16)}, // lowercase
+		{"aws_temp_access_key", "Asia" + strings.Repeat("A", 16)},
+		{"aws_temp_access_key", "SOUTHEAST ASIA PACIFIC REGION, EURASIA, ASIAN MARKETS, ASIA-PACIFIC 2026"},
+		{"openai_service_key", j("sk-", "svcacct-", "short")},
+		{"openai_service_key", j("sk-", "service-", strings.Repeat("a", 30))},
+		{"anthropic_admin_key", j("sk-ant-", "admin1-", strings.Repeat("a", 60))},
+		{"anthropic_admin_key", j("sk-ant-", "admin01-", strings.Repeat("a", 49))},
+		{"stripe_restricted_key", j("rk_", "live_", "short12345")},
+		{"stripe_restricted_key", j("work_", "live_", strings.Repeat("a", 30))}, // no word boundary
+		{"stripe_webhook_secret", j("wh", "sec_", strings.Repeat("a", 31))},
+		{"slack_app_token", j("xa", "pp-", "short")},
+		{"slack_app_token", j("xa", "pp-x-", strings.Repeat("a", 30))},
+		{"slack_refresh_token", j("xo", "xe-1-", "short")},
+		{"gitlab_token", j("gl", "pat-", "short")},
+		{"gitlab_token", j("xgl", "pat-", strings.Repeat("a", 30))},
+		{"google_oauth_client_secret", j("GOC", "SPX-", "short")},
+		{"google_oauth_client_secret", j("goc", "spx-", strings.Repeat("a", 30))},
+		{"google_oauth_token", j("ya", "29.", "short")},
+		{"google_oauth_token", j("ya", "30.", strings.Repeat("a", 30))},
 	}
 	for _, c := range cases {
 		if fs := Scan([]byte(c.in)); has(fs, c.id) {

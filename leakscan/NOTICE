@@ -9,7 +9,8 @@ License:  MIT OR Apache-2.0; this port uses it under the MIT license, reproduced
 What was ported: the pattern regexes, severities and actions (21 of the 23 defaults; NEAR AI's session
 pattern and IronClaw's sandbox-placeholder pattern are left out, per docs/21-gateway-v0.md), the bare-JWT
 header check and its 64 KiB fail-closed bound, range merging for redaction, and test vectors. Everything
-about decoding before scanning, exact-secret redaction across encodings and the streaming redactor is ours.
+about decoding before scanning, exact-secret redaction across encodings and the streaming redactor is ours, as are
+the patterns after upstream's (tacy_placeholder and the siblings added in VM release 2, from aws_temp_access_key on).
 
 ----
 

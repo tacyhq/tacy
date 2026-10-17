@@ -205,20 +205,12 @@ func (s *server) run(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, "model_mismatch: the X-Agent-Model header doesn't match the run's model")
 		return
 	}
-	flusher, _ := w.(http.Flusher)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(200)
-	emit := func(e proto.Event) error {
-		b, _ := json.Marshal(e)
-		if _, err := fmt.Fprintf(w, "data: %s\n\n", b); err != nil {
-			return err
-		}
-		if flusher != nil {
-			flusher.Flush()
-		}
-		return nil
-	}
+	out := newEventStream(w, keepaliveEvery)
+	defer out.stop()
+	emit := out.emit
 	if t, ok := r.Context().Value(ticketKey{}).(*ticket); ok {
 		err := t.wait(r.Context(), s.lim.QueueTimeout, 5*time.Second, func(pos int) error {
 			return emit(proto.Event{Type: "queue", Position: pos})
@@ -227,7 +219,7 @@ func (s *server) run(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, errQueueTimeout):
 			emit(proto.Event{Type: "error", Error: fmt.Sprintf("queue_timeout: the agent VM is busy and no slot freed up within %d s. Try again in a minute.",
 				int(s.lim.QueueTimeout.Seconds()))})
-			fmt.Fprint(w, "data: [DONE]\n\n")
+			out.done()
 			return
 		case err != nil:
 			return // the client went away
@@ -240,15 +232,12 @@ func (s *server) run(w http.ResponseWriter, r *http.Request) {
 	if !s.waitBrain(r.Context(), brainWait) {
 		if r.Context().Err() == nil {
 			emit(proto.Event{Type: "error", Error: "agent_unavailable: the agent VM's brain isn't running. Try again in a minute."})
-			fmt.Fprint(w, "data: [DONE]\n\n")
+			out.done()
 		}
 		return
 	}
 	guard.Run(r.Context(), s.rt, s.agent, userFrom(r.Context()), &req, emit)
-	fmt.Fprint(w, "data: [DONE]\n\n")
-	if flusher != nil {
-		flusher.Flush()
-	}
+	out.done()
 }
 
 // waitBrain reports whether a brain is connected, waiting up to d for one.

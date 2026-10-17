@@ -72,11 +72,19 @@ var (
 	gatewayEnv = []string{"SEARCH_PROVIDER"}
 )
 
-// uids. agentd is root without capabilities (cap_drop ALL: no DAC override, no chown): it owns the queue on the
-// encrypted disk and dstack's guest agent socket is root's. Each socket is 0660, owned by the process that listens,
-// with the group of the one peer (also checked by uid with SO_PEERCRED).
+// uids. Each process has its own; none is root (agentd was until VM release 2). Each socket is 0660, owned by the
+// process that listens, with the group of the one peer (also checked by uid with SO_PEERCRED). agentd needs no
+// root: dstack's guest agent socket is mode 0777 (dstack v0.6.1, os/common/rootfs/dstack-guest-agent.socket,
+// SocketMode=0777; the guest agent doesn't check the caller's uid), and the build container gives agentd its queue
+// directory and its socket directories.
+//
+// Rollback: an older compose runs agentd as root without capabilities (no DAC override), which can't open files
+// this uid owns with mode 0600. So the new layout leaves what an older agentd uses as it was: the queue moves to
+// /state/agentd (the older one used /state/queue.db, which the build removes; the runs it held ended with the
+// process anyway), and the brain's socket directory is a new volume (brainsock2; brainsock stays root's). The
+// agent socket directory is reset by every compose's build, so it needs nothing.
 const (
-	agentdUID   = "0"
+	agentdUID   = "10003"
 	brainUID    = "65534" // nobody
 	gatewaydUID = "10001"
 	vaultdUID   = "10002"
@@ -405,6 +413,8 @@ func generate() (string, error) {
       - bin:/cache
       - agentsock:/run/tacy/agent
       - vaultsock:/run/tacy/vault
+      - brainsock2:/run/tacy/brain
+      - state:/state
     environment:
       CGO_ENABLED: "0"
       GOFLAGS: ""
@@ -440,9 +450,15 @@ func generate() (string, error) {
           done
         fi
         # Socket directories, each in a volume only its two containers mount: agentd's HTTP socket and gatewayd's
-        # gateway/v0 socket (agentd root, gatewayd by group); vaultd's socket (gatewayd may only enter).
+        # gateway/v0 socket (agentd, gatewayd by group); vaultd's socket (gatewayd may only enter); the brain's
+        # socket (agentd listens, the brain may only enter).
         chown ` + agentdUID + `:` + gatewaydUID + ` /run/tacy/agent && chmod 0770 /run/tacy/agent
         chown ` + vaultdUID + `:` + gatewaydUID + ` /run/tacy/vault && chmod 0750 /run/tacy/vault
+        chown ` + agentdUID + `:` + brainUID + ` /run/tacy/brain && chmod 0750 /run/tacy/brain
+        # agentd's queue on the encrypted disk, its uid's only. The queue a root agentd kept (before VM release 2,
+        # or after a rollback) is removed: its runs ended with that process.
+        rm -f /state/queue.db /state/queue.db-wal /state/queue.db-shm /state/queue.db-journal
+        mkdir -p /state/agentd && chown -R ` + agentdUID + `:` + agentdUID + ` /state/agentd && chmod 0700 /state/agentd
       - build
 `)
 	for i := range chunks {
@@ -458,11 +474,11 @@ func generate() (string, error) {
       - /var/run/dstack.sock:/var/run/dstack.sock
       - bin:/cache:ro
       - state:/state
-      - brainsock:/run/tacy/brain
+      - brainsock2:/run/tacy/brain
       - agentsock:/run/tacy/agent
 `)
 	env(agentEnv)
-	run("agentd", "-storage /state -brain-socket /run/tacy/brain/brain.sock -brain-uid "+brainUID+" -brain-gid "+brainUID+
+	run("agentd", "-storage /state/agentd -brain-socket /run/tacy/brain/brain.sock -brain-uid "+brainUID+" -brain-gid "+brainUID+
 		" -gateway-socket /run/tacy/agent/gateway.sock -listen-unix /run/tacy/agent/http.sock -listen-uid "+gatewaydUID+
 		" -listen-gid "+gatewaydUID+" -mem-limit-mib 600")
 	b.WriteString(`  brain:
@@ -472,7 +488,7 @@ func generate() (string, error) {
 	hardened(brainUID + ":" + brainUID)
 	b.WriteString(`    volumes:
       - bin:/cache:ro
-      - brainsock:/run/tacy/brain
+      - brainsock2:/run/tacy/brain
 `)
 	run("brain", "--socket /run/tacy/brain/brain.sock")
 	b.WriteString(`  agentvm:
@@ -507,7 +523,7 @@ func generate() (string, error) {
   gomod:
   bin:
   state:
-  brainsock:
+  brainsock2:
   agentsock:
   vaultsock:
 `)

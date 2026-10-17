@@ -121,6 +121,23 @@ func TestComposeLayout(t *testing.T) {
 	if strings.Count(out, "/var/run/dstack.sock:") != 1 || !strings.Contains(byName["agentd"], "/var/run/dstack.sock:") {
 		t.Error("only agentd mounts dstack's socket")
 	}
+	// No long-running process is root (agentd was until VM release 2): each has its own uid, and agentd's is the one
+	// gatewayd accepts on its socket.
+	for name, body := range byName {
+		if name != "build" && (!strings.Contains(body, "    user: \"") || strings.Contains(body, "    user: \"0")) {
+			t.Errorf("%s runs as root", name)
+		}
+	}
+	if !strings.Contains(byName["agentd"], `user: "`+agentdUID+":"+agentdUID+`"`) ||
+		!strings.Contains(byName["agentvm"], "-agent-uid "+agentdUID+" ") {
+		t.Error("agentd's uid and gatewayd's -agent-uid differ")
+	}
+	// agentd's queue directory and the brain's socket directory are its own, set by the build.
+	if !strings.Contains(byName["agentd"], "-storage /state/agentd ") ||
+		!strings.Contains(byName["build"], "chown -R "+agentdUID+":"+agentdUID+" /state/agentd") ||
+		!strings.Contains(byName["build"], "chown "+agentdUID+":"+brainUID+" /run/tacy/brain") {
+		t.Error("agentd's directories")
+	}
 }
 
 // The embedded source unpacks to exactly the files the compose was generated from, byte for byte.

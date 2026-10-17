@@ -16,8 +16,10 @@ import (
 	"golang.org/x/net/html"
 )
 
-// Real pages, saved 2026-10-17 with fetch_page's headers and no cookies (testdata/pages, gzipped): a Keychron
-// and an Epomaker product page, a BBC News article, a Wikipedia article.
+// Synthetic pages (testdata/pages, gzipped; written by testdata/pages/gen.go, every brand, name and sentence
+// invented) with the structure real ones have: a store's product page whose content comes after 2.3 MB of scripts
+// and a mega-menu, a second store with its content in role=main, a news article, a wiki article with a list of
+// languages in its <main>.
 func fixture(t *testing.T, name string) []byte {
 	t.Helper()
 	f, err := os.Open("testdata/pages/" + name + ".html.gz")
@@ -59,27 +61,30 @@ func oldText(body []byte) string {
 func TestPageFixtures(t *testing.T) {
 	for _, c := range []struct {
 		name      string
+		streamed  bool     // the content starts after maxPageBytes of the page (scripts): only streaming reaches it
 		want      []string // in the new text
 		notWant   []string // menus, headers, banners: gone
 		oldMissed []string // what the old text didn't have
 	}{
-		{name: "keychron",
-			want: []string{"Product: Keychron Q1 Max", "229.99 USD, InStock", "Carbon Black / Gateron Jupiter Red",
+		{name: "shop-product", streamed: true,
+			want: []string{"Product: Larkspur K7 Pro", "Brand: Larkspur Keys", "189.00 USD, InStock", "Assembled / Slate Grey / Tidewater Red",
 				"Regular price", "Specifications", "Layout: 75%, ANSI, with knob", "Battery: 4000 mAh"},
-			notWant:   []string{"Select region", "Skip to content", "Find The Best Keyboard For You"},
-			oldMissed: []string{"229.99", "Specifications"}},
-		{name: "epomaker",
-			want:      []string{"HE60", "59.99", "Hall Effect", "8000mAh"},
-			notWant:   []string{"Search our store", "Country / currency", "Free shipping on orders over"},
+			notWant: []string{"Select region", "Skip to content", "Find Your Perfect Board", "Add to cart", "You may also like",
+				"We use cookies"},
+			oldMissed: []string{"189.00", "Specifications"}},
+		{name: "gadget-store",
+			want:      []string{"Quillon HE60", "59.99", "Hall Effect", "8000mAh"},
+			notWant:   []string{"Search our store", "Country / currency", "Free shipping on orders over", "Join our newsletter"},
 			oldMissed: nil},
-		{name: "bbc-article",
-			want: []string{"Headline: Katie Zacharia leaving White House role", "Published: 2026-10-16", "By: Brandon Drenon",
-				"Katie Zacharia will be leaving her post"},
-			notWant:   []string{"Skip to content", "Site search"},
+		{name: "news-article",
+			want: []string{"Headline: Lantern festival moves to the river quay", "Published: 2026-10-16", "By: Odile Marchetti",
+				"Lantern festival moves to the river quay after storm damages the old market square\n2 hours ago Odile Marchetti Wrenmouth",
+				"The Wrenmouth lantern festival will move to the river quay"},
+			notWant:   []string{"Skip to content", "Site search", "We use cookies", "More stories"},
 			oldMissed: []string{"Published: 2026-10-16"}},
-		{name: "wikipedia",
-			want:      []string{"Modern computer keyboards are input devices", "Updated: 2026-10-05"},
-			notWant:   []string{"Jump to content", "العربية", "Edit links"},
+		{name: "wiki-article",
+			want:      []string{"Fernwick keyboards are mechanical input devices", "Updated: 2026-10-05"},
+			notWant:   []string{"Jump to content", "العربية", "中文", "Edit links", "View history"},
 			oldMissed: []string{"Updated: 2026-10-05"}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -105,9 +110,12 @@ func TestPageFixtures(t *testing.T) {
 				}
 			}
 			for _, w := range c.notWant {
-				if !strings.Contains(old, w) && w != "Find The Best Keyboard For You" {
+				if !strings.Contains(old, w) {
 					t.Logf("note: the old text didn't have %q either", w)
 				}
+			}
+			if i := bytes.Index(body, []byte("<main")); c.streamed && i < maxPageBytes {
+				t.Errorf("<main> at byte %d, within the first %d: the fixture no longer needs streaming", i, maxPageBytes)
 			}
 		})
 	}

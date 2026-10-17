@@ -11,6 +11,7 @@ import (
 	"github.com/tacyhq/tacy/guard"
 	"github.com/tacyhq/tacy/harness"
 	"github.com/tacyhq/tacy/proto"
+	"github.com/tacyhq/tacy/safety"
 )
 
 // Client is agentd's side: a guard.Gateway whose guard is gatewayd, over its socket. The runtime calls it for the
@@ -21,6 +22,9 @@ type Client struct {
 	// Wait is how long a request waits for gatewayd to accept a connection (it restarts in about a second);
 	// 0: 20 s.
 	Wait time.Duration
+	// Docs, when set, are the signed policies and stop lists agentd holds: sent with every session's open, so
+	// gatewayd has them before it serves a task (it checks each itself).
+	Docs func() []safety.Envelope
 
 	mu       sync.Mutex
 	sessions map[string]*session // the tasks Run serves, by id
@@ -51,6 +55,29 @@ func (c *Client) Open(id string, opts guard.TaskOptions, emit func(proto.Event) 
 	return s
 }
 
+// PushDocs passes signed policies and stop lists to gatewayd at once (a stop must reach it within seconds), on a
+// connection of their own. gatewayd checks each and passes the ones it takes on to the vault.
+func (c *Client) PushDocs(ctx context.Context, docs []safety.Envelope) error {
+	var d net.Dialer
+	nc, err := d.DialContext(ctx, "unix", c.Path)
+	if err != nil {
+		return err
+	}
+	defer nc.Close()
+	nc.SetDeadline(time.Now().Add(10 * time.Second))
+	if err := writeFrame(nc, &frame{T: tSafety, Version: Version, Docs: docs}); err != nil {
+		return err
+	}
+	var f frame
+	if err := readFrame(nc, &f); err != nil {
+		return err
+	}
+	if f.T != tResult || f.Err != nil {
+		return errors.New("gateway: documents refused")
+	}
+	return nil
+}
+
 // ReplaySafe: as the guard's (it depends on the request only).
 func (c *Client) ReplaySafe(_ *harness.TaskInfo, req any) bool { return guard.ReplaySafe(req) }
 
@@ -62,7 +89,7 @@ func (c *Client) Exec(context.Context, *harness.TaskInfo, string, *harness.Exec)
 func (c *Client) ModelCall(ctx context.Context, ti *harness.TaskInfo, req *harness.ModelCall) (*harness.ModelResult, error) {
 	s, done := c.sessionFor(ti.ID)
 	defer done()
-	r, err := s.call(ctx, ti, &frame{T: tModel, ID: harness.RequestID(ctx), Model: req})
+	r, err := s.call(ctx, ti, &frame{T: tModel, ID: harness.RequestID(ctx), Model: req, MaxTokens: guard.MaxTokensFrom(ctx)})
 	if err != nil {
 		return nil, err
 	}
@@ -157,7 +184,11 @@ func (s *session) connect(ctx context.Context) (*conn, error) {
 		}
 	}
 	cn := &conn{nc: nc, pending: map[uint64]chan *frame{}}
-	if err := cn.write(&frame{T: tOpen, Version: Version, Task: s.id, Options: s.opts}); err != nil {
+	var docs []safety.Envelope
+	if s.c.Docs != nil {
+		docs = s.c.Docs()
+	}
+	if err := cn.write(&frame{T: tOpen, Version: Version, Task: s.id, Options: s.opts, Docs: docs}); err != nil {
 		nc.Close()
 		return nil, err
 	}

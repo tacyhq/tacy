@@ -28,6 +28,7 @@ import (
 
 	"github.com/tacyhq/tacy/harness"
 	"github.com/tacyhq/tacy/proto"
+	"github.com/tacyhq/tacy/safety"
 )
 
 // Config is what a Guard runs with.
@@ -40,6 +41,9 @@ type Config struct {
 	CacheSecret string         // per-boot default scope of Tinfoil's prompt cache
 	Now         func() time.Time
 	Record      func(Egress) // leak-scan decisions (metadata only); nil: none
+	// Safety is the signed policy and stop lists this process verified itself (step 6, safety.go); nil: no
+	// checks (tests that predate it).
+	Safety *safety.State
 }
 
 // Guard is a harness.Guard: the runtime's Runtime.Guard. Run serves one chat request on a runtime with it.
@@ -69,6 +73,9 @@ func New(cfg Config) *Guard {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
+	if cfg.Safety != nil {
+		cfg.Fetcher, cfg.Icons = withPolicyTransport(cfg.Fetcher), withPolicyTransport(cfg.Icons)
+	}
 	g := &Guard{cfg: cfg, tasks: map[string]*task{}}
 	if cfg.Limits != nil {
 		g.gates = newToolGates(*cfg.Limits)
@@ -83,6 +90,7 @@ type TaskOptions struct {
 	ReasoningEffort string `json:"reasoning_effort,omitzero"` // the most effort the model may use (the model must accept it)
 	CacheSecret     string `json:"cache_secret,omitzero"`     // scopes Tinfoil's prompt cache (user_cache_secret); "": the guard's per-boot one
 	User            string `json:"user,omitzero"`             // whose tool caps (the relay's opaque X-Agent-User tag)
+	Space           string `json:"space,omitzero"`            // the task's space: whose policy, stop and rates apply
 }
 
 // task is the guard's state for one task: what the old app/agent.go kept per run.
@@ -180,6 +188,9 @@ func (g *Guard) open(id string, opts TaskOptions, out func(proto.Event) error) *
 	}
 	t := &task{id: id, opts: opts, out: out}
 	t.ctx, t.cancel = context.WithCancel(context.Background())
+	if g.cfg.Safety != nil { // site icons fetch under the task's context
+		t.ctx = withHostFilter(t.ctx, g.fetchFilter(opts.Space))
+	}
 	t.tools = &Tools{search: g.cfg.Search, fetcher: g.cfg.Fetcher}
 	if g.gates != nil {
 		t.tools.gate = g.gates.forUser(opts.User)
@@ -305,7 +316,7 @@ func Run(ctx context.Context, rt *harness.Runtime, gw Gateway, user string, r *p
 	if err != nil {
 		return err
 	}
-	opts.User = user
+	opts.User, opts.Space = user, start.Space
 	optsJSON, err := json.Marshal(opts)
 	if err != nil {
 		return err
@@ -340,7 +351,16 @@ func Run(ctx context.Context, rt *harness.Runtime, gw Gateway, user string, r *p
 		return ps.emit(proto.Event{Type: "done", Step: step, FinishReason: finish})
 	}
 	msg := "the agent stopped" // untrusted when the brain says why: display only
+	code := ""
+	if w, ok := gw.(interface {
+		Why(task string) (string, string)
+	}); ok {
+		if c, m := w.Why(id); c != "" { // a safety control ended it: say which (step 6)
+			code, msg = c, m
+		}
+	}
 	switch {
+	case code != "":
 	case o.State == harness.OutcomeCancelled && pastDeadline(start.Limits.Deadline):
 		msg = "run timed out" // as the old loop (app/agent.go) said at its 5-minute cap
 	case o.State == harness.OutcomeCancelled:
@@ -348,7 +368,7 @@ func Run(ctx context.Context, rt *harness.Runtime, gw Gateway, user string, r *p
 	case o.Done != nil && o.Done.Error != "":
 		msg = o.Done.Error
 	}
-	ps.emit(proto.Event{Type: "error", Error: msg})
+	ps.emit(proto.Event{Type: "error", Error: msg, Code: code})
 	return errors.New(msg)
 }
 

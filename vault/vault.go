@@ -20,6 +20,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/tacyhq/tacy/safety"
 )
 
 // Grant says which connector may lease a secret and the hosts the value may be sent to (exact names, lowercase;
@@ -42,6 +44,12 @@ type Request struct {
 	Host      string `json:"host,omitzero"`
 	Task      string `json:"task,omitzero"`
 	Action    string `json:"action,omitzero"`
+	// Space is the task's space: its stop, policy and rate apply (step 6). Effect: the lease is for an operation
+	// that changes something outside (refused while the stop list is stale).
+	Space  string `json:"space,omitzero"`
+	Effect bool   `json:"effect,omitzero"`
+	// Docs (op "safety"): signed policies and stop lists, checked here before they count.
+	Docs []safety.Envelope `json:"docs,omitzero"`
 }
 
 // Record is what the vault writes for every request: names and ids, never the value. Later these go to the
@@ -53,6 +61,7 @@ type Record struct {
 	Host      string    `json:"host"`
 	Task      string    `json:"task"`
 	Action    string    `json:"action"`
+	Space     string    `json:"space,omitzero"`
 	Decision  string    `json:"decision"` // "released" or "denied"
 	Reason    string    `json:"reason,omitzero"`
 	Lease     string    `json:"lease,omitzero"`
@@ -64,7 +73,16 @@ var (
 	ErrHost       = errors.New("vault: host not in the secret's send_only_to")
 	ErrNotSet     = errors.New("vault: secret not set")
 	ErrBadRequest = errors.New("vault: bad request")
+	// Step 6 (safety controls).
+	ErrStopped       = errors.New("vault: stopped by a stop list")
+	ErrStale         = errors.New("vault: the stop list isn't fresh")
+	ErrPolicyMissing = errors.New("vault: no signed policy for this space")
+	ErrPolicy        = errors.New("vault: the policy doesn't allow this connector or host")
+	ErrRateLimited   = errors.New("vault: lease rate exceeded")
 )
+
+// known are the errors that cross the wire by their text.
+var known = []error{ErrNoGrant, ErrHost, ErrNotSet, ErrBadRequest, ErrStopped, ErrStale, ErrPolicyMissing, ErrPolicy, ErrRateLimited}
 
 // Vault holds the secrets and grants. Safe for concurrent use.
 type Vault struct {
@@ -73,6 +91,24 @@ type Vault struct {
 	grants  []Grant
 	record  func(Record)
 	now     func() time.Time
+	safety  *safety.State // nil: no step 6 checks
+	rates   safety.Limiter
+}
+
+// SetSafety turns on the step 6 checks: every lease is refused while its space is stopped, without a policy
+// (when admin keys are pinned), to a connector or host the policy doesn't list, past the rate per key, connector
+// and space, and, while the stop list is stale, when it's for a side effect (or any, if the policy says so).
+func (v *Vault) SetSafety(st *safety.State) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.safety = st
+}
+
+// Safety is the vault's verified controls (nil: none).
+func (v *Vault) Safety() *safety.State {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.safety
 }
 
 // New makes a vault. secrets are copied; the caller should wipe its own copies. record may be nil.
@@ -103,7 +139,7 @@ func New(secrets map[string][]byte, grants []Grant, record func(Record)) (*Vault
 // Lease checks r against the grants and returns a copy of the value and a fresh lease id. Every call is recorded.
 func (v *Vault) Lease(r Request) ([]byte, string, error) {
 	rec := Record{Time: v.now().UTC(), Secret: r.Secret, Connector: r.Connector, Host: r.Host, Task: r.Task,
-		Action: r.Action, Decision: "denied"}
+		Action: r.Action, Space: r.Space, Decision: "denied"}
 	val, lease, err := v.lease(r)
 	if err == nil {
 		rec.Decision, rec.Lease = "released", lease
@@ -113,6 +149,9 @@ func (v *Vault) Lease(r Request) ([]byte, string, error) {
 	if !validName(rec.Secret) { // a hostile or broken caller's input stays out of the record
 		rec.Secret = ""
 	}
+	if r.Space != "" && !safety.ValidID(r.Space) {
+		rec.Space = ""
+	}
 	if v.record != nil {
 		v.record(rec)
 	}
@@ -120,7 +159,8 @@ func (v *Vault) Lease(r Request) ([]byte, string, error) {
 }
 
 func (v *Vault) lease(r Request) ([]byte, string, error) {
-	if !validName(r.Secret) || !validConnector(r.Connector) || !validHost(r.Host) || !validID(r.Task) || !validID(r.Action) {
+	if !validName(r.Secret) || !validConnector(r.Connector) || !validHost(r.Host) || !validID(r.Task) || !validID(r.Action) ||
+		r.Space != "" && !safety.ValidID(r.Space) || len(r.Docs) > 0 {
 		return nil, "", ErrBadRequest
 	}
 	v.mu.Lock()
@@ -136,6 +176,9 @@ func (v *Vault) lease(r Request) ([]byte, string, error) {
 			if !ok {
 				return nil, "", ErrNotSet
 			}
+			if err := v.checkSafety(r); err != nil {
+				return nil, "", err
+			}
 			return slices.Clone(val), newLease(), nil
 		}
 	}
@@ -143,6 +186,35 @@ func (v *Vault) lease(r Request) ([]byte, string, error) {
 		return nil, "", ErrHost
 	}
 	return nil, "", ErrNoGrant
+}
+
+// checkSafety applies the step 6 controls to a granted lease (v.mu held).
+func (v *Vault) checkSafety(r Request) error {
+	if v.safety == nil {
+		return nil
+	}
+	e, err := v.safety.Check(r.Space, r.Effect)
+	switch safety.CodeOf(err) {
+	case "":
+	case safety.CodeStopped:
+		return ErrStopped
+	case safety.CodeStale:
+		return ErrStale
+	default:
+		return ErrPolicyMissing
+	}
+	if !e.AllowsConnector(r.Connector) || !e.AllowsLeaseHost(r.Connector, r.Host) {
+		return ErrPolicy
+	}
+	rt := e.Rates()
+	if v.rates.Now == nil {
+		v.rates.Now = v.now
+	}
+	if v.rates.Allow([]string{"key:" + r.Secret, "connector:" + r.Connector, "space:" + r.Space},
+		[]safety.Rate{rt.Key, rt.Connector, rt.Space}) != "" {
+		return ErrRateLimited
+	}
+	return nil
 }
 
 // Names returns the names of the secrets that are set and have a grant, sorted. Never values.

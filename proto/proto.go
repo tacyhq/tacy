@@ -85,7 +85,7 @@ type RunRequest struct {
 //	usage        token counts, summed over all steps so far
 //	metrics      timing of one model call or tool call that just ended, or of the queue when the run started
 //	             (Metric): numbers and fixed names only
-//	error        a fatal error; the stream ends after it
+//	error        a fatal error; the stream ends after it. code says when a safety control ended the run
 //	done         finish_reason and step count; last event before [DONE]
 type Event struct {
 	Type         string          `json:"type"`
@@ -104,6 +104,7 @@ type Event struct {
 	Meta         *Meta           `json:"meta,omitempty"`
 	Metrics      *Metric         `json:"metrics,omitempty"`
 	Error        string          `json:"error,omitempty"`
+	Code         string          `json:"code,omitempty"` // error: why a safety control ended the run (stopped, stop_list_stale, policy_missing, policy_denied, budget_exceeded, rate_limited)
 	FinishReason string          `json:"finish_reason,omitempty"`
 }
 
@@ -154,6 +155,18 @@ type Meta struct {
 	TinfoilMeasure string   `json:"tinfoil_measurement"` // SEV-SNP launch measurement, equal to the release's
 	TinfoilHPKEKey string   `json:"tinfoil_hpke_key"`    // key the request was encrypted to
 	Tools          []string `json:"tools"`
+	// Controls are the signed controls the run started under (step 6, docs/23-safety-controls.md).
+	Controls *Controls `json:"controls,omitempty"`
+}
+
+// Controls name the policy and stop lists a run ran under, so the browser can show which policy applied. Hashes
+// are of the signed documents (safety.Envelope.Hash); none means the release's own default policy.
+type Controls struct {
+	Policy        []string `json:"policy,omitempty"`       // signed policy hashes: the firm's, then the space's
+	ReleasePolicy string   `json:"release_policy"`         // hash of the release's ceiling policy
+	OperatorSeq   uint64   `json:"operator_seq,omitempty"` // newest operator stop list held
+	FirmSeq       uint64   `json:"firm_seq,omitempty"`     // newest firm stop list held
+	Fresh         bool     `json:"stop_list_fresh"`        // the operator's list is fresh (side effects allowed)
 }
 
 // Metric is the timing of one part of a run, sent as a "metrics" event when that part ends (so a run cut short

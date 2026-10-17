@@ -93,7 +93,7 @@ func (t *tinfoilUpstream) Stream(ctx context.Context, body []byte) (io.ReadClose
 		}
 		key, err := t.lease(ctx, tinfoilKey, "model", v.Enclave)
 		if err != nil {
-			return nil, errors.New("model key unavailable") // the vault's rule stays in its record
+			return nil, leaseError(err, "model key unavailable") // the vault's rule stays in its record
 		}
 		req, _ := http.NewRequestWithContext(ctx, "POST", "https://"+v.Enclave+"/v1/chat/completions", bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")

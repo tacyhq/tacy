@@ -12,6 +12,7 @@ import (
 
 	"github.com/tacyhq/tacy/harness"
 	"github.com/tacyhq/tacy/proto"
+	"github.com/tacyhq/tacy/safety"
 )
 
 // ModelCall is the model gateway: one streamed completion from the verified upstream for a brain's model.call.
@@ -22,6 +23,10 @@ import (
 func (g *Guard) ModelCall(ctx context.Context, ti *harness.TaskInfo, req *harness.ModelCall) (*harness.ModelResult, error) {
 	ctx = withTask(ctx, ti.ID) // the vault records the key's lease under the task and this request
 	t := g.task(ti)
+	ctx = withSpace(ctx, t.opts.Space)
+	if err := g.checkSafety(t.opts.Space, req); err != nil {
+		return nil, err
+	}
 	efforts, ok := models[req.Model]
 	if !ok {
 		return nil, harness.Errf(harness.CodeNotAllowed, "model %s isn't available", req.Model)
@@ -78,7 +83,13 @@ func (g *Guard) ModelCall(ctx context.Context, ti *harness.TaskInfo, req *harnes
 	// whole message the brain gets (a key split across deltas is caught there). Model output isn't pattern-scanned
 	// (docs/21 section 2: the model is attested and the answer is the point).
 	leased := leasedOf(stream)
+	maxOut, outBytes := MaxTokensFrom(ctx), int64(0)
 	res, err := readStream(stream, func(kind, delta string) error {
+		// The output cap agentd reserved budget for (step 6): counted from the bytes streamed back (about 3 per
+		// token, on the high side), so a call can't run past its budget even if the upstream would.
+		if outBytes += int64(len(delta)); maxOut > 0 && outBytes/3 > maxOut {
+			return fmt.Errorf("%s: the model's answer passed the %d tokens reserved for it", safety.CodeBudgetExceeded, maxOut)
+		}
 		if leased != nil {
 			delta = string(exactRedact([]byte(delta), leased))
 		}

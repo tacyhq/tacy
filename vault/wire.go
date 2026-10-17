@@ -11,13 +11,16 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/tacyhq/tacy/safety"
 )
 
 // The wire: harness/v1's framing (a 4-byte big-endian length, then one JSON object), one request and one reply
 // per frame, any number per connection. Decoding is strict: unknown members, a bad length or trailing data close
 // the connection.
 
-const maxFrame = 16 << 10
+// maxFrame: a lease is small; a safety push carries up to 8 signed documents.
+const maxFrame = 16<<10 + 8*2*safety.MaxEnvelope
 
 type reply struct {
 	Value []byte   `json:"value,omitzero"` // base64 in JSON
@@ -122,6 +125,21 @@ func (v *Vault) serveConn(c net.Conn, peerUID int) {
 			}
 		case "names":
 			rep = reply{Names: v.Names()}
+		case "safety":
+			// Signed documents the gateway passes on: each is verified here, against this process's pinned keys.
+			if st := v.Safety(); st == nil {
+				rep = reply{Error: "vault: no safety controls"}
+			} else {
+				errs, changed := st.Apply(r.Docs)
+				if err := errors.Join(errs...); err != nil {
+					rep = reply{Error: "vault: " + err.Error()}
+				}
+				if changed && v.record != nil {
+					s := st.StatusOf("")
+					v.record(Record{Time: v.now().UTC(), Decision: "controls", Reason: fmt.Sprintf("policy %v, operator seq %d, firm seq %d",
+						s.Policy, s.OperatorSeq, s.FirmSeq)})
+				}
+			}
 		default:
 			return // unknown op: closed, like any malformed frame
 		}
@@ -170,6 +188,19 @@ func (c *Client) do(ctx context.Context, r Request, rep *reply) error {
 	return readFrame(conn, rep)
 }
 
+// Push passes signed policies and stop lists to the vault, which checks each itself. The error lists the ones it
+// refused (older, forged, for another firm); the others are taken.
+func (c *Client) Push(ctx context.Context, docs []safety.Envelope) error {
+	var rep reply
+	if err := c.do(ctx, Request{Op: "safety", Docs: docs}, &rep); err != nil {
+		return err
+	}
+	if rep.Error != "" {
+		return errors.New(rep.Error)
+	}
+	return nil
+}
+
 // Lease asks the vault for one secret for one action. The error names the rule that refused it.
 func (c *Client) Lease(ctx context.Context, r Request) (*Secret, error) {
 	r.Op = ""
@@ -178,9 +209,9 @@ func (c *Client) Lease(ctx context.Context, r Request) (*Secret, error) {
 		return nil, err
 	}
 	if rep.Error != "" {
-		for _, known := range []error{ErrNoGrant, ErrHost, ErrNotSet, ErrBadRequest} {
-			if rep.Error == known.Error() {
-				return nil, known
+		for _, k := range known {
+			if rep.Error == k.Error() {
+				return nil, k
 			}
 		}
 		return nil, errors.New("vault: refused")

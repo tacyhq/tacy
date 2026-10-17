@@ -59,6 +59,17 @@ func (g *Guard) Action(ctx context.Context, ti *harness.TaskInfo, id string, req
 	}
 	ctx = withTask(ctx, ti.ID)
 	t := g.task(ti)
+	ctx = withSpace(ctx, t.opts.Space)
+	if err := g.checkSafety(t.opts.Space, req); err != nil {
+		if d, ok := deniedResult(err); ok {
+			g.record(Egress{Task: ti.ID, Action: id, Op: req.Name, Decision: "denied", Rule: "policy"})
+			return d, nil
+		}
+		return nil, err
+	}
+	if g.cfg.Safety != nil {
+		ctx = withHostFilter(ctx, g.fetchFilter(t.opts.Space))
+	}
 	call := t.claim(req.Call, id, app, req.Args)
 	step := t.currentStep()
 	t1 := time.Now()

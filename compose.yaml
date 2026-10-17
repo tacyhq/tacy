@@ -8,11 +8,11 @@
 # Every image is named by digest only: the pinned distroless base (gcr.io/distroless/static-debian13@sha256:2293b36c7c9082bf4115aab724b4d2cddec82c8eba39bf27ac0517e159acf150)
 # plus one layer with the binary at /tacy/<name>. Rebuild them from the tagged source (scripts/reproduce.sh) to get
 # the same digests. Binaries (linux/amd64, sha256):
-#   agentd   a2d7389344c2cbf3c4ecf1edaa5c201537af20c7d9b470da3613173d2e51703c
+#   agentd   e2ec50c2000a1f3e4991302573ad05f527be766552ad97c9763cf755bfabb266
 #   brain    24be340e95b54714005043948f4f762ce0368633505df12b3b4fd2623ac6cecc
-#   gatewayd 6892967a056192c742a032b338fa2392d8910c6ac84991ee76d3576208536a69
+#   gatewayd 5226246a87b28a828b54db3acd26d3a48ad27347b2c2140cb3b5f49a15355b5d
 #   setup    80f380d97b1cc77da758d69ba978e5f09c720f10ef853f6afa06e06ffa006de6
-#   vaultd   f6ccd0ea860d7e337adff12144dc87fc22a24af2cfb860868b9b6fda43692135
+#   vaultd   4f18ddeef70396dbb2f2a683c0cf338ffef775a3b8de4d3c49f3d499cebf61eb
 services:
   setup:
     image: ghcr.io/tacyhq/tacy/setup@sha256:7c33f77d06d41b1f14c0729fd52abbabd657ec5e418e16fd17deac35bb607a0e
@@ -31,7 +31,7 @@ services:
       - state:/state
     command: ["-dir", "/run/tacy/agent=10003:10001:0770", "-dir", "/run/tacy/vault=10002:10001:0750", "-dir", "/run/tacy/brain=10003:65534:0750", "-remove", "/state/queue.db", "-remove", "/state/queue.db-wal", "-remove", "/state/queue.db-shm", "-remove", "/state/queue.db-journal", "-tree", "/state/agentd=10003:10003:0700"]
   agentd:
-    image: ghcr.io/tacyhq/tacy/agentd@sha256:7a9edd1b10871ae4138e857c5c4547289165a774d27c2cd67b5fc75de3c556f1
+    image: ghcr.io/tacyhq/tacy/agentd@sha256:8fefdcee560d7580be336bf8df6b237adcee9865df5fec242f222d9df3eced68
     entrypoint: ["/tacy/agentd"]
     network_mode: none
     restart: unless-stopped
@@ -50,7 +50,7 @@ services:
       - agentsock:/run/tacy/agent
     environment:
       AGENT_VM_TOKEN: ${AGENT_VM_TOKEN}
-    command: ["-storage", "/state/agentd", "-brain-socket", "/run/tacy/brain/brain.sock", "-brain-uid", "65534", "-brain-gid", "65534", "-gateway-socket", "/run/tacy/agent/gateway.sock", "-listen-unix", "/run/tacy/agent/http.sock", "-listen-uid", "10001", "-listen-gid", "10001", "-mem-limit-mib", "600"]
+    command: ["-storage", "/state/agentd", "-brain-socket", "/run/tacy/brain/brain.sock", "-brain-uid", "65534", "-brain-gid", "65534", "-gateway-socket", "/run/tacy/agent/gateway.sock", "-listen-unix", "/run/tacy/agent/http.sock", "-listen-uid", "10001", "-listen-gid", "10001", "-mem-limit-mib", "600", "-firm", "f_chat"]
   brain:
     image: ghcr.io/tacyhq/tacy/brain@sha256:87109ed7e139f230fb3346f612e50ea45a965c1938ad0975d588c56277103d4f
     entrypoint: ["/tacy/brain"]
@@ -67,7 +67,7 @@ services:
       - brainsock2:/run/tacy/brain
     command: ["--socket", "/run/tacy/brain/brain.sock"]
   agentvm:
-    image: ghcr.io/tacyhq/tacy/gatewayd@sha256:c64aaa24f6a9ccc13f994132855654098fc36ddd8b3db0e683f8a4637073d8fe
+    image: ghcr.io/tacyhq/tacy/gatewayd@sha256:41eb089123a9d71898a9f9ea8132be91653e9fe3ee85d731c9bf38d7e2d90f82
     entrypoint: ["/tacy/gatewayd"]
     restart: unless-stopped
     depends_on:
@@ -86,9 +86,9 @@ services:
     environment:
       SEARCH_PROVIDER: ${SEARCH_PROVIDER}
       HOME: /tmp
-    command: ["-socket", "/run/tacy/agent/gateway.sock", "-agent-uid", "10003", "-vault-socket", "/run/tacy/vault/vault.sock", "-listen", ":8080", "-forward", "/run/tacy/agent/http.sock"]
+    command: ["-socket", "/run/tacy/agent/gateway.sock", "-agent-uid", "10003", "-vault-socket", "/run/tacy/vault/vault.sock", "-listen", ":8080", "-forward", "/run/tacy/agent/http.sock", "-firm", "f_chat"]
   vaultd:
-    image: ghcr.io/tacyhq/tacy/vaultd@sha256:f3b38de8512881adecd12ab5dcfb75cab9995ff782e872f12ed1996f942bfc16
+    image: ghcr.io/tacyhq/tacy/vaultd@sha256:ba5329fcb92e3941ec413b4b05ca894680ab65f435c16bb4a4f901e3f8549d17
     entrypoint: ["/tacy/vaultd"]
     network_mode: none
     restart: unless-stopped
@@ -105,7 +105,7 @@ services:
       TINFOIL_API_KEY: ${TINFOIL_API_KEY}
       BRAVE_SEARCH_API_KEY: ${BRAVE_SEARCH_API_KEY}
       TAVILY_API_KEY: ${TAVILY_API_KEY}
-    command: ["-socket", "/run/tacy/vault/vault.sock", "-gateway-uid", "10001", "-group-mode"]
+    command: ["-socket", "/run/tacy/vault/vault.sock", "-gateway-uid", "10001", "-group-mode", "-firm", "f_chat"]
 volumes:
   state:
   brainsock2:

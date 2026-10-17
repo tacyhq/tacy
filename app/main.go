@@ -65,6 +65,7 @@ import (
 	"github.com/tacyhq/tacy/internal/tinfoil"
 	"github.com/tacyhq/tacy/proto"
 	"github.com/tacyhq/tacy/queue"
+	"github.com/tacyhq/tacy/safety"
 )
 
 type server struct {
@@ -78,6 +79,10 @@ type server struct {
 	lim      Limits
 	quotes   chan struct{} // concurrent /attest limit
 	runsDone atomic.Int64  // finished runs (local platform stats only)
+
+	safety      *safety.State // signed policies and stop lists agentd verified (step 6, safety.go)
+	gw          guard.Gateway // the guard under the safety checks (pushSafety reaches gatewayd through it)
+	safetySlots chan struct{} // concurrent POST /safety limit
 }
 
 type ticketKey struct{}
@@ -196,6 +201,17 @@ func (s *server) run(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, _, err := s.agent.StartFor(&req); err != nil { // the request checks (Run makes the task from it again)
+		if safety.CodeOf(err) != "" { // stopped, no policy, a model it doesn't allow, the day used up: say why
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-store")
+			w.WriteHeader(200)
+			out := newEventStream(w, keepaliveEvery)
+			code, msg := coded(err)
+			out.emit(proto.Event{Type: "error", Error: msg, Code: code})
+			out.done()
+			out.stop()
+			return
+		}
 		fail(w, 400, err.Error())
 		return
 	}
@@ -298,6 +314,8 @@ func main() {
 	devModel := flag.String("dev-model", "", "local only: plain OpenAI-compatible chat completions URL instead of Tinfoil")
 	devSearch := flag.String("dev-search", "", "local only: Tavily-compatible search URL")
 	devFetchAny := flag.Bool("dev-fetch-any", false, "local only: let fetch_page reach private addresses")
+	var sf safety.Flags
+	sf.Register(flag.CommandLine)
 	flag.Parse()
 	log.Printf("agentd: %s", procinfo.Line())
 	if lim.MaxRuns > 256 {
@@ -329,6 +347,19 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	// Step 6: the signed controls, kept on the encrypted disk (the version floors outlive a restart).
+	safetyDir := ""
+	if dir := p.StoragePath(); dir != "" {
+		safetyDir = filepath.Join(dir, "safety")
+	}
+	scfg, err := sf.Config(guard.ReleasePolicy(sf.Firm, p.Secret("TINFOIL_ENCLAVE")), safetyDir)
+	if err != nil {
+		log.Fatal(err)
+	}
+	st, err := safety.NewState(scfg)
+	if err != nil {
+		log.Fatalf("safety: %v", err)
+	}
 	var gw guard.Gateway
 	searchName := "gatewayd"
 	var tc *tinfoil.Client
@@ -336,7 +367,7 @@ func main() {
 		if *devModel != "" || *devSearch != "" || *devFetchAny {
 			log.Fatal("-dev-* flags configure this process's guard: not with -gateway-socket")
 		}
-		gw = &gateway.Client{Path: *gatewaySocket, Now: func() time.Time { return time.Now().UTC() }}
+		gw = &gateway.Client{Path: *gatewaySocket, Now: func() time.Time { return time.Now().UTC() }, Docs: st.Docs}
 	} else {
 		// Local development and the load test: the guard in this process, keys from the environment.
 		keys := guard.StaticKeys(p.Secret)
@@ -353,8 +384,9 @@ func main() {
 		fetcher := guard.NewFetcher(*devFetchAny)
 		gw = guard.New(guard.Config{Up: up, Search: search, Fetcher: fetcher,
 			Icons:  fetcher, // site icons go through the same guarded client (guard/favicons.go)
-			Limits: &lim, CacheSecret: randomHex(32), Now: func() time.Time { return time.Now().UTC() }})
+			Limits: &lim, CacheSecret: randomHex(32), Now: func() time.Time { return time.Now().UTC() }, Safety: st})
 	}
+	sg := newSafeGateway(gw, st, &safety.Ledger{Dir: safetyDir})
 	var store harness.Store = harness.NewMemStore()
 	if dir := p.StoragePath(); dir != "" {
 		q, err := queue.Open(filepath.Join(dir, "queue.db"))
@@ -363,7 +395,8 @@ func main() {
 		}
 		store = q
 	}
-	rt := newRuntime(gw, store, lim)
+	rt := newRuntime(sg, store, lim)
+	sg.cancel = func(id, reason string) { rt.Cancel(id, reason) }
 	ids, err := rt.Restore()
 	if err != nil {
 		log.Fatalf("queue: %v", err)
@@ -371,9 +404,19 @@ func main() {
 	if n := guard.Abandon(rt, ids); n > 0 {
 		log.Printf("ended %d runs a previous process left open", n)
 	}
-	s := &server{platform: p, id: id, agent: gw, rt: rt, token: p.Secret("AGENT_VM_TOKEN"), booted: time.Now().UTC(),
-		sched: newScheduler(lim), lim: lim, quotes: make(chan struct{}, 8)}
+	s := &server{platform: p, id: id, agent: sg, rt: rt, token: p.Secret("AGENT_VM_TOKEN"), booted: time.Now().UTC(),
+		sched: newScheduler(lim), lim: lim, quotes: make(chan struct{}, 8), safety: st, gw: gw, safetySlots: make(chan struct{}, 4)}
 	ctx := context.Background()
+	go sg.enforce(ctx, 2*time.Second)
+	go func() { // gatewayd (and through it the vault) gets agentd's documents now and every 10 s
+		for {
+			s.pushSafety()
+			select {
+			case <-st.Changed():
+			case <-time.After(10 * time.Second):
+			}
+		}
+	}()
 	if *brainSocket == "" {
 		go localBrain(ctx, rt)
 	} else if err := serveBrains(ctx, rt, *brainSocket, *brainUID, *brainGID); err != nil {
@@ -398,6 +441,12 @@ func main() {
 	mux.HandleFunc("GET "+ehbpproto.KeysPath, id.ConfigHandler)
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) { fmt.Fprintln(w, "ok") })
 	mux.Handle("POST /run", s.guard(id.Middleware()(http.HandlerFunc(s.run))))
+	// Signed policies and stop lists; the signature is the authorization. Only served when the compose pins a key
+	// (stage 2): without one nothing could verify, so there's nothing to take.
+	if scfg.Operator != nil || len(scfg.Admins) > 0 {
+		mux.HandleFunc("POST /safety", s.safetyIn)
+	}
+	mux.HandleFunc("GET /safety", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, st.StatusOf("s_chat")) })
 	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)

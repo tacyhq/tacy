@@ -32,7 +32,7 @@ func taskFrom(ctx context.Context) string {
 func VaultLease(c *vault.Client) Lease {
 	return func(ctx context.Context, secret, connector, host string) (*vault.Secret, error) {
 		return c.Lease(ctx, vault.Request{Secret: secret, Connector: connector, Host: host,
-			Task: orNone(taskFrom(ctx)), Action: orNone(harness.RequestID(ctx))})
+			Task: orNone(taskFrom(ctx)), Action: orNone(harness.RequestID(ctx)), Space: SpaceFrom(ctx)})
 	}
 }
 
@@ -67,7 +67,7 @@ func searchKey(ctx context.Context, lease Lease, secret, base string) (*vault.Se
 	case errors.Is(err, vault.ErrNotSet):
 		return nil, errSearchNotConfigured
 	case err != nil:
-		return nil, errors.New("search key unavailable")
+		return nil, leaseError(err, "search key unavailable")
 	}
 	return s, nil
 }

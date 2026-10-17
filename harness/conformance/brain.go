@@ -3,8 +3,8 @@
 // RunBrain runs a brain (a harness: our Go loop, a Pi adapter, a builder's SDK) against the fake runtime through
 // what every harness must handle: the handshake, a task with a tool call, steering mid-run, cancel, a crash
 // while an action runs (the replayed action must not run twice), a crash and resume from a checkpoint, a runtime
-// restart mid-task, a request the runtime refuses, arguments the model got wrong, and malformed or oversize frames
-// from the runtime. Every frame the brain sends goes through the runtime's strict decoder; one refusal fails the
+// restart mid-task, a request the runtime refuses, arguments the model got wrong, the safety controls (kill switch,
+// a budget refusal, a policy refusal), and malformed or oversize frames from the runtime. Every frame the brain sends goes through the runtime's strict decoder; one refusal fails the
 // test, as does an action that doesn't name the model tool call it carries out.
 //
 // RunRuntime plays a hostile brain against a runtime: malformed and oversize frames, wrong order, an unsupported
@@ -572,6 +572,78 @@ func RunBrain(t *testing.T, brain Brain) {
 		}
 		if e.f.ActionRuns("t1", "files.delete") != 0 {
 			t.Error("files.delete ran")
+		}
+		e.clean()
+	})
+
+	// Safety controls (step 6, docs/23-safety-controls.md) reach a brain through harness/v1 as it is: the kill
+	// switch is a cancel with reason kill_switch, a budget is a limit error, a policy refusal is a denied action.
+	t.Run("kill switch", func(t *testing.T) {
+		e := newEnv(t, brain)
+		e.f.Model = harness.Script(harness.Calls(call("c1", "web.search", `{"q":"x"}`)), harness.Text("never"))
+		running := make(chan struct{}, 1)
+		e.f.Actions["web.search"] = func(ctx context.Context, _ *harness.TaskInfo, _ jsontext.Value) (*harness.ActionResult, error) {
+			running <- struct{}{}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+		e.launch()
+		e.f.Start("t1", Task("web.search"))
+		select {
+		case <-running:
+		case <-time.After(wait):
+			t.Fatal("the action never started")
+		}
+		e.f.Cancel("t1", "kill_switch")
+		if o := e.outcome("t1"); o.State != harness.OutcomeCancelled || o.Done == nil || o.Done.Outcome != harness.OutcomeCancelled {
+			t.Fatalf("outcome %+v: the brain must send done (cancelled) after a kill switch", o)
+		}
+		if n := e.f.ModelCalls("t1"); n != 1 {
+			t.Errorf("%d model calls: none may follow the kill switch", n)
+		}
+		if n := e.f.ActionRuns("t1", "web.search"); n != 1 {
+			t.Errorf("web.search ran %d times", n)
+		}
+		e.clean()
+	})
+
+	t.Run("budget refuses a model call", func(t *testing.T) {
+		e := newEnv(t, brain)
+		var mu sync.Mutex
+		n := 0
+		e.f.Model = func(context.Context, *harness.TaskInfo, *harness.ModelCall) (*harness.ModelResult, error) {
+			mu.Lock()
+			n++
+			mu.Unlock()
+			return nil, harness.Errf(harness.CodeLimit, "budget_exceeded: the run's budget for model tokens is used up")
+		}
+		e.launch()
+		e.f.Start("t1", Task("web.search"))
+		o := e.outcome("t1")
+		if o.State != harness.OutcomeFailed || o.Done == nil || o.Done.Outcome != harness.OutcomeFailed {
+			t.Fatalf("outcome %+v: a refused model call must end the task (failed)", o)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if n != 1 {
+			t.Errorf("%d model calls: the brain must not retry a budget refusal", n)
+		}
+	})
+
+	t.Run("policy denies an action", func(t *testing.T) {
+		e := newEnv(t, brain)
+		e.f.Model = harness.Script(harness.Calls(call("c1", "web.fetch", `{"url":"https://elsewhere.example/"}`)), harness.Text("couldn't"))
+		e.f.Actions["web.fetch"] = func(context.Context, *harness.TaskInfo, jsontext.Value) (*harness.ActionResult, error) {
+			return &harness.ActionResult{Status: harness.ActionDenied, Error: "policy_denied: host not allowed by the policy"}, nil
+		}
+		e.launch()
+		e.f.Start("t1", Task("web.fetch"))
+		if o := e.outcome("t1"); o.State != harness.OutcomeSucceeded {
+			t.Fatalf("outcome %+v: a policy refusal is an outcome the model sees, not the task's end", o)
+		}
+		calls := modelCalls(t, e.snapshot(), "t1")
+		if len(calls) != 2 || !toolResult(calls[1], "c1", "policy_denied") {
+			t.Error("the model wasn't told the policy refused the action")
 		}
 		e.clean()
 	})

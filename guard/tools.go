@@ -388,6 +388,8 @@ func (t *Tools) fetch(ctx context.Context, raw string) (title, text, final strin
 func errText(err error) string {
 	s := err.Error()
 	switch {
+	case strings.Contains(s, errHostPolicy.Error()):
+		return "host not allowed by the policy"
 	case strings.Contains(s, "address not public"), strings.Contains(s, "not allowed"):
 		return "address not allowed"
 	case strings.Contains(s, "timeout"), strings.Contains(s, "deadline"):

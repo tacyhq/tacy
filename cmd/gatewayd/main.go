@@ -33,6 +33,7 @@ import (
 	"github.com/tacyhq/tacy/guard"
 	"github.com/tacyhq/tacy/internal/procinfo"
 	"github.com/tacyhq/tacy/internal/tinfoil"
+	"github.com/tacyhq/tacy/safety"
 	"github.com/tacyhq/tacy/vault"
 )
 
@@ -43,6 +44,10 @@ func main() {
 	listen := flag.String("listen", "", "TCP address of the published port to forward to -forward (empty: none)")
 	forward := flag.String("forward", "", "agentd's HTTP unix socket")
 	memLimit := flag.Int("mem-limit-mib", 900, "Go soft memory limit (GOMEMLIMIT), MiB; 0 = none")
+	safetyURL := flag.String("safety-url", "", "https URL to pull the signed stop lists and policies from (empty: agentd's pushes only)")
+	safetyEvery := flag.Duration("safety-every", 10*time.Second, "how often to pull -safety-url")
+	var sf safety.Flags
+	sf.Register(flag.CommandLine)
 	flag.Parse()
 	log.Printf("gatewayd: %s", procinfo.Line())
 	if *socket == "" || *vaultSocket == "" {
@@ -71,7 +76,18 @@ func main() {
 		}
 		time.Sleep(time.Second)
 	}
-	lease := guard.VaultLease(vc)
+	// Step 6: gatewayd checks the signed controls itself (memory only: agentd, which keeps the floors on disk,
+	// sends its documents with every session and every 10 s; the vault gets what gatewayd takes).
+	scfg, err := sf.Config(guard.ReleasePolicy(sf.Firm, os.Getenv("TINFOIL_ENCLAVE")), "")
+	if err != nil {
+		log.Fatal(err)
+	}
+	st, err := safety.NewState(scfg)
+	if err != nil {
+		log.Fatal(err)
+	}
+	toVault := vaultPusher(vc, st)
+	lease := retryLease(guard.VaultLease(vc), toVault)
 	tc := tinfoil.NewClient(os.Getenv("TINFOIL_ENCLAVE"), "")
 	search := guard.NewSearch(os.Getenv("SEARCH_PROVIDER"), func(n string) bool { return slices.Contains(names, n) }, lease)
 	fetcher := guard.NewFetcher(false)
@@ -79,7 +95,7 @@ func main() {
 	var logMu sync.Mutex
 	enc := json.NewEncoder(os.Stdout)
 	g := guard.New(guard.Config{Up: guard.NewTinfoilUpstream(tc, lease), Search: search, Fetcher: fetcher,
-		Icons: fetcher, Limits: &lim, CacheSecret: randomHex(32), Now: func() time.Time { return time.Now().UTC() },
+		Icons: fetcher, Limits: &lim, CacheSecret: randomHex(32), Now: func() time.Time { return time.Now().UTC() }, Safety: st,
 		Record: func(e guard.Egress) { // metadata only: ids, operation, decision, pattern ids
 			logMu.Lock()
 			defer logMu.Unlock()
@@ -108,7 +124,26 @@ func main() {
 	}
 	log.Printf("gatewayd %s on %s (search %s, keys set %v, forwarding %s to %s)", gateway.Version, *socket,
 		search.Name(), names, *listen, *forward)
-	log.Fatal((&gateway.Server{G: g}).Serve(l, *agentUID))
+	go func() { // the vault gets gatewayd's documents on every change and every 10 s (a restarted vault starts empty)
+		for {
+			toVault()
+			ch := st.Changed()
+			select {
+			case <-ch:
+				s := st.StatusOf("s_chat") // hashes and numbers only
+				log.Printf("safety: controls now policy %v, operator seq %d, firm seq %d, fresh %v, stopped %q", s.Policy,
+					s.OperatorSeq, s.FirmSeq, s.Fresh, s.Stopped)
+			case <-time.After(10 * time.Second):
+			}
+		}
+	}()
+	if *safetyURL != "" {
+		if *forward == "" {
+			log.Fatal("gatewayd: -safety-url needs -forward (pulled documents go to agentd)")
+		}
+		go pullSafety(*safetyURL, *safetyEvery, *forward)
+	}
+	log.Fatal((&gateway.Server{G: g, Safety: st}).Serve(l, *agentUID))
 }
 
 // forwardPort copies each inbound connection on addr to and from agentd's HTTP socket. The bytes aren't read:

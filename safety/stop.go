@@ -1,0 +1,85 @@
+package safety
+
+import (
+	"errors"
+	"time"
+)
+
+// StopType names this stop list format.
+const StopType = "tacy.stop/v1"
+
+// Stop list issuers.
+const (
+	IssuerOperator = "operator" // us: a global stop or a stop for a firm or space (availability only)
+	IssuerFirm     = "firm"     // the firm's admins: their whole firm or some spaces
+)
+
+// MaxStopLifetime bounds an operator list's validity: it is a heartbeat, signed again and again.
+const MaxStopLifetime = time.Hour
+
+// StopList is a signed list of what must stop. The newest list of each issuer replaces the older one (Seq only
+// goes up). The operator's list also proves freshness: it expires soon after it's signed, and a VM whose newest
+// operator list is stale stops side effects (and reads, unless the policy allows them).
+type StopList struct {
+	Type      string    `json:"type"`
+	Issuer    string    `json:"issuer"`
+	Firm      string    `json:"firm,omitzero"` // firm lists: the firm
+	Seq       uint64    `json:"seq"`
+	IssuedAt  time.Time `json:"issued_at"`
+	ExpiresAt time.Time `json:"expires_at,omitzero"` // required for the operator's list
+	// All stops everything the issuer covers: every firm (operator) or the whole firm (firm).
+	All  bool     `json:"all,omitzero"`
+	Stop []Target `json:"stop,omitzero"`
+}
+
+// Target is a firm (Space "") or one of its spaces. In a firm's list, Firm must be the list's.
+type Target struct {
+	Firm  string `json:"firm"`
+	Space string `json:"space,omitzero"`
+}
+
+// Validate checks a stop list's shape.
+func (l *StopList) Validate() error {
+	switch {
+	case l.Type != StopType:
+		return errors.New("stop list: type must be " + StopType)
+	case l.Seq == 0 || l.IssuedAt.IsZero():
+		return errors.New("stop list: seq and issued_at are required")
+	case len(l.Stop) > 256:
+		return errors.New("stop list: too many targets")
+	}
+	switch l.Issuer {
+	case IssuerOperator:
+		if l.Firm != "" || l.ExpiresAt.IsZero() || !l.ExpiresAt.After(l.IssuedAt) || l.ExpiresAt.Sub(l.IssuedAt) > MaxStopLifetime {
+			return errors.New("stop list: an operator list has no firm and expires within an hour of issue")
+		}
+	case IssuerFirm:
+		if !ValidID(l.Firm) {
+			return errors.New("stop list: a firm list names its firm")
+		}
+	default:
+		return errors.New("stop list: issuer must be operator or firm")
+	}
+	for _, t := range l.Stop {
+		if !ValidID(t.Firm) || t.Space != "" && !ValidID(t.Space) || l.Issuer == IssuerFirm && t.Firm != l.Firm {
+			return errors.New("stop list: bad target")
+		}
+	}
+	return nil
+}
+
+// stops: whether the list stops space in firm.
+func (l *StopList) stops(firm, space string) bool {
+	if l == nil {
+		return false
+	}
+	if l.All {
+		return true
+	}
+	for _, t := range l.Stop {
+		if t.Firm == firm && (t.Space == "" || t.Space == space) {
+			return true
+		}
+	}
+	return false
+}

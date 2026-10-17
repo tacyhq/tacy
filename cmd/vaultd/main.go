@@ -16,6 +16,7 @@ import (
 	"sync"
 
 	"github.com/tacyhq/tacy/internal/procinfo"
+	"github.com/tacyhq/tacy/safety"
 	"github.com/tacyhq/tacy/vault"
 )
 
@@ -23,6 +24,8 @@ func main() {
 	socket := flag.String("socket", "", "the vault's unix socket")
 	uid := flag.Int("gateway-uid", -1, "the only uid allowed to connect (required on Linux)")
 	group := flag.Bool("group-mode", false, "socket mode 0660: gatewayd connects through the socket's group (vaultd's primary group is gatewayd's)")
+	var sf safety.Flags
+	sf.Register(flag.CommandLine)
 	flag.Parse()
 	log.Printf("vaultd: %s", procinfo.Line())
 	if *socket == "" {
@@ -48,6 +51,16 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	// Step 6: the vault checks the signed controls itself (memory only; gatewayd passes them on).
+	scfg, err := sf.Config(safety.ChatRelease(sf.Firm, os.Getenv("TINFOIL_ENCLAVE"), nil, 300), "")
+	if err != nil {
+		log.Fatal(err)
+	}
+	st, err := safety.NewState(scfg)
+	if err != nil {
+		log.Fatal(err)
+	}
+	v.SetSafety(st)
 	mode := os.FileMode(0o600)
 	if *group {
 		mode = 0o660

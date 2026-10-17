@@ -114,6 +114,29 @@ var bins = []struct{ name, pkg string }{
 	{"vaultd", "./cmd/vaultd"},
 }
 
+// Safety trust roots (docs/23-safety-controls.md), pinned here so the attested compose names them; the same in
+// agentd, gatewayd and vaultd. Public keys only ("ed25519:<base64>"). Empty until the production keys are made
+// offline (stage 2): then the release policy applies alone and side effects fail closed (no operator stop list
+// can be checked). safetyURL: where gatewayd pulls the signed stop lists (empty: pushes to POST /safety only).
+const (
+	safetyFirm  = "f_chat"
+	operatorKey = ""
+	adminKeys   = ""
+	safetyURL   = ""
+)
+
+// safetyArgs are the trust-root flags every guard process gets.
+func safetyArgs() []string {
+	a := []string{"-firm", safetyFirm}
+	if operatorKey != "" {
+		a = append(a, "-operator-key", operatorKey)
+	}
+	if adminKeys != "" {
+		a = append(a, "-admin-keys", adminKeys)
+	}
+	return a
+}
+
 func run(env []string, name string, args ...string) (string, error) {
 	cmd := exec.Command(name, args...)
 	cmd.Env = append(os.Environ(), env...)
@@ -378,9 +401,9 @@ func generate(images []Image) (string, error) {
       - agentsock:/run/tacy/agent
 `)
 	env(agentEnv)
-	args("-storage", "/state/agentd", "-brain-socket", "/run/tacy/brain/brain.sock", "-brain-uid", brainUID, "-brain-gid", brainUID,
+	args(append([]string{"-storage", "/state/agentd", "-brain-socket", "/run/tacy/brain/brain.sock", "-brain-uid", brainUID, "-brain-gid", brainUID,
 		"-gateway-socket", "/run/tacy/agent/gateway.sock", "-listen-unix", "/run/tacy/agent/http.sock", "-listen-uid", gatewaydUID,
-		"-listen-gid", gatewaydUID, "-mem-limit-mib", "600")
+		"-listen-gid", gatewaydUID, "-mem-limit-mib", "600"}, safetyArgs()...)...)
 	service("brain", "brain", brainUID+":"+brainUID, false)
 	b.WriteString(`    volumes:
       - brainsock2:/run/tacy/brain
@@ -396,14 +419,18 @@ func generate(images []Image) (string, error) {
 `)
 	env(gatewayEnv)
 	b.WriteString("      HOME: /tmp\n")
-	args("-socket", "/run/tacy/agent/gateway.sock", "-agent-uid", agentdUID, "-vault-socket", "/run/tacy/vault/vault.sock",
-		"-listen", ":8080", "-forward", "/run/tacy/agent/http.sock")
+	gw := append([]string{"-socket", "/run/tacy/agent/gateway.sock", "-agent-uid", agentdUID, "-vault-socket", "/run/tacy/vault/vault.sock",
+		"-listen", ":8080", "-forward", "/run/tacy/agent/http.sock"}, safetyArgs()...)
+	if safetyURL != "" {
+		gw = append(gw, "-safety-url", safetyURL)
+	}
+	args(gw...)
 	service("vaultd", "vaultd", vaultdUID+":"+gatewaydUID, false) // primary group: gatewayd's, so its socket is the gateway's to open
 	b.WriteString(`    volumes:
       - vaultsock:/run/tacy/vault
 `)
 	env(vaultEnv)
-	args("-socket", "/run/tacy/vault/vault.sock", "-gateway-uid", gatewaydUID, "-group-mode")
+	args(append([]string{"-socket", "/run/tacy/vault/vault.sock", "-gateway-uid", gatewaydUID, "-group-mode"}, safetyArgs()...)...)
 	b.WriteString(`volumes:
   state:
   brainsock2:

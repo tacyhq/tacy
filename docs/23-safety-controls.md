@@ -1,0 +1,68 @@
+# Safety controls: signed policy, kill switch, budgets, rate limits
+
+> **Status:** in the agent VM since v0.3.0 without keys: the release policy (`safety.ChatRelease`) applies alone, with its budgets, the vault's lease rates and the fail-closed rule for side effects (none of today's connectors has any). Pinning the admin and operator keys and the first signed policy is the next step (section 7). Code: `safety/` plus small hooks in agentd (`app/safety.go`), gatewayd (`guard/safety.go`, `cmd/gatewayd/safety.go`) and vaultd (`vault/`); `cmd/safetysign` makes keys and signs documents (not part of the VM).
+
+Builds on [harness/v1](20-harness-protocol.md) and [gateway v0 and the vault](21-gateway-v0.md) (four processes).
+
+## 1. What it does
+- **Signed policy.** Per firm, optionally per space, versioned: models, connectors with their tools and key hosts, fetch hosts, actions that need approval, whether reads may go on while the stop list is stale, budgets, lease rates. Signed by the firm's admin keys; agentd, gatewayd and vaultd each check the signature themselves against keys pinned in the attested compose. Our servers can deliver a policy but can't make or widen one.
+- **Kill switch.** Two levels: the firm's own signed stop list (whole firm or some spaces), and the operator's signed list (a global stop or a stop for a firm or space, availability only). A stop refuses new runs, cancels running ones (measured: 0.13 s in the local compose, under 0.3 s in tests) and refuses leases in the vault.
+- **Works when our control plane is down.** The operator's list is a heartbeat: it expires within an hour of signing, and the VM counts it stale after 10 minutes. With no fresh list, actions with side effects stop (fail closed); reads go on only if the policy allows. Anyone can push signed documents straight to the VM (`POST /safety`, no bearer token: the signature is the authorization; served only when the compose pins a key), so an admin's browser can stop agents without our relay.
+- **Budgets.** Per run and per space per UTC day: model tokens, tool calls, running time, estimated cost. Every request reserves what it may use before it runs, under one lock, so parallel calls can't each see room that only one has. A model call reserves its prompt plus up to 32,768 completion tokens (less if the budget has less left), and gatewayd ends the call if the output streamed back passes that (counted at 3 bytes a token), so the upstream needs no cap of its own. A call that reports no usage, or fails after it started, keeps its whole reservation counted.
+- **Vault rate limits.** Token buckets per key, per connector and per space (leases per minute, burst). Names and ids only.
+- **People see why.** A run a control ends carries `code` on its error event (`stopped`, `stop_list_stale`, `policy_missing`, `policy_denied`, `budget_exceeded`, `rate_limited`); the chat shows plain words for each. The run's `meta` event carries `controls`: the signed policy hashes it started under, the release policy's hash and the stop lists' numbers, authenticated by EHBP to the attested key.
+
+## 2. Documents
+One envelope for every kind: `{"kind", "payload" (the exact JSON signed, base64), "sigs": [{"key": "ed25519:<base64>", "sig"}]}`. A signature covers `"tacy-safety/v1\0" + kind + "\0" + payload`, so a policy signature can't be presented as a stop list. The document's id is `sha256(that)` (hex). Payloads are decoded strictly (unknown fields, duplicate names, invalid UTF-8 refused).
+
+| Document | Signed by | Numbered by | Rules |
+|---|---|---|---|
+| `tacy.policy/v1` (firm, or one space) | firm admin keys (threshold, 1 now) | `version`, per firm or space | Lower version refused (rollback); the same version with other content refused (equivocation); `issued_at` at most 5 min ahead |
+| `tacy.stop/v1`, issuer `firm` | firm admin keys | `seq` | Stops the whole firm (`all`) or listed spaces; no expiry; only the firm's newer list lifts it |
+| `tacy.stop/v1`, issuer `operator` | the operator key | `seq` (signing time in ms) | Must expire within 1 h of issue; refused if already expired; stale after 10 min (`-stop-max-age`); can't lift a firm stop (separate list) and can't sign policy |
+
+Example policy (dev): `{"type":"tacy.policy/v1","firm":"f_chat","version":2,"issued_at":"…","models":["gpt-oss-120b"],"connectors":{"model":{"hosts":["inference.tinfoil.sh"]},"web":{"tools":["web.search","web.fetch"],"hosts":["api.tavily.com"],"fetch":["*"]}},"stale_reads":true,"budget":{"run":{"tokens":300000,"tool_calls":2,"wall_seconds":120,"cost_usd_micros":500000},"day":{"tokens":3000000,"tool_calls":200}},"rates":{"key":{"per_minute":30,"burst":10},"connector":{},"space":{}}}`.
+
+**Narrow only.** The effective policy is every layer at once: the release's ceiling (`safety.ChatRelease`, in the attested code: every model, the web connector, any public host, generous budgets), then the firm's, then the space's. A thing is allowed only if every layer allows it; budgets and rates take the tightest. A signed policy that lists a model the release doesn't have changes nothing.
+
+**Without admin keys pinned** (v0.3.0's compose) the release policy applies alone and no policy is accepted. **With admin keys pinned** nothing runs until a signed policy covers the space (`policy_missing`).
+
+## 3. Keys and the upgrade path
+- **Now:** Ed25519 public keys pinned as flags in the compose (`-operator-key`, `-admin-keys`, `-admin-threshold`, `-firm`), the same in agentd, gatewayd and vaultd. The compose is attested and pinned by the browser's verifier, so the browser checks which keys the VM trusts. Changing a key is a release.
+- **Next:** each person gets an identity key pair (X25519 + Ed25519). An admin signs policies and stop lists with their identity Ed25519 key, which is already the envelope's signature type. The VM stops taking admin keys from the compose and checks signers against the firm key log instead (entries signed by admins, log head checked in the enclave), so the compose pins only the operator key and the firm id. The envelope keeps a list of signatures, so a two-admin rule for widening needs no format change.
+- **Later:** a passkey assertion over the document hash as a second signature type; measuring the policy hash into RTMR3 for Dedicated firm VMs.
+
+## 4. Where each check runs
+Every process verifies the documents itself; none trusts another's parsing.
+
+| Check | agentd (runtime) | gatewayd (guard) | vaultd |
+|---|---|---|---|
+| Stop (firm, space, global) | refuses new runs; cancels running tasks (`kill_switch`) on every change and every 2 s | refuses every model call and action | refuses every lease |
+| Stale stop list | side effects refused; reads only if `stale_reads` | same | same (leases marked `effect`) |
+| Policy present | `policy_missing` | same | same |
+| Models | refuses the run; refuses a model call | refuses a model call | - |
+| Tools, approval | takes tools out of the task (the model never sees them); a denied action is a normal `denied` result | same, per action | - |
+| Connectors and key hosts | - | connector must be allowed | lease host must be in the policy's `hosts` |
+| Fetch hosts (pages, images, site icons, every redirect) | - | checked before any connection (`policyTransport`) | - |
+| Budgets | reserve before, commit after; run and day | ends a model call whose output passes its reservation | - |
+| Rates | - | - | per key, connector, space |
+
+**Floors.** agentd keeps the documents and the version floors on the encrypted disk (`/state/agentd/safety/`), so a restart can't take an older policy or a lifted stop back. gatewayd and vaultd keep theirs in memory and get documents only from agentd (every session's open, every change, every 10 s; gatewayd passes them to the vault), so after their restart they never take something older than agentd holds. A vault that restarted refuses leases until gatewayd passes the documents again (one retry per lease).
+
+**Delivery.** `POST /safety` on the VM's public port, only when the compose pins a key (one document or an array of up to 8; the body read within 5 s and 512 KiB before it takes one of 4 verification slots, so slow senders can't block a stop; answers per-document results and the status, never content). Signatures are checked outside the state's lock. A request must name its space; none is refused (it would skip space-level stops). Optional pull: gatewayd fetches `-safety-url` every 10 s and hands the body to agentd; off until the Worker serves it.
+
+## 5. harness/v1 unchanged
+v1 is frozen, and nothing new was needed: a kill switch is `cancel` with reason `kill_switch` (already in the spec); a used-up budget is a `limit` error on the request; a policy refusal of an action is `status: denied` (the model sees it and goes on); a stop or missing policy on a request is `not_allowed`. The codes people see travel in their own event stream (`proto.Event.Code`), which isn't part of harness/v1. Three conformance cases were added for every brain: kill switch mid-action (done cancelled, no further requests), a budget refusal of a model call (the task fails, no retry loop), a policy-denied action (the model is told, the task goes on).
+
+## 6. Tests
+- `safety/`: forged documents (unpinned key, operator key on a policy, admin key on the operator's list, no signature, wrong kind, payload changed after signing, a claimed key with another key's signature, another firm, future-dated, unknown and duplicate fields), rollback and equivocation (also after a restart and with a tampered state file), narrowing across layers, stop lists and staleness (max age, expiry, global stop, the operator can't lift a firm stop), threshold (one key signing twice counts once), budgets under 50 parallel reservations, day budgets across runs and restarts, the running-time deadline, rate buckets (burst, refill, all-or-none).
+- `app/safety_test.go` (agentd end to end with the brain): fail closed before a policy; policy hash in meta and narrowed tools; forged and replayed policies over `POST /safety`; the kill switch cancelling a run stuck in a fetch (and new runs refused, then lifted by the firm's newer list); a global stop; stale lists (reads allowed, then refused by policy; an expired list refused); 4 parallel searches against a budget of 2 (2 ran); a token budget refusing the first model call; a model and a fetch host outside the policy (the page never got a request); an action held for approval; a long answer cut at its reservation; a call without reported usage keeping its reservation; six slow senders on `POST /safety` not blocking a stop list.
+- `gateway/safety_test.go`: gatewayd ignores a forged policy agentd's side sends, takes a valid one, refuses after a pushed stop. `vault/safety_test.go`: leases refused before a policy, after a forged push, for a side effect while stale, to a host outside the policy, for a stopped space, past the rate (20 parallel leases, burst 3: exactly 3 released); records carry no values.
+- Local compose (OrbStack, linux/amd64, dev Tinfoil and Tavily keys, dev safety keys made by `cmd/safetysign`; stopped and removed afterwards): fail closed before a policy; forged and replayed policies refused; 4 parallel searches against a budget of 2 (2 ran, the model told why); the kill switch ending a long run 0.13 s after the stop was posted; agentd restarted with a new binary keeps the policy, the stop and the floors (v1 and stop seq 1 refused again); the operator's newer list didn't lift the firm's stop, the firm's did; gatewayd and vaultd restarted, then a run works (documents passed again); a burst of 8 runs against a key rate of 30/min with burst 10: 3 ok, 5 ended `rate_limited`; a 3,000-word essay against a 4,000-token run budget ended `budget_exceeded` when the output passed its 3,513 reserved tokens; vaultd's lease records name the space, never a value. A review pass found and fixed: slow senders could hold `POST /safety`'s slots, uncapped model output could overrun a reservation, a call without usage was counted as zero, an empty space skipped space stops.
+
+## 7. Defaults and next steps
+- **Freshness:** stale after 10 min, an operator list lives at most 1 h, pull every 10 s, kill-switch sweep every 2 s.
+- **Release ceilings** (`safety.ChatRelease`): per run 8M tokens, 64 tool calls, 5 min, $20; per space per day 200M tokens, 5,000 tool calls, 24 h, $200; leases 600/min (burst 120) per key and per connector, 900/min (burst 180) per space. An unknown model is priced as the dearest; a model call reserves at most 32,768 completion tokens and is cut there. Real limits come in signed policies.
+- **Reads while stale** go on unless a firm's policy turns them off; side effects never do. Approval-required actions are refused until approvals exist.
+- **Floors** live on agentd's encrypted disk only; a host that rolls back that disk could roll them back (dstack has no rollback protection for it). Later: anchor policy versions in a transparency log or measure them into RTMR3.
+- **Next:** generate the admin and operator keys offline (`go run ./cmd/safetysign keygen DIR admin`, `… operator`), put the public halves in `cmd/compose` (`operatorKey`, `adminKeys`), sign the first policy, and post it with a fresh operator list right after that release is deployed (until then every run is `policy_missing`); a service that signs heartbeats, then `safetyURL` in `cmd/compose`.

@@ -21,6 +21,7 @@ Only what runs inside the VM, and what checks it, is here. Everything outside on
 | `guard/` | The runtime side the brain can't bypass: model gateway (attested models only), web connector (search, page reading, images, site icons) with PII masking and a public-only fetcher, leak scanning, and the events people see. |
 | `harness/` | The `harness/v1` protocol between brain and runtime: messages, strict codec, runtime engine, fake runtime and the conformance suite every brain must pass. |
 | `queue/` | The runtime's task queue and journal in SQLite on the VM's encrypted disk; a run's rows are deleted when it ends. |
+| `safety/`, `cmd/safetysign/` | Safety controls ([docs/23](docs/23-safety-controls.md)): Ed25519-signed policies and stop lists that agentd, gatewayd and vaultd each verify against keys pinned in the compose, the kill switch, per-run and per-day budgets reserved before each call, the vault's lease rates. No keys are pinned yet, so the release's own policy applies alone. `cmd/safetysign` makes keys and signs documents (not part of the VM). |
 | `leakscan/` | Credential scanner (patterns ported from IronClaw, MIT; decodes before scanning): blocks credentials in an agent's outbound arguments and redacts them from what comes back. |
 | `proto/` | Wire format shared by the service and its verifiers. |
 | `internal/tinfoil/` | Verifies the model provider's enclave (Tinfoil, AMD SEV-SNP, Sigstore-signed releases) before the VM sends it anything. |
@@ -36,7 +37,7 @@ Only what runs inside the VM, and what checks it, is here. Everything outside on
 | `scripts/` | `build-wasm.sh` (browser verifier), `reproduce.sh` (rebuild a release and compare). |
 | `.github/workflows/` | CI (tests, and the compose and image digests rebuilt on the runner and in the pinned Go container must match), the release workflow that pushes the images and signs, and `reproduce.yml` (rebuilds each release and checks what ghcr.io serves). |
 | `testdata/` | A recorded attestation from a test VM on dstack 0.6.1 (public data: quote, event log, app compose), used by the verifier's tests. |
-| `docs/` | Specs: [harness/v1](docs/20-harness-protocol.md) (brain ↔ runtime) and [gateway v0 and the vault](docs/21-gateway-v0.md). |
+| `docs/` | Specs: [harness/v1](docs/20-harness-protocol.md) (brain ↔ runtime) and [gateway v0 and the vault](docs/21-gateway-v0.md), [safety controls](docs/23-safety-controls.md) (signed policy, kill switch, budgets, rate limits). |
 
 ## How it works
 

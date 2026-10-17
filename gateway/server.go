@@ -13,12 +13,27 @@ import (
 	"github.com/tacyhq/tacy/guard"
 	"github.com/tacyhq/tacy/harness"
 	"github.com/tacyhq/tacy/proto"
+	"github.com/tacyhq/tacy/safety"
 )
 
 // Server is gatewayd's side: it serves task sessions on G, this process's guard (the model gateway and the web
 // connector, with keys leased from the vault per call).
 type Server struct {
 	G *guard.Guard
+	// Safety is gatewayd's own verified controls (the guard checks them); documents agentd sends are applied
+	// here, and OnDocs is told when something changed (gatewayd passes them on to the vault).
+	Safety *safety.State
+	OnDocs func()
+}
+
+// apply takes signed documents from agentd: each is checked against gatewayd's own pinned keys and floors.
+func (s *Server) apply(docs []safety.Envelope) {
+	if s.Safety == nil || len(docs) == 0 {
+		return
+	}
+	if _, changed := s.Safety.Apply(docs); changed && s.OnDocs != nil {
+		s.OnDocs()
+	}
 }
 
 // Listen makes gatewayd's socket with mode (0660: agentd connects through the socket's group; Serve checks its
@@ -83,9 +98,19 @@ func (s *Server) serve(c net.Conn) {
 	defer c.Close()
 	var open frame
 	c.SetReadDeadline(time.Now().Add(30 * time.Second))
-	if readFrame(c, &open) != nil || open.T != tOpen || open.Version != Version || !validID(open.Task) {
+	if readFrame(c, &open) != nil || open.Version != Version {
 		return
 	}
+	if open.T == tSafety {
+		s.apply(open.Docs)
+		c.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		writeFrame(c, &frame{T: tResult})
+		return
+	}
+	if open.T != tOpen || !validID(open.Task) {
+		return
+	}
+	s.apply(open.Docs)
 	c.SetReadDeadline(time.Time{})
 	var opts guard.TaskOptions
 	if len(open.Options) > 0 && jsonv1.Unmarshal(open.Options, &opts) != nil {
@@ -185,7 +210,7 @@ func (s *Server) do(ctx context.Context, sess guard.Session, ti *harness.TaskInf
 		res.Step, res.Finish = sess.End()
 		return &res
 	case tModel:
-		res.ModelResult, err = s.G.ModelCall(harness.WithRequestID(ctx, f.ID), ti, f.Model)
+		res.ModelResult, err = s.G.ModelCall(guard.WithMaxTokens(harness.WithRequestID(ctx, f.ID), f.MaxTokens), ti, f.Model)
 	case tAction:
 		res.ActionResult, err = s.G.Action(harness.WithRequestID(ctx, f.ID), ti, f.ID, f.Action)
 	}

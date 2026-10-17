@@ -24,6 +24,7 @@ import (
 
 	"github.com/tacyhq/tacy/harness"
 	"github.com/tacyhq/tacy/proto"
+	"github.com/tacyhq/tacy/safety"
 )
 
 // Version names this protocol (internal, unfrozen).
@@ -44,6 +45,7 @@ const (
 	tCancel = "cancel" // agentd → gatewayd: stop request rid
 	tEvent  = "event"  // gatewayd → agentd: one of the task's events
 	tResult = "result" // gatewayd → agentd: request rid's result
+	tSafety = "safety" // agentd → gatewayd, a connection's only frame: signed policies and stop lists (step 6)
 )
 
 type frame struct {
@@ -54,13 +56,17 @@ type frame struct {
 	Task    string         `json:"task,omitzero"`
 	Version string         `json:"version,omitzero"`
 	Options jsontext.Value `json:"options,omitzero"`
+	// open, safety: the signed documents agentd holds; gatewayd checks each itself (step 6)
+	Docs []safety.Envelope `json:"docs,omitzero"`
 	// task
 	Tools   []harness.Tool `json:"tools,omitzero"`
 	Journal []record       `json:"journal,omitzero"`
 	// model, action
-	ID     string             `json:"id,omitzero"` // the harness request id (journal, vault lease records)
-	Model  *harness.ModelCall `json:"model,omitzero"`
-	Action *harness.Action    `json:"action,omitzero"`
+	ID    string             `json:"id,omitzero"` // the harness request id (journal, vault lease records)
+	Model *harness.ModelCall `json:"model,omitzero"`
+	// model: the output cap agentd reserved budget for (guard.WithMaxTokens; 0: none)
+	MaxTokens int64           `json:"max_tokens,omitzero"`
+	Action    *harness.Action `json:"action,omitzero"`
 
 	// event
 	Event jsontext.Value `json:"event,omitzero"` // a proto.Event as encoding/json writes it

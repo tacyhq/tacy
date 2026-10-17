@@ -51,6 +51,7 @@ jobs:
           mkdir -p dist
           docker run --rm -v "$PWD:/src" -w /src -e GOFLAGS=-mod=readonly "$image" \
             go run ./cmd/compose --check --oci dist/oci --manifest dist/release.json --version "$GITHUB_REF_NAME" --commit "$GITHUB_SHA"
+          sudo chown -R "$(id -u):$(id -g)" dist # the container wrote them as root (some blobs 0600)
           cp compose.yaml dist/compose.yaml
       - name: same result on the runner (reproducible binaries and image digests)
         run: |

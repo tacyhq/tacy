@@ -5,6 +5,7 @@ go 1.27.2
 require (
 	github.com/cyberphone/json-canonicalization v0.0.0-20241213102144-19d51d7fe467
 	github.com/google/certificate-transparency-go v1.3.3
+	github.com/google/go-containerregistry v0.21.7
 	github.com/google/go-sev-guest v0.15.0
 	github.com/google/go-tdx-guest v0.3.2-0.20260908172713-48f3644ca143
 	github.com/secure-systems-lab/go-securesystemslib v0.11.0
@@ -13,6 +14,7 @@ require (
 	github.com/sigstore/sigstore v1.10.8
 	github.com/sigstore/sigstore-go v1.3.0
 	github.com/tinfoilsh/encrypted-http-body-protocol v0.3.2
+	go.yaml.in/yaml/v3 v3.0.4
 	golang.org/x/image v0.46.0
 	golang.org/x/net v0.59.0
 	modernc.org/sqlite v1.60.1
@@ -25,6 +27,8 @@ require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/digitorus/pkcs7 v0.0.0-20230818184609-3a137a874352 // indirect
 	github.com/digitorus/timestamp v0.0.0-20231217203849-220c5c2851b7 // indirect
+	github.com/docker/cli v29.5.3+incompatible // indirect
+	github.com/docker/docker-credential-helpers v0.9.3 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
@@ -52,16 +56,17 @@ require (
 	github.com/go-openapi/swag/yamlutils v0.27.3 // indirect
 	github.com/go-openapi/validate v0.26.1 // indirect
 	github.com/go-viper/mapstructure/v2 v2.5.0 // indirect
-	github.com/google/go-containerregistry v0.21.7 // indirect
 	github.com/google/logger v1.1.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.29.0 // indirect
 	github.com/in-toto/attestation v1.2.0 // indirect
 	github.com/in-toto/in-toto-golang v0.11.0 // indirect
+	github.com/klauspost/compress v1.18.6 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/oklog/ulid/v2 v2.1.1 // indirect
 	github.com/opencontainers/go-digest v1.0.0 // indirect
+	github.com/opencontainers/image-spec v1.1.1 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/shibumi/go-pathspec v1.3.0 // indirect
@@ -77,7 +82,6 @@ require (
 	go.opentelemetry.io/otel/metric v1.44.0 // indirect
 	go.opentelemetry.io/otel/trace v1.44.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
-	go.yaml.in/yaml/v3 v3.0.4 // indirect
 	golang.org/x/crypto v0.57.0 // indirect
 	golang.org/x/mod v0.41.0 // indirect
 	golang.org/x/sync v0.23.0 // indirect
@@ -88,6 +92,7 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260523011958-0a33c5d7ca68 // indirect
 	google.golang.org/grpc v1.82.1 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
+	gotest.tools/v3 v3.5.2 // indirect
 	k8s.io/klog/v2 v2.140.0 // indirect
 	modernc.org/libc v1.77.1 // indirect
 	modernc.org/mathutil v1.7.1 // indirect

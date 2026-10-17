@@ -1,22 +1,36 @@
 package main
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
+	"io"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
-	"time"
+
+	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/empty"
+	"github.com/google/go-containerregistry/pkg/v1/layout"
+	"github.com/google/go-containerregistry/pkg/v1/mutate"
+	"github.com/google/go-containerregistry/pkg/v1/types"
+	"go.yaml.in/yaml/v3"
+
+	"github.com/tacyhq/tacy/verifier"
 )
 
-// compose.yaml must be what the current source generates, including the reproducible binary hashes.
-// Builds the service and the brain for linux/amd64 (a few seconds when cached). Skipped with -short.
+// compose.yaml must be what the current source generates: the reproducible binaries, their images on the pinned
+// base (fetched from its registry by digest), and the compose naming them. Skipped with -short (network, builds).
 func TestComposeCurrent(t *testing.T) {
 	if testing.Short() {
-		t.Skip("builds the service")
+		t.Skip("builds the binaries and fetches the base image")
 	}
 	os.Chdir("../..")
-	out, err := generate()
+	images, err := build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := generate(images)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -37,199 +51,248 @@ func readCompose(t *testing.T) []byte {
 	return out
 }
 
-// Linux caps one argument at 128 KiB (MAX_ARG_STRLEN), and compose passes each command item as one argument: the
-// script and every source chunk must stay under it (the whole source in one script once didn't, and the CVM
-// restarted with "argument list too long"). And Phala refuses a compose over 200 KiB with its pre-launch script
-// (208 KiB once did).
-func TestComposeArgumentsFit(t *testing.T) {
+type service struct {
+	Image       string            `yaml:"image"`
+	Entrypoint  []string          `yaml:"entrypoint"`
+	Command     []string          `yaml:"command"`
+	NetworkMode string            `yaml:"network_mode"`
+	User        string            `yaml:"user"`
+	ReadOnly    bool              `yaml:"read_only"`
+	CapDrop     []string          `yaml:"cap_drop"`
+	CapAdd      []string          `yaml:"cap_add"`
+	SecurityOpt []string          `yaml:"security_opt"`
+	Ports       []string          `yaml:"ports"`
+	Volumes     []string          `yaml:"volumes"`
+	Environment map[string]string `yaml:"environment"`
+	GroupAdd    []string          `yaml:"group_add"`
+	DependsOn   map[string]struct {
+		Condition string `yaml:"condition"`
+	} `yaml:"depends_on"`
+	Restart string   `yaml:"restart"`
+	Tmpfs   []string `yaml:"tmpfs"`
+}
+
+func services(t *testing.T) map[string]service {
+	var doc struct {
+		Services map[string]service `yaml:"services"`
+		Volumes  map[string]any     `yaml:"volumes"`
+	}
+	dec := yaml.NewDecoder(bytes.NewReader(readCompose(t)))
+	dec.KnownFields(true)
+	if err := dec.Decode(&doc); err != nil {
+		t.Fatal(err)
+	}
+	return doc.Services
+}
+
+// The process layout of docs/21: only gatewayd (service agentvm) has a network; agentd, the brain, vaultd and setup
+// have none. The keys go to vaultd only, the run token to agentd only. Every image is ours, by digest, and runs
+// the binary of its name.
+func TestComposeLayout(t *testing.T) {
 	out := readCompose(t)
 	if len(out) > MaxCompose {
 		t.Fatalf("compose.yaml is %d bytes (limit %d)", len(out), MaxCompose)
 	}
-	src := strings.SplitN(string(out), "\nx-agentvm-source:\n", 2)[1]
-	src = strings.SplitN(src, "\nservices:\n", 2)[0]
-	chunks := strings.Split(src, "\n- &")
-	cmd := strings.SplitN(string(out), "    command:\n", 2)[1]
-	cmd = strings.SplitN(cmd, "\n  agentd:\n", 2)[0] // the build container's
-	items := strings.Split(cmd, "\n      - ")
-	if len(chunks) < 2 || len(items) != 2+len(chunks) {
-		t.Fatalf("%d chunks, %d command items", len(chunks), len(items))
-	}
-	for i, it := range append(chunks, items[0]) {
-		if len(it) > 120<<10 {
-			t.Errorf("item %d is %d bytes", i, len(it))
-		}
-	}
-	// Every chunk is passed by alias, in order, and every alias has its anchor.
-	for i := 2; i < len(items); i++ {
-		alias := strings.TrimSpace(items[i])
-		if alias != "*src"+string(rune('0'+i-2)) || !strings.Contains(src, "&src"+string(rune('0'+i-2))+" |\n") {
-			t.Errorf("item %d: %q", i, alias)
-		}
-	}
-	for _, pin := range []string{"AGENTD_SHA256=", "BRAIN_SHA256=", "GATEWAYD_SHA256=", "VAULTD_SHA256="} {
-		if strings.Count(string(out), pin) != 2 {
-			t.Errorf("%s must appear twice: in the build and in the container that runs it", pin)
-		}
-	}
-}
-
-// The process layout of docs/21: only gatewayd (service agentvm) and the one-shot build have a network; agentd, the
-// brain and vaultd have none. The keys go to vaultd only, the run token to agentd only.
-func TestComposeLayout(t *testing.T) {
-	out := string(readCompose(t))
-	services := strings.SplitN(out, "\nservices:\n", 2)[1]
-	services = strings.SplitN(services, "\nvolumes:\n", 2)[0]
-	byName := map[string]string{}
-	name := ""
-	for _, ln := range strings.Split(services, "\n") {
-		if strings.HasPrefix(ln, "  ") && !strings.HasPrefix(ln, "   ") && strings.HasSuffix(ln, ":") {
-			name = strings.TrimSuffix(strings.TrimSpace(ln), ":")
-			continue
-		}
-		byName[name] += ln + "\n"
-	}
-	for _, name := range []string{"build", "agentd", "brain", "agentvm", "vaultd"} {
-		if byName[name] == "" {
-			t.Fatalf("no service %s (have %d)", name, len(byName))
-		}
-	}
-	if len(byName) != 5 {
-		t.Fatalf("%d services", len(byName))
-	}
-	for name, body := range byName {
-		none := strings.Contains(body, "network_mode: none")
-		if want := name == "agentd" || name == "brain" || name == "vaultd"; none != want {
-			t.Errorf("%s: network_mode none is %v", name, none)
-		}
-		if strings.Contains(body, "ports:") != (name == "agentvm") {
-			t.Errorf("%s: published ports", name)
-		}
-		if name != "build" && (!strings.Contains(body, "cap_drop: [ALL]") || !strings.Contains(body, "read_only: true") ||
-			!strings.Contains(body, "no-new-privileges:true")) {
-			t.Errorf("%s isn't hardened", name)
-		}
-		for _, env := range []string{"TINFOIL_API_KEY", "TAVILY_API_KEY", "BRAVE_SEARCH_API_KEY"} {
-			if strings.Contains(body, "${"+env+"}") != (name == "vaultd") {
-				t.Errorf("%s: %s", name, env)
-			}
-		}
-		if strings.Contains(body, "${AGENT_VM_TOKEN}") != (name == "agentd") {
-			t.Errorf("%s: AGENT_VM_TOKEN", name)
-		}
-	}
-	if strings.Count(out, "/var/run/dstack.sock:") != 1 || !strings.Contains(byName["agentd"], "/var/run/dstack.sock:") {
-		t.Error("only agentd mounts dstack's socket")
-	}
-	// No long-running process is root (agentd was until VM release 2): each has its own uid, and agentd's is the one
-	// gatewayd accepts on its socket.
-	for name, body := range byName {
-		if name != "build" && (!strings.Contains(body, "    user: \"") || strings.Contains(body, "    user: \"0")) {
-			t.Errorf("%s runs as root", name)
-		}
-	}
-	if !strings.Contains(byName["agentd"], `user: "`+agentdUID+":"+agentdUID+`"`) ||
-		!strings.Contains(byName["agentvm"], "-agent-uid "+agentdUID+" ") {
-		t.Error("agentd's uid and gatewayd's -agent-uid differ")
-	}
-	// agentd's queue directory and the brain's socket directory are its own, set by the build.
-	if !strings.Contains(byName["agentd"], "-storage /state/agentd ") ||
-		!strings.Contains(byName["build"], "chown -R "+agentdUID+":"+agentdUID+" /state/agentd") ||
-		!strings.Contains(byName["build"], "chown "+agentdUID+":"+brainUID+" /run/tacy/brain") {
-		t.Error("agentd's directories")
-	}
-}
-
-// The embedded source unpacks to exactly the files the compose was generated from, byte for byte.
-func TestComposeSourceRoundTrip(t *testing.T) {
-	out := readCompose(t)
-	root := "../.."
-	if _, err := os.Stat("compose.yaml"); err == nil {
-		root = "."
-	}
-	dir := t.TempDir()
-	if err := extract(out, dir); err != nil {
-		t.Fatal(err)
-	}
-	n := 0
-	err := filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return err
-		}
-		rel, _ := filepath.Rel(dir, p)
-		got, _ := os.ReadFile(p)
-		want, err := os.ReadFile(filepath.Join(root, rel))
-		if rel == "go.sum" { // the lines the build needs: each one is the repository's
-			for _, ln := range strings.Split(strings.TrimSpace(string(got)), "\n") {
-				if !strings.Contains("\n"+string(want), "\n"+ln+"\n") {
-					t.Errorf("go.sum line %q isn't the repository's", ln)
-				}
-			}
-			n++
-			return nil
-		}
-		if err != nil || !bytes.Equal(got, want) {
-			t.Errorf("%s differs from the repository's (or isn't there): %v", rel, err)
-		}
-		n++
-		return nil
-	})
-	if err != nil || n < 10 {
-		t.Fatalf("%d files, %v", n, err)
-	}
-	for _, must := range []string{"go.mod", "go.sum", "app/main.go", "cmd/brain/main.go", "brain/brain.go", "guard/guard.go",
-		"harness/runtime.go", "queue/queue.go", "app/peer_linux.go", "cmd/gatewayd/main.go", "cmd/vaultd/main.go",
-		"gateway/server.go", "vault/vault.go", "leakscan/scan.go", "leakscan/patterns.go"} {
-		if _, err := os.Stat(filepath.Join(dir, must)); err != nil {
-			t.Errorf("%s isn't embedded", must)
-		}
-	}
-	if _, err := os.Stat(filepath.Join(dir, "app/peer_other.go")); err == nil {
-		t.Error("a file the linux build doesn't use is embedded")
-	}
-}
-
-// The tar.gz is deterministic: the same files give the same bytes.
-func TestArchiveDeterministic(t *testing.T) {
-	dir := t.TempDir()
-	wd, _ := os.Getwd()
-	defer os.Chdir(wd)
-	os.Chdir(dir)
-	os.MkdirAll("a/b", 0o755)
-	os.WriteFile("a/b/x.go", []byte("package b\n"), 0o600)
-	os.WriteFile("go.mod", []byte("module m\n"), 0o640)
-	one, err := archive([]string{"go.mod", "a/b/x.go"})
+	images, err := verifier.ComposeImages(string(out))
 	if err != nil {
 		t.Fatal(err)
 	}
-	later := time.Now().Add(time.Hour)
-	os.Chtimes("go.mod", later, later) // times and file modes don't reach the archive
-	two, _ := archive([]string{"go.mod", "a/b/x.go"})
-	if !bytes.Equal(one, two) {
-		t.Fatal("archive isn't deterministic")
+	byName := services(t)
+	binOf := map[string]string{"setup": "setup", "agentd": "agentd", "brain": "brain", "agentvm": "gatewayd", "vaultd": "vaultd"}
+	if len(byName) != len(binOf) || len(images) != len(binOf) {
+		t.Fatalf("%d services", len(byName))
+	}
+	for name, bin := range binOf {
+		s, ok := byName[name]
+		if !ok {
+			t.Fatalf("no service %s", name)
+		}
+		if !strings.HasPrefix(s.Image, Registry+"/"+bin+"@sha256:") || len(s.Entrypoint) != 1 || s.Entrypoint[0] != "/tacy/"+bin {
+			t.Errorf("%s: image %s, entrypoint %v", name, s.Image, s.Entrypoint)
+		}
+		if (s.NetworkMode == "none") != (name != "agentvm") {
+			t.Errorf("%s: network_mode %q", name, s.NetworkMode)
+		}
+		if (len(s.Ports) > 0) != (name == "agentvm") {
+			t.Errorf("%s: published ports", name)
+		}
+		if !s.ReadOnly || len(s.CapDrop) != 1 || s.CapDrop[0] != "ALL" || len(s.SecurityOpt) != 1 || s.SecurityOpt[0] != "no-new-privileges:true" {
+			t.Errorf("%s isn't hardened", name)
+		}
+		if (len(s.CapAdd) > 0) != (name == "setup") {
+			t.Errorf("%s: cap_add %v", name, s.CapAdd)
+		}
+		for _, env := range []string{"TINFOIL_API_KEY", "TAVILY_API_KEY", "BRAVE_SEARCH_API_KEY"} {
+			if (s.Environment[env] == "${"+env+"}") != (name == "vaultd") {
+				t.Errorf("%s: %s", name, env)
+			}
+		}
+		if (s.Environment["AGENT_VM_TOKEN"] != "") != (name == "agentd") {
+			t.Errorf("%s: AGENT_VM_TOKEN", name)
+		}
+		for _, v := range s.Volumes {
+			if strings.Contains(v, "dstack.sock") && name != "agentd" {
+				t.Errorf("%s mounts dstack's socket", name)
+			}
+		}
+		if name == "setup" {
+			if s.User != "0:0" || s.Restart != "no" || strings.Join(s.CapAdd, ",") != "CHOWN,DAC_OVERRIDE,FOWNER" || len(s.Environment) != 0 {
+				t.Errorf("setup: user %q restart %q caps %v env %v", s.User, s.Restart, s.CapAdd, s.Environment)
+			}
+			continue
+		}
+		// No long-running process is root; each waits for setup.
+		if s.User == "" || strings.HasPrefix(s.User, "0") || s.DependsOn["setup"].Condition != "service_completed_successfully" ||
+			s.Restart != "unless-stopped" {
+			t.Errorf("%s: user %q, depends_on %v, restart %q", name, s.User, s.DependsOn, s.Restart)
+		}
+	}
+	if !strings.Contains(strings.Join(byName["agentd"].Volumes, " "), "/var/run/dstack.sock:/var/run/dstack.sock") {
+		t.Error("agentd doesn't mount dstack's socket")
+	}
+	agentd, gw, setup := byName["agentd"], byName["agentvm"], strings.Join(byName["setup"].Command, " ")
+	if agentd.User != agentdUID+":"+agentdUID || !strings.Contains(strings.Join(gw.Command, " "), "-agent-uid "+agentdUID+" ") {
+		t.Error("agentd's uid and gatewayd's -agent-uid differ")
+	}
+	if byName["brain"].User != brainUID+":"+brainUID || byName["vaultd"].User != vaultdUID+":"+gatewaydUID || gw.User != gatewaydUID+":"+gatewaydUID {
+		t.Error("uids")
+	}
+	// agentd's queue directory and the brain's socket directory are its own, set by setup.
+	if !strings.Contains(strings.Join(agentd.Command, " "), "-storage /state/agentd ") ||
+		!strings.Contains(setup, "-tree /state/agentd="+agentdUID+":"+agentdUID+":0700") ||
+		!strings.Contains(setup, "-dir /run/tacy/brain="+agentdUID+":"+brainUID+":0750") ||
+		!strings.Contains(setup, "-dir /run/tacy/agent="+agentdUID+":"+gatewaydUID+":0770") ||
+		!strings.Contains(setup, "-dir /run/tacy/vault="+vaultdUID+":"+gatewaydUID+":0750") ||
+		!strings.Contains(setup, "-remove /state/queue.db ") {
+		t.Errorf("setup: %s", setup)
+	}
+	// Each socket directory is mounted only by its two containers (and setup).
+	for vol, who := range map[string]string{"agentsock": "agentd agentvm setup", "vaultsock": "agentvm setup vaultd",
+		"brainsock2": "agentd brain setup", "state": "agentd setup"} {
+		var got []string
+		for _, name := range []string{"agentd", "agentvm", "brain", "setup", "vaultd"} {
+			for _, v := range byName[name].Volumes {
+				if strings.HasPrefix(v, vol+":") {
+					got = append(got, name)
+				}
+			}
+		}
+		if strings.Join(got, " ") != who {
+			t.Errorf("volume %s mounted by %v", vol, got)
+		}
 	}
 }
 
-// Phala refuses a compose with a refused word in it (terms of use), even inside base64: no line may contain one.
+// Phala refuses a compose with a refused word in it (terms of use).
 func TestComposeNoRefusedWords(t *testing.T) {
 	if w := refusedWord(string(readCompose(t))); w != "" {
 		t.Fatalf("compose.yaml contains %q", w)
 	}
 }
 
-// wrap breaks lines inside refused words and keeps every character, in order.
-func TestWrap(t *testing.T) {
-	in := strings.Repeat("A", lineLen-2) + "fRpB" + strings.Repeat("C", 3*lineLen) + "frp" + "xFRP"
-	lines := wrap(in)
-	if strings.Join(lines, "") != in {
-		t.Fatal("wrap lost or reordered characters")
+// fakeBase stands in for the distroless base (offline): one layer, an OCI manifest.
+func fakeBase(t *testing.T) v1.Image {
+	t.Helper()
+	img, err := buildImage(mutate.MediaType(empty.Image, types.OCIManifestSchema1), "base", []byte("base"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, ln := range lines {
-		if len(ln) == 0 || len(ln) > lineLen || refusedWord(ln) != "" {
-			t.Fatalf("bad line %q", ln)
+	return img
+}
+
+// An image is the base plus one layer: /tacy/ (0755) and /tacy/<name> (0555), root-owned, time 0, nothing else;
+// the entrypoint is the binary. The same binary gives the same digest; another binary another one. The OCI layout
+// holds exactly that image.
+func TestImageLayout(t *testing.T) {
+	base := fakeBase(t)
+	bin := []byte("\x7fELF not really a binary")
+	img, err := buildImage(base, "agentd", bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, _ := buildImage(fakeBase(t), "agentd", append([]byte{}, bin...))
+	other, _ := buildImage(base, "agentd", append(append([]byte{}, bin...), 0))
+	d1, _ := img.Digest()
+	d2, _ := again.Digest()
+	d3, _ := other.Digest()
+	if d1 != d2 || d1 == d3 {
+		t.Fatalf("digests %s %s %s", d1, d2, d3)
+	}
+	layers, _ := img.Layers()
+	baseLayers, _ := base.Layers()
+	if len(layers) != len(baseLayers)+1 {
+		t.Fatalf("%d layers on a %d-layer base", len(layers), len(baseLayers))
+	}
+	top := layers[len(layers)-1]
+	if mt, _ := top.MediaType(); mt != types.OCILayer {
+		t.Fatalf("layer media type %s", mt)
+	}
+	rc, err := top.Compressed()
+	if err != nil {
+		t.Fatal(err)
+	}
+	gz, err := gzip.NewReader(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := tar.NewReader(gz)
+	var got []string
+	for {
+		h, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if h.Uid != 0 || h.Gid != 0 || h.ModTime.Unix() != 0 || h.Uname != "" || h.Gname != "" {
+			t.Errorf("%s: owner %d:%d %q:%q, time %v", h.Name, h.Uid, h.Gid, h.Uname, h.Gname, h.ModTime)
+		}
+		got = append(got, h.Name)
+		switch h.Name {
+		case "tacy/":
+			if h.Mode != 0o755 || h.Typeflag != tar.TypeDir {
+				t.Errorf("tacy/: %o", h.Mode)
+			}
+		case "tacy/agentd":
+			b, _ := io.ReadAll(tr)
+			if h.Mode != 0o555 || h.Typeflag != tar.TypeReg || !bytes.Equal(b, bin) {
+				t.Errorf("tacy/agentd: mode %o", h.Mode)
+			}
+		default:
+			t.Errorf("unexpected entry %s", h.Name)
 		}
 	}
-	if got := wrap(strings.Repeat("B", 2*lineLen)); len(got) != 2 {
-		t.Fatalf("%d lines for two full ones", len(got))
+	if len(got) != 2 {
+		t.Fatalf("entries %v", got)
+	}
+	cf, _ := img.ConfigFile()
+	if strings.Join(cf.Config.Entrypoint, " ") != "/tacy/agentd" || len(cf.Config.Cmd) != 0 || cf.Created.Unix() != 0 ||
+		cf.History[len(cf.History)-1].Created.Unix() != 0 {
+		t.Fatalf("config %+v", cf.Config)
+	}
+	if mt, _ := img.MediaType(); mt != types.OCIManifestSchema1 {
+		t.Fatalf("manifest media type %s", mt)
+	}
+	dir := t.TempDir()
+	if err := writeLayout(dir, img); err != nil {
+		t.Fatal(err)
+	}
+	idx, err := layout.ImageIndexFromPath(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	im, _ := idx.IndexManifest()
+	if len(im.Manifests) != 1 || im.Manifests[0].Digest != d1 || len(im.Manifests[0].Annotations) != 0 {
+		t.Fatalf("layout index %+v", im)
+	}
+}
+
+// The binary layer is deterministic: the same bytes give the same gzip'd tar.
+func TestBinaryLayerDeterministic(t *testing.T) {
+	a, _ := binaryLayer("x", []byte("abc"))
+	b, _ := binaryLayer("x", []byte("abc"))
+	if !bytes.Equal(a, b) {
+		t.Fatal("layer isn't deterministic")
 	}
 }

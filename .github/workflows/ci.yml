@@ -1,5 +1,5 @@
-# Tests on every push and pull request, plus a reproducibility check: compose.yaml (which pins the service binary's
-# sha256) must come out byte for byte the same on the runner and in the pinned Go container the VM builds in.
+# Tests on every push and pull request, plus a reproducibility check: compose.yaml, the binaries and their OCI images
+# (digests and layouts) must come out byte for byte the same on the runner and in the pinned Go container.
 # Least privilege: read-only token, no secrets, actions pinned by commit.
 name: ci
 
@@ -53,11 +53,14 @@ jobs:
           check-latest: false
           cache: false
       - name: build on the runner
-        run: go run ./cmd/compose --check | tee "$RUNNER_TEMP/runner.txt"
-      - name: build in the pinned Go container (the image the VM builds in)
+        run: go run ./cmd/compose --check --oci "$RUNNER_TEMP/oci-runner" | grep -v '^wrote OCI layouts' | tee "$RUNNER_TEMP/runner.txt"
+      - name: build in the pinned Go container (the image releases build in)
         run: |
           image=$(grep -o 'golang:[^"]*@sha256:[0-9a-f]*' cmd/compose/main.go)
-          docker run --rm -v "$PWD:/src:ro" -w /src -e GOFLAGS=-mod=readonly "$image" \
-            go run ./cmd/compose --check | tee "$RUNNER_TEMP/container.txt"
-      - name: same compose and binary hashes
-        run: diff "$RUNNER_TEMP/runner.txt" "$RUNNER_TEMP/container.txt"
+          mkdir -p "$RUNNER_TEMP/oci-container"
+          docker run --rm -v "$PWD:/src:ro" -v "$RUNNER_TEMP/oci-container:/oci" -w /src -e GOFLAGS=-mod=readonly "$image" \
+            go run ./cmd/compose --check --oci /oci | grep -v '^wrote OCI layouts' | tee "$RUNNER_TEMP/container.txt"
+      - name: same compose, binary hashes, image digests and OCI layouts
+        run: |
+          diff "$RUNNER_TEMP/runner.txt" "$RUNNER_TEMP/container.txt"
+          sudo diff -r "$RUNNER_TEMP/oci-runner" "$RUNNER_TEMP/oci-container"

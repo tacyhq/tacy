@@ -1,6 +1,6 @@
 # Safety controls: signed policy, kill switch, budgets, rate limits
 
-> **Status:** in the agent VM since v0.3.0 without keys: the release policy (`safety.ChatRelease`) applies alone, with its budgets, the vault's lease rates and the fail-closed rule for side effects (none of today's connectors has any). Pinning the admin and operator keys and the first signed policy is the next step (section 7). Code: `safety/` plus small hooks in agentd (`app/safety.go`), gatewayd (`guard/safety.go`, `cmd/gatewayd/safety.go`) and vaultd (`vault/`); `cmd/safetysign` makes keys and signs documents (not part of the VM).
+> **Status:** in the agent VM since v0.3.1 without keys: the release policy (`safety.ChatRelease`) applies alone, with its budgets, the vault's lease rates and the fail-closed rule for side effects (none of today's connectors has any). Pinning the admin and operator keys and the first signed policy is the next step (section 7). Code: `safety/` plus small hooks in agentd (`app/safety.go`), gatewayd (`guard/safety.go`, `cmd/gatewayd/safety.go`) and vaultd (`vault/`); `cmd/safetysign` makes keys and signs documents (not part of the VM).
 
 Builds on [harness/v1](20-harness-protocol.md) and [gateway v0 and the vault](21-gateway-v0.md) (four processes).
 
@@ -25,7 +25,7 @@ Example policy (dev): `{"type":"tacy.policy/v1","firm":"f_chat","version":2,"iss
 
 **Narrow only.** The effective policy is every layer at once: the release's ceiling (`safety.ChatRelease`, in the attested code: every model, the web connector, any public host, generous budgets), then the firm's, then the space's. A thing is allowed only if every layer allows it; budgets and rates take the tightest. A signed policy that lists a model the release doesn't have changes nothing.
 
-**Without admin keys pinned** (v0.3.0's compose) the release policy applies alone and no policy is accepted. **With admin keys pinned** nothing runs until a signed policy covers the space (`policy_missing`).
+**Without admin keys pinned** (v0.3.x's compose) the release policy applies alone and no policy is accepted, also on a VM that ran a release with keys before (its version floors stay on the disk for when keys come back; v0.3.0 still refused runs there). **With admin keys pinned** nothing runs until a signed policy covers the space (`policy_missing`).
 
 ## 3. Keys and the upgrade path
 - **Now:** Ed25519 public keys pinned as flags in the compose (`-operator-key`, `-admin-keys`, `-admin-threshold`, `-firm`), the same in agentd, gatewayd and vaultd. The compose is attested and pinned by the browser's verifier, so the browser checks which keys the VM trusts. Changing a key is a release.

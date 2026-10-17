@@ -340,7 +340,10 @@ func (s *State) policy(space string) (*Effective, error) {
 	for _, k := range keys {
 		d := s.policies[k]
 		if d == nil {
-			if _, had := s.floors["policy:"+k]; had { // was signed once, isn't verifiable now: fail closed
+			// Signed once, not verifiable now (keys rotated in a new release): fail closed until a newer one
+			// arrives. Not when no admin keys are pinned: then nothing could ever arrive, and the release policy
+			// applies alone, as the attested compose says (a release without keys after one with them).
+			if _, had := s.floors["policy:"+k]; had && len(s.cfg.Admins) > 0 {
 				return nil, errorf(CodePolicyMissing, "the signed policy for this space can't be verified")
 			}
 			continue

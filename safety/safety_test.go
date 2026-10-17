@@ -321,6 +321,39 @@ func TestNoKeysMeansReleaseDefault(t *testing.T) {
 	}
 }
 
+// A VM that ran a release with admin keys and then one without them (a rollback to stage 1) runs on the release
+// policy: the old floors stay on disk, but without keys no policy could ever arrive to satisfy them. Keys
+// rotated to others still fail closed until a policy they signed arrives.
+func TestFloorsWithoutKeys(t *testing.T) {
+	f := newFixture(t)
+	s := f.state(t)
+	if err := apply(t, s, signP(t, policy(3, ""), f.admin)); err != nil {
+		t.Fatal(err)
+	}
+	cfg := func(admins ...ed25519.PublicKey) Config {
+		return Config{Firm: "f_test", Admins: admins, Release: release(), Dir: f.dir, Now: func() time.Time { return *f.now.Load() }}
+	}
+	none, err := NewState(cfg())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e, err := none.Check("s_x", false); err != nil || len(e.Hashes) != 0 {
+		t.Fatalf("no keys pinned: want the release policy alone, got %v %v", e, err)
+	}
+	rotated, err := NewState(cfg(pub(key(t))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rotated.Check("s_x", false); CodeOf(err) != CodePolicyMissing {
+		t.Fatalf("rotated keys: want policy_missing, got %v", err)
+	}
+	// Back with the original key: the floor still refuses the older version.
+	back := f.state(t)
+	if err := apply(t, back, signP(t, policy(2, ""), f.admin)); err == nil {
+		t.Fatal("v2 accepted after v3, across a keyless release")
+	}
+}
+
 func TestThreshold(t *testing.T) {
 	a, b := key(t), key(t)
 	s, _ := NewState(Config{Firm: "f_test", Admins: []ed25519.PublicKey{pub(a), pub(b)}, Threshold: 2, Release: release(),

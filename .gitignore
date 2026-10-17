@@ -1,0 +1,7 @@
+*.wasm
+wasm/wasm_exec.js
+dist/
+rebuilt.json
+node_modules/
+.DS_Store
+.env*

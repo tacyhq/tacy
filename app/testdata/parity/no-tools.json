@@ -1,0 +1,54 @@
+{
+ "events": [
+  {
+   "type": "meta",
+   "meta": {
+    "model": "deepseek-v4-1-flash",
+    "tinfoil_enclave": "test",
+    "tinfoil_release": "",
+    "tinfoil_measurement": "",
+    "tinfoil_hpke_key": "",
+    "tools": [
+     "web_search",
+     "fetch_page",
+     "image_search"
+    ]
+   }
+  },
+  {
+   "type": "step",
+   "step": 1
+  },
+  {
+   "type": "text",
+   "delta": "Hi."
+  },
+  {
+   "type": "usage",
+   "step": 1,
+   "usage": {
+    "prompt_tokens": 20,
+    "completion_tokens": 6,
+    "total_tokens": 26
+   }
+  },
+  {
+   "type": "metrics",
+   "metrics": {
+    "kind": "model",
+    "step": 1,
+    "ms": 0,
+    "prompt": 20,
+    "cached": 4,
+    "completion": 6,
+    "outcome": "ok"
+   }
+  },
+  {
+   "type": "done",
+   "step": 1,
+   "finish_reason": "stop"
+  }
+ ],
+ "favicons": null
+}

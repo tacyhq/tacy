@@ -1,0 +1,63 @@
+# Tests on every push and pull request, plus a reproducibility check: compose.yaml (which pins the service binary's
+# sha256) must come out byte for byte the same on the runner and in the pinned Go container the VM builds in.
+# Least privilege: read-only token, no secrets, actions pinned by commit.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.2" # = mise.toml
+          check-latest: false
+          cache: false
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - name: vet
+        run: go vet ./... && (cd wasm && GOOS=js GOARCH=wasm go vet .)
+      - name: test (offline)
+        run: go test -short ./...
+      - name: WebAssembly verifier builds and runs
+        run: |
+          scripts/build-wasm.sh "$RUNNER_TEMP/wasm/verifier.wasm"
+          node wasm/smoke.mjs "$RUNNER_TEMP/wasm/verifier.wasm" "$RUNNER_TEMP/wasm"
+
+  reproducible:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.2"
+          check-latest: false
+          cache: false
+      - name: build on the runner
+        run: go run ./cmd/compose --check | tee "$RUNNER_TEMP/runner.txt"
+      - name: build in the pinned Go container (the image the VM builds in)
+        run: |
+          image=$(grep -o 'golang:[^"]*@sha256:[0-9a-f]*' cmd/compose/main.go)
+          docker run --rm -v "$PWD:/src:ro" -w /src -e GOFLAGS=-mod=readonly "$image" \
+            go run ./cmd/compose --check | tee "$RUNNER_TEMP/container.txt"
+      - name: same compose and binary hashes
+        run: diff "$RUNNER_TEMP/runner.txt" "$RUNNER_TEMP/container.txt"

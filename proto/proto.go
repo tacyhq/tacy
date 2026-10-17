@@ -1,0 +1,181 @@
+// Package proto is the agent VM's wire format, shared by the service (compiled into the CVM) and its verifiers.
+// Standard library only.
+package proto
+
+import (
+	"crypto/sha512"
+	"encoding/json"
+)
+
+// Version names this wire format. It is part of the report_data hash, so a quote for another format can't be
+// replayed as this one.
+const Version = "sealed-agent-vm/v1"
+
+// HPKESuite is the only EHBP suite the service offers (RFC 9180 ids 0x0020/0x0001/0x0002).
+const HPKESuite = "DHKEM(X25519, HKDF-SHA256) / HKDF-SHA256 / AES-256-GCM"
+
+// ReportData is the 64-byte TDX report_data the service asks dstack to put in its quote:
+//
+//	sha512("sealed-agent-vm/v1" || 0x00 || nonce (32 bytes) || hpke_public_key (32 bytes, raw X25519))
+//
+// The nonce is the verifier's fresh random value; the key is this boot's EHBP key. dstack passes 64 bytes through
+// unchanged (no prefix or hashing) when given exactly 64.
+func ReportData(nonce, hpkePublicKey []byte) []byte {
+	h := sha512.New()
+	h.Write([]byte(Version))
+	h.Write([]byte{0})
+	h.Write(nonce)
+	h.Write(hpkePublicKey)
+	return h.Sum(nil)
+}
+
+// Attestation is the GET /attest?nonce=<64 hex> response.
+type Attestation struct {
+	Version       string `json:"version"`         // Version
+	Platform      string `json:"platform"`        // "dstack" (Phala, or dstack on Google Cloud); "local" in dev mode
+	Nonce         string `json:"nonce"`           // the verifier's nonce, echoed (hex)
+	HPKEPublicKey string `json:"hpke_public_key"` // this boot's EHBP key: raw X25519, hex
+	HPKESuite     string `json:"hpke_suite"`
+	// Quote is dstack's GetQuote response as returned by the guest agent: {"quote": hex, "event_log": JSON string,
+	// "vm_config": JSON string, ...}.
+	Quote json.RawMessage `json:"quote,omitempty"`
+	// Info is dstack's Info response: {"app_id", "instance_id", "tcb_info": JSON string with "app_compose", ...}.
+	Info json.RawMessage `json:"info,omitempty"`
+	// Booted is when this process started (RFC 3339, from the CVM's clock; informational).
+	Booted string `json:"booted"`
+}
+
+// Message is one chat message. Only plain text content: earlier tool calls come back as assistant text.
+type Message struct {
+	Role    string `json:"role"` // system | user | assistant
+	Content string `json:"content"`
+}
+
+// DefaultModel is the model a run gets when its request names none.
+const DefaultModel = "gpt-oss-120b"
+
+// RunRequest is the (EHBP-encrypted) POST /run body. POST /run also needs the model in plaintext, in the
+// X-Agent-Model header; the VM refuses a run whose body names another model.
+type RunRequest struct {
+	Model           string    `json:"model"`                      // a Tinfoil chat model id; default gpt-oss-120b
+	Messages        []Message `json:"messages"`                   // the conversation, oldest first
+	ReasoningEffort string    `json:"reasoning_effort,omitempty"` // passed to the model as is (it must accept it)
+	Tools           []string  `json:"tools,omitempty"`            // subset of web_search, fetch_page; nil = all
+	MaxSteps        int       `json:"max_steps,omitempty"`        // model calls per run; default 6, max 10
+	// CacheSecret scopes Tinfoil's prompt cache (user_cache_secret); the chat sends its per-user secret.
+	// When empty, a per-boot random secret is used.
+	CacheSecret string `json:"cache_secret,omitempty"`
+}
+
+// Event is one server-sent event in the (EHBP-encrypted) /run response: `data: <json>\n\n`, ending with
+// `data: [DONE]`. Types and how they map onto assistant-ui message parts:
+//
+//	queue        the run waits for a free slot: position (1 = next); repeated when it changes (and every few
+//	             seconds), none once the run starts. A run that never gets a slot ends with an error event.
+//	meta         first event once the run starts: model, Tinfoil enclave and release that were verified
+//	step         a model call starts (step = 1, 2, ...)
+//	reasoning    delta of the reasoning trace            -> { type: "reasoning", text }
+//	text         delta of the answer                     -> { type: "text", text }
+//	tool_call    the model called a tool (args final)    -> { type: "tool-call", toolCallId: id, toolName: name, args }
+//	image        image_search: one image it found, fetched and re-encoded in the VM (id = the tool call). Sent
+//	             before that call's tool_result, in order (Image)
+//	tool_result  the tool's output as the model sees it  -> same part, result: result (+ citations as sources)
+//	favicon      a source site's icon, fetched and re-encoded in the VM (Favicon); sent whenever one is ready,
+//	             at most one per site and maxIconHosts per run, never before the tool_result that named the site
+//	usage        token counts, summed over all steps so far
+//	metrics      timing of one model call or tool call that just ended, or of the queue when the run started
+//	             (Metric): numbers and fixed names only
+//	error        a fatal error; the stream ends after it
+//	done         finish_reason and step count; last event before [DONE]
+type Event struct {
+	Type         string          `json:"type"`
+	Step         int             `json:"step,omitempty"`
+	Position     int             `json:"position,omitempty"` // queue: place in the queue, 1 = next
+	Delta        string          `json:"delta,omitempty"`
+	ID           string          `json:"id,omitempty"`
+	Name         string          `json:"name,omitempty"`
+	Args         json.RawMessage `json:"args,omitempty"`
+	Masked       []string        `json:"masked,omitempty"` // PII kinds replaced before the query left the VM
+	Result       json.RawMessage `json:"result,omitempty"`
+	Citations    []Citation      `json:"citations,omitempty"`
+	Image        *Image          `json:"image,omitempty"`
+	Favicon      *Favicon        `json:"favicon,omitempty"`
+	Usage        *Usage          `json:"usage,omitempty"`
+	Meta         *Meta           `json:"meta,omitempty"`
+	Metrics      *Metric         `json:"metrics,omitempty"`
+	Error        string          `json:"error,omitempty"`
+	FinishReason string          `json:"finish_reason,omitempty"`
+}
+
+// Citation is a source a tool returned. Index is the [n] the model is told to cite.
+type Citation struct {
+	Index   int    `json:"index"`
+	Title   string `json:"title"`
+	URL     string `json:"url"`
+	Snippet string `json:"snippet,omitempty"`
+	Age     string `json:"age,omitempty"`
+}
+
+// Image is one picture image_search shows: a JPEG the VM decoded, scaled to at most 1024 px and re-encoded from
+// the pixels (no metadata of the original survives), with where it came from. Title and URLs are untrusted web
+// text: display only.
+type Image struct {
+	Index  int    `json:"index"`            // 1, 2, ... within the call, in the order shown to the model
+	Title  string `json:"title"`            // the provider's title or description
+	Source string `json:"source,omitempty"` // the page the image is on, when known
+	URL    string `json:"url"`              // the original image's URL (never loaded by the browser)
+	Type   string `json:"type"`             // "image/jpeg"
+	Width  int    `json:"width"`
+	Height int    `json:"height"`
+	Data   []byte `json:"data"` // the JPEG (base64 in JSON)
+}
+
+// Favicon is the icon of a site the run's sources are on: fetched by the VM (never by the browser, which would tell
+// the site, or a favicon service, what the user read), decoded and re-encoded from the pixels as a 32x32 PNG, so
+// nothing of the original file survives. Display only.
+type Favicon struct {
+	Host string `json:"host"` // the site: hostname, lowercase, without "www."
+	Type string `json:"type"` // "image/png"
+	Data []byte `json:"data"` // the PNG (base64 in JSON), 32x32
+}
+
+// Usage is token counts as the model reports them.
+type Usage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
+}
+
+// Meta describes what the run used.
+type Meta struct {
+	Model          string   `json:"model"`
+	TinfoilEnclave string   `json:"tinfoil_enclave"`     // host the model request goes to
+	TinfoilRelease string   `json:"tinfoil_release"`     // signed release tag of tinfoilsh/confidential-model-router
+	TinfoilMeasure string   `json:"tinfoil_measurement"` // SEV-SNP launch measurement, equal to the release's
+	TinfoilHPKEKey string   `json:"tinfoil_hpke_key"`    // key the request was encrypted to
+	Tools          []string `json:"tools"`
+}
+
+// Metric is the timing of one part of a run, sent as a "metrics" event when that part ends (so a run cut short
+// still reports what finished). The chat's browser decrypts it and reports the numbers for the admin's
+// performance view. Numbers and fixed names only: never content, search queries, URLs or hosts.
+type Metric struct {
+	Kind       string `json:"kind"`                 // "model" (one model call), "search" (web_search), "fetch" (fetch_page), "images" (image_search), "favicons" (the run's site icons), "queue" (the run started)
+	Step       int    `json:"step"`                 // the model call this belongs to (1, 2, ...)
+	Ms         int64  `json:"ms"`                   // duration in milliseconds (queue: time waiting for a slot, 0 if none)
+	FirstMs    int64  `json:"first_ms,omitempty"`   // model: request sent -> first token (reasoning, text or a tool call)
+	TextMs     int64  `json:"text_ms,omitempty"`    // model: request sent -> first answer text
+	Prompt     int    `json:"prompt,omitempty"`     // model: prompt tokens (cached ones included)
+	Cached     int    `json:"cached,omitempty"`     // model: prompt tokens served from Tinfoil's prompt cache
+	Completion int    `json:"completion,omitempty"` // model: completion tokens (reasoning included)
+	Provider   string `json:"provider,omitempty"`   // search: the provider that ran it (brave | tavily)
+	Results    int    `json:"results,omitempty"`    // search: results returned; images: image candidates found; favicons: sites tried
+	Images     int    `json:"images,omitempty"`     // images: images shown; favicons: icons sent
+	Tried      int    `json:"tried,omitempty"`      // images: downloads tried (failed ones included)
+	Failed     int    `json:"failed,omitempty"`     // images: downloads refused or failed (too big, wrong type, HTTP error); favicons: sites without a usable icon
+	Bytes      int    `json:"bytes,omitempty"`      // images, favicons: re-encoded bytes sent
+	FetchMs    int64  `json:"fetch_ms,omitempty"`   // images: download + decode + encode time, summed over the images tried; favicons: the same over the sites
+	WaitMs     int64  `json:"wait_ms,omitempty"`    // search, fetch, images, favicons: time waiting for the per-user and global tool caps (not in ms)
+	Running    int    `json:"running,omitempty"`    // queue: runs running on the VM when this one started, itself included
+	Outcome    string `json:"outcome"`              // ok | error | refused (fetch: the URL held personal data)
+}

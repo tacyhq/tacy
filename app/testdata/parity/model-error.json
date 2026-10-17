@@ -1,0 +1,37 @@
+{
+ "events": [
+  {
+   "type": "meta",
+   "meta": {
+    "model": "gpt-oss-120b",
+    "tinfoil_enclave": "test",
+    "tinfoil_release": "",
+    "tinfoil_measurement": "",
+    "tinfoil_hpke_key": "",
+    "tools": [
+     "web_search",
+     "fetch_page",
+     "image_search"
+    ]
+   }
+  },
+  {
+   "type": "step",
+   "step": 1
+  },
+  {
+   "type": "metrics",
+   "metrics": {
+    "kind": "model",
+    "step": 1,
+    "ms": 0,
+    "outcome": "error"
+   }
+  },
+  {
+   "type": "error",
+   "error": "model returned 500: upstream overloaded"
+  }
+ ],
+ "favicons": null
+}

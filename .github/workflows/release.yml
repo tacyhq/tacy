@@ -1,0 +1,99 @@
+# Release: on a tag vX.Y.Z, build the release (today: compose.yaml with the embedded source and the pinned hashes
+# of the four binaries: agentd, brain, gatewayd, vaultd), sign it with Sigstore through GitHub artifact attestations, and publish it.
+# README.md ("Releases and signing") has the format and the signing identity the verifier pins:
+#   https://github.com/tacyhq/tacy/.github/workflows/release.yml@refs/tags/vX.Y.Z
+#
+# Two jobs on purpose:
+#   build    read-only; runs tests and builds. It is the part to swap for an OCI image build later: whatever it
+#            does, it uploads dist/compose.yaml and dist/release.json.
+#   release  no checkout, no build, no test code: the only job that can get an OIDC token (signing) and write the
+#            release. It signs the files the build job produced.
+# No long-lived secrets: Sigstore signing uses the job's short-lived OIDC token.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: tag is vMAJOR.MINOR.PATCH (the verifier accepts nothing else)
+        run: |
+          [[ "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || {
+            echo "tag $GITHUB_REF_NAME isn't vX.Y.Z"; exit 1; }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.2" # = mise.toml
+          check-latest: false
+          cache: false
+      - name: test
+        run: go vet ./... && go test -short ./...
+      # --- build artifact (swap for an OCI image build later; keep the outputs) ---
+      - name: compose.yaml and release.json, built in the pinned Go container
+        run: |
+          image=$(grep -o 'golang:[^"]*@sha256:[0-9a-f]*' cmd/compose/main.go)
+          mkdir -p dist
+          docker run --rm -v "$PWD:/src" -w /src -e GOFLAGS=-mod=readonly "$image" \
+            go run ./cmd/compose --check --manifest dist/release.json --version "$GITHUB_REF_NAME" --commit "$GITHUB_SHA"
+          cp compose.yaml dist/compose.yaml
+      - name: same result on the runner (reproducible)
+        run: |
+          go run ./cmd/compose --check --manifest "$RUNNER_TEMP/release.json" --version "$GITHUB_REF_NAME" --commit "$GITHUB_SHA"
+          diff dist/release.json "$RUNNER_TEMP/release.json"
+      # ---
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write     # create the GitHub Release
+      id-token: write     # Sigstore signing certificate (Fulcio) from the workflow's OIDC identity
+      attestations: write # store the attestation (GitHub's attestations API)
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+          path: dist
+      - name: manifest matches the files, the tag and the commit
+        run: |
+          sum=$(sha256sum dist/compose.yaml | cut -d' ' -f1)
+          jq -e --arg sum "$sum" --arg v "$GITHUB_REF_NAME" --arg c "$GITHUB_SHA" \
+            '.schema == "tacy-release/v1" and .compose_sha256 == $sum and .version == $v and .commit == $c' dist/release.json
+          echo "compose sha256 $sum"
+      - name: sign (in-toto SLSA provenance, subjects compose.yaml and release.json; logged in Rekor)
+        id: attest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/compose.yaml
+            dist/release.json
+      - name: publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          cp "$BUNDLE" dist/compose.sigstore.json
+          sum=$(jq -r .compose_sha256 dist/release.json)
+          gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" \
+            --notes "compose sha256 \`$sum\`. Verify: see README.md. Rebuild: \`scripts/reproduce.sh $GITHUB_REF_NAME\`." \
+            dist/compose.yaml dist/release.json dist/compose.sigstore.json

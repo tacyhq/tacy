@@ -1,0 +1,24 @@
+package main
+
+// The old tree's side of parity_test.go (app/ before the switchover: app/agent.go's loop). To record
+// testdata/parity from it: check out the commit before the switchover, copy parity_test.go into its app/ and this
+// file as app/parity_server_test.go, then: go test ./app -run TestParity -args -update-parity
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+)
+
+func modelTool(app string) string { return app }
+
+func parityServer(t *testing.T, model *httptest.Server, ps *paritySearch, web parityWeb) *server {
+	lim := defaultLimits
+	client := &http.Client{Transport: web}
+	a := &Agent{up: &plainUpstream{url: model.URL, http: model.Client()}, cacheSecret: "boot-secret",
+		now:   func() time.Time { return time.Date(2026, 10, 13, 0, 0, 0, 0, time.UTC) },
+		gates: newToolGates(lim), runTools: lim.RunTools, icons: client,
+		newTools: func() *Tools { return &Tools{search: ps, fetcher: client} }}
+	return &server{platform: local{}, agent: a, sched: newScheduler(lim), lim: lim, quotes: make(chan struct{}, 4)}
+}

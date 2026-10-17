@@ -1,0 +1,6 @@
+Tacy
+Copyright 2026 Tacy
+
+This product is licensed under the Apache License, Version 2.0 (LICENSE).
+wasm/loggershim and wasm/intotoshim are copies of third-party Apache-2.0 code; their own LICENSE files apply.
+leakscan/ ports IronClaw's leak-detection patterns (Copyright 2026 NEAR AI, MIT); leakscan/NOTICE has the license.

@@ -1,14 +1,18 @@
-# Release: on a tag vX.Y.Z, build the release (today: compose.yaml with the embedded source and the pinned hashes
-# of the four binaries: agentd, brain, gatewayd, vaultd), sign it with Sigstore through GitHub artifact attestations, and publish it.
-# README.md ("Releases and signing") has the format and the signing identity the verifier pins:
+# Release: on a tag vX.Y.Z, build the release (compose.yaml naming one OCI image per binary by digest: agentd,
+# brain, gatewayd, vaultd and setup; release.json; the images as OCI layouts), push the images to ghcr.io, check
+# that each one pulls without credentials, sign everything with Sigstore through GitHub artifact attestations, and
+# publish it. README.md ("Releases and signing") has the format and the signing identity the verifier pins:
 #   https://github.com/tacyhq/tacy/.github/workflows/release.yml@refs/tags/vX.Y.Z
 #
 # Two jobs on purpose:
-#   build    read-only; runs tests and builds. It is the part to swap for an OCI image build later: whatever it
-#            does, it uploads dist/compose.yaml and dist/release.json.
-#   release  no checkout, no build, no test code: the only job that can get an OIDC token (signing) and write the
-#            release. It signs the files the build job produced.
-# No long-lived secrets: Sigstore signing uses the job's short-lived OIDC token.
+#   build    read-only; runs tests and builds, in the pinned Go container and again on the runner (the two must
+#            agree byte for byte). It uploads dist/compose.yaml, dist/release.json and dist/oci/<name>.
+#   release  no checkout, no build, no test code: the only job that can get an OIDC token (signing), push packages
+#            and write the release. It pushes the layouts the build job produced, checks they pull anonymously,
+#            then signs and publishes. If a package is private (new ghcr packages start private, and only an org
+#            owner can change that, in the web UI), the job stops before anything is signed or published: make the
+#            package public and re-run this job (same tag; never re-tag).
+# No long-lived secrets: pushing uses the job's GITHUB_TOKEN, Sigstore signing its short-lived OIDC token.
 name: release
 
 on:
@@ -41,19 +45,18 @@ jobs:
           cache: false
       - name: test
         run: go vet ./... && go test -short ./...
-      # --- build artifact (swap for an OCI image build later; keep the outputs) ---
-      - name: compose.yaml and release.json, built in the pinned Go container
+      - name: compose.yaml, release.json and the images, built in the pinned Go container
         run: |
           image=$(grep -o 'golang:[^"]*@sha256:[0-9a-f]*' cmd/compose/main.go)
           mkdir -p dist
           docker run --rm -v "$PWD:/src" -w /src -e GOFLAGS=-mod=readonly "$image" \
-            go run ./cmd/compose --check --manifest dist/release.json --version "$GITHUB_REF_NAME" --commit "$GITHUB_SHA"
+            go run ./cmd/compose --check --oci dist/oci --manifest dist/release.json --version "$GITHUB_REF_NAME" --commit "$GITHUB_SHA"
           cp compose.yaml dist/compose.yaml
-      - name: same result on the runner (reproducible)
+      - name: same result on the runner (reproducible binaries and image digests)
         run: |
-          go run ./cmd/compose --check --manifest "$RUNNER_TEMP/release.json" --version "$GITHUB_REF_NAME" --commit "$GITHUB_SHA"
+          go run ./cmd/compose --check --oci "$RUNNER_TEMP/oci" --manifest "$RUNNER_TEMP/release.json" --version "$GITHUB_REF_NAME" --commit "$GITHUB_SHA"
           diff dist/release.json "$RUNNER_TEMP/release.json"
-      # ---
+          for d in dist/oci/*/; do n=$(basename "$d"); diff -r "$d" "$RUNNER_TEMP/oci/$n"; done
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release
@@ -66,26 +69,88 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write     # create the GitHub Release
+      packages: write     # push the images to ghcr.io/tacyhq/tacy/<name>
       id-token: write     # Sigstore signing certificate (Fulcio) from the workflow's OIDC identity
       attestations: write # store the attestation (GitHub's attestations API)
+    env:
+      # crane (go-containerregistry), pinned by the release file's sha256 (its checksums.txt).
+      CRANE_URL: https://github.com/google/go-containerregistry/releases/download/v0.21.7/go-containerregistry_Linux_x86_64.tar.gz
+      CRANE_SHA256: 1a57bc98207fa1c0d04bf760699099e26f8383499bfd55b99c1b919a928a7230
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: release
           path: dist
-      - name: manifest matches the files, the tag and the commit
+      - name: manifest matches the files, the tag, the commit and the images
         run: |
           sum=$(sha256sum dist/compose.yaml | cut -d' ' -f1)
           jq -e --arg sum "$sum" --arg v "$GITHUB_REF_NAME" --arg c "$GITHUB_SHA" \
-            '.schema == "tacy-release/v1" and .compose_sha256 == $sum and .version == $v and .commit == $c' dist/release.json
+            '.schema == "tacy-release/v2" and .compose_sha256 == $sum and .version == $v and .commit == $c and (.images | length) > 0' dist/release.json
           echo "compose sha256 $sum"
-      - name: sign (in-toto SLSA provenance, subjects compose.yaml and release.json; logged in Rekor)
+          # Every image release.json names is in compose.yaml, comes from ghcr.io/tacyhq/tacy, and is the one layout
+          # in dist/oci/<name>; and compose.yaml names no other image.
+          jq -r '.images | to_entries[] | "\(.key) \(.value)"' dist/release.json | while read -r name ref; do
+            [[ "$ref" =~ ^ghcr\.io/tacyhq/tacy/${name}@sha256:[0-9a-f]{64}$ ]] || { echo "bad image $name $ref"; exit 1; }
+            grep -qxF "    image: $ref" dist/compose.yaml || { echo "$ref isn't in compose.yaml"; exit 1; }
+            jq -e --arg d "${ref#*@}" '.manifests | length == 1 and .[0].digest == $d' "dist/oci/$name/index.json" >/dev/null ||
+              { echo "dist/oci/$name isn't $ref"; exit 1; }
+          done
+          [ "$(grep -c '^    image: ' dist/compose.yaml)" = "$(jq '.images | length' dist/release.json)" ] || { echo "compose.yaml names other images"; exit 1; }
+      - name: install crane
+        run: |
+          curl -fsSL "$CRANE_URL" -o "$RUNNER_TEMP/crane.tgz"
+          echo "$CRANE_SHA256  $RUNNER_TEMP/crane.tgz" | sha256sum -c
+          tar -xzf "$RUNNER_TEMP/crane.tgz" -C "$RUNNER_TEMP" crane
+      - name: push the images (by digest, tagged with the version)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          export DOCKER_CONFIG="$RUNNER_TEMP/docker-push"
+          echo "$GH_TOKEN" | "$RUNNER_TEMP/crane" auth login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          jq -r '.images | to_entries[] | "\(.key) \(.value)"' dist/release.json | while read -r name ref; do
+            got=$("$RUNNER_TEMP/crane" push "dist/oci/$name" "${ref%@*}:$GITHUB_REF_NAME")
+            [ "$got" = "$ref" ] || { echo "pushed $got, want $ref"; exit 1; }
+            echo "pushed $ref"
+          done
+          rm -rf "$DOCKER_CONFIG"
+      - name: every image pulls without credentials (else stop before signing anything)
+        run: |
+          # Anonymous token, manifest by digest, then the config and every layer, each checked against its digest.
+          # A private package answers 401/403 here.
+          failed=""
+          while read -r name ref; do
+            repo=${ref#ghcr.io/}; repo=${repo%@*}; digest=${ref#*@}
+            if ! tok=$(curl -fsS "https://ghcr.io/token?scope=repository:$repo:pull&service=ghcr.io" | jq -er .token) ||
+               ! curl -fsS -H "Authorization: Bearer $tok" -H "Accept: application/vnd.oci.image.manifest.v1+json" \
+                 "https://ghcr.io/v2/$repo/manifests/$digest" -o "$RUNNER_TEMP/m.json"; then
+              failed="$failed $name"; continue
+            fi
+            [ "sha256:$(sha256sum "$RUNNER_TEMP/m.json" | cut -d' ' -f1)" = "$digest" ] || { echo "$ref: manifest digest differs"; exit 1; }
+            for b in $(jq -r '.config.digest, .layers[].digest' "$RUNNER_TEMP/m.json"); do
+              got=$(curl -fsSL -H "Authorization: Bearer $tok" "https://ghcr.io/v2/$repo/blobs/$b" | sha256sum | cut -d' ' -f1)
+              [ "sha256:$got" = "$b" ] || { echo "$ref: blob $b doesn't pull anonymously or differs"; exit 1; }
+            done
+            echo "pulls anonymously: $ref"
+          done < <(jq -r '.images | to_entries[] | "\(.key) \(.value)"' dist/release.json)
+          if [ -n "$failed" ]; then
+            echo "::error::not public:$failed. Nothing was signed or published. An org owner sets each one public once:"
+            for n in $failed; do echo "  https://github.com/orgs/tacyhq/packages/container/package/tacy%2F$n -> Package settings -> Change visibility -> Public"; done
+            echo "then re-run this job (same tag)."
+            exit 1
+          fi
+      - name: subjects (compose.yaml, release.json and each image by digest)
+        run: |
+          {
+            sha256sum dist/compose.yaml | sed 's#  dist/#  #'
+            sha256sum dist/release.json | sed 's#  dist/#  #'
+            jq -r '.images[] | "\(.[index("@sha256:")+8:])  \(.[:index("@")])"' dist/release.json
+          } > "$RUNNER_TEMP/subjects.txt"
+          cat "$RUNNER_TEMP/subjects.txt"
+      - name: sign (in-toto SLSA provenance, one statement for all the subjects; logged in Rekor)
         id: attest
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: |
-            dist/compose.yaml
-            dist/release.json
+          subject-checksums: ${{ runner.temp }}/subjects.txt
       - name: publish the GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -94,6 +159,10 @@ jobs:
         run: |
           cp "$BUNDLE" dist/compose.sigstore.json
           sum=$(jq -r .compose_sha256 dist/release.json)
+          images=$(jq -r '.images | to_entries[] | "- `\(.value)`"' dist/release.json)
           gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" \
-            --notes "compose sha256 \`$sum\`. Verify: see README.md. Rebuild: \`scripts/reproduce.sh $GITHUB_REF_NAME\`." \
+            --notes "compose sha256 \`$sum\`. Images:
+          $images
+
+          Verify: see README.md. Rebuild: \`scripts/reproduce.sh $GITHUB_REF_NAME\`." \
             dist/compose.yaml dist/release.json dist/compose.sigstore.json

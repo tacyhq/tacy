@@ -53,7 +53,7 @@ const (
 	Issuer = "https://token.actions.githubusercontent.com"
 	// MinVersion is the oldest release this verifier accepts. Raise it when a release must stop being used (a
 	// security fix): a relay can then no longer serve an older, validly signed compose.
-	MinVersion = "v0.1.0"
+	MinVersion = "v0.2.0"
 	// Subject is the in-toto subject name of the compose.
 	Subject = "compose.yaml"
 	// PredicateType is what actions/attest-build-provenance signs.

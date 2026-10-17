@@ -30,18 +30,19 @@ Only what runs inside the VM, and what checks it, is here. Everything outside on
 | `release/` | Checks that a compose is a signed release of this repository (Sigstore). |
 | `wasm/` | The verifier compiled to WebAssembly, for the browser. |
 | `agentclient/` | Attest, verify, then send encrypted runs; used by the service's end-to-end tests. |
-| `cmd/compose/` | Generates `compose.yaml` (the VM's definition: embeds the source and pins the four binaries' sha256) and the release manifest. |
+| `cmd/compose/` | Builds the binaries reproducibly, one OCI image each on a pinned distroless base, and generates `compose.yaml` (the VM's definition: every image by digest) and the release manifest. |
+| `cmd/setup/` | `setup`, a one-shot step (root, no network) that gives the processes their directories on the shared volumes before they start. |
 | `compose.yaml`, `pins.go` | What the VM runs. Its sha256 is what the attestation measures and what a release signs. `pins.go` embeds it for the browser verifier. |
 | `scripts/` | `build-wasm.sh` (browser verifier), `reproduce.sh` (rebuild a release and compare). |
-| `.github/workflows/` | CI (tests, and the compose rebuilt on the runner and in the pinned Go container must match) and the release workflow that signs. |
+| `.github/workflows/` | CI (tests, and the compose and image digests rebuilt on the runner and in the pinned Go container must match), the release workflow that pushes the images and signs, and `reproduce.yml` (rebuilds each release and checks what ghcr.io serves). |
 | `testdata/` | A recorded attestation from a test VM on dstack 0.6.1 (public data: quote, event log, app compose), used by the verifier's tests. |
 | `docs/` | Specs: [harness/v1](docs/20-harness-protocol.md) (brain ↔ runtime) and [gateway v0 and the vault](docs/21-gateway-v0.md). |
 
 ## How it works
 
-1. **Boot.** The VM (Intel TDX, dstack 0.6.1) runs `compose.yaml`: four processes, each in its own container with its own uid, linked only by unix sockets ([docs/21](docs/21-gateway-v0.md)): `agentd` (front door and runtime), `brain` (the agent loop, untrusted), `gatewayd` (service `agentvm`, the only one with a network) and `vaultd` (the keys). A one-shot `build` container builds the four binaries from the embedded source and refuses to finish unless each has its pinned sha256; every other container checks its own pin again before running it. agentd makes a fresh HPKE key in memory.
+1. **Boot.** The VM (Intel TDX, dstack 0.6.1) runs `compose.yaml`: four processes, each in its own container with its own uid, linked only by unix sockets ([docs/21](docs/21-gateway-v0.md)): `agentd` (front door and runtime), `brain` (the agent loop, untrusted), `gatewayd` (service `agentvm`, the only one with a network) and `vaultd` (the keys). Each container runs one image from `ghcr.io/tacyhq/tacy/<name>`, named by digest in the compose (no tag, nothing built on the VM); a one-shot `setup` container (root, no network) first gives the processes their directories. agentd makes a fresh HPKE key in memory.
 2. **Attest.** `GET /attest?nonce=<64 hex>` returns a TDX quote whose report_data is `sha512("sealed-agent-vm/v1" || 0x00 || nonce || hpke_public_key)`, plus the event log and the app compose.
-3. **Verify.** The client checks the quote (Intel signature chain, collateral, revocation, TCB, debug off), the key binding, the event log replay to RTMR3 and the compose hash, a production OS image, pinned boot measurements (MRTD, RTMR0-2: firmware, kernel, initramfs, root filesystem and VM size), the pre-launch script, no init script, and that the compose is a signed release.
+3. **Verify.** The client checks the quote (Intel signature chain, collateral, revocation, TCB, debug off), the key binding, the event log replay to RTMR3 and the compose hash, a production OS image, pinned boot measurements (MRTD, RTMR0-2: firmware, kernel, initramfs, root filesystem and VM size), the pre-launch script, no init script, that the compose is a signed release, and that it names every image by digest (16 checks).
 4. **Run.** Requests and responses are encrypted to the verified key. No request logs; a run's task and journal sit in the queue on the VM's encrypted disk while it runs and are deleted when it ends.
 
 ## How the browser verifies a VM
@@ -55,37 +56,38 @@ The web app loads the WebAssembly verifier (`wasm/`, built with `scripts/build-w
 
 The release check accepts a compose only if this repository's release workflow signed it on a version tag at or above the pinned minimum (below).
 
-## Reproduce the compose and binary hashes
+## Reproduce the compose, binary hashes and image digests
 
 ```sh
 mise exec -- go run ./cmd/compose --check
 ```
 
-It rebuilds the four binaries the way the VM does (linux/amd64, `CGO_ENABLED=0`, `-trimpath`, no VCS stamp, Go 1.27.2) and checks that `compose.yaml` matches this tree byte for byte, then prints the compose sha256 and each binary's. To see exactly what a compose runs: `go run ./cmd/compose --extract DIR`. CI runs the same check on the runner and in the pinned Go container and fails on any difference.
+It builds the five binaries (`agentd`, `brain`, `gatewayd`, `vaultd`, `setup`) for linux/amd64 (`CGO_ENABLED=0`, `-trimpath`, no VCS stamp, Go 1.27.2) and makes one image of each: the pinned base `gcr.io/distroless/static-debian13` (by its linux/amd64 manifest digest) plus one layer holding only `/tacy/<name>` (owner 0:0, mode 0555, time 0, gzip from Go's standard library), entrypoint the binary, every time in the config 0. Same binaries and base, same image digests, on any machine. It checks that `compose.yaml` matches this tree byte for byte, then prints the compose sha256, each binary's sha256 and each image's digest (`--oci DIR` also writes the images as OCI layouts). CI runs the same check on the runner and in the pinned Go container and fails on any difference.
+
+**The rule the verifier adds** (`verifier.ComposeImages`, the 16th check): the attested compose is one YAML document whose every service has `image: <registry>/<path>@sha256:<64 hex>` with no tag, no service has `build:` or `extends:`, and there's no top-level `include:`. So the compose hash covers exactly the images that run, and the images' digests cover the binaries.
 
 **The compose hash** is `sha256(compose.yaml)`. dstack copies the file unchanged into `app-compose.json` (`docker_compose_file`), whose own hash is the attested `compose-hash`. The verifier hashes that attested copy, so the signed value and the measured value are the same bytes.
 
-**Status:** the live agent VM doesn't yet run a signed release built from this repository; v0.1.0 will be the first. Until then, its hashes come from the same code built in a private tree with a different Go module path, so they don't match a build of this repository.
-
-To rebuild a published release and compare it with its manifest:
+To rebuild a published release and compare it with its manifest and with what the registry serves:
 
 ```sh
-scripts/reproduce.sh v0.1.0
+scripts/reproduce.sh v0.2.0            # in the pinned Go container (cmd/compose's image, by digest); needs docker
+scripts/reproduce.sh --native v0.2.0   # with your own Go (must be 1.27.2, e.g. through mise)
 ```
 
-It clones the tag, rebuilds in the pinned Go container (`cmd/compose`'s image, by digest) and compares with the release's `release.json`. Needs git, curl and docker.
+It clones the tag, rebuilds, compares with the release's `release.json` (compose sha256, binary sha256s, image digests), then fetches each image's manifest from ghcr.io anonymously by digest and checks it hashes to that digest and is the rebuilt one. Needs git, curl and jq. `.github/workflows/reproduce.yml` runs both after every release. Releases before v0.2.0 (`tacy-release/v1`) built the binaries on the VM and have no images.
 
 ## Releases and signing
 
-A release is a tag `vMAJOR.MINOR.PATCH` (no suffixes). `.github/workflows/release.yml` builds it and publishes a GitHub Release with three files:
+A release is a tag `vMAJOR.MINOR.PATCH` (no suffixes). `.github/workflows/release.yml` builds it, pushes the images to `ghcr.io/tacyhq/tacy/<name>` (tagged with the version for people; the compose uses only the digests) and publishes a GitHub Release with three files:
 
 | File | What |
 |---|---|
-| `compose.yaml` | What the VM runs. It embeds the source and pins the sha256 of the four binaries (`agentd`, `brain`, `gatewayd`, `vaultd`). |
-| `release.json` | Manifest: `schema` (`tacy-release/v1`), `repository`, `version`, `commit`, `compose_sha256`, `binaries` (name → sha256), `go_version`, `build_image`. |
-| `compose.sigstore.json` | The Sigstore bundle that signs both files. |
+| `compose.yaml` | What the VM runs: five images by digest (`setup`, `agentd`, `brain`, `gatewayd` as service `agentvm`, `vaultd`). |
+| `release.json` | Manifest: `schema` (`tacy-release/v2`), `repository`, `version`, `commit`, `compose_sha256`, `binaries` (name → sha256), `images` (name → `ghcr.io/tacyhq/tacy/<name>@sha256:…`), `base_image`, `go_version`, `build_image`. (`tacy-release/v1`, before v0.2.0, had no images: the VM built the binaries from source embedded in the compose.) |
+| `compose.sigstore.json` | The Sigstore bundle that signs the files and the images. |
 
-Signing uses GitHub artifact attestations (`actions/attest-build-provenance`) on Sigstore's public-good instance: the release job gets a short-lived Fulcio certificate for its GitHub Actions OIDC identity (no long-lived keys), signs an in-toto statement (SLSA provenance v1) with `compose.yaml` and `release.json` as subjects, and the signature is logged in Rekor. The workflow has two jobs: `build` (read-only token, tests and build) and `release` (checks out nothing, runs no repository code; only it can get the OIDC token), so test or build code can't sign anything.
+Signing uses GitHub artifact attestations (`actions/attest-build-provenance`) on Sigstore's public-good instance: the release job gets a short-lived Fulcio certificate for its GitHub Actions OIDC identity (no long-lived keys), signs one in-toto statement (SLSA provenance v1) whose subjects are `compose.yaml`, `release.json` and each image (named `ghcr.io/tacyhq/tacy/<name>`, with its manifest digest), and the signature is logged in Rekor. The workflow has two jobs: `build` (read-only token, tests and build, in the pinned Go container and again on the runner, which must agree) and `release` (checks out nothing, runs no repository code; only it can push packages or get the OIDC token), so test or build code can't push or sign anything. Before it signs, the release job pushes the images and pulls each one back **without credentials** (manifest, config and every layer, each checked against its digest), because a VM pulls anonymously; if one doesn't pull (a new ghcr package starts private), nothing is signed or published, an org owner sets the package public, and the job is re-run for the same tag.
 
 The verifier (`release/`) accepts a bundle only if all of these hold:
 
@@ -108,10 +110,10 @@ Sigstore's trusted root is embedded (`release/trusted_root.json`, from Sigstore'
 
 ```sh
 gh attestation verify compose.yaml --repo tacyhq/tacy \
-  --signer-workflow tacyhq/tacy/.github/workflows/release.yml --source-ref refs/tags/v0.1.0
+  --signer-workflow tacyhq/tacy/.github/workflows/release.yml --source-ref refs/tags/v0.2.0
 ```
 
-**Rollback protection:** a relay could serve an older, validly signed release with a known bug, so the verifier refuses releases older than `release.MinVersion` (`release/release.go`, currently `v0.1.0`), raised when a release must stop being used. A caller can raise the minimum further but never lower it, and can pass the newest version it has accepted before (`release.Policy.LastSeen`; the optional last argument of the browser's `verifyRelease` and `verifyReleaseBundle`) so a relay can't move it back. Pre-release tags are never accepted.
+**Rollback protection:** a relay could serve an older, validly signed release with a known bug, so the verifier refuses releases older than `release.MinVersion` (`release/release.go`, currently `v0.2.0`: the first release with images), raised when a release must stop being used. A caller can raise the minimum further but never lower it, and can pass the newest version it has accepted before (`release.Policy.LastSeen`; the optional last argument of the browser's `verifyRelease` and `verifyReleaseBundle`) so a relay can't move it back. Pre-release tags are never accepted.
 
 ## Boot measurements
 
@@ -141,7 +143,7 @@ Not checked by us: a full rebuild of the dstack OS image from source (the image 
 ```sh
 mise exec -- go test -short ./...    # offline
 mise exec -- go test ./...           # adds Intel PCS, live Tinfoil verification and the compose rebuild (network)
-mise exec -- go run ./cmd/compose    # after editing anything the four binaries build from
+mise exec -- go run ./cmd/compose    # after editing anything the binaries build from
 scripts/build-wasm.sh                # browser verifier -> wasm/verifier.wasm
 ```
 

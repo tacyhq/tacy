@@ -1,0 +1,43 @@
+# Reproduce: after every release (and by hand for any tag), rebuild it from the tag in the pinned Go container and
+# natively on the runner, compare with the published release.json (compose sha256, binary sha256s, image
+# digests), and check that ghcr.io serves exactly the rebuilt images to an anonymous client
+# (scripts/reproduce.sh). Read-only: it checks, it never changes a release.
+name: reproduce
+
+on:
+  workflow_run:
+    workflows: [release]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: release tag (vX.Y.Z)
+        required: true
+
+permissions: {}
+
+jobs:
+  reproduce:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: which tag
+        env:
+          TAG: ${{ inputs.tag || github.event.workflow_run.head_branch }}
+        run: |
+          [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || { echo "not a release tag: $TAG"; exit 1; }
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.2" # = mise.toml
+          check-latest: false
+          cache: false
+      - name: rebuild in the pinned Go container
+        run: scripts/reproduce.sh "$TAG"
+      - name: rebuild natively on the runner
+        run: scripts/reproduce.sh --native "$TAG"

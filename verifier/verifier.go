@@ -8,9 +8,11 @@
 //   - the boot measurements (MRTD, RTMR0-2: firmware, its configuration and the VM shape, kernel, command line
 //     with the root filesystem hash, initramfs) are one of the pinned sets (BootMeasurements), for that OS image
 //   - app-compose.json: a reviewed pre-launch script, the docker-compose runner, expected env names only
-//   - the docker compose the VM runs (which embeds the service source and pins the binary hash) is a signed
-//     release: a Sigstore bundle from this repo's release workflow on a version tag, in Sigstore's public log,
-//     for exactly sha256(docker compose), at least release.MinVersion (package release)
+//   - the docker compose the VM runs (which names every image by digest) is a signed release: a Sigstore bundle
+//     from this repo's release workflow on a version tag, in Sigstore's public log, for exactly
+//     sha256(docker compose), at least release.MinVersion (package release)
+//   - the docker compose pins every container to an image digest (name@sha256, no tag, no build:, extends: or
+//     include:), so the compose hash covers exactly the code that runs (ComposeImages)
 //
 // The older mode, Policy.Compose, instead requires one exact compose.yaml given by the caller. It stays until every
 // client passes release bundles, then goes.
@@ -359,8 +361,11 @@ func Verify(ctx context.Context, att *proto.Attestation, nonce []byte, p Policy)
 			err = errors.New("no expected compose given")
 		}
 		h := sha256.Sum256(p.Compose)
-		if !r.add("runs exactly our compose.yaml (service source + pinned binary hash)", err,
-			"compose.yaml sha256 "+short(hex.EncodeToString(h[:]))+", binary "+short(pin)) {
+		detail := ""
+		if pin != "" {
+			detail = ", binary " + short(pin)
+		}
+		if !r.add("runs exactly our compose.yaml", err, "compose.yaml sha256 "+short(hex.EncodeToString(h[:]))+detail) {
 			return failed()
 		}
 	} else {
@@ -371,8 +376,10 @@ func Verify(ctx context.Context, att *proto.Attestation, nonce []byte, p Policy)
 		}
 		detail := ""
 		if rel != nil {
-			detail = rel.Version + " (commit " + short(rel.Commit) + "), compose sha256 " + short(rel.ComposeSHA256) +
-				", binary " + short(pin)
+			detail = rel.Version + " (commit " + short(rel.Commit) + "), compose sha256 " + short(rel.ComposeSHA256)
+			if pin != "" {
+				detail += ", binary " + short(pin)
+			}
 			r.Facts["release"] = rel.Version
 			r.Facts["release commit"] = rel.Commit
 			r.Facts["release signer"] = rel.Identity
@@ -384,6 +391,9 @@ func Verify(ctx context.Context, att *proto.Attestation, nonce []byte, p Policy)
 			err, detail) {
 			return failed()
 		}
+	}
+	if !r.checkImages(ac.DockerComposeFile) {
+		return failed()
 	}
 	r.HPKEPublicKey = key
 	return r, nil

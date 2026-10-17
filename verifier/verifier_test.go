@@ -152,9 +152,7 @@ func TestRecorded061Offline(t *testing.T) {
 	p := offline
 	p.Compose = compose
 	res, err := Verify(context.Background(), a, nonce, p)
-	if err != nil {
-		t.Fatal(err)
-	}
+	onlyImagesFailed(t, res, err)
 	if res.Facts["OS image"] != "dstack-0.6.1" || res.Facts["boot measurements"] != BootMeasurements[0].Name ||
 		res.Facts["pre-launch script"] != "Phala pre-launch script v0.0.20" || res.Facts["brain binary sha256"] == "" {
 		t.Fatalf("facts %v", res.Facts)
@@ -185,9 +183,8 @@ func TestInitScriptRefused(t *testing.T) {
 		p.Compose = compose
 		rtmr3 := recompose(t, a, appCompose)
 		p.VerifyQuote = changeQuote(func(q *tdx.Quote) { q.Rtmrs[3] = rtmr3 })
-		if _, err := Verify(context.Background(), a, nonce, p); err != nil {
-			t.Fatalf("init_script %#v: %v", v, err)
-		}
+		res, err := Verify(context.Background(), a, nonce, p)
+		onlyImagesFailed(t, res, err)
 	}
 }
 
@@ -259,8 +256,63 @@ func TestRecordedOnline(t *testing.T) {
 		t.Skip("needs Intel PCS")
 	}
 	a, nonce, compose := load061(t)
-	if _, err := Verify(context.Background(), a, nonce, Policy{Compose: compose}); err != nil {
+	res, err := Verify(context.Background(), a, nonce, Policy{Compose: compose})
+	onlyImagesFailed(t, res, err)
+}
+
+// onlyImagesFailed: the recordings run composes that built the binaries on the VM, from before the OCI images.
+// Every check passes except the last, the image rule, and no key is returned.
+func onlyImagesFailed(t *testing.T, res *Result, err error) {
+	t.Helper()
+	if err == nil || !strings.HasPrefix(err.Error(), ImagesCheck+": ") || res.HPKEPublicKey != nil {
+		t.Fatalf("want only the image rule to fail: %v", err)
+	}
+	for i, c := range res.Checks {
+		if c.OK != (i < len(res.Checks)-1) {
+			t.Fatalf("check %d %q ok=%v (%s)", i, c.Name, c.OK, c.Detail)
+		}
+	}
+	if !strings.Contains(err.Error(), `golang:1.27.2-alpine@sha256:f92b6ef800e499660581efdabdf25d9d817a9d124eaf900924f0504e7e27e12d" isn't name@sha256`) {
+		t.Fatalf("refused for another reason: %v", err)
+	}
+}
+
+// A VM running an image compose (this folder's compose.yaml, put into the 0.6.1 recording with its compose-hash
+// event and RTMR3 made consistent) passes every check, and its images are facts.
+func TestImageComposeOffline(t *testing.T) {
+	a, nonce, _ := load061(t)
+	compose, err := os.ReadFile("../compose.yaml")
+	if err != nil {
 		t.Fatal(err)
+	}
+	appCompose := withAppCompose(t, a, func(ac map[string]any) { ac["docker_compose_file"] = string(compose) })
+	rtmr3 := recompose(t, a, appCompose)
+	p := offline
+	p.Compose = compose
+	p.VerifyQuote = changeQuote(func(q *tdx.Quote) { q.Rtmrs[3] = rtmr3 })
+	res, err := Verify(context.Background(), a, nonce, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Checks) != 16 || res.Checks[15].Name != ImagesCheck || hex.EncodeToString(res.HPKEPublicKey) != a.HPKEPublicKey {
+		t.Fatalf("%d checks, last %q", len(res.Checks), res.Checks[len(res.Checks)-1].Name)
+	}
+	for _, svc := range []string{"setup", "agentd", "brain", "agentvm", "vaultd"} {
+		if !strings.HasPrefix(res.Facts["image "+svc], "ghcr.io/tacyhq/tacy/") || !strings.Contains(res.Facts["image "+svc], "@sha256:") {
+			t.Errorf("image %s: %q", svc, res.Facts["image "+svc])
+		}
+	}
+	// The same VM with one image's digest swapped for a tag: compose-hash and RTMR3 consistent again, and refused
+	// by the image rule even with that compose expected.
+	i := strings.Index(string(compose), "\n    image: ")
+	j := i + strings.Index(string(compose[i:]), "@sha256:")
+	tagged := string(compose[:j]) + ":latest" + string(compose[j+len("@sha256:")+64:])
+	appCompose = withAppCompose(t, a, func(ac map[string]any) { ac["docker_compose_file"] = tagged })
+	rtmr3 = recompose(t, a, appCompose)
+	p.Compose = []byte(tagged)
+	res, err = Verify(context.Background(), a, nonce, p)
+	if err == nil || !strings.Contains(err.Error(), "isn't name@sha256") || res.HPKEPublicKey != nil {
+		t.Fatalf("tagged image accepted: %v", err)
 	}
 }
 
@@ -366,10 +418,24 @@ func TestTamper(t *testing.T) {
 	}
 }
 
-// Release mode: the recorded VM's docker compose, released by a throwaway Sigstore that stands in for GitHub
+// load061Images is the 0.6.1 recording running this repo's compose.yaml (images by digest): its app-compose.json
+// carries that compose, and the compose-hash event and RTMR3 are made consistent with it (offline only).
+func load061Images(t *testing.T) (*proto.Attestation, []byte, []byte, func(context.Context, []byte) (*tdx.Quote, error)) {
+	t.Helper()
+	a, nonce, _ := load061(t)
+	compose, err := os.ReadFile("../compose.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	appCompose := withAppCompose(t, a, func(ac map[string]any) { ac["docker_compose_file"] = string(compose) })
+	rtmr3 := recompose(t, a, appCompose)
+	return a, nonce, compose, changeQuote(func(q *tdx.Quote) { q.Rtmrs[3] = rtmr3 })
+}
+
+// Release mode: a VM running this repo's compose.yaml, released by a throwaway Sigstore that stands in for GitHub
 // Actions + Sigstore's public-good instance.
 func TestRelease(t *testing.T) {
-	a, nonce, compose := load061(t)
+	a, nonce, compose, vq := load061Images(t)
 	sum := sha256.Sum256(compose)
 	s, err := releasetest.New()
 	if err != nil {
@@ -387,6 +453,7 @@ func TestRelease(t *testing.T) {
 	}
 	policy := func(b []byte) Policy {
 		p := offline
+		p.VerifyQuote = vq
 		p.Bundle = b
 		p.Release = release.Policy{Trusted: s.Trusted()}
 		return p
@@ -395,8 +462,21 @@ func TestRelease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Facts["release"] != "v0.3.1" || res.Facts["docker compose sha256"] != hex.EncodeToString(sum[:]) || res.HPKEPublicKey == nil {
+	if res.Facts["release"] != "v0.3.1" || res.Facts["docker compose sha256"] != hex.EncodeToString(sum[:]) || res.HPKEPublicKey == nil ||
+		len(res.Checks) != 16 || res.Checks[15].Name != ImagesCheck || !strings.HasPrefix(res.Facts["image agentd"], "ghcr.io/tacyhq/tacy/agentd@sha256:") {
 		t.Fatalf("facts %v", res.Facts)
+	}
+	// A signed release whose compose builds on the VM (the recording's own, as before v0.2.0): the signature holds,
+	// the image rule refuses it.
+	{
+		a, nonce, old := load061(t)
+		osum := sha256.Sum256(old)
+		p := policy(signed(releasetest.Options{Version: "v0.3.1", Subjects: map[string][]byte{release.Subject: osum[:]}}))
+		p.VerifyQuote = offline.VerifyQuote
+		res, err := Verify(context.Background(), a, nonce, p)
+		if err == nil || !strings.HasPrefix(err.Error(), ImagesCheck) || res.HPKEPublicKey != nil || res.Facts["release"] != "v0.3.1" {
+			t.Fatalf("a release that builds on the VM: %v", err)
+		}
 	}
 
 	other := sha256.Sum256([]byte("another compose"))
@@ -427,7 +507,7 @@ func TestRelease(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			a, nonce, _ := load061(t)
+			a, nonce, _, _ := load061Images(t)
 			res, err := Verify(context.Background(), a, nonce, c.p)
 			if err == nil || !strings.Contains(err.Error(), c.want) {
 				t.Fatalf("want %q, got %v", c.want, err)

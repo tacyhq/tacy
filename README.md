@@ -171,7 +171,7 @@ Tacy was renamed from an earlier working name. These identifiers keep the old na
 
 ## Security
 
-Report vulnerabilities privately to info@tacy.io, not in a public issue.
+Report vulnerabilities privately to security@tacy.io, not in a public issue. Scope and safe harbor: https://tacy.io/security.
 
 ## License
 

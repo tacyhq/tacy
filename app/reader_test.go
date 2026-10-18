@@ -134,7 +134,7 @@ func TestHistoryTaint(t *testing.T) {
 		io.WriteString(w, "<p>Release v0.6.1 is out</p>")
 	}))
 	defer page.Close()
-	e := newSafeEnvWith(t, safeOpts{reader: readerAnswer}, pText("Hello."), pCalls([3]string{"c1", "fetch_page", `{"url":"`+page.URL+`/a"}`}), pText("ok"))
+	e := newSafeEnvWith(t, safeOpts{reader: readerAnswer}, pText("Hello."), pCalls([3]string{"c1", "fetch_page", `{"url":"` + page.URL + `/a"}`}), pText("ok"))
 	e.mustPost(e.policy(1, nil), e.heartbeat())
 	priv, _ := recipientKey(t)
 	evs := runParity(t, e.s, e.recorded(priv, proto.RunRequest{Messages: user1("hi")}))

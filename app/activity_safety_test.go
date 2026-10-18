@@ -64,7 +64,7 @@ func TestActivityPolicyDecisionsOnTheRecord(t *testing.T) {
 	key := e.rec.Signer.Public()
 
 	// A model the policy doesn't allow: refused at the door, one refused record with the code.
-	evs := runParity(t, e.s, e.recorded(priv, proto.RunRequest{Model: "kimi-k3", Messages: user1("draft the acme memo")}))
+	evs := runParity(t, e.s, e.recorded(priv, proto.RunRequest{Permissions: guard.AllowAll(), Model: "kimi-k3", Messages: user1("draft the acme memo")}))
 	runs := openedActivity(t, evs, priv, key)
 	if len(runs) != 1 || runs[0].Event != activity.EventRefused || runs[0].Status.Code != safety.CodePolicyDenied ||
 		len(runs[0].Models) != 1 || runs[0].Models[0] != "kimi-k3" {
@@ -74,7 +74,7 @@ func TestActivityPolicyDecisionsOnTheRecord(t *testing.T) {
 
 	// A search held for approval and a fetch outside the policy's hosts: both on the end record with the code;
 	// the fetch counts one refused request to the host and none sent.
-	evs = runParity(t, e.s, e.recorded(priv, proto.RunRequest{Messages: user1("look up the acme deal")}))
+	evs = runParity(t, e.s, e.recorded(priv, proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("look up the acme deal")}))
 	runs = openedActivity(t, evs, priv, key)
 	if len(runs) != 2 || runs[1].Status.State != "succeeded" {
 		t.Fatalf("records: %+v", runs)
@@ -103,14 +103,14 @@ func TestActivityStaleAndBudgetOnTheRecord(t *testing.T) {
 
 	// No operator list and a policy that stops reads while stale: refused at the door.
 	e.mustPost(e.policy(1, func(p *safety.Policy) { p.StaleReads = false }))
-	runs := openedActivity(t, runParity(t, e.s, e.recorded(priv, proto.RunRequest{Messages: user1("hi")})), priv, key)
+	runs := openedActivity(t, runParity(t, e.s, e.recorded(priv, proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("hi")})), priv, key)
 	if len(runs) != 1 || runs[0].Event != activity.EventRefused || runs[0].Status.Code != safety.CodeStale {
 		t.Fatalf("stale: %+v", runs)
 	}
 
 	// Four parallel searches against a run budget of two: two ran, two refused with the code.
 	e.mustPost(e.policy(2, func(p *safety.Policy) { p.Budget.Run.ToolCalls = 2 }), e.heartbeat())
-	runs = openedActivity(t, runParity(t, e.s, e.recorded(priv, proto.RunRequest{Messages: user1("search matter 7731")})), priv, key)
+	runs = openedActivity(t, runParity(t, e.s, e.recorded(priv, proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("search matter 7731")})), priv, key)
 	if len(runs) != 2 {
 		t.Fatalf("records: %+v", runs)
 	}
@@ -139,7 +139,7 @@ func TestActivityRateLimitOnTheRecord(t *testing.T) {
 		pCalls([3]string{"c1", "web_search", `{"query":"opposing counsel strategy"}`}), pText("try later"))
 	e.mustPost(e.policy(1, nil), e.heartbeat())
 	priv, _ := recipientKey(t)
-	evs := runParity(t, e.s, e.recorded(priv, proto.RunRequest{Messages: user1("search it")}))
+	evs := runParity(t, e.s, e.recorded(priv, proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("search it")}))
 	runs := openedActivity(t, evs, priv, e.rec.Signer.Public())
 	if len(runs) != 2 {
 		t.Fatalf("records: %+v", runs)
@@ -167,7 +167,7 @@ func TestActivityKeylessReleaseOnTheRecord(t *testing.T) {
 	// Stage 1 (the live compose): no keys pinned, the release policy alone; the start names it.
 	e := newSafeEnvWith(t, safeOpts{keyless: true}, pText("fine"))
 	priv, _ := recipientKey(t)
-	evs := runParity(t, e.s, e.recorded(priv, proto.RunRequest{Messages: user1("hello")}))
+	evs := runParity(t, e.s, e.recorded(priv, proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("hello")}))
 	runs := openedActivity(t, evs, priv, e.rec.Signer.Public())
 	rel := e.s.safety.StatusOf("s_chat").Release
 	if len(runs) != 2 || runs[1].Status.State != "succeeded" || runs[0].Controls == nil || rel == "" || runs[0].Controls.ReleasePolicy != rel {

@@ -511,3 +511,41 @@ func TestDecodeEnvelopes(t *testing.T) {
 		}
 	}
 }
+
+// Permission prompts: a firm caps people's permission settings per kind; layers only narrow, and a bad cap is refused.
+func TestPermissionCap(t *testing.T) {
+	f := newFixture(t)
+	s := f.state(t)
+	firm := policy(1, "")
+	firm.AskCap = map[string]string{"web.search": PermAsk, "web.images": PermAlways}
+	space := policy(1, "s_a")
+	space.AskCap = map[string]string{"web.fetch": PermNever, "web.search": PermAlways /* looser: the firm's ask holds */}
+	for _, e := range []Envelope{signP(t, firm, f.admin), signP(t, space, f.admin)} {
+		if err := apply(t, s, e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e, err := s.Policy("s_a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for kind, want := range map[string]string{"web.search": PermAsk, "web.fetch": PermNever, "web.images": PermAlways, "mail.list": PermAlways} {
+		if got := e.PermissionCap(kind); got != want {
+			t.Errorf("cap %s = %s, want %s", kind, got, want)
+		}
+	}
+	for _, c := range []struct{ a, b, want string }{{"", "", PermAlways}, {PermAlways, PermAsk, PermAsk}, {PermNever, PermAsk, PermNever}, {PermAsk, "", PermAsk}} {
+		if got := NarrowerPermission(c.a, c.b); got != c.want {
+			t.Errorf("NarrowerPermission(%q, %q) = %q, want %q", c.a, c.b, got, c.want)
+		}
+	}
+	bad := policy(2, "")
+	bad.AskCap = map[string]string{"web.search": "sometimes"}
+	if bad.Validate() == nil {
+		t.Error("a bad ask_cap value was accepted")
+	}
+	bad.AskCap = map[string]string{"Web Search": PermAsk}
+	if bad.Validate() == nil {
+		t.Error("a bad ask_cap kind was accepted")
+	}
+}

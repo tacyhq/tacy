@@ -71,6 +71,14 @@ type RunRequest struct {
 	// RecordProof shows the sender holds RecordTo's private key (activity.RecordProof, base64): without it the VM
 	// refuses a run that names record_to.
 	RecordProof []byte `json:"record_proof,omitempty"`
+	// RunSecret is this run's answer key for permission prompts (docs/27 section 6): 32 random bytes as 64
+	// lowercase hex, made by the person's tab and sent only inside this encrypted body. A grant (POST /tasks/grant)
+	// carries an HMAC with it, so only that tab can answer the run's prompts; the relay can't read or forge one.
+	// Without it nothing can be asked, so kinds on Ask are refused. Until people have identity keys.
+	RunSecret string `json:"run_secret,omitempty"`
+	// Permissions are the person's settings per kind of outgoing data: "web.search", "web.fetch",
+	// "web.images" -> "ask" | "always" | "never". A kind not named is "ask". A firm's policy may cap them.
+	Permissions map[string]string `json:"permissions,omitempty"`
 }
 
 // Event is one server-sent event in the (EHBP-encrypted) /run response: `data: <json>\n\n`, ending with
@@ -92,6 +100,10 @@ type RunRequest struct {
 //	metrics      timing of one model call or tool call that just ended, or of the queue when the run started
 //	             (Metric): numbers and fixed names only
 //	activity     the run's sealed activity records (Activity), right before done or error
+//	permission   a tool call that would send data out of the VM waits for the person: id is the tool call,
+//	             permission has the kind and exactly what would go out. Sent again with permission.decision once
+//	             it is settled (allowed_once, allowed_always, denied, timed_out, never, unavailable). Never sent
+//	             for a kind set to Always allow.
 //	error        a fatal error; the stream ends after it. code says when a safety control ended the run
 //	done         finish_reason and step count; last event before [DONE]
 type Event struct {
@@ -119,6 +131,21 @@ type Event struct {
 	// right before done or error. Each is signed by Meta.Activity.Key and sealed to RunRequest.RecordTo.
 	Activity     []json.RawMessage `json:"activity,omitempty"`
 	FinishReason string            `json:"finish_reason,omitempty"`
+	// Permission: a permission prompt or its outcome.
+	Permission *Permission `json:"permission,omitempty"`
+}
+
+// Permission is a permission prompt: before data of a kind leaves the VM, the person allows it once, always (that kind,
+// this run and their setting), or denies it. Value is exactly what would go out (a search's masked query, a page's
+// address); the person may edit it before allowing. Untrusted model output: display only.
+type Permission struct {
+	Task     string `json:"task"`                // the task (grants name it)
+	Request  string `json:"request"`             // the held request (grants name it)
+	Kind     string `json:"kind"`                // web.search | web.fetch | web.images
+	Value    string `json:"value"`               // what would go out
+	Decision string `json:"decision,omitempty"`  // "": waiting; allowed_once | allowed_always | denied | timed_out | never | unavailable
+	TimeoutS int    `json:"timeout_s,omitempty"` // waiting: seconds until no answer counts as denied
+	Edited   bool   `json:"edited,omitempty"`    // settled: the person changed the value before allowing
 }
 
 // Citation is a source a tool returned. Index is the [n] the model is told to cite.

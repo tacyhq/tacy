@@ -102,7 +102,7 @@ func TestAgentLoop(t *testing.T) {
 	a, fm, fs := newTestAgent(t,
 		toolCallSSE("c1", "web_search", `{"query":"dstack release for jane@example.com","count":3}`),
 		textSSE("dstack v0.6.1 is the latest [1]."))
-	evs := collect(t, a, proto.RunRequest{Messages: []proto.Message{{Role: "user", Content: "latest dstack?"}}})
+	evs := collect(t, a, proto.RunRequest{Permissions: AllowAll(), Messages: []proto.Message{{Role: "user", Content: "latest dstack?"}}})
 	if got := types(evs); got != "meta,step,usage,metrics,tool_call,tool_result,metrics,step,text,usage,metrics,done" {
 		t.Fatalf("events %s", got)
 	}
@@ -158,7 +158,7 @@ func TestAgentLastStepHasNoTools(t *testing.T) {
 	a, fm, _ := newTestAgent(t,
 		toolCallSSE("c1", "web_search", `{"query":"a"}`),
 		toolCallSSE("c2", "web_search", `{"query":"b"}`))
-	evs := collect(t, a, proto.RunRequest{MaxSteps: 2, CacheSecret: "user-secret",
+	evs := collect(t, a, proto.RunRequest{Permissions: AllowAll(), MaxSteps: 2, CacheSecret: "user-secret",
 		Messages: []proto.Message{{Role: "user", Content: "q"}}})
 	if _, ok := fm.requests[1]["tools"]; ok {
 		t.Fatal("last step was offered tools")
@@ -189,7 +189,7 @@ func TestAgentBadToolCalls(t *testing.T) {
 		toolCallSSE("c2", "rm_rf", `{}`),
 		toolCallSSE("c3", "web_search", `{not json`),
 		textSSE("ok"))
-	evs := collect(t, a, proto.RunRequest{Tools: []string{"web_search", "fetch_page"},
+	evs := collect(t, a, proto.RunRequest{Permissions: AllowAll(), Tools: []string{"web_search", "fetch_page"},
 		Messages: []proto.Message{{Role: "user", Content: "q"}}})
 	var errs []string
 	for _, e := range evs {
@@ -221,7 +221,7 @@ func TestAgentBadToolCalls(t *testing.T) {
 func TestAgentModelErrorMetric(t *testing.T) {
 	a := &Agent{up: &plainUpstream{url: "http://127.0.0.1:1/none", http: &http.Client{Timeout: time.Second}},
 		now: time.Now, newTools: func() *Tools { return &Tools{search: &fakeSearch{}, fetcher: newFetcher(nil)} }}
-	evs := collect(t, a, proto.RunRequest{Messages: []proto.Message{{Role: "user", Content: "q"}}})
+	evs := collect(t, a, proto.RunRequest{Permissions: AllowAll(), Messages: []proto.Message{{Role: "user", Content: "q"}}})
 	if got := types(evs); got != "meta,step,metrics,error" {
 		t.Fatalf("events %s", got)
 	}
@@ -258,7 +258,7 @@ func TestValidate(t *testing.T) {
 			t.Errorf("case %d accepted", i)
 		}
 	}
-	ok := proto.RunRequest{Model: "deepseek-v4-1-flash", ReasoningEffort: "none", Tools: []string{},
+	ok := proto.RunRequest{Permissions: AllowAll(), Model: "deepseek-v4-1-flash", ReasoningEffort: "none", Tools: []string{},
 		Messages: []proto.Message{{Role: "user", Content: "x"}}}
 	if err := validate(&ok); err != nil || len(ok.Tools) != 0 || ok.MaxSteps != defaultSteps {
 		t.Fatalf("%v %+v", err, ok)

@@ -84,7 +84,7 @@ func TestSearchKeyLeasedPerCallAndRedacted(t *testing.T) {
 	tv := newTavily(VaultLease(vc))
 	tv.http = &http.Client{Transport: to{srv}}
 	g := New(Config{Up: &plainUpstream{}, Search: tv, Now: time.Now})
-	ti := &harness.TaskInfo{ID: "t_lease", Start: &harness.Start{}}
+	ti := &harness.TaskInfo{ID: "t_lease", Start: &harness.Start{}, Options: []byte(`{"permissions":{"web.search":"always"}}`)}
 	for i, id := range []string{"r1", "r2"} {
 		ctx := harness.WithRequestID(context.Background(), id)
 		res, err := g.Action(ctx, ti, id, &harness.Action{Name: "web.search", Args: []byte(`{"query":"q"}`)})

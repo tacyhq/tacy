@@ -19,6 +19,7 @@ import (
 	ehbpclient "github.com/tinfoilsh/encrypted-http-body-protocol/client"
 	ehbpidentity "github.com/tinfoilsh/encrypted-http-body-protocol/identity"
 
+	"github.com/tacyhq/tacy/guard"
 	"github.com/tacyhq/tacy/proto"
 	"github.com/tacyhq/tacy/verifier"
 )
@@ -199,6 +200,25 @@ func (c *Conn) StartTask(ctx context.Context, req proto.RunRequest, key string) 
 		proto.RunRequest
 		Key string `json:"key,omitempty"`
 	}{req, key})
+}
+
+// Grant answers a permission prompt of a run this client started with secret (its run_secret): decision once,
+// always or deny, value what goes out (the prompt's, or an edit). Returns the outcome.
+func (c *Conn) Grant(ctx context.Context, secret string, p proto.Permission, decision, value string) (string, error) {
+	g := guard.Grant{Task: p.Task, Request: p.Request, Kind: p.Kind, Decision: decision, Value: value}
+	g.MAC = guard.GrantMAC(secret, g)
+	res, err := c.post(ctx, "/tasks/grant", "", g)
+	if err != nil {
+		return "", err
+	}
+	defer res.Body.Close()
+	var out struct {
+		Outcome string `json:"outcome"`
+	}
+	if err := json.NewDecoder(io.LimitReader(res.Body, 4096)).Decode(&out); err != nil {
+		return "", err
+	}
+	return out.Outcome, nil
 }
 
 // TaskStatus is a task's state.

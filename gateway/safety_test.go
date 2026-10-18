@@ -49,7 +49,7 @@ func TestGatewaydChecksDocumentsItself(t *testing.T) {
 	c := &Client{Path: path, Wait: 5 * time.Second, Docs: func() []safety.Envelope { return docs }}
 	ti := &harness.TaskInfo{ID: "t_1", Start: &harness.Start{Tools: guard.ToolDefs("web.search")}}
 	search := func(id string) (*harness.ActionResult, error) {
-		s := c.Open(ti.ID+id, guard.TaskOptions{Space: "s_chat"}, nil)
+		s := c.Open(ti.ID+id, guard.TaskOptions{Permissions: guard.AllowAll(), Space: "s_chat"}, nil)
 		defer s.Close()
 		ti := &harness.TaskInfo{ID: ti.ID + id, Start: ti.Start, Journal: func() ([]harness.Record, error) { return nil, nil }}
 		return c.Action(harness.WithRequestID(context.Background(), id), ti, id,

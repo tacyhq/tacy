@@ -309,7 +309,7 @@ func TestAgentImageSearch(t *testing.T) {
 	a, fm, is, _ := newImageAgent(t,
 		toolCallSSE("c1", "web_images", `{"query":"Arrival poster for jane@example.com","count":3}`),
 		textSSE("Here are three posters."))
-	evs := collect(t, a, proto.RunRequest{Messages: []proto.Message{{Role: "user", Content: "show me posters of Arrival"}}})
+	evs := collect(t, a, proto.RunRequest{Permissions: AllowAll(), Messages: []proto.Message{{Role: "user", Content: "show me posters of Arrival"}}})
 	if got := types(evs); got != "meta,step,usage,metrics,tool_call,image,image,image,tool_result,metrics,step,text,usage,metrics,done" {
 		t.Fatalf("events %s", got)
 	}
@@ -364,7 +364,7 @@ func TestAgentImageRunCap(t *testing.T) {
 		toolCallSSE("c2", "web_images", `{"query":"b","count":6}`),
 		toolCallSSE("c3", "web_images", `{"query":"c","count":6}`),
 		textSSE("done"))
-	evs := collect(t, a, proto.RunRequest{Messages: []proto.Message{{Role: "user", Content: "lots of pictures"}}})
+	evs := collect(t, a, proto.RunRequest{Permissions: AllowAll(), Messages: []proto.Message{{Role: "user", Content: "lots of pictures"}}})
 	per := map[string]int{}
 	for _, e := range evs {
 		if e.Type == "image" {
@@ -393,7 +393,7 @@ func TestAgentImageSearchUnsupportedProvider(t *testing.T) {
 	a.newTools = func() *Tools {
 		return &Tools{search: struct{ SearchProvider }{&fakeSearch{}}, fetcher: newFetcher(nil)}
 	}
-	evs := collect(t, a, proto.RunRequest{Messages: []proto.Message{{Role: "user", Content: "q"}}})
+	evs := collect(t, a, proto.RunRequest{Permissions: AllowAll(), Messages: []proto.Message{{Role: "user", Content: "q"}}})
 	for _, e := range evs {
 		if e.Type == "tool_result" && !strings.Contains(string(e.Result), "isn't available") {
 			t.Fatalf("result %s", e.Result)
@@ -408,7 +408,7 @@ func TestAgentImageSearchReaderTitles(t *testing.T) {
 		toolCallSSE("c1", "web_images", `{"query":"Arrival poster","count":3}`),
 		textSSE("Here are three posters."))
 	a.newTools = func() *Tools { return &Tools{search: is, fetcher: newFetcher(nil), reader: true} }
-	evs := collect(t, a, proto.RunRequest{Messages: []proto.Message{{Role: "user", Content: "show me posters of Arrival"}}})
+	evs := collect(t, a, proto.RunRequest{Permissions: AllowAll(), Messages: []proto.Message{{Role: "user", Content: "show me posters of Arrival"}}})
 	var res *proto.Event
 	for i := range evs {
 		if evs[i].Type == "tool_result" {

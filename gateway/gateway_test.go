@@ -91,7 +91,7 @@ func TestReconnectRebuildsFromJournal(t *testing.T) {
 	c := &Client{Path: path, Wait: 5 * time.Second}
 	var mu sync.Mutex
 	var events []proto.Event
-	s := c.Open(task.ID, guard.TaskOptions{}, func(e proto.Event) error {
+	s := c.Open(task.ID, guard.TaskOptions{Permissions: guard.AllowAll()}, func(e proto.Event) error {
 		mu.Lock()
 		events = append(events, e)
 		mu.Unlock()
@@ -154,7 +154,7 @@ func TestCancelReachesGatewayd(t *testing.T) {
 	path := socketPath(t)
 	serve(t, path, newGuard(guard.NewPlainUpstream(up.URL, up.Client())))
 	c := &Client{Path: path}
-	s := c.Open(task.ID, guard.TaskOptions{}, func(proto.Event) error { return nil })
+	s := c.Open(task.ID, guard.TaskOptions{Permissions: guard.AllowAll()}, func(proto.Event) error { return nil })
 	defer s.Close()
 	ctx, cancel := context.WithCancel(harness.WithRequestID(context.Background(), "m1"))
 	go func() { time.Sleep(200 * time.Millisecond); cancel() }()
@@ -218,7 +218,7 @@ func TestParallelRequests(t *testing.T) {
 	path := socketPath(t)
 	serve(t, path, newGuard(guard.NewPlainUpstream("http://unused", nil)))
 	c := &Client{Path: path}
-	s := c.Open(task.ID, guard.TaskOptions{}, func(proto.Event) error { return nil })
+	s := c.Open(task.ID, guard.TaskOptions{Permissions: guard.AllowAll()}, func(proto.Event) error { return nil })
 	defer s.Close()
 	var wg sync.WaitGroup
 	errs := make(chan error, 8)
@@ -254,7 +254,7 @@ func TestFactsCrossTheSocket(t *testing.T) {
 	path := socketPath(t)
 	serve(t, path, guard.New(guard.Config{Up: guard.NewPlainUpstream("http://unused", nil), Search: searchN{}, Fetcher: guard.NewFetcher(true), Now: time.Now}))
 	c := &Client{Path: path, Wait: 5 * time.Second}
-	s := c.Open("t_f", guard.TaskOptions{}, func(proto.Event) error { return nil })
+	s := c.Open("t_f", guard.TaskOptions{Permissions: guard.AllowAll()}, func(proto.Event) error { return nil })
 	defer s.Close()
 	ti := &harness.TaskInfo{ID: "t_f", Start: &harness.Start{Tools: guard.ToolDefs("web.fetch")}}
 	f := &guard.Facts{}
@@ -297,7 +297,7 @@ func TestReaderAcrossTheSocket(t *testing.T) {
 	c := &Client{Path: path, Wait: 5 * time.Second}
 	var mu sync.Mutex
 	var quotes []proto.Quote
-	s := c.Open("t_r", guard.TaskOptions{Question: "what does the fox do?"}, func(e proto.Event) error {
+	s := c.Open("t_r", guard.TaskOptions{Permissions: guard.AllowAll(), Question: "what does the fox do?"}, func(e proto.Event) error {
 		mu.Lock()
 		quotes = append(quotes, e.Quotes...)
 		mu.Unlock()
@@ -326,4 +326,53 @@ func TestReaderAcrossTheSocket(t *testing.T) {
 	if !c.Untrusted(ti, &harness.Action{Name: "web.fetch"}) || c.Untrusted(ti, &harness.ModelCall{}) {
 		t.Fatal("Untrusted")
 	}
+}
+
+// Permission prompts: the person's grant crosses the socket with its action, and gatewayd checks it itself: without one (or with
+// one made with another secret) nothing is searched; with a valid one the person's edit is what goes out.
+func TestGrantCrossesTheSocket(t *testing.T) {
+	path := socketPath(t)
+	var mu sync.Mutex
+	var queries []string
+	g := guard.New(guard.Config{Up: guard.NewPlainUpstream("http://unused", nil), Search: recSearch{&mu, &queries}, Now: time.Now})
+	serve(t, path, g)
+	c := &Client{Path: path}
+	secret := strings.Repeat("0a", 32)
+	s := c.Open(task.ID, guard.TaskOptions{RunSecret: secret}, func(proto.Event) error { return nil })
+	defer s.Close()
+	ti := &harness.TaskInfo{ID: task.ID, Start: task.Start, Options: []byte(`{"run_secret":"` + secret + `"}`)}
+	act := &harness.Action{Name: "web.search", Args: []byte(`{"query":"model q"}`)}
+	mk := func(sec string) *guard.Grant {
+		gr := &guard.Grant{Task: task.ID, Request: "a1", Kind: "web.search", Decision: guard.DecideOnce, Value: "person q"}
+		gr.MAC = guard.GrantMAC(sec, *gr)
+		return gr
+	}
+	for _, gr := range []*guard.Grant{nil, mk(strings.Repeat("0b", 32))} {
+		res, err := c.Action(guard.WithGrant(harness.WithRequestID(context.Background(), "a1"), gr), ti, "a1", act)
+		if err != nil || res.Status != harness.ActionDenied {
+			t.Fatalf("without a valid grant: %+v %v", res, err)
+		}
+	}
+	res, err := c.Action(guard.WithGrant(harness.WithRequestID(context.Background(), "a1"), mk(secret)), ti, "a1", act)
+	if err != nil || res.Status != harness.ActionDone {
+		t.Fatalf("with the grant: %+v %v", res, err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if strings.Join(queries, "|") != "person q" {
+		t.Fatalf("searched %q", queries)
+	}
+}
+
+type recSearch struct {
+	mu *sync.Mutex
+	q  *[]string
+}
+
+func (recSearch) Name() string { return "fake" }
+func (r recSearch) Search(_ context.Context, q string, n int) ([]guard.SearchResult, error) {
+	r.mu.Lock()
+	*r.q = append(*r.q, q)
+	r.mu.Unlock()
+	return []guard.SearchResult{{Title: "t", URL: "https://a.example/", Snippet: "s"}}, nil
 }

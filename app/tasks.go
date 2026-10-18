@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -32,6 +33,10 @@ import (
 //	POST /tasks/events   {task, after} -> SSE: "id: <seq>" and "data: <proto.Event>" per event after seq after,
 //	                     as they come, then "data: [DONE]" once the task ended; reconnect with the last id seen.
 //	POST /tasks/cancel   {task} -> {task, state}
+//	POST /tasks/grant    {task, request, kind, decision, value, mac} -> {outcome}: the person's answer to a
+//	                     permission prompt (guard.Prompts) of a /tasks or /run task. The MAC with the run's
+//	                     secret is the authorization (only the tab that started the run has it). 404
+//	                     no_such_prompt (answered, timed out or never asked), 403 bad_grant, 400 bad_value.
 //
 // POST /run stays as a shim over this (guard.Host.Run) until the chat moves to /tasks, then goes one release later
 // (docs/27 section 8).
@@ -57,6 +62,38 @@ func (s *server) taskRoutes(mux *http.ServeMux, id *ehbpidentity.Identity) {
 	mux.Handle("POST /tasks/status", s.taskGuard(false, id.Middleware()(http.HandlerFunc(s.taskStatus))))
 	mux.Handle("POST /tasks/events", s.taskGuard(false, id.Middleware()(http.HandlerFunc(s.taskEvents))))
 	mux.Handle("POST /tasks/cancel", s.taskGuard(false, id.Middleware()(http.HandlerFunc(s.taskCancel))))
+	mux.Handle("POST /tasks/grant", s.taskGuard(false, id.Middleware()(http.HandlerFunc(s.taskGrant))))
+}
+
+// taskGrant is behind EHBP: POST /tasks/grant. Strict JSON; the grant's MAC, kind and value are checked by
+// guard.Prompts.Answer, and a prompt takes one answer.
+func (s *server) taskGrant(w http.ResponseWriter, r *http.Request) {
+	if s.prompts == nil {
+		fail(w, 404, "no_such_prompt")
+		return
+	}
+	var g guard.Grant
+	body, err := io.ReadAll(io.LimitReader(r.Body, 16<<10))
+	if err == nil {
+		err = jsonv2.Unmarshal(body, &g, jsonv2.RejectUnknownMembers(true))
+	}
+	if err != nil {
+		fail(w, 400, "body must be a JSON grant")
+		return
+	}
+	outcome, err := s.prompts.Answer(g)
+	switch {
+	case errors.Is(err, guard.ErrNoPrompt):
+		fail(w, 404, "no_such_prompt")
+	case errors.Is(err, guard.ErrBadGrant):
+		fail(w, 403, "bad_grant")
+	case errors.Is(err, guard.ErrBadValue):
+		fail(w, 400, "bad_value")
+	case err != nil:
+		fail(w, 500, "grant_unavailable")
+	default:
+		writeJSON(w, 200, map[string]string{"outcome": outcome})
+	}
 }
 
 // tasks is the server's task host, made on first use (tests build servers without one).

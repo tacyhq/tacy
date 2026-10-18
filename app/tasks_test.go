@@ -281,7 +281,7 @@ func TestTasksRestartMidTask(t *testing.T) {
 	m := newStepModel(t, pCalls([3]string{"c1", "web_search", `{"query":"dstack release"}`}), "block", pText("v0.6.1 [1]."))
 	p1 := bootTasks(t, path, m, fs, false)
 	c1 := p1.conn(t, tasksUser)
-	tk, err := c1.StartTask(context.Background(), proto.RunRequest{Messages: user1("latest dstack?")}, "")
+	tk, err := c1.StartTask(context.Background(), proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("latest dstack?")}, "")
 	if err != nil || !harness.ValidTaskID(tk.Task) || tk.Existing {
 		t.Fatalf("start: %+v %v", tk, err)
 	}
@@ -397,7 +397,7 @@ func TestTasksDuplicateStart(t *testing.T) {
 	m := newStepModel(t, pText("one"), pText("two"), pText("three"))
 	p1 := bootTasks(t, path, m, &fakeSearch{}, false)
 	c := p1.conn(t, tasksUser)
-	req := proto.RunRequest{Messages: user1("once please")}
+	req := proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("once please")}
 	a, err := c.StartTask(context.Background(), req, "k-1")
 	if err != nil || a.Existing {
 		t.Fatalf("first: %+v %v", a, err)
@@ -443,7 +443,7 @@ func TestTasksCancelDuringHeldRequest(t *testing.T) {
 	m := newStepModel(t, pCalls([3]string{"c1", "web_search", `{"query":"dstack release"}`}), pText("never"))
 	p1 := bootTasks(t, path, m, fs, true)
 	c1 := p1.conn(t, tasksUser)
-	tk, err := c1.StartTask(context.Background(), proto.RunRequest{Messages: user1("latest dstack?")}, "")
+	tk, err := c1.StartTask(context.Background(), proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("latest dstack?")}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -514,7 +514,7 @@ func TestTasksKillSwitch(t *testing.T) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		id, evs := runTask(t, e.s, e.recorded(priv, proto.RunRequest{Messages: user1("read it")}))
+		id, evs := runTask(t, e.s, e.recorded(priv, proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("read it")}))
 		done <- result{id, evs}
 	}()
 	for deadline := time.Now().Add(5 * time.Second); e.modelReqs.Load() < 1 && time.Now().Before(deadline); {
@@ -546,7 +546,7 @@ func TestTasksKillSwitch(t *testing.T) {
 	}
 	// A new task is refused at the door while the stop holds, with its own record, and nothing runs.
 	c := connTo(t, e.s, tasksUser)
-	_, err := c.StartTask(context.Background(), e.recorded(priv, proto.RunRequest{Messages: user1("again")}), "")
+	_, err := c.StartTask(context.Background(), e.recorded(priv, proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("again")}), "")
 	if err == nil || !strings.Contains(err.Error(), "403") || !strings.Contains(err.Error(), safety.CodeStopped) {
 		t.Fatalf("start while stopped: %v", err)
 	}
@@ -568,7 +568,7 @@ func plainEvents(evs []seqEvent) []proto.Event {
 func TestTasksBudgetExhaustion(t *testing.T) {
 	e := newSafeEnv(t, pText("never"))
 	e.mustPost(e.policy(1, func(p *safety.Policy) { p.Budget.Run.Tokens = 300 }), e.heartbeat())
-	id, evs := runTask(t, e.s, proto.RunRequest{Messages: user1("hi")})
+	id, evs := runTask(t, e.s, proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("hi")})
 	last := evs[len(evs)-1].ev
 	if last.Type != "error" || last.Code != safety.CodeBudgetExceeded || e.modelReqs.Load() != 0 {
 		t.Fatalf("events %s, last %+v, model calls %d", evTypes(evs), last, e.modelReqs.Load())
@@ -583,7 +583,7 @@ func TestTasksBudgetExhaustion(t *testing.T) {
 	}
 	e = newSafeEnv(t, pCalls(calls...), pText("done"))
 	e.mustPost(e.policy(1, func(p *safety.Policy) { p.Budget.Run.ToolCalls = 2 }), e.heartbeat())
-	_, evs = runTask(t, e.s, proto.RunRequest{Messages: user1("search a lot")})
+	_, evs = runTask(t, e.s, proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("search a lot")})
 	refused := 0
 	for _, ev := range evs {
 		if ev.ev.Type == "tool_result" && strings.Contains(string(ev.ev.Result), safety.CodeBudgetExceeded) {
@@ -643,7 +643,7 @@ func TestRunShimLeavesNothing(t *testing.T) {
 	e := newSafeEnv(t, pText("hello"))
 	e.mustPost(e.policy(1, nil), e.heartbeat())
 	priv, _ := recipientKey(t)
-	evs := runParity(t, e.s, e.recorded(priv, proto.RunRequest{Messages: user1("hi")}))
+	evs := runParity(t, e.s, e.recorded(priv, proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("hi")}))
 	if evs[len(evs)-1].Type != "done" {
 		t.Fatalf("events %s", types(evs))
 	}
@@ -663,7 +663,7 @@ func TestRunShimLeavesNothing(t *testing.T) {
 	}
 	// A refused run's record has a tk_ id too.
 	e.mustPost(e.stop(safety.IssuerFirm, 1, func(l *safety.StopList) { l.Stop = []safety.Target{{Firm: "f_chat", Space: "s_chat"}} }, e.admin))
-	evs = runParity(t, e.s, e.recorded(priv, proto.RunRequest{Messages: user1("hi")}))
+	evs = runParity(t, e.s, e.recorded(priv, proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("hi")}))
 	var refused []*activity.Run
 	for _, ev := range evs {
 		if ev.Type == "activity" {

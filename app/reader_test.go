@@ -44,7 +44,7 @@ func TestReaderBudgetAndRecord(t *testing.T) {
 		pText("It is out: [quote 1] [1]."))
 	e.mustPost(e.policy(1, nil), e.heartbeat())
 	priv, _ := recipientKey(t)
-	evs := runParity(t, e.s, e.recorded(priv, proto.RunRequest{Messages: user1("is v0.6.1 out?")}))
+	evs := runParity(t, e.s, e.recorded(priv, proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("is v0.6.1 out?")}))
 	if evs[len(evs)-1].Type != "done" || e.readerReqs.Load() != 2 || hits.Load() < 2 {
 		t.Fatalf("run %s; reader calls %d, page hits %d", types(evs), e.readerReqs.Load(), hits.Load())
 	}
@@ -98,7 +98,7 @@ func TestReaderBudgetRefusesFetch(t *testing.T) {
 	e := newSafeEnvWith(t, safeOpts{reader: readerAnswer},
 		pCalls([3]string{"c1", "fetch_page", `{"url":"` + page.URL + `/a"}`}), pText("couldn't"))
 	e.mustPost(e.policy(1, func(p *safety.Policy) { p.Budget.Run.Tokens = 6000 }), e.heartbeat())
-	evs := runParity(t, e.s, proto.RunRequest{Messages: user1("read it")})
+	evs := runParity(t, e.s, proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("read it")})
 	if hits.Load() != 0 || e.readerReqs.Load() != 0 {
 		t.Fatalf("page hits %d, reader calls %d", hits.Load(), e.readerReqs.Load())
 	}
@@ -137,12 +137,12 @@ func TestHistoryTaint(t *testing.T) {
 	e := newSafeEnvWith(t, safeOpts{reader: readerAnswer}, pText("Hello."), pCalls([3]string{"c1", "fetch_page", `{"url":"` + page.URL + `/a"}`}), pText("ok"))
 	e.mustPost(e.policy(1, nil), e.heartbeat())
 	priv, _ := recipientKey(t)
-	evs := runParity(t, e.s, e.recorded(priv, proto.RunRequest{Messages: user1("hi")}))
+	evs := runParity(t, e.s, e.recorded(priv, proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("hi")}))
 	if end := openedActivity(t, evs, priv, e.rec.Signer.Public())[1]; end.Tainted {
 		t.Fatalf("a run without history tainted: %+v", end)
 	}
 	msgs := []proto.Message{{Role: "user", Content: "is v0.6.1 out?"}, {Role: "assistant", Content: "Yes [1]."}, {Role: "user", Content: "read it again"}}
-	evs = runParity(t, e.s, e.recorded(priv, proto.RunRequest{Messages: msgs}))
+	evs = runParity(t, e.s, e.recorded(priv, proto.RunRequest{Permissions: guard.AllowAll(), Messages: msgs}))
 	runs := openedActivity(t, evs, priv, e.rec.Signer.Public())
 	end := runs[len(runs)-1]
 	if !end.Tainted {

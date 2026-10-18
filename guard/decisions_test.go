@@ -44,7 +44,7 @@ func TestEffortClampJournaled(t *testing.T) {
 	g := New(Config{Up: &plainUpstream{url: srv.URL, http: srv.Client()}, Now: time.Now})
 	store := harness.NewMemStore()
 	rt := &harness.Runtime{Guard: g, Store: store}
-	start, opts, err := g.StartFor(&proto.RunRequest{Model: "gpt-oss-120b", ReasoningEffort: "medium", Messages: user("q")})
+	start, opts, err := g.StartFor(&proto.RunRequest{Permissions: AllowAll(), Model: "gpt-oss-120b", ReasoningEffort: "medium", Messages: user("q")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,7 +175,7 @@ func TestRuntimeRestartRebuild(t *testing.T) {
 	store := harness.NewMemStore()
 	g1 := New(cfg(s1))
 	rt1 := &harness.Runtime{Guard: g1, Store: store}
-	start, opts, err := g1.StartFor(&proto.RunRequest{Messages: user("q"), ReasoningEffort: "low", CacheSecret: "person-secret"})
+	start, opts, err := g1.StartFor(&proto.RunRequest{Permissions: AllowAll(), Messages: user("q"), ReasoningEffort: "low", CacheSecret: "person-secret"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -317,7 +317,7 @@ func TestRuntimeRestartMidModelCall(t *testing.T) {
 	store := harness.NewMemStore()
 	g1 := New(Config{Up: &plainUpstream{url: srv1.URL, http: srv1.Client()}, Search: s1, Now: now})
 	rt1 := &harness.Runtime{Guard: g1, Store: store}
-	start, opts, err := g1.StartFor(&proto.RunRequest{Messages: user("q")})
+	start, opts, err := g1.StartFor(&proto.RunRequest{Permissions: AllowAll(), Messages: user("q")})
 	if err != nil {
 		t.Fatal(err)
 	}

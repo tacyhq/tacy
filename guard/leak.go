@@ -23,7 +23,7 @@ type Egress struct {
 	Action   string   `json:"action"`   // the harness request id
 	Op       string   `json:"op"`       // web.search, web.fetch, web.images
 	Decision string   `json:"decision"` // denied (nothing sent) | redacted (the response, before the brain)
-	Rule     string   `json:"rule"`     // leak_scan
+	Rule     string   `json:"rule"`     // leak_scan | policy | permission (no answer from the person)
 	Patterns []string `json:"patterns"` // pattern ids that matched, sorted, each once
 }
 

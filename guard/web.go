@@ -68,26 +68,33 @@ func (g *Guard) Action(ctx context.Context, ti *harness.TaskInfo, id string, req
 		}
 		return nil, err
 	}
+	// Permission prompts: nothing goes out without the person's answer (permission.go): their setting, or a valid grant from
+	// their tab; an edited value replaces the model's.
+	args, denied := g.permit(ctx, t, ti, id, req)
+	if denied != nil {
+		g.record(Egress{Task: ti.ID, Action: id, Op: req.Name, Decision: "denied", Rule: "permission"})
+		return denied, nil
+	}
 	if g.cfg.Safety != nil {
 		ctx = withHostFilter(ctx, g.fetchFilter(t.opts.Space))
 	}
-	call := t.claim(req.Call, id, app, req.Args)
+	call := t.claim(req.Call, id, app, args)
 	step := t.currentStep()
 	t1 := time.Now()
 	var p pending
 	var shown json.RawMessage
 	// The brain's arguments are scanned before anything is sent: a credential pattern, in any encoding, blocks the
 	// action (denied), like a URL with personal data.
-	if ids := outboundLeak(req.Args); ids != nil {
+	if ids := outboundLeak(args); ids != nil {
 		g.record(Egress{Task: ti.ID, Action: id, Op: req.Name, Decision: "denied", Rule: "leak_scan", Patterns: ids})
 		FactsFrom(ctx).leak(true, ids)
 		provider := ""
 		if app != "fetch_page" {
 			provider = t.tools.search.Name()
 		}
-		p, shown = pending{out: leakRefused(ids, provider)}, json.RawMessage(req.Args)
+		p, shown = pending{out: leakRefused(ids, provider)}, json.RawMessage(args)
 	} else {
-		p, shown = t.tools.Exec(ctx, app, json.RawMessage(req.Args))
+		p, shown = t.tools.Exec(ctx, app, json.RawMessage(args))
 	}
 	ms := max(0, time.Since(t1)-p.out.wait).Milliseconds()
 	if ctx.Err() != nil {

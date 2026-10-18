@@ -165,7 +165,8 @@ func (s *Server) serve(c net.Conn) {
 			continue
 		case tMeta, tEnd:
 		case tModel, tAction:
-			if !haveCtx || f.ID == "" || (f.T == tModel) != (f.Model != nil) || (f.T == tAction) != (f.Action != nil) {
+			if !haveCtx || f.ID == "" || (f.T == tModel) != (f.Model != nil) || (f.T == tAction) != (f.Action != nil) ||
+				f.Grant != nil && f.T != tAction {
 				return
 			}
 		default:
@@ -220,7 +221,7 @@ func (s *Server) do(ctx context.Context, sess guard.Session, ti *harness.TaskInf
 		res.ModelResult, err = s.G.ModelCall(guard.WithFacts(guard.WithMaxTokens(harness.WithRequestID(ctx, f.ID), f.MaxTokens), facts), ti, f.Model)
 	case tAction:
 		facts = &guard.Facts{}
-		res.ActionResult, err = s.G.Action(guard.WithFacts(harness.WithRequestID(ctx, f.ID), facts), ti, f.ID, f.Action)
+		res.ActionResult, err = s.G.Action(guard.WithGrant(guard.WithFacts(harness.WithRequestID(ctx, f.ID), facts), f.Grant), ti, f.ID, f.Action)
 	}
 	res.Facts = facts.Ptr()
 	if err != nil {

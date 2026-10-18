@@ -127,7 +127,7 @@ func TestRunOverEHBP(t *testing.T) {
 	}
 	conn, _ := agentclient.New(srv.URL, "tok", id.MarshalPublicKey())
 	var text string
-	err = conn.Run(context.Background(), proto.RunRequest{Messages: []proto.Message{{Role: "user", Content: "my private question"}}},
+	err = conn.Run(context.Background(), proto.RunRequest{Permissions: guard.AllowAll(), Messages: []proto.Message{{Role: "user", Content: "my private question"}}},
 		func(e proto.Event) { text += e.Delta })
 	if err != nil || text != "secret answer 42" {
 		t.Fatalf("run: %v %q", err, text)
@@ -138,7 +138,7 @@ func TestRunOverEHBP(t *testing.T) {
 
 	// Wrong token, no token, plaintext body.
 	conn.Token = "nope"
-	if err := conn.Run(context.Background(), proto.RunRequest{Messages: []proto.Message{{Role: "user", Content: "x"}}},
+	if err := conn.Run(context.Background(), proto.RunRequest{Permissions: guard.AllowAll(), Messages: []proto.Message{{Role: "user", Content: "x"}}},
 		func(proto.Event) {}); err == nil || !strings.Contains(err.Error(), "401") {
 		t.Fatalf("wrong token: %v", err)
 	}
@@ -151,7 +151,7 @@ func TestRunOverEHBP(t *testing.T) {
 	// A client that encrypts to another key is refused (the server can't decrypt).
 	other, _ := ehbpidentity.NewIdentity()
 	conn, _ = agentclient.New(srv.URL, "tok", other.MarshalPublicKey())
-	if err := conn.Run(context.Background(), proto.RunRequest{Messages: []proto.Message{{Role: "user", Content: "x"}}},
+	if err := conn.Run(context.Background(), proto.RunRequest{Permissions: guard.AllowAll(), Messages: []proto.Message{{Role: "user", Content: "x"}}},
 		func(proto.Event) {}); err == nil {
 		t.Fatal("request to the wrong key succeeded")
 	}

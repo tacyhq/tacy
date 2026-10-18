@@ -257,7 +257,7 @@ func (e *readerE2E) run(t *testing.T, q string) []proto.Event {
 	defer cancel()
 	var mu sync.Mutex
 	var evs []proto.Event
-	err := e.g.Run(ctx, e.rt, "u1", &proto.RunRequest{Messages: user(q)}, func(ev proto.Event) error {
+	err := e.g.Run(ctx, e.rt, "u1", &proto.RunRequest{Permissions: AllowAll(), Messages: user(q)}, func(ev proto.Event) error {
 		mu.Lock()
 		evs = append(evs, ev)
 		mu.Unlock()
@@ -399,7 +399,7 @@ func TestReaderJournal(t *testing.T) {
 	}
 	e := newReaderE2E(t, sm, pages)
 	h := &Host{RT: e.rt, GW: e.g}
-	id, _, err := h.Start(context.Background(), StartRequest{User: "u1", Req: &proto.RunRequest{Messages: user("price?")}, Via: ViaTasks})
+	id, _, err := h.Start(context.Background(), StartRequest{User: "u1", Req: &proto.RunRequest{Permissions: AllowAll(), Messages: user("price?")}, Via: ViaTasks})
 	if err != nil {
 		t.Fatal(err)
 	}

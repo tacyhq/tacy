@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"github.com/tacyhq/tacy/guard"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -27,7 +28,7 @@ func TestModelHeader(t *testing.T) {
 	defer srv.Close()
 	conn, _ := agentclient.New(srv.URL, "tok", id.MarshalPublicKey())
 	run := func(model string) error {
-		return conn.Run(context.Background(), proto.RunRequest{Model: model, Messages: []proto.Message{{Role: "user", Content: "x"}}}, func(proto.Event) {})
+		return conn.Run(context.Background(), proto.RunRequest{Permissions: guard.AllowAll(), Model: model, Messages: []proto.Message{{Role: "user", Content: "x"}}}, func(proto.Event) {})
 	}
 	// The header claims the cheap model, the body asks for another one.
 	conn.Model = "gpt-oss-120b"

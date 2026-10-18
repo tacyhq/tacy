@@ -201,7 +201,7 @@ func TestQueueOverEHBP(t *testing.T) {
 	run := func(user string, on func(proto.Event)) error {
 		conn, _ := agentclient.New(srv.URL, "tok", id.MarshalPublicKey())
 		conn.User = user
-		return conn.Run(context.Background(), proto.RunRequest{Messages: []proto.Message{{Role: "user", Content: "secret prompt"}}}, on)
+		return conn.Run(context.Background(), proto.RunRequest{Permissions: guard.AllowAll(), Messages: []proto.Message{{Role: "user", Content: "secret prompt"}}}, on)
 	}
 	type result struct {
 		evs []proto.Event

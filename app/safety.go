@@ -458,6 +458,18 @@ func (g *safeGateway) enforce(ctx context.Context, every time.Duration) {
 	}
 }
 
+// permissionCap is the policy's cap on people's permission settings for a space: never when no policy covers
+// it (nothing goes out then anyway).
+func permissionCap(st *safety.State) func(space, kind string) string {
+	return func(space, kind string) string {
+		e, err := st.Policy(space)
+		if err != nil {
+			return safety.PermNever
+		}
+		return e.PermissionCap(kind)
+	}
+}
+
 // ---- POST /safety: signed documents in --------------------------------------------------------------------------
 
 // safetyIn takes signed policies and stop lists from anyone: an admin's browser, the operator, the relay, or

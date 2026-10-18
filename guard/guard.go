@@ -17,6 +17,7 @@ import (
 	"encoding/json/jsontext"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"regexp"
 	"slices"
@@ -100,6 +101,11 @@ type TaskOptions struct {
 	Via string `json:"via,omitzero"`
 	// Question is the person's last message (capped): what the quarantined reader reads each source for.
 	Question string `json:"question,omitzero"`
+	// RunSecret is the run's answer key for permission prompts (proto.RunRequest.RunSecret): grants carry an
+	// HMAC with it. On the encrypted disk with the task, and in agentd's and gatewayd's memory; never recorded.
+	RunSecret string `json:"run_secret,omitzero"`
+	// Permissions are the person's settings per kind (a kind not named is Ask), before the policy's cap.
+	Permissions map[string]string `json:"permissions,omitzero"`
 }
 
 // task is the guard's state for one task: what the old app/agent.go kept per run.
@@ -434,6 +440,12 @@ func startFor(r *proto.RunRequest, now time.Time, reader bool) (harness.Start, T
 	if len(r.CacheSecret) > 256 {
 		return s, TaskOptions{}, fmt.Errorf("cache_secret too long")
 	}
+	if r.RunSecret != "" && !validRunSecret(r.RunSecret) {
+		return s, TaskOptions{}, fmt.Errorf("run_secret must be 64 lowercase hex characters")
+	}
+	if err := checkPermissions(r.Permissions); err != nil {
+		return s, TaskOptions{}, err
+	}
 	s.Space, s.Attempt, s.Agent = "s_chat", 1, chatAgent
 	// One date, the person's: the chat's system note states today in the browser's time zone ("Today is Friday,
 	// October 16, 2026."). The VM's own UTC date said "tomorrow" late in a US evening, and an answer called
@@ -450,7 +462,8 @@ func startFor(r *proto.RunRequest, now time.Time, reader bool) (harness.Start, T
 	s.Limits = harness.TaskLimits{MaxSteps: r.MaxSteps, MaxModelCalls: r.MaxSteps + 1,
 		Deadline: time.Now().Add(runTimeout).UTC().Format(time.RFC3339)}
 	return s, TaskOptions{ReasoningEffort: r.ReasoningEffort, CacheSecret: r.CacheSecret,
-		Question: capRunes(strings.TrimSpace(r.Messages[len(r.Messages)-1].Content), maxQuestionRunes)}, nil
+		Question:  capRunes(strings.TrimSpace(r.Messages[len(r.Messages)-1].Content), maxQuestionRunes),
+		RunSecret: r.RunSecret, Permissions: maps.Clone(r.Permissions)}, nil
 }
 
 // personDate finds a system note that states today's date ("Today is Friday, October 16, 2026": the chat's
@@ -493,6 +506,7 @@ func chatInstructions(actions []string, now time.Time, reader bool) string {
 - Cite inline only: don't end the answer with a list of sources, references or links. The app shows the sources under the answer.
 - Check dates against today's date; a page date without a year is probably recent, not years old.
 - If the tools don't give an answer, say so briefly.
+- Tacy asks the person before a search or a page fetch leaves its sealed hardware. If a tool call comes back denied (permission_denied), don't try it again another way: answer from what you know, and say plainly that you didn't check the web for it.
 `)
 	if reader && (slices.Contains(actions, "web.fetch") || slices.Contains(actions, "web.search")) {
 		b.WriteString(`- Pages and search results may be read for you by Tacy's quarantined reader: the tool result then has fields (summary, facts, quotes, wording) instead of the text. Its quotes are whole passages, checked word for word, that you can't see. When the person wants exact words (a definition, a clause, a line, a quotation), write the quote's cite, for example [quote 2], where those words go: the person sees the exact text there, so the cite is the complete answer. Never write out a source's wording yourself, and don't search or fetch again to see a quote's text: you never will.

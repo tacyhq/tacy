@@ -494,7 +494,7 @@ func TestAgentSiteIcons(t *testing.T) {
 	a.newTools = func() *Tools { return &Tools{search: sites, fetcher: newFetcher(nil)} }
 	a.icons = web.client(nil)
 	a.gates = newToolGates(DefaultLimits)
-	evs := collect(t, a, proto.RunRequest{Messages: []proto.Message{{Role: "user", Content: "posters"}}})
+	evs := collect(t, a, proto.RunRequest{Permissions: AllowAll(), Messages: []proto.Message{{Role: "user", Content: "posters"}}})
 	// Two searches of 12 sites each, the same sites: 12 distinct sites, one icon each.
 	var icons []proto.Event
 	firstResult, done, metric := -1, -1, -1
@@ -555,7 +555,7 @@ func TestAgentSiteIconCaps(t *testing.T) {
 	a, _, _ := newTestAgent(t, toolCallSSE("c1", "web_search", `{"query":"x"}`), textSSE("ok"))
 	a.newTools = func() *Tools { return &Tools{search: &manySites{n: 40, kind: "none"}, fetcher: newFetcher(nil)} }
 	a.icons = web.client(nil)
-	evs := collect(t, a, proto.RunRequest{Messages: []proto.Message{{Role: "user", Content: "q"}}})
+	evs := collect(t, a, proto.RunRequest{Permissions: AllowAll(), Messages: []proto.Message{{Role: "user", Content: "q"}}})
 	// No site has an icon: the run still ends normally, and at most maxIconHosts sites were tried.
 	if evs[len(evs)-1].Type != "done" {
 		t.Fatalf("events %s", types(evs))
@@ -584,7 +584,7 @@ func TestAgentSiteIconsDontHoldTheAnswer(t *testing.T) {
 	t0 := time.Now()
 	var mu sync.Mutex
 	var evs []proto.Event
-	r := proto.RunRequest{Messages: []proto.Message{{Role: "user", Content: "q"}}}
+	r := proto.RunRequest{Permissions: AllowAll(), Messages: []proto.Message{{Role: "user", Content: "q"}}}
 	validate(&r)
 	a.Run(context.Background(), &r, func(e proto.Event) error {
 		mu.Lock()

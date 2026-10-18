@@ -33,6 +33,37 @@ type Policy struct {
 	StaleReads bool    `json:"stale_reads"`
 	Budget     Budgets `json:"budget"`
 	Rates      Rates   `json:"rates"`
+	// AskCap caps people's permission settings per kind of outgoing data ("web.search" -> "ask" | "never"; or
+	// "always", which caps nothing). A person's setting above the cap is lowered to it: a firm can make its members
+	// be asked every time, or turn a kind off. Unnamed kinds aren't capped.
+	AskCap map[string]string `json:"ask_cap,omitzero"`
+}
+
+// Permission settings, from the most open to the narrowest.
+const (
+	PermAlways = "always"
+	PermAsk    = "ask"
+	PermNever  = "never"
+)
+
+// permRank orders the settings: a higher rank is narrower.
+var permRank = map[string]int{PermAlways: 0, PermAsk: 1, PermNever: 2}
+
+// ValidPermission: one of always, ask, never.
+func ValidPermission(s string) bool { _, ok := permRank[s]; return ok }
+
+// NarrowerPermission is the narrower of two settings ("" counts as always: no limit).
+func NarrowerPermission(a, b string) string {
+	if a == "" {
+		a = PermAlways
+	}
+	if b == "" {
+		b = PermAlways
+	}
+	if permRank[b] > permRank[a] {
+		return b
+	}
+	return a
 }
 
 // Connector is one connector's grant.
@@ -145,6 +176,14 @@ func (p *Policy) Validate() error {
 			return fmt.Errorf("policy: bad action %q", a)
 		}
 	}
+	if len(p.AskCap) > 64 {
+		return errors.New("policy: too many entries")
+	}
+	for k, v := range p.AskCap {
+		if !actionRe.MatchString(k) || !ValidPermission(v) {
+			return fmt.Errorf("policy: bad ask_cap %q: %q", k, v)
+		}
+	}
 	for _, l := range []Limits{p.Budget.Run, p.Budget.Day} {
 		if l.Tokens < 0 || l.ToolCalls < 0 || l.WallSeconds < 0 || l.CostMicros < 0 {
 			return errors.New("policy: negative budget")
@@ -191,6 +230,16 @@ func (e *Effective) AllowsTool(action string) bool {
 // AllowsConnector: every layer has the connector.
 func (e *Effective) AllowsConnector(conn string) bool {
 	return e.all(func(p *Policy) bool { _, ok := p.Connectors[conn]; return ok })
+}
+
+// PermissionCap is the narrowest cap any layer puts on a kind's permission setting: always (no cap), ask or
+// never.
+func (e *Effective) PermissionCap(kind string) string {
+	c := PermAlways
+	for _, p := range e.Layers {
+		c = NarrowerPermission(c, p.AskCap[kind])
+	}
+	return c
 }
 
 // NeedsApproval: some layer lists the action.

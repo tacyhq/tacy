@@ -1,6 +1,6 @@
-# Tasks and the quarantined reader
+# Tasks, the quarantined reader and permission prompts
 
-> **Status:** in the agent VM since v0.7.0. Code: `harness/` (task ids, lifecycle, held requests, taint), `guard/tasks.go` (`Host`: start, follow, cancel, resume), `app/tasks.go` (the `/tasks` API), `queue/` (the versioned SQLite queue), `guard/reader.go` (the reader).
+> **Status:** tasks and the reader in the agent VM since v0.7.0, permission prompts since v0.8.0. Code: `harness/` (task ids, lifecycle, held requests, taint), `guard/tasks.go` (`Host`: start, follow, cancel, resume), `app/tasks.go` (the `/tasks` API), `queue/` (the versioned SQLite queue), `guard/reader.go` (the reader), `guard/permission.go` and `guard/prompts.go` (permission prompts).
 
 Builds on [harness/v1](20-harness-protocol.md), [gateway v0 and the vault](21-gateway-v0.md), [safety controls](23-safety-controls.md) (the reader's model call is budgeted and checked like any other) and [activity records](24-activity-records.md) (the reader's numbers and the taint are on the record).
 
@@ -35,11 +35,21 @@ A model call with **no tools**, made by gatewayd, never by the brain. It turns o
 - A task whose input already holds an **earlier assistant turn** is tainted from its start (taint `history`): an earlier answer may carry web-derived text, and the VM can't tell which.
 - Taint is on the activity record (each call untrusted or tainted, the run tainted) and in `/tasks/status`. A tainted change or send will need a person's approval once such actions exist.
 
-## 6. Permission prompts (later)
-Asking the person before data leaves (a search, a fetch) for a task: held reads, one-time grants, deny and edit. The runtime's hold is ready; the prompts aren't in the VM yet.
+## 6. Permission prompts
+Before data leaves the VM for a task, the person is asked, with exactly what would go out: **Allow once**, **Always allow** (that kind, for the rest of the run) or **Deny**. The model only asks; it can't answer, and it never writes what the person is shown.
+
+- **Kinds.** An action's class is set in the release, never by a model or a policy. Today the class "read, data goes out" is the web connector's three actions, each its own kind: `web.search` (the query goes to a search provider), `web.fetch` (the page's address goes to that site), `web.images` (the query goes to a search provider). Model calls go to the attested model provider and aren't asked about.
+- **Settings.** Each run carries the person's setting per kind: `ask` (the default; a kind not named is `ask`), `always` or `never`. A signed policy may cap them with `ask_cap` (per kind: `always`, `ask` or `never`); the narrowest layer wins, so a firm can make its members be asked every time, or turn a kind off. A policy without `ask_cap` caps nothing.
+- **The flow.** agentd holds the action (`waiting`, sub-state `permission`; journaled `held`) and adds a `permission` event to the task's stream: the kind, the value that would go out (the masked query or the page's address) and how long it waits. The person's tab answers with `POST /tasks/grant` (`{task, request, kind, decision, value, mac}`, EHBP-encrypted like every task call). agentd checks the grant and hands the action to gatewayd with it; **gatewayd checks it again itself before anything is sent.**
+- **The grant.** Until people have identity keys, a grant is `HMAC-SHA256(run secret, "tacy-grant/v1" NUL task NUL request NUL kind NUL decision NUL value)`. The run secret (32 random bytes) is made by the person's tab and sent only inside the run's encrypted body, so only that tab can answer, and the relay can neither read nor forge a grant. A grant for another task, request or kind, a changed value or decision, or a replay is refused (a refused grant leaves the prompt open). A run without a secret can't ask, so kinds on `ask` are refused there (`unavailable`).
+- **Edit.** The person may change the value before allowing. The grant carries their value, and gatewayd sends that one (after the same masking and leak scan as any other); the record says it was edited, never the value.
+- **Deny.** The action isn't run and the model gets `permission_denied`: answer without it and say it didn't check. The run goes on. **No answer** in time is a deny (`timed_out`): 10 minutes, but never past the run's deadline less a minute, so the model can still answer. With today's 5-minute run deadline a prompt waits about 4 minutes.
+- **Restarts.** A prompt still waiting when agentd restarts is shown again with a fresh timeout; grants given before the restart are gone with it.
+- **On the record.** Each call that sends data out says how it was allowed: `allowed_once`, `allowed_always`, `always_setting`, `denied`, `timed_out`, `never` or `unavailable`, and whether the value was edited. Never the value.
+- **Rolling back to v0.7.0.** v0.7.0 doesn't ask: it ignores the run secret and the settings and sends what the model proposes. A client that relies on the prompts must refuse v0.7.0 (the chat's minimum release is v0.8.0), so a rollback of the VM goes with a rollback of the client.
 
 ## 7. Sub-tasks (later)
 `task.spawn` and `task.wait` with depth and width caps and one budget per tree; a child of a tainted task is tainted.
 
 ## 8. Slices
-Each slice is a release on the usual path (a throwaway VM and the end-to-end test first). v0.7.0 has slices 1 (the task model) and 2 (the reader and taint). `/run` stays as a shim until the chat moves to `/tasks`, then goes one release later.
+Each slice is a release on the usual path (a throwaway VM and the end-to-end test first). v0.7.0 has slices 1 (the task model) and 2 (the reader and taint); v0.8.0 slice 3 (permission prompts). `/run` stays as a shim until the chat moves to `/tasks`, then goes one release later.

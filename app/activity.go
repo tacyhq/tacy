@@ -47,6 +47,9 @@ type recGateway struct {
 	// history: recorded tasks tainted from their start (an earlier assistant turn in the input; guard.StartTaint),
 	// so their end record says tainted even if no call of theirs brought outside content.
 	history map[string]bool
+	// prompts holds actions that send data out until the person answered (guard.Prompts); nil: none held
+	// (gatewayd then refuses every kind not set to Always allow).
+	prompts *guard.Prompts
 }
 
 var (
@@ -97,6 +100,9 @@ func (s *recSession) End() (int, string) {
 
 func (s *recSession) Close() {
 	s.Session.Close()
+	if s.g.prompts != nil {
+		s.g.prompts.Forget(s.id)
+	}
 	s.g.mu.Lock()
 	delete(s.g.bg, s.id)
 	s.g.mu.Unlock()
@@ -356,8 +362,21 @@ func (g *recGateway) Action(ctx context.Context, ti *harness.TaskInfo, id string
 	f := &guard.Facts{}
 	connector, _, _ := strings.Cut(req.Name, ".")
 	done := g.begin(ti, id, "action", req.Name, connector, req)
-	res, err := g.safeGateway.Action(guard.WithFacts(ctx, f), ti, id, req)
+	// Permission prompts: an action that sends data out goes on with the person's grant, or is denied here without running.
+	var res *harness.ActionResult
+	var err error
+	if g.prompts != nil {
+		ctx, res = g.prompts.Attach(ctx, ti, id, req)
+	}
+	if res == nil {
+		res, err = g.safeGateway.Action(guard.WithFacts(ctx, f), ti, id, req)
+	}
 	done(f, res, err, func(c *activity.Call) {
+		if g.prompts != nil {
+			if o, ok := g.prompts.Outcome(ti.ID, id); ok {
+				c.Permission, c.Edited = o.Outcome, o.Edited
+			}
+		}
 		switch res.Status {
 		case harness.ActionDenied:
 			c.Outcome, c.Code = "denied", controlCode(res.Error)
@@ -368,6 +387,31 @@ func (g *recGateway) Action(ctx context.Context, ti *harness.TaskInfo, id string
 		}
 	})
 	return res, err
+}
+
+var (
+	_ harness.HoldGuard  = (*recGateway)(nil)
+	_ guard.TaskFollower = (*recGateway)(nil)
+)
+
+// Hold: an action that would send data out waits for the person's answer (guard.Prompts.Hold).
+func (g *recGateway) Hold(ti *harness.TaskInfo, id string, req any) string {
+	if g.prompts == nil {
+		return ""
+	}
+	return g.prompts.Hold(ti, id, req)
+}
+
+// TaskResumed shows a resumed task's waiting prompts again (guard.Prompts.Resume).
+func (g *recGateway) TaskResumed(task string, start *harness.Start, opts guard.TaskOptions, journal []harness.Record) {
+	if g.prompts == nil {
+		return
+	}
+	b, err := json.Marshal(opts)
+	if err != nil {
+		return
+	}
+	g.prompts.Resume(&harness.TaskInfo{ID: task, Start: start, Options: b}, journal)
 }
 
 func (g *recGateway) Exec(ctx context.Context, ti *harness.TaskInfo, id string, req *harness.Exec) (*harness.ExecResult, error) {

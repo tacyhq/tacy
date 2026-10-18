@@ -169,6 +169,11 @@ type Call struct {
 	Tainted   bool `json:"tainted,omitzero"`
 	// Reader is the quarantined reader's model call for this action (a page or search results read for the agent).
 	Reader *Reader `json:"reader,omitzero"`
+	// Permission is how the person's permission for an action that sends data out was given: allowed_once,
+	// allowed_always, always_setting (not asked: their setting), denied, timed_out, never (not asked: off in their
+	// settings), unavailable (the run couldn't ask). Edited: they changed what was sent. Never the value itself.
+	Permission string `json:"permission,omitzero"`
+	Edited     bool   `json:"edited,omitzero"`
 }
 
 // Reader is one quarantined reader call: numbers and fixed words only.

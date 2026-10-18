@@ -101,6 +101,8 @@ type server struct {
 	host     *guard.Host // tasks (tasks.go); made on first use when nil
 	hostOnce sync.Once
 	follows  chan struct{} // concurrent POST /tasks/events limit
+	// prompts are the permission prompts (guard.Prompts): POST /tasks/grant answers them. nil: none.
+	prompts *guard.Prompts
 }
 
 type ticketKey struct{}
@@ -466,9 +468,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("tasks: %v", err)
 	}
+	host := &guard.Host{RT: rt, GW: rg, IDKey: idKey}
+	// Permission prompts: actions that send data out wait for the person's answer; the policy may cap their settings.
+	rg.prompts = &guard.Prompts{Release: rt.Release, Emit: host.Emit, Cap: permissionCap(st)}
 	s := &server{platform: p, id: id, agent: rg, rt: rt, rec: rec, token: p.Secret("AGENT_VM_TOKEN"), booted: time.Now().UTC(),
 		sched: newScheduler(lim), lim: lim, quotes: make(chan struct{}, 8), safety: st, gw: gw, safetySlots: make(chan struct{}, 4),
-		host: &guard.Host{RT: rt, GW: rg, IDKey: idKey}}
+		host: host, prompts: rg.prompts}
 	ctx := context.Background()
 	s.resumeTasks(ctx, ids, log.Printf)
 	go sg.enforce(ctx, 2*time.Second)

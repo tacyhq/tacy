@@ -25,7 +25,7 @@ func TestInstructionsDateIsThePersons(t *testing.T) {
 		{"other system note", []proto.Message{{Role: "system", Content: "Be brief."}, {Role: "user", Content: "q"}}, true},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			s, _, err := StartFor(&proto.RunRequest{Messages: c.msgs}, now)
+			s, _, err := StartFor(&proto.RunRequest{Permissions: AllowAll(), Messages: c.msgs}, now)
 			if err != nil {
 				t.Fatal(err)
 			}

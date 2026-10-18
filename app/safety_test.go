@@ -208,7 +208,7 @@ func lastError(evs []proto.Event) (proto.Event, bool) {
 func TestSafetyPolicyHashInMetaAndNarrowedTools(t *testing.T) {
 	e := newSafeEnv(t, pText("ok"))
 	// Before any policy: admin keys are pinned, so nothing runs (fail closed), and the model is never called.
-	evs := runParity(t, e.s, proto.RunRequest{Messages: user1("hi")})
+	evs := runParity(t, e.s, proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("hi")})
 	if er, ok := lastError(evs); !ok || er.Code != safety.CodePolicyMissing || e.modelReqs.Load() != 0 {
 		t.Fatalf("no policy: %+v", evs)
 	}
@@ -218,7 +218,7 @@ func TestSafetyPolicyHashInMetaAndNarrowedTools(t *testing.T) {
 		p.Connectors["web"] = w
 	})
 	e.mustPost(pol, e.heartbeat())
-	evs = runParity(t, e.s, proto.RunRequest{Messages: user1("hi")})
+	evs = runParity(t, e.s, proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("hi")})
 	if evs[len(evs)-1].Type != "done" {
 		t.Fatalf("run: %+v", evs)
 	}
@@ -293,7 +293,9 @@ func testSafetyKillSwitch(t *testing.T, behindRunner bool) {
 	e.model.replies[0] = pCalls([3]string{"c1", "fetch_page", `{"url":"` + page.URL + `/slow"}`})
 	e.mustPost(e.policy(1, nil), e.heartbeat())
 	done := make(chan []proto.Event, 1)
-	go func() { done <- runParity(t, e.s, proto.RunRequest{Messages: user1("read it")}) }()
+	go func() {
+		done <- runParity(t, e.s, proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("read it")})
+	}()
 	deadline := time.Now().Add(5 * time.Second)
 	for e.modelReqs.Load() < 1 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
@@ -317,7 +319,7 @@ func testSafetyKillSwitch(t *testing.T, behindRunner bool) {
 		t.Fatal("the model was called after the stop")
 	}
 	// New runs are refused while it holds, without calling the model.
-	evs = runParity(t, e.s, proto.RunRequest{Messages: user1("again")})
+	evs = runParity(t, e.s, proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("again")})
 	if er, ok := lastError(evs); !ok || er.Code != safety.CodeStopped || e.modelReqs.Load() != 1 {
 		t.Fatalf("new run while stopped: %+v", evs)
 	}
@@ -325,7 +327,7 @@ func testSafetyKillSwitch(t *testing.T, behindRunner bool) {
 	e.mustPost(e.stop(safety.IssuerFirm, 2, nil, e.admin))
 	e.model.replies = append(e.model.replies, pText("back"))
 	e.model.n = 2
-	evs = runParity(t, e.s, proto.RunRequest{Messages: user1("again")})
+	evs = runParity(t, e.s, proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("again")})
 	if evs[len(evs)-1].Type != "done" {
 		t.Fatalf("after the stop was lifted: %+v", evs)
 	}
@@ -336,7 +338,7 @@ func TestSafetyGlobalStopAndOperatorCantLiftFirmStop(t *testing.T) {
 	e.mustPost(e.policy(1, nil), e.heartbeat())
 	e.seq++
 	e.mustPost(e.stop(safety.IssuerOperator, e.seq, func(l *safety.StopList) { l.All = true }, e.operator))
-	if er, ok := lastError(runParity(t, e.s, proto.RunRequest{Messages: user1("hi")})); !ok || er.Code != safety.CodeStopped {
+	if er, ok := lastError(runParity(t, e.s, proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("hi")})); !ok || er.Code != safety.CodeStopped {
 		t.Fatal("global stop didn't refuse the run")
 	}
 	// The admin's key can't sign the operator's list (nor lift its stop with one).
@@ -344,7 +346,7 @@ func TestSafetyGlobalStopAndOperatorCantLiftFirmStop(t *testing.T) {
 		t.Fatal("an operator list signed by the admin was accepted")
 	}
 	e.mustPost(e.heartbeat(), e.stop(safety.IssuerFirm, 1, func(l *safety.StopList) { l.All = true }, e.admin))
-	if er, ok := lastError(runParity(t, e.s, proto.RunRequest{Messages: user1("hi")})); !ok || er.Code != safety.CodeStopped {
+	if er, ok := lastError(runParity(t, e.s, proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("hi")})); !ok || er.Code != safety.CodeStopped {
 		t.Fatal("the operator's newer list lifted the firm's stop")
 	}
 }
@@ -353,12 +355,12 @@ func TestSafetyStaleStopList(t *testing.T) {
 	e := newSafeEnv(t, pText("ok"), pText("ok"))
 	// No operator list ever arrived (the control plane is down): reads go on, as the policy allows.
 	e.mustPost(e.policy(1, nil))
-	if evs := runParity(t, e.s, proto.RunRequest{Messages: user1("hi")}); evs[len(evs)-1].Type != "done" {
+	if evs := runParity(t, e.s, proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("hi")}); evs[len(evs)-1].Type != "done" {
 		t.Fatalf("stale, reads allowed: %+v", evs)
 	}
 	// A policy that stops reads too while stale.
 	e.mustPost(e.policy(2, func(p *safety.Policy) { p.StaleReads = false }))
-	evs := runParity(t, e.s, proto.RunRequest{Messages: user1("hi")})
+	evs := runParity(t, e.s, proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("hi")})
 	if er, ok := lastError(evs); !ok || er.Code != safety.CodeStale {
 		t.Fatalf("stale, reads not allowed: %+v", evs)
 	}
@@ -370,7 +372,7 @@ func TestSafetyStaleStopList(t *testing.T) {
 		t.Fatal("expired operator list accepted")
 	}
 	e.mustPost(e.heartbeat())
-	if evs := runParity(t, e.s, proto.RunRequest{Messages: user1("hi")}); evs[len(evs)-1].Type != "done" {
+	if evs := runParity(t, e.s, proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("hi")}); evs[len(evs)-1].Type != "done" {
 		t.Fatalf("fresh again: %+v", evs)
 	}
 }
@@ -384,7 +386,7 @@ func testSafetyBudgetParallel(t *testing.T, behindRunner bool) {
 	}
 	e := newSafeEnvBrain(t, behindRunner, pCalls(calls...), pText("done"))
 	e.mustPost(e.policy(1, func(p *safety.Policy) { p.Budget.Run.ToolCalls = 2 }), e.heartbeat())
-	evs := runParity(t, e.s, proto.RunRequest{Messages: user1("search a lot")})
+	evs := runParity(t, e.s, proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("search a lot")})
 	if evs[len(evs)-1].Type != "done" {
 		t.Fatalf("the run should answer without the refused calls: %+v", evs)
 	}
@@ -410,7 +412,7 @@ func TestSafetyTokenBudgetEndsRun(t *testing.T) { testSafetyTokenBudget(t, false
 func testSafetyTokenBudget(t *testing.T, behindRunner bool) {
 	e := newSafeEnvBrain(t, behindRunner, pText("never"))
 	e.mustPost(e.policy(1, func(p *safety.Policy) { p.Budget.Run.Tokens = 300 }), e.heartbeat())
-	evs := runParity(t, e.s, proto.RunRequest{Messages: user1("hi")})
+	evs := runParity(t, e.s, proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("hi")})
 	if er, ok := lastError(evs); !ok || er.Code != safety.CodeBudgetExceeded || e.modelReqs.Load() != 0 {
 		t.Fatalf("token budget: %+v (model called %d)", evs, e.modelReqs.Load())
 	}
@@ -427,11 +429,11 @@ func TestSafetyModelAndFetchHostDenied(t *testing.T) {
 		w.Fetch = []string{"docs.tacy.io", "*.example.org"}
 		p.Connectors["web"] = w
 	}), e.heartbeat())
-	evs := runParity(t, e.s, proto.RunRequest{Model: "kimi-k3", Messages: user1("hi")})
+	evs := runParity(t, e.s, proto.RunRequest{Permissions: guard.AllowAll(), Model: "kimi-k3", Messages: user1("hi")})
 	if er, ok := lastError(evs); !ok || er.Code != safety.CodePolicyDenied {
 		t.Fatalf("model not in the policy: %+v", evs)
 	}
-	evs = runParity(t, e.s, proto.RunRequest{Messages: user1("read it")})
+	evs = runParity(t, e.s, proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("read it")})
 	if evs[len(evs)-1].Type != "done" || hits.Load() != 0 {
 		t.Fatalf("fetch to a host outside the policy: hits %d, %+v", hits.Load(), evs)
 	}
@@ -447,7 +449,7 @@ func TestSafetyModelAndFetchHostDenied(t *testing.T) {
 func TestSafetyApprovalRequiredRefusesAction(t *testing.T) {
 	e := newSafeEnv(t, pCalls([3]string{"c1", "web_search", `{"query":"x"}`}), pText("ok"))
 	e.mustPost(e.policy(1, func(p *safety.Policy) { p.Approve = []string{"web.search"} }), e.heartbeat())
-	runParity(t, e.s, proto.RunRequest{Messages: user1("hi")})
+	runParity(t, e.s, proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("hi")})
 	if len(e.fs.queries) != 0 {
 		t.Fatal("an action held for approval ran")
 	}
@@ -458,14 +460,14 @@ func TestSafetyOutputCapAndMissingUsage(t *testing.T) {
 	long := `data: {"choices":[{"delta":{"content":"` + strings.Repeat("word ", 2000) + `"},"finish_reason":"stop"}]}` + "\n\ndata: [DONE]\n\n"
 	e := newSafeEnv(t, long)
 	e.mustPost(e.policy(1, func(p *safety.Policy) { p.Budget.Run.Tokens = 2000 }), e.heartbeat())
-	evs := runParity(t, e.s, proto.RunRequest{Messages: user1("write a lot")})
+	evs := runParity(t, e.s, proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("write a lot")})
 	if er, ok := lastError(evs); !ok || er.Code != safety.CodeBudgetExceeded {
 		t.Fatalf("output past the reservation: %+v", evs)
 	}
 	// No usage reported (the reply above has none): the whole reservation stays counted.
 	e2 := newSafeEnv(t, `data: {"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}`+"\n\ndata: [DONE]\n\n")
 	e2.mustPost(e2.policy(1, nil), e2.heartbeat())
-	runParity(t, e2.s, proto.RunRequest{Messages: user1("hi")})
+	runParity(t, e2.s, proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("hi")})
 	sg := e2.s.agent.(*recGateway).safeGateway
 	if _, err := sg.ledger.Admit("s_chat", safety.Budgets{Day: safety.Limits{Tokens: safety.CompletionReserve}}); safety.CodeOf(err) != safety.CodeBudgetExceeded {
 		t.Fatal("a call without reported usage was counted as less than its reservation")

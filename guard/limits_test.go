@@ -141,7 +141,7 @@ func TestParallelToolCallsKeepOrder(t *testing.T) {
 	a.newTools = func() *Tools { return &Tools{search: ss, fetcher: newFetcher(nil)} }
 	a.runTools = 3
 	t0 := time.Now()
-	evs := collect(t, a, proto.RunRequest{Messages: []proto.Message{{Role: "user", Content: "q"}}})
+	evs := collect(t, a, proto.RunRequest{Permissions: AllowAll(), Messages: []proto.Message{{Role: "user", Content: "q"}}})
 	elapsed := time.Since(t0)
 	// Sequential would be ~620 ms; 3 at once: slow (400) alongside fast+mid, then fast2.
 	if elapsed > 550*time.Millisecond {
@@ -209,7 +209,7 @@ func TestUserToolCapAcrossRuns(t *testing.T) {
 			a, _, _ := newTestAgent(t, multiCallSSE("a", "b", "c"), textSSE("ok"))
 			a.gates = g
 			a.newTools = func() *Tools { return &Tools{search: ss, fetcher: newFetcher(nil)} }
-			r := proto.RunRequest{Messages: []proto.Message{{Role: "user", Content: "q"}}}
+			r := proto.RunRequest{Permissions: AllowAll(), Messages: []proto.Message{{Role: "user", Content: "q"}}}
 			validate(&r)
 			a.Run(withUser(context.Background(), "same-user"), &r, func(e proto.Event) error {
 				if e.Type == "metrics" && e.Metrics.Kind == "search" {
@@ -240,7 +240,7 @@ func TestSystemPromptAndParallelFlag(t *testing.T) {
 		t.Error("no-tools prompt talks about tools")
 	}
 	a, fm, _ := newTestAgent(t, toolCallSSE("c1", "web_search", `{"query":"a"}`), textSSE("ok"))
-	collect(t, a, proto.RunRequest{MaxSteps: 2, Messages: []proto.Message{{Role: "user", Content: "q"}}})
+	collect(t, a, proto.RunRequest{Permissions: AllowAll(), MaxSteps: 2, Messages: []proto.Message{{Role: "user", Content: "q"}}})
 	if fm.requests[0]["parallel_tool_calls"] != true {
 		t.Fatal("parallel_tool_calls not sent with tools")
 	}

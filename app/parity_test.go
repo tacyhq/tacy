@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"github.com/tacyhq/tacy/guard"
 	"image"
 	"image/color"
 	"image/png"
@@ -142,26 +143,26 @@ func pCalls(calls ...[3]string) string {
 func user1(s string) []proto.Message { return []proto.Message{{Role: "user", Content: s}} }
 
 var parityScenarios = []parityScenario{
-	{name: "answer", req: proto.RunRequest{Messages: user1("hi")},
+	{name: "answer", req: proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("hi")},
 		model: []string{sse(pReasoning("thinking"), pText("Hello there."))}},
-	{name: "search", req: proto.RunRequest{Messages: user1("latest dstack?")},
+	{name: "search", req: proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("latest dstack?")},
 		model: []string{pCalls([3]string{"c1", "web_search", `{"query":"dstack release for jane@example.com","count":3}`}), pText("v0.6.1 [1].")}},
-	{name: "fetch", req: proto.RunRequest{Messages: user1("read it")},
+	{name: "fetch", req: proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("read it")},
 		model: []string{pCalls([3]string{"c1", "fetch_page", `{"url":"https://docs.example.org/page"}`}), pText("It says v0.6.1 [1].")}},
-	{name: "fetch-refused", req: proto.RunRequest{Messages: user1("read it")},
+	{name: "fetch-refused", req: proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("read it")},
 		model: []string{pCalls([3]string{"c1", "fetch_page", `{"url":"https://example.com/?email=jane@example.com"}`}), pText("Can't.")}},
-	{name: "images", req: proto.RunRequest{Messages: user1("posters please")},
+	{name: "images", req: proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("posters please")},
 		model: []string{pCalls([3]string{"c1", "image_search", `{"query":"Arrival poster","count":3}`}), pText("Here they are.")}},
-	{name: "bad-calls", req: proto.RunRequest{Tools: []string{"web_search", "fetch_page"}, Messages: user1("q")},
+	{name: "bad-calls", req: proto.RunRequest{Permissions: guard.AllowAll(), Tools: []string{"web_search", "fetch_page"}, Messages: user1("q")},
 		model: []string{pCalls([3]string{"c1", "rm_rf", `{}`}), pCalls([3]string{"c2", "web_search", `{not json`}), pText("ok")}},
 	// "last-step" (the last step's reply only a tool call) was dropped on 2026-10-16: the brain now asks once more
 	// for the answer there (a decided difference: brain TestLastStepToolCallAsksForTheAnswer, guard
 	// TestAgentLastStepHasNoTools and TestRunLastStepHasNoTools cover it).
-	{name: "model-error", req: proto.RunRequest{Messages: user1("q")}, model: []string{"500"}},
-	{name: "parallel", req: proto.RunRequest{Messages: user1("compare")},
+	{name: "model-error", req: proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("q")}, model: []string{"500"}},
+	{name: "parallel", req: proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("compare")},
 		model: []string{pCalls([3]string{"c1", "web_search", `{"query":"one"}`}, [3]string{"c2", "fetch_page", `{"url":"https://docs.example.org/slow-page"}`},
 			[3]string{"c3", "web_search", `{"query":"slower three"}`}), pText("Both [1] [3] [5].")}},
-	{name: "no-tools", req: proto.RunRequest{Tools: []string{}, Model: "deepseek-v4-1-flash", ReasoningEffort: "none", Messages: user1("hi")},
+	{name: "no-tools", req: proto.RunRequest{Permissions: guard.AllowAll(), Tools: []string{}, Model: "deepseek-v4-1-flash", ReasoningEffort: "none", Messages: user1("hi")},
 		model: []string{pText("Hi.")}},
 }
 
@@ -170,11 +171,13 @@ type parityModel struct {
 	mu      sync.Mutex
 	replies []string
 	n       int
+	bodies  []string // the requests' bodies, in order
 }
 
 func (m *parityModel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	io.Copy(io.Discard, r.Body)
+	b, _ := io.ReadAll(r.Body)
 	m.mu.Lock()
+	m.bodies = append(m.bodies, string(b))
 	i := m.n
 	m.n++
 	m.mu.Unlock()

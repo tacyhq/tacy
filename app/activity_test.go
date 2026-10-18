@@ -4,6 +4,7 @@ import (
 	"crypto/ecdh"
 	"crypto/rand"
 	"encoding/json"
+	"github.com/tacyhq/tacy/guard"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -106,7 +107,7 @@ func testActivityChain(t *testing.T, behindRunner bool) {
 	var all []*activity.Run
 
 	// 1. A plain answer.
-	evs := runParity(t, e.s, e.recorded(priv, proto.RunRequest{Messages: user1("what is the meaning of life, my SSN is 078-05-1120")}))
+	evs := runParity(t, e.s, e.recorded(priv, proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("what is the meaning of life, my SSN is 078-05-1120")}))
 	m := metaOf(evs)
 	if m == nil || m.Activity == nil || m.Activity.Key != key || m.Activity.Seq != 0 || m.Activity.Head != "" || m.Activity.Chain != activity.ChainID("s_chat", to) {
 		t.Fatalf("meta.activity: %+v", m)
@@ -122,7 +123,7 @@ func testActivityChain(t *testing.T, behindRunner bool) {
 	all = append(all, runs...)
 
 	// 2. A search and a fetch: the page's host and sizes are on the record, never the query, path or text.
-	evs = runParity(t, e.s, e.recorded(priv, proto.RunRequest{Messages: user1("look it up")}))
+	evs = runParity(t, e.s, e.recorded(priv, proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("look it up")}))
 	if m := metaOf(evs); m.Activity.Seq != 2 {
 		t.Fatalf("second run's meta: %+v", m.Activity)
 	}
@@ -158,7 +159,7 @@ func testActivityChain(t *testing.T, behindRunner bool) {
 
 	// 3. Refused at the door (a firm stop): one refused record.
 	e.mustPost(e.stop(safety.IssuerFirm, 1, func(l *safety.StopList) { l.All = true }, e.admin))
-	evs = runParity(t, e.s, e.recorded(priv, proto.RunRequest{Messages: user1("again")}))
+	evs = runParity(t, e.s, e.recorded(priv, proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("again")}))
 	runs = openedActivity(t, evs, priv, key)
 	if len(runs) != 1 || runs[0].Event != activity.EventRefused || runs[0].Status.Code != safety.CodeStopped {
 		t.Fatalf("refused: %+v", runs)
@@ -168,14 +169,14 @@ func testActivityChain(t *testing.T, behindRunner bool) {
 
 	// 4. A run without a recipient isn't recorded (and gets no activity event).
 	e.model.replies = append(e.model.replies, pText("unrecorded"))
-	evs = runParity(t, e.s, proto.RunRequest{Messages: user1("hi")})
+	evs = runParity(t, e.s, proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("hi")})
 	if strings.Contains(types(evs), "activity") || metaOf(evs).Activity != nil {
 		t.Fatalf("unrecorded run: %s", types(evs))
 	}
 
 	// 5. A budget ends it: the end says which control.
 	e.mustPost(e.policy(2, func(p *safety.Policy) { p.Budget.Run.Tokens = 300 }))
-	evs = runParity(t, e.s, e.recorded(priv, proto.RunRequest{Messages: user1("hi")}))
+	evs = runParity(t, e.s, e.recorded(priv, proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("hi")}))
 	runs = openedActivity(t, evs, priv, key)
 	if len(runs) != 2 || runs[1].Status.Code != safety.CodeBudgetExceeded || runs[1].Status.State != "failed" ||
 		len(runs[1].Calls) != 1 || runs[1].Calls[0].Outcome != "refused" || runs[1].Calls[0].Code != safety.CodeBudgetExceeded {
@@ -264,7 +265,9 @@ func TestActivityKillSwitchOnTheRecord(t *testing.T) {
 	e.mustPost(e.policy(1, nil), e.heartbeat())
 	priv, _ := recipientKey(t)
 	done := make(chan []proto.Event, 1)
-	go func() { done <- runParity(t, e.s, e.recorded(priv, proto.RunRequest{Messages: user1("read it")})) }()
+	go func() {
+		done <- runParity(t, e.s, e.recorded(priv, proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("read it")}))
+	}()
 	deadline := time.Now().Add(5 * time.Second)
 	for e.modelReqs.Load() < 1 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
@@ -299,7 +302,7 @@ func TestActivityKillSwitchOnTheRecord(t *testing.T) {
 func TestActivityBadRecipientRefused(t *testing.T) {
 	e := newSafeEnv(t, pText("x"))
 	e.mustPost(e.policy(1, nil), e.heartbeat())
-	body, _ := json.Marshal(proto.RunRequest{Messages: user1("hi"), RecordTo: "x25519:AAAA"})
+	body, _ := json.Marshal(proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("hi"), RecordTo: "x25519:AAAA"})
 	r := httptest.NewRequest("POST", "/run", strings.NewReader(string(body)))
 	r.Header.Set(ModelHeader, proto.DefaultModel)
 	w := httptest.NewRecorder()
@@ -314,7 +317,7 @@ func TestActivityBadRecipientRefused(t *testing.T) {
 	forger, _ := recipientKey(t)
 	forged, _ := activity.RecordProof(forger, e.vmKey.PublicKey(), to, e.vmKey.PublicKey().Bytes())
 	for _, proof := range [][]byte{nil, forged} {
-		body, _ := json.Marshal(proto.RunRequest{Messages: user1("hi"), RecordTo: to, RecordProof: proof})
+		body, _ := json.Marshal(proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("hi"), RecordTo: to, RecordProof: proof})
 		r := httptest.NewRequest("POST", "/run", strings.NewReader(string(body)))
 		r.Header.Set(ModelHeader, proto.DefaultModel)
 		w := httptest.NewRecorder()

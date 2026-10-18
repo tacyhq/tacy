@@ -34,6 +34,12 @@ type TaskResumer interface {
 	ResumeTask(task string, start *harness.Start, opts TaskOptions, started time.Time, journal []harness.Record)
 }
 
+// TaskFollower is a Gateway told when a resumed task's stream is live again (after TaskResumer.ResumeTask), so it
+// can add to it (agentd: the permission prompts its held actions still wait for).
+type TaskFollower interface {
+	TaskResumed(task string, start *harness.Start, opts TaskOptions, journal []harness.Record)
+}
+
 // Host runs people's tasks on one runtime and gateway. Set the exported fields before use.
 type Host struct {
 	RT *harness.Runtime
@@ -373,6 +379,18 @@ func (h *Host) close(l *hosted) {
 	}
 }
 
+// Emit adds an event to a task's stream (the permission prompts agentd shows, guard.Prompts). A task this process
+// doesn't serve is ignored.
+func (h *Host) Emit(id string, e proto.Event) {
+	h.init()
+	h.mu.Lock()
+	l := h.live[id]
+	h.mu.Unlock()
+	if l != nil {
+		l.emit(e, h.flushEvery())
+	}
+}
+
 // ---- following ----------------------------------------------------------------------------------------------
 
 // Event is one event of a task's stream as Follow hands it on: its number, and the event (as it was emitted, or
@@ -609,6 +627,9 @@ func (h *Host) Resume(ids []string) (resumed, abandoned int) {
 		h.live[id] = l
 		h.mu.Unlock()
 		l.sess = h.GW.Open(id, opts, func(e proto.Event) error { l.emit(e, h.flushEvery()); return nil })
+		if r, ok := h.GW.(TaskFollower); ok { // its stream is live again: e.g. its permission prompts are shown again
+			r.TaskResumed(id, &start, opts, journal)
+		}
 		go h.finish(l)
 		resumed++
 	}

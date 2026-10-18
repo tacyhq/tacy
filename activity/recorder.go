@@ -51,7 +51,9 @@ type End struct {
 	Usage      *Usage
 	Steps      int
 	Background []Host
-	Tainted    bool // the run had untrusted input from its start (an earlier assistant turn); its calls say the rest
+	// BackgroundImages: late image search pictures that failed or never landed (Run.BackgroundImages).
+	BackgroundImages *Images
+	Tainted          bool // the run had untrusted input from its start (an earlier assistant turn); its calls say the rest
 }
 
 func (r *Recorder) now() time.Time {
@@ -208,7 +210,7 @@ func (r *Recorder) Finish(id string, e End) ([]Sealed, error) {
 		}
 	}
 	body := &Run{Event: EventEnd, Run: id, Space: x.info.Space, Started: x.info.Started, Ended: r.now(), Status: &e.Status,
-		Calls: x.calls, Leases: x.leases, Usage: e.Usage, Steps: e.Steps, Background: e.Background, StartSeq: x.startSeq,
+		Calls: x.calls, Leases: x.leases, Usage: e.Usage, Steps: e.Steps, Background: e.Background, BackgroundImages: e.BackgroundImages, StartSeq: x.startSeq,
 		Tainted: e.Tainted || slices.ContainsFunc(x.calls, func(c Call) bool { return c.Untrusted || c.Tainted })}
 	rec, _, err := r.append(x.chain, x.info.To, body, nil, id)
 	if err != nil {

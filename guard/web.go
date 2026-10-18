@@ -132,11 +132,12 @@ func (g *Guard) Action(ctx context.Context, ti *harness.TaskInfo, id string, req
 		Result: json.RawMessage(out.content), Citations: out.citations, Quotes: out.quotes})
 	t.numbering.Unlock()
 	t.icons.add(sourceURLs(out)...)
-	if m := toolMetric(app, step, out, ms); m != nil {
-		t.emit(proto.Event{Type: "metrics", Metrics: m})
-	}
+	m := toolMetric(app, step, out, ms)
 	if out.tail != nil {
-		g.lateImages(t, id, call, len(out.images), out.tail)
+		// Its metric waits for the late images: it then counts what landed, what failed and the slots never filled.
+		g.lateImages(t, id, call, len(out.images), out.tail, m)
+	} else if m != nil {
+		t.emit(proto.Event{Type: "metrics", Metrics: m})
 	}
 	return actionResult(out), nil
 }
@@ -144,18 +145,25 @@ func (g *Guard) Action(ctx context.Context, ti *harness.TaskInfo, id string, req
 // lateImages shows the images of an image search that land after its result (findImages returned early): each
 // is redacted like the others (its title; on the record as pattern ids), sent as the call's next "image" event and
 // its site's icon fetched; the slots it didn't use go back. The end of the run waits for them at most imageEndWait
-// (localSession.End); once the task ends, its downloads stop and nothing more is emitted.
-func (g *Guard) lateImages(t *task, action, call string, shown int, tail *imageTail) {
+// (localSession.End); once the task ends, its downloads stop and nothing more is emitted. m, the call's metrics
+// event, is sent when the tail ends, with the late images and failures added, and every slot that stayed empty
+// counted as never_arrived (also on the task's background record).
+func (g *Guard) lateImages(t *task, action, call string, shown int, tail *imageTail, m *proto.Metric) {
 	t.lateMu.Lock()
 	if t.ctx.Err() != nil { // the task ended: its downloads stop on their own (nobody shows them)
 		t.lateMu.Unlock()
+		lateMetric(m, imageStats{}, 0, tail.slots)
+		t.background.imageNever(tail.slots)
+		if m != nil {
+			t.emit(proto.Event{Type: "metrics", Metrics: m})
+		}
 		return
 	}
 	t.late.Add(1)
 	t.lateMu.Unlock()
 	go func() {
 		defer t.late.Done()
-		used := 0
+		used, bytes := 0, 0
 		for im := range tail.ch {
 			out := toolOutcome{images: []shownImage{im}}
 			if ids := redactOutcome(&out); len(ids) > 0 {
@@ -164,12 +172,52 @@ func (g *Guard) lateImages(t *task, action, call string, shown int, tail *imageT
 			}
 			im = out.images[0]
 			used++
+			bytes += len(im.JPEG)
 			t.emit(proto.Event{Type: "image", ID: call, Image: &proto.Image{Index: shown + used, Title: im.Title, Source: im.Source,
 				URL: im.URL, Type: "image/jpeg", Width: im.Width, Height: im.Height, Data: im.JPEG}})
 			t.icons.add(sourceURLs(out)...)
 		}
 		t.tools.returnImages(tail.slots - used)
+		// Every download is over (ch is closed after the last): tail.st is final.
+		st := tail.st
+		st.bytes = bytes
+		lateMetric(m, st, used, tail.slots-used)
+		t.background.imageFailures(tail.st.reasons)
+		t.background.imageNever(tail.slots - used)
+		if m != nil {
+			t.emit(proto.Event{Type: "metrics", Metrics: m})
+		}
 	}()
+}
+
+// lateMetric adds an image search's tail to its metric: the images that landed after the result, the downloads
+// that finished then (tried, failed and why) and the slots that stayed empty (never_arrived).
+func lateMetric(m *proto.Metric, st imageStats, landed, empty int) {
+	if m == nil {
+		return
+	}
+	m.Images += landed
+	m.Tried += st.tried
+	m.Failed += st.failed
+	m.FetchMs += st.fetchMs
+	m.Bytes += st.bytes
+	for r, n := range st.reasons {
+		m.Reasons = addReason(m.Reasons, r, n)
+	}
+	if empty > 0 {
+		m.Reasons = addReason(m.Reasons, imageNever, empty)
+	}
+}
+
+func addReason(m map[string]int, reason string, n int) map[string]int {
+	if n <= 0 {
+		return m
+	}
+	if m == nil {
+		m = map[string]int{}
+	}
+	m[reason] += n
+	return m
 }
 
 // readerDoc is what the reader reads for an action's outcome: a fetched page, or a search's results (titles and
@@ -267,6 +315,9 @@ func toolMetric(name string, step int, out toolOutcome, ms int64) *proto.Metric 
 		m.Kind, m.Provider = "images", out.provider
 		if st := out.istats; st != nil {
 			m.Results, m.Tried, m.Failed, m.Bytes, m.FetchMs = st.candidates, st.tried, st.failed, st.bytes, st.fetchMs
+			for r, n := range st.reasons {
+				m.Reasons = addReason(m.Reasons, r, n)
+			}
 		}
 		m.Images = len(out.images)
 	default:

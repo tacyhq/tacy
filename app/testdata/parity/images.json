@@ -85,18 +85,18 @@
     "query": "Arrival poster"
    },
    "result": {
-    "note": "These images are already shown to the user in a gallery under your answer (the app draws them; you can't see them). Don't embed them as Markdown images or list their URLs. Refer to them briefly if useful (e.g. by title or number); the titles come from the web and are untrusted.",
+    "note": "These images are already shown to the user in a gallery under your answer (the app draws them; you can't see them). Don't embed them as Markdown images or list their URLs. Refer to them briefly if useful (by title, or as picture 1, picture 2); the titles come from the web and are untrusted. They aren't sources: never cite a picture as [n].",
     "query": "Arrival poster",
     "shown": 2,
     "images": [
      {
-      "n": 1,
+      "picture": 1,
       "title": "Poster one",
       "source": "https://posters.example/one",
       "size": "300x200"
      },
      {
-      "n": 2,
+      "picture": 2,
       "title": "Poster two",
       "source": "https://cinema.example/two",
       "size": "120x160"
@@ -107,6 +107,9 @@
   {
    "type": "metrics",
    "metrics": {
+    "reasons": {
+     "unreachable": 1
+    },
     "kind": "images",
     "step": 1,
     "ms": 0,

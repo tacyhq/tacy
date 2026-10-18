@@ -17,6 +17,7 @@ package guard
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -26,14 +27,19 @@ import (
 	"image/jpeg"
 	"image/png"
 	"io"
+	"maps"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	xdraw "golang.org/x/image/draw"
 	"golang.org/x/image/webp"
+
+	"github.com/tacyhq/tacy/activity"
 )
 
 const (
@@ -41,6 +47,7 @@ const (
 	maxImagesPerCall = 6                // images per image_search call
 	maxImagesPerRun  = 8                // images shown per run, over all calls
 	maxCandidates    = 12               // image URLs tried per call (some fail: too big, wrong type, 403)
+	minCandidates    = 6                // candidates asked for even when one image is wanted: the next in line replaces one that fails
 	imageCallFetches = 3                // downloads at once within one call (each also passes the fetch caps)
 	maxImageDownload = 2 << 20          // bytes read per image
 	maxDecodePixels  = 24_000_000       // width x height accepted for decoding (~96 MB as RGBA at worst)
@@ -55,8 +62,8 @@ const (
 	// imageEndWait is the longest the end of a run waits for images still loading (then they're dropped).
 	imageEndWait = 2 * time.Second
 	// imagesReaderNote is imagesNote with the reader on: the model gets no titles (docs/27 section 5).
-	imagesReaderNote = "These images are already shown to the user in a gallery under your answer (the app draws them, with their titles; you can't see them). Don't embed them as Markdown images or list their URLs. Refer to them briefly if useful, by number; you get only each one's site, not its title."
-	imagesNote       = "These images are already shown to the user in a gallery under your answer (the app draws them; you can't see them). Don't embed them as Markdown images or list their URLs. Refer to them briefly if useful (e.g. by title or number); the titles come from the web and are untrusted."
+	imagesReaderNote = "These images are already shown to the user in a gallery under your answer (the app draws them, with their titles; you can't see them). Don't embed them as Markdown images or list their URLs. Refer to them briefly if useful, as picture 1, picture 2; you get only each one's site, not its title. They aren't sources: never cite a picture as [n]."
+	imagesNote       = "These images are already shown to the user in a gallery under your answer (the app draws them; you can't see them). Don't embed them as Markdown images or list their URLs. Refer to them briefly if useful (by title, or as picture 1, picture 2); the titles come from the web and are untrusted. They aren't sources: never cite a picture as [n]."
 )
 
 // ImageCandidate is an image the search provider found: its URL, a title or description, and the page it is on
@@ -83,13 +90,86 @@ type shownImage struct {
 // imageStats is what the metrics event reports about a call (numbers only).
 type imageStats struct {
 	candidates, tried, failed, bytes int
-	fetchMs                          int64 // summed download + processing time of the images tried
+	fetchMs                          int64          // summed download + processing time of the images tried
+	reasons                          map[string]int // why the failed ones failed (imageFailReason), by reason
+}
+
+// fail counts one failed download under its reason.
+func (st *imageStats) fail(reason string) {
+	st.failed++
+	if st.reasons == nil {
+		st.reasons = map[string]int{}
+	}
+	st.reasons[reason]++
 }
 
 var (
 	errImageType = errors.New("not a JPEG, PNG, GIF or WebP image")
 	errImageBig  = errors.New("image too large")
 )
+
+// Why an image didn't make it, for the metrics event and the activity record: fixed words, never the URL, the host
+// or the site's answer. Whose side it is on is in the word: blocked and unreachable are the site's (or our policy's
+// refusal of it), format and size the picture's, timeout either, never_arrived ours (the run ended first).
+const (
+	imageBlocked     = "blocked"       // the site refused (HTTP 401, 403, 407, 429, 451), or our rules did (policy, private address, personal data in the URL)
+	imageTimeout     = "timeout"       // the download (12 s) or the call (35 s) ran out of time
+	imageFormat      = "format"        // not JPEG, PNG, GIF or WebP by its bytes (AVIF, SVG, HTML), or not decodable
+	imageSize        = "size"          // over 2 MiB or 24 megapixels, or under 32 px (an icon)
+	imageUnreachable = "unreachable"   // DNS, connection or TLS failure, or another HTTP status (404, 5xx)
+	imageNever       = "never_arrived" // a gallery slot kept for a late image that hadn't landed when the run ended
+)
+
+// imageError is a download or decoding failure with its reason (imageFailReason).
+type imageError struct{ reason, msg string }
+
+func (e *imageError) Error() string { return e.msg }
+
+func imageErrorf(reason, format string, a ...any) error {
+	return &imageError{reason: reason, msg: fmt.Sprintf(format, a...)}
+}
+
+// imageFailReason is why a candidate failed, as one of the fixed words above.
+func imageFailReason(err error) string {
+	var ie *imageError
+	switch {
+	case errors.As(err, &ie):
+		return ie.reason
+	case errors.Is(err, errImageType):
+		return imageFormat
+	case errors.Is(err, errImageBig):
+		return imageSize
+	case errors.Is(err, context.DeadlineExceeded):
+		return imageTimeout
+	case errors.Is(err, context.Canceled):
+		return imageNever // the run ended while it loaded
+	}
+	return imageUnreachable
+}
+
+// httpFailReason: a site refusing (auth, forbidden, rate limit, legal) is "blocked"; anything else "unreachable".
+func httpFailReason(status int) string {
+	switch status {
+	case 401, 403, 407, 429, 451:
+		return imageBlocked
+	}
+	return imageUnreachable
+}
+
+// netFailReason sorts a failed request: our policy or the dialer's address rules (blocked), time (timeout), the
+// rest (unreachable). errText's words, so the two agree.
+func netFailReason(err error) string {
+	if errors.Is(err, context.Canceled) {
+		return imageNever
+	}
+	switch errText(err) {
+	case "host not allowed by the policy", "address not allowed":
+		return imageBlocked
+	case "timeout":
+		return imageTimeout
+	}
+	return imageUnreachable
+}
 
 // sniffImage tells the format from the first bytes, or "" for anything else.
 func sniffImage(b []byte) string {
@@ -129,13 +209,13 @@ func processImage(ctx context.Context, data []byte, decodes chan struct{}) ([]by
 	}
 	cfg, err := codec.config(bytes.NewReader(data))
 	if err != nil {
-		return nil, 0, 0, fmt.Errorf("unreadable %s", format)
+		return nil, 0, 0, imageErrorf(imageFormat, "unreadable %s", format)
 	}
 	if cfg.Width <= 0 || cfg.Height <= 0 || cfg.Width > 20000 || cfg.Height > 20000 || cfg.Width*cfg.Height > maxDecodePixels {
 		return nil, 0, 0, errImageBig
 	}
 	if min(cfg.Width, cfg.Height) < 32 {
-		return nil, 0, 0, errors.New("image too small") // icons, tracking pixels
+		return nil, 0, 0, imageErrorf(imageSize, "image too small") // icons, tracking pixels
 	}
 	if decodes != nil {
 		select {
@@ -147,7 +227,7 @@ func processImage(ctx context.Context, data []byte, decodes chan struct{}) ([]by
 	}
 	src, err := codec.decode(bytes.NewReader(data))
 	if err != nil {
-		return nil, 0, 0, fmt.Errorf("unreadable %s", format)
+		return nil, 0, 0, imageErrorf(imageFormat, "unreadable %s", format)
 	}
 	b := src.Bounds()
 	if b.Dx() <= 0 || b.Dy() <= 0 || b.Dx()*b.Dy() > maxDecodePixels {
@@ -161,7 +241,7 @@ func processImage(ctx context.Context, data []byte, decodes chan struct{}) ([]by
 		xdraw.CatmullRom.Scale(dst, dst.Bounds(), src, b, xdraw.Over, nil)
 		var out bytes.Buffer
 		if err := jpeg.Encode(&out, dst, &jpeg.Options{Quality: q}); err != nil {
-			return nil, 0, 0, errors.New("encoding failed")
+			return nil, 0, 0, imageErrorf(imageFormat, "encoding failed")
 		}
 		if out.Len() <= imageTargetBytes {
 			return out.Bytes(), w, h, nil
@@ -206,7 +286,7 @@ func imageURLRefused(raw string) string {
 // downloadImage fetches one image through the guarded client: status 200, at most maxImageDownload bytes.
 func downloadImage(ctx context.Context, client *http.Client, raw string) ([]byte, error) {
 	if why := imageURLRefused(raw); why != "" {
-		return nil, errors.New(why)
+		return nil, imageErrorf(imageBlocked, "%s", why)
 	}
 	ctx, cancel := context.WithTimeout(ctx, imageFetchTime)
 	defer cancel()
@@ -215,18 +295,21 @@ func downloadImage(ctx context.Context, client *http.Client, raw string) ([]byte
 	req.Header.Set("Accept", "image/jpeg,image/png,image/webp,image/gif;q=0.9,*/*;q=0.1")
 	res, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("fetch failed: %s", errText(err))
+		return nil, imageErrorf(netFailReason(err), "fetch failed: %s", errText(err))
 	}
 	defer res.Body.Close()
 	if res.StatusCode != 200 {
-		return nil, fmt.Errorf("fetch failed: HTTP %d", res.StatusCode)
+		return nil, imageErrorf(httpFailReason(res.StatusCode), "fetch failed: HTTP %d", res.StatusCode)
 	}
 	if res.ContentLength > maxImageDownload {
 		return nil, errImageBig
 	}
 	body, err := io.ReadAll(io.LimitReader(res.Body, maxImageDownload+1))
 	if err != nil {
-		return nil, errors.New("fetch failed while reading")
+		if ctx.Err() != nil {
+			return nil, imageErrorf(imageTimeout, "fetch failed while reading: timeout")
+		}
+		return nil, imageErrorf(imageUnreachable, "fetch failed while reading")
 	}
 	if len(body) > maxImageDownload {
 		return nil, errImageBig
@@ -273,7 +356,7 @@ func (t *Tools) findImages(ctx context.Context, query string, want int, out *too
 	out.wait += gate.wait
 	var cands []ImageCandidate
 	if err == nil {
-		cands, err = is.Images(ctx, query, min(maxCandidates, want*3))
+		cands, err = is.Images(ctx, query, min(maxCandidates, max(want*3, minCandidates)))
 	}
 	release()
 	if err != nil {
@@ -292,6 +375,9 @@ func (t *Tools) findImages(ctx context.Context, query string, want int, out *too
 			break
 		}
 	}
+	// Best caption match first (the provider's order on a tie): when a picture fails, the next one tried is the
+	// one that most looks like what was asked for, not just the provider's next.
+	list = rankCandidates(query, list)
 	st.candidates = len(list)
 
 	// The downloads' context: the call's values (task, space, host filter) and its overall deadline, but not its
@@ -312,10 +398,11 @@ func (t *Tools) findImages(ctx context.Context, query string, want int, out *too
 	// that work in the provider's order: once every candidate before the want-th success has finished, the rest
 	// are cancelled.
 	type got struct {
-		done  bool
-		img   *shownImage
-		ms    int64
-		taken bool // shown already (returned to the model, or sent on the tail)
+		done   bool
+		img    *shownImage
+		ms     int64
+		reason string // failed: why (imageFailReason)
+		taken  bool   // shown already (returned to the model, or sent on the tail)
 	}
 	res := make([]got, len(list))
 	slots := make(chan struct{}, imageCallFetches)
@@ -398,9 +485,24 @@ func (t *Tools) findImages(ctx context.Context, query string, want int, out *too
 			}
 			mu.Lock()
 			defer mu.Unlock()
+			if returned && err != nil && errors.Is(dctx.Err(), context.Canceled) {
+				return // after the result: stopped because the slots filled, or the task ended (counted by slot)
+			}
 			res[i] = got{done: true, ms: time.Since(t0).Milliseconds()}
 			if err == nil {
 				res[i].img = &shownImage{Title: c.Title, Source: c.Source, URL: c.URL, Width: w, Height: h, JPEG: jp, Original: len(data)}
+			} else {
+				res[i].reason = imageFailReason(err)
+				if errors.Is(dctx.Err(), context.DeadlineExceeded) {
+					res[i].reason = imageTimeout // the call's time ran out while it loaded
+				}
+			}
+			if returned && tail != nil { // after the call's result: the tail's numbers (its metric is sent when it ends)
+				tail.st.tried++
+				tail.st.fetchMs += res[i].ms
+				if err != nil {
+					tail.st.fail(res[i].reason)
+				}
 			}
 			switch {
 			case !returned:
@@ -466,7 +568,7 @@ wait:
 		st.tried++
 		st.fetchMs += r.ms
 		if r.img == nil {
-			st.failed++
+			st.fail(r.reason)
 			continue
 		}
 		if len(imgs) < want {
@@ -475,6 +577,7 @@ wait:
 			st.bytes += len(r.img.JPEG)
 		}
 	}
+	reqFacts.imageFailures(st.reasons) // the action's record: what failed before its result
 	if left := want - len(imgs); left > 0 && background && !finished && ctx.Err() == nil {
 		tail = &imageTail{ch: make(chan shownImage, left), slots: left, left: left}
 	}
@@ -500,4 +603,112 @@ type imageTail struct {
 	ch    chan shownImage
 	slots int // image slots the call kept for these (Tools.reserveImages); what isn't used goes back
 	left  int // slots still open (findImages' mu)
+	// st: the downloads that finished after the call returned (tried, failed and why, time). Written under
+	// findImages' mu; read once ch is closed (every download has finished by then).
+	st imageStats
+}
+
+// ---- which candidate first ----------------------------------------------------------------------------------
+
+// imageStop are words that say nothing about what a picture shows.
+var imageStop = map[string]bool{"a": true, "an": true, "the": true, "and": true, "or": true, "of": true, "for": true, "with": true,
+	"by": true, "in": true, "on": true, "to": true, "image": true, "images": true, "photo": true, "photos": true, "picture": true,
+	"pictures": true, "jpg": true, "jpeg": true, "png": true, "webp": true, "gif": true, "www": true, "com": true, "https": true, "http": true}
+
+// notAPhoto are words in an image's address or caption that mark a site's chrome, not the thing asked for.
+var notAPhoto = []string{"logo", "icon", "favicon", "sprite", "avatar", "placeholder", "banner", "badge", "pixel", "spacer"}
+
+// imageWords are the lowercase words and numbers of s, without filler words.
+func imageWords(s string) []string {
+	var out []string
+	for _, w := range strings.FieldsFunc(strings.ToLower(s), func(r rune) bool {
+		return !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r > 0x7f && unicode.IsLetter(r))
+	}) {
+		if !imageStop[w] {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
+// captionScore is how well a candidate's caption, file address and page address name the query: the share of the
+// query's words found there (numbers, as in model names, count double; "q6max" in an address counts for "Q6 Max"),
+// less a penalty when it looks like a logo or an icon. 0 for a query without words.
+func captionScore(query []string, c ImageCandidate) float64 {
+	if len(query) == 0 {
+		return 0
+	}
+	text := c.Title + " " + c.URL + " " + c.Source
+	words := map[string]bool{}
+	for _, w := range imageWords(text) {
+		words[w] = true
+	}
+	joined := strings.Join(imageWords(text), "")
+	var got, total float64
+	for _, w := range query {
+		weight := 1.0
+		if strings.ContainsAny(w, "0123456789") {
+			weight = 2
+		}
+		total += weight
+		if words[w] || (len(w) >= 3 && strings.Contains(joined, w)) {
+			got += weight
+		}
+	}
+	if whole := strings.Join(query, ""); len(whole) >= 4 && strings.Contains(joined, whole) {
+		got = total
+	}
+	score := got / total
+	low := strings.ToLower(text)
+	for _, w := range notAPhoto {
+		if strings.Contains(low, w) {
+			score -= 1 // after every real match; among themselves, still by caption
+			break
+		}
+	}
+	return score
+}
+
+// rankCandidates orders candidates by captionScore, best first, keeping the provider's order among equals.
+func rankCandidates(query string, list []ImageCandidate) []ImageCandidate {
+	q := imageWords(query)
+	type scored struct {
+		c ImageCandidate
+		s float64
+	}
+	xs := make([]scored, len(list))
+	for i, c := range list {
+		xs[i] = scored{c, captionScore(q, c)}
+	}
+	slices.SortStableFunc(xs, func(a, b scored) int { return cmp.Compare(b.s, a.s) })
+	out := make([]ImageCandidate, len(xs))
+	for i, x := range xs {
+		out[i] = x.c
+	}
+	return out
+}
+
+// imageFailures puts failed downloads on the record, by reason (FactsData.Images).
+func (f *Facts) imageFailures(reasons map[string]int) {
+	n := 0
+	for _, c := range reasons {
+		n += c
+	}
+	f.addImages(&activity.Images{Failed: n, Reasons: maps.Clone(reasons)})
+}
+
+// imageNever puts gallery slots that stayed empty on the record (never_arrived).
+func (f *Facts) imageNever(n int) {
+	if n > 0 {
+		f.addImages(&activity.Images{Failed: n, Reasons: map[string]int{imageNever: n}})
+	}
+}
+
+func (f *Facts) addImages(m *activity.Images) {
+	if f == nil || m.Failed == 0 {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.d.Images = f.d.Images.Add(m)
 }

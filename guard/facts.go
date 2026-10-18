@@ -35,6 +35,9 @@ type FactsData struct {
 	// fallback, fallback.go). Abandoned: the calls given up first as slow or overloaded.
 	Model     string         `json:"model,omitzero"`
 	Abandoned []ModelAttempt `json:"abandoned,omitzero"`
+	// Images: an image search's pictures that didn't make it, by reason (images.go): the action's for what failed
+	// before its result, the task's background facts for what failed or never landed after it.
+	Images *activity.Images `json:"images,omitzero"`
 }
 
 // ModelAttempt is a model call given up for a fallback (fallback.go): its model, why (abandoned_slow or
@@ -66,14 +69,15 @@ func (f *Facts) Data() FactsData {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return FactsData{Hosts: slices.Clone(f.d.Hosts), Leases: slices.Clone(f.d.Leases), Blocked: slices.Clone(f.d.Blocked),
-		Redacted: slices.Clone(f.d.Redacted), Reader: slices.Clone(f.d.Reader), Model: f.d.Model, Abandoned: slices.Clone(f.d.Abandoned)}
+		Redacted: slices.Clone(f.d.Redacted), Reader: slices.Clone(f.d.Reader), Model: f.d.Model, Abandoned: slices.Clone(f.d.Abandoned),
+		Images: f.d.Images.Clone()}
 }
 
 // Ptr is Data as a pointer, nil when nothing was collected (nil f too): what gateway/v0 sends.
 func (f *Facts) Ptr() *FactsData {
 	d := f.Data()
 	if len(d.Hosts) == 0 && len(d.Leases) == 0 && len(d.Blocked) == 0 && len(d.Redacted) == 0 && len(d.Reader) == 0 &&
-		d.Model == "" && len(d.Abandoned) == 0 {
+		d.Model == "" && len(d.Abandoned) == 0 && d.Images == nil {
 		return nil
 	}
 	return &d
@@ -101,6 +105,7 @@ func (f *Facts) Merge(d FactsData) {
 	if d.Model != "" {
 		f.d.Model = d.Model
 	}
+	f.d.Images = f.d.Images.Add(d.Images)
 	f.d.Blocked = addIDs(f.d.Blocked, d.Blocked)
 	f.d.Redacted = addIDs(f.d.Redacted, d.Redacted)
 }

@@ -289,10 +289,12 @@ func (t *Tools) finish(p pending) toolOutcome {
 		return out
 	case out.istats != nil: // image_search
 		type item struct {
-			N      int    `json:"n"`
-			Title  string `json:"title,omitempty"`
-			Source string `json:"source,omitempty"`
-			Size   string `json:"size"`
+			// Picture: its number in the gallery. Not "n": that is a source's number, and a model citing a picture as
+			// [n] cited whichever search result had that number.
+			Picture int    `json:"picture"`
+			Title   string `json:"title,omitempty"`
+			Source  string `json:"source,omitempty"`
+			Size    string `json:"size"`
 		}
 		res := struct {
 			Note  string `json:"note"`
@@ -314,7 +316,7 @@ func (t *Tools) finish(p pending) toolOutcome {
 			res.Note = "No images could be loaded for this query (none found, or they were too large, not JPEG/PNG/GIF/WebP, or unreachable). Say so briefly or try a different query."
 		}
 		for i, im := range out.images {
-			it := item{N: i + 1, Title: im.Title, Source: im.Source, Size: fmt.Sprintf("%dx%d", im.Width, im.Height)}
+			it := item{Picture: i + 1, Title: im.Title, Source: im.Source, Size: fmt.Sprintf("%dx%d", im.Width, im.Height)}
 			if t.reader {
 				// An image's title and its page's address are the provider's and the page author's text: with the
 				// reader on, the model gets neither, only the page's host (people see the titles in the gallery).

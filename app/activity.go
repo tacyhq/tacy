@@ -184,6 +184,7 @@ func (g *recGateway) RunEnded(task string, e guard.RunEnd) []proto.Event {
 	}
 	g.mu.Lock()
 	end.Background = g.bg[task].Hosts
+	end.BackgroundImages = g.bg[task].Images
 	end.Tainted = g.history[task]
 	delete(g.history, task)
 	g.mu.Unlock()
@@ -264,6 +265,7 @@ func (g *recGateway) begin(ti *harness.TaskInfo, id, kind, name, connector strin
 		defer g.inflight(ti.ID, -1)
 		d := f.Data()
 		c.Hosts, c.Blocked, c.Redacted, c.Ms = d.Hosts, d.Blocked, d.Redacted, time.Since(t0).Milliseconds()
+		c.Images = d.Images // web.images: pictures that didn't make it, by reason
 		if n := len(d.Reader); n > 0 {
 			u := d.Reader[n-1]
 			c.Reader = &activity.Reader{Model: u.Model, Prompt: u.Prompt, Completion: u.Completion, Ms: u.Ms, Outcome: u.Outcome,

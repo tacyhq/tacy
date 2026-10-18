@@ -262,6 +262,10 @@ type Controls struct {
 // still reports what finished). The chat's browser decrypts it and reports the numbers for the admin's
 // performance view. Numbers and fixed names only: never content, search queries, URLs or hosts.
 type Metric struct {
+	// Reasons (images): the failed downloads by why (blocked, timeout, format, size, unreachable), and never_arrived
+	// for gallery slots kept for late images that hadn't landed when the run ended. Fixed words and counts only.
+	Reasons map[string]int `json:"reasons,omitempty"`
+
 	Kind       string `json:"kind"`                 // "model" (one model call), "search" (web_search), "fetch" (fetch_page), "images" (image_search), "favicons" (the run's site icons), "queue" (the run started), "reader" (the quarantined reader's call for a page or a search)
 	Step       int    `json:"step"`                 // the model call this belongs to (1, 2, ...)
 	Ms         int64  `json:"ms"`                   // duration in milliseconds (queue: time waiting for a slot, 0 if none)

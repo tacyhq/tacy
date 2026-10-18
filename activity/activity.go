@@ -25,7 +25,10 @@
 // no prompt, answer, search query, URL path, page text or tool argument.
 package activity
 
-import "time"
+import (
+	"maps"
+	"time"
+)
 
 // Label prefixes every signed and hashed byte string and names the HPKE context.
 const Label = "tacy-activity/v1"
@@ -94,6 +97,8 @@ type Run struct {
 	Steps  int       `json:"steps,omitzero"`
 	// Background is egress that belongs to the run but no single call: the sources' site icons.
 	Background []Host `json:"background,omitzero"`
+	// BackgroundImages: image search pictures that failed or never landed after their call's result (late images).
+	BackgroundImages *Images `json:"background_images,omitzero"`
 	// StartSeq is the sequence number of the run's start record in this chain (end, interrupted).
 	StartSeq uint64 `json:"start_seq,omitzero"`
 	// Tainted (end): the run received outside content (web pages, search results), so anything it proposed after that
@@ -174,6 +179,41 @@ type Call struct {
 	// settings), unavailable (the run couldn't ask). Edited: they changed what was sent. Never the value itself.
 	Permission string `json:"permission,omitzero"`
 	Edited     bool   `json:"edited,omitzero"`
+	// Images (web.images): the pictures that didn't make it, by reason. Fixed words and counts only.
+	Images *Images `json:"images,omitzero"`
+}
+
+// Images counts an image search's pictures that didn't make it, by reason: blocked, timeout, format, size,
+// unreachable (a download that failed), never_arrived (a gallery slot that stayed empty when the run ended).
+type Images struct {
+	Failed  int            `json:"failed"`
+	Reasons map[string]int `json:"reasons"`
+}
+
+// Clone is a copy (nil for nil).
+func (m *Images) Clone() *Images {
+	if m == nil {
+		return nil
+	}
+	return &Images{Failed: m.Failed, Reasons: maps.Clone(m.Reasons)}
+}
+
+// Add is m with o's counts added (m is changed when not nil; nil when both are).
+func (m *Images) Add(o *Images) *Images {
+	if o == nil || o.Failed == 0 && len(o.Reasons) == 0 {
+		return m
+	}
+	if m == nil {
+		m = &Images{}
+	}
+	m.Failed += o.Failed
+	for r, n := range o.Reasons {
+		if m.Reasons == nil {
+			m.Reasons = map[string]int{}
+		}
+		m.Reasons[r] += n
+	}
+	return m
 }
 
 // Reader is one quarantined reader call: numbers and fixed words only.

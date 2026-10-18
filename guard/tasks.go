@@ -352,7 +352,7 @@ func (h *Host) finish(l *hosted) {
 		if o.State == harness.OutcomeCancelled {
 			reason = "kill_switch"
 		}
-	case o.State == harness.OutcomeCancelled && pastDeadline(l.start.Limits.Deadline):
+	case o.State == harness.OutcomeCancelled && (pastDeadline(l.start.Limits.Deadline) || h.timedOut(l.id)):
 		msg, reason = "run timed out", "deadline" // as the old loop (app/agent.go) said at its 5-minute cap
 	case o.State == harness.OutcomeCancelled:
 		msg, reason = "run cancelled", "person"
@@ -367,6 +367,13 @@ func (h *Host) finish(l *hosted) {
 	h.ended(l, RunEnd{State: o.State, Code: code, Reason: reason, Msg: detail, Steps: step, Finish: finish})
 	l.emit(proto.Event{Type: "error", Error: msg, Code: code}, 0)
 	h.close(l)
+}
+
+// timedOut: the gateway (agentd's safety checks) ended the task at the run's running-time limit, before its
+// deadline (time waiting for the person doesn't count, so that limit isn't a fixed time; guard.RunTimeout).
+func (h *Host) timedOut(task string) bool {
+	t, ok := h.GW.(interface{ TimedOut(task string) bool })
+	return ok && t.TimedOut(task)
 }
 
 // close ends a task's stream once its last event is in. A POST /tasks task's events are all in the queue then, so

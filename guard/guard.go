@@ -370,15 +370,24 @@ const (
 	maxSteps        = 10
 	maxMessages     = 400
 	maxRequestChars = 1_500_000
-	runTimeout      = 5 * time.Minute
 )
+
+// RunTimeout is a chat run's running-time limit (the release policy's run wall_seconds): agentd's safety checks
+// end a run when it has worked this long. Time it only waits for its person (a permission prompt) doesn't count (v0.8.1,
+// docs/27 section 6).
+const RunTimeout = 5 * time.Minute
+
+// RunCap is a chat run's overall cap, waits included: the task's deadline (start.limits.deadline), where the
+// runtime cancels it whatever its running time. Five minutes of work and up to 10-minute prompts fit in it; a
+// prompt never waits past it less a minute (Prompts). A variable only so tests can shorten it.
+var RunCap = 30 * time.Minute
 
 // chatAgent stands for the chat agent's definition. There are no signed agent definitions yet.
 var chatAgent = harness.AgentRef{ID: "a_chat", Version: "1", Digest: "unsigned"}
 
 // StartFor checks a chat request (as the old app/agent.go validate did) and makes the task:
 // the system prompt as instructions, the person's model first, the web tools as actions, max_steps and the run's
-// 5-minute deadline as limits. The model options the person chose stay with the runtime (TaskOptions).
+// overall cap (RunCap) as the deadline in limits. The model options the person chose stay with the runtime (TaskOptions).
 func (g *Guard) StartFor(r *proto.RunRequest) (harness.Start, TaskOptions, error) {
 	return startFor(r, g.cfg.Now(), g.cfg.Reader != nil)
 }
@@ -460,7 +469,7 @@ func startFor(r *proto.RunRequest, now time.Time, reader bool) (harness.Start, T
 	// One model call more than steps: the brain may ask once more for the answer when the last step's reply is
 	// only a tool call (brain.go finalNudge).
 	s.Limits = harness.TaskLimits{MaxSteps: r.MaxSteps, MaxModelCalls: r.MaxSteps + 1,
-		Deadline: time.Now().Add(runTimeout).UTC().Format(time.RFC3339)}
+		Deadline: time.Now().Add(RunCap).UTC().Format(time.RFC3339)}
 	return s, TaskOptions{ReasoningEffort: r.ReasoningEffort, CacheSecret: r.CacheSecret,
 		Question:  capRunes(strings.TrimSpace(r.Messages[len(r.Messages)-1].Content), maxQuestionRunes),
 		RunSecret: r.RunSecret, Permissions: maps.Clone(r.Permissions)}, nil

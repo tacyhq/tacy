@@ -30,10 +30,14 @@ type Prompts struct {
 	// Cap is the policy's cap on a kind's setting for a space (safety.Effective.PermissionCap); nil: none.
 	Cap func(space, kind string) string
 	// Timeout is how long a prompt waits for an answer; 0: 10 minutes. A prompt never waits past the task's deadline
-	// less Grace, so the model can still answer after a timeout.
+	// (its overall cap, RunCap) less Grace, so the model can still answer after a timeout.
 	Timeout time.Duration
 	// Grace is the time kept before a task's deadline for the answer; 0: a minute.
 	Grace time.Duration
+	// OnWait is told when a prompt of a task opens (true) and when it closes (answered, timed out or dropped):
+	// agentd stops the run's running-time clock while one is open (safety.Ledger.Pause). nil: nobody is told.
+	// Called with the prompts' lock held: it must not call back into Prompts.
+	OnWait func(task string, open bool)
 
 	mu       sync.Mutex
 	open     map[string]*prompt           // waiting for the person, by task\x00request
@@ -141,6 +145,9 @@ func (p *Prompts) Hold(ti *harness.TaskInfo, id string, req any) string {
 		}
 		pr := &prompt{task: ti.ID, request: id, call: cmp.Or(a.Call, id), kind: kind, value: value, secret: opts.RunSecret}
 		p.open[k] = pr
+		if p.OnWait != nil {
+			p.OnWait(ti.ID, true)
+		}
 		pr.timer = time.AfterFunc(timeout, func() { p.expire(ti.ID, id) })
 		p.mu.Unlock()
 		p.Emit(ti.ID, proto.Event{Type: "permission", ID: pr.call, Permission: &proto.Permission{Task: ti.ID, Request: id,
@@ -226,6 +233,9 @@ func (p *Prompts) close(k string, pr *prompt) {
 	delete(p.open, k)
 	if pr.timer != nil {
 		pr.timer.Stop()
+	}
+	if p.OnWait != nil {
+		p.OnWait(pr.task, false)
 	}
 }
 

@@ -435,7 +435,7 @@ func TestBudgetWallAndPersist(t *testing.T) {
 	l := &Ledger{Dir: dir, Now: func() time.Time { return now }}
 	b := Budgets{Run: Limits{WallSeconds: 60}, Day: Limits{WallSeconds: 100, Tokens: 1000}}
 	end, err := l.Start("t1", "s_a", b)
-	if err != nil || !end.Equal(t0.Add(60*time.Second)) {
+	if err != nil || !end.Equal(t0.Add(100*time.Second)) { // the day's: the run's own isn't a fixed end (v0.8.1)
 		t.Fatalf("deadline %v %v", end, err)
 	}
 	c, _ := l.Reserve("t1", Usage{Tokens: 10}, b)
@@ -461,6 +461,62 @@ func TestBudgetWallAndPersist(t *testing.T) {
 	}
 	if ModelCost("gpt-oss-120b", 1_000_000, 1_000_000) != 750_000 || ModelCost("unknown", 1, 0) != 4 {
 		t.Error("cost")
+	}
+}
+
+// v0.8.1: time a run only waits for its person (a prompt open, nothing in flight) isn't running time, for the
+// run's budget or the day's; time with a request in flight is, prompt or not; a pause the ledger can't place
+// (an unknown run, an Unpause too many) changes nothing.
+func TestBudgetWaitingForThePerson(t *testing.T) {
+	now := t0
+	l := &Ledger{Now: func() time.Time { return now }}
+	b := Budgets{Run: Limits{WallSeconds: 60}, Day: Limits{WallSeconds: 1000}}
+	if _, err := l.Start("t1", "s_a", b); err != nil {
+		t.Fatal(err)
+	}
+	el := func(want time.Duration) {
+		t.Helper()
+		if got, _ := l.Elapsed("t1"); got != want {
+			t.Fatalf("running time %v, want %v", got, want)
+		}
+	}
+	now = now.Add(10 * time.Second) // working
+	el(10 * time.Second)
+	l.Pause("t1")
+	now = now.Add(9 * time.Minute) // a long prompt: the clock stops
+	el(10 * time.Second)
+	// Nine minutes in, 50 s of the 60 left: a request fits, and while it is in flight (the prompt still open) the
+	// clock runs.
+	c, err := l.Reserve("t1", Usage{Tokens: 1}, b)
+	if err != nil {
+		t.Fatalf("a request after a long wait: %v", err)
+	}
+	now = now.Add(20 * time.Second)
+	el(30 * time.Second)
+	c(Usage{Tokens: 1}) // back to waiting only
+	now = now.Add(time.Minute)
+	el(30 * time.Second)
+	l.Unpause("t1")
+	l.Unpause("t1") // one too many: no effect
+	now = now.Add(30 * time.Second)
+	el(60 * time.Second)
+	if _, err := l.Reserve("t1", Usage{Tokens: 1}, b); CodeOf(err) != CodeBudgetExceeded {
+		t.Fatal("past 60 s of running time")
+	}
+	// Two prompts at once: the clock stops until both are closed.
+	l.Pause("t1")
+	l.Pause("t1")
+	now = now.Add(time.Minute)
+	l.Unpause("t1")
+	now = now.Add(time.Minute)
+	el(60 * time.Second)
+	l.Unpause("t1")
+	now = now.Add(5 * time.Second)
+	el(65 * time.Second)
+	l.Pause("nope") // unknown run: ignored
+	l.End("t1")     // the day counts running time only
+	if got := l.day("s_a").Used.WallMs; got != 65_000 {
+		t.Fatalf("the day counted %d ms, want 65000", got)
 	}
 }
 

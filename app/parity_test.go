@@ -186,6 +186,17 @@ func (m *parityModel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, pText("(no more)"))
 		return
 	}
+	if d, rest, ok := strings.Cut(m.replies[i], " then "); ok && strings.HasPrefix(d, "sleep ") { // a slow model
+		wait, _ := time.ParseDuration(strings.TrimPrefix(d, "sleep "))
+		select {
+		case <-time.After(wait):
+		case <-r.Context().Done():
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, rest)
+		return
+	}
 	if m.replies[i] == "500" {
 		http.Error(w, `{"error":{"message":"upstream overloaded"}}`, 500)
 		return

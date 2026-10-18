@@ -143,10 +143,12 @@ func bootTasks(t *testing.T, path string, model http.Handler, fs *fakeSearch, ho
 	id, _ := ehbpidentity.NewIdentity()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	go localBrain(ctx, rt)
 	s := &server{platform: local{}, id: id, agent: g, rt: rt, token: "tok", booted: time.Now(), sched: newScheduler(lim), lim: lim,
 		quotes: make(chan struct{}, 4), host: &guard.Host{RT: rt, GW: g, IDKey: []byte("the space's task-id key")}}
 	s.resumeTasks(ctx, ids, t.Logf)
+	// The brain connects only once the restored tasks are resumed, as in main.go: a brain already connected would
+	// take a restored task up before its stream was open, and its events would go nowhere.
+	go localBrain(ctx, rt)
 	return &taskProc{s: s, q: dq, id: id, cancel: cancel}
 }
 

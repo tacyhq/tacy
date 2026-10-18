@@ -36,6 +36,7 @@ func newPermEnv(t *testing.T, timeout time.Duration, edit func(p *safety.Policy)
 	host := e.s.tasks()
 	pe := &permEnv{safeEnv: e, asks: make(chan proto.Permission, 16), settled: make(chan proto.Permission, 16)}
 	pe.prompts = &guard.Prompts{Release: e.s.rt.Release, Cap: permissionCap(e.s.safety), Timeout: timeout,
+		OnWait: e.s.agent.(*recGateway).waiting, // as main: a prompt stops the run's running-time clock
 		Emit: func(task string, ev proto.Event) {
 			host.Emit(task, ev)
 			if ev.Type == "permission" && ev.Permission.Decision == "" {
@@ -381,5 +382,96 @@ func TestPermissionStartChecks(t *testing.T) {
 		if _, _, err := pe.s.agent.StartFor(&r); err == nil {
 			t.Errorf("accepted %+v", r)
 		}
+	}
+}
+
+// waitErr waits for a run that must end with an error and returns that error event and how long the run took.
+func waitErr(t *testing.T, done chan []proto.Event, began time.Time) (proto.Event, time.Duration) {
+	t.Helper()
+	select {
+	case evs := <-done:
+		took := time.Since(began)
+		er, ok := lastError(evs)
+		if !ok {
+			t.Fatalf("the run didn't end with an error: %s", types(evs))
+		}
+		return er, took
+	case <-time.After(20 * time.Second):
+		t.Fatal("the run didn't end")
+	}
+	return proto.Event{}, 0
+}
+
+// v0.8.1: time waiting for the person isn't running time. With a 1-second running-time limit (the policy's), a
+// prompt answered after 2.5 s still lets the run go on and answer; the prompt offers the full 10 minutes.
+func TestPermissionLongWaitIsntRunningTime(t *testing.T) {
+	pe := newPermEnv(t, 0, func(p *safety.Policy) { p.Budget.Run.WallSeconds = 1 },
+		pCalls([3]string{"c1", "web_search", `{"query":"q"}`}), pText("ok"))
+	done := pe.start(askReq("q", nil))
+	p := pe.ask()
+	if p.TimeoutS != 600 {
+		t.Fatalf("timeout_s %d, want 600 (10 minutes, under the 30-minute cap)", p.TimeoutS)
+	}
+	time.Sleep(2500 * time.Millisecond)
+	if code, body := pe.grant(p, permSecret, guard.DecideOnce, p.Value); code != 200 {
+		t.Fatalf("grant: %d %s", code, body)
+	}
+	evs := wait(t, done)
+	if q := pe.queries(); len(q) != 1 || q[0] != "q" {
+		t.Fatalf("queries %v", q)
+	}
+	if !strings.Contains(types(evs), "tool_result") {
+		t.Fatalf("events %s", types(evs))
+	}
+}
+
+// Running time is still enforced: work after a long wait counts. The release's limit (shortened to 1 s here) ends
+// a run whose model call runs past it, though the prompt before it waited 2 s, longer than the limit: "run timed
+// out" (reason deadline), as at the old fixed deadline. A tighter policy limit says budget_exceeded.
+func TestPermissionRunningTimeStillEnforced(t *testing.T) {
+	pe := newPermEnv(t, 0, nil, pCalls([3]string{"c1", "web_search", `{"query":"q"}`}), "sleep 10s then "+pText("late"))
+	pe.s.agent.(*recGateway).runTimeout = time.Second
+	began := time.Now()
+	done := pe.start(askReq("q", nil))
+	p := pe.ask()
+	time.Sleep(2 * time.Second)
+	if code, _ := pe.grant(p, permSecret, guard.DecideOnce, p.Value); code != 200 {
+		t.Fatal("grant refused")
+	}
+	er, took := waitErr(t, done, began)
+	if er.Error != "run timed out" || er.Code != "" || took < 2*time.Second || took > 5*time.Second {
+		t.Fatalf("ended %+v after %v; want run timed out after the wait plus about a second of work", er, took)
+	}
+
+	pe = newPermEnv(t, 0, func(p *safety.Policy) { p.Budget.Run.WallSeconds = 1 }, "sleep 10s then "+pText("late"))
+	began = time.Now()
+	er, took = waitErr(t, pe.start(askReq("q", nil)), began)
+	if er.Code != safety.CodeBudgetExceeded || !strings.Contains(er.Error, "running time") || took > 4*time.Second {
+		t.Fatalf("ended %+v after %v; want the policy's running-time budget", er, took)
+	}
+}
+
+// The overall cap (the task's deadline, guard.RunCap; shortened to 4 s here) counts waits too: a run that waited
+// on a prompt and then works past the cap is cancelled there, though its running time is far under the limit.
+// The prompt itself never offers more than the cap less the grace.
+func TestPermissionOverallCapCountsWaits(t *testing.T) {
+	old := guard.RunCap
+	guard.RunCap = 4 * time.Second
+	t.Cleanup(func() { guard.RunCap = old })
+	pe := newPermEnv(t, 0, nil, pCalls([3]string{"c1", "web_search", `{"query":"q"}`}), "sleep 20s then "+pText("late"))
+	pe.prompts.Grace = 100 * time.Millisecond
+	began := time.Now()
+	done := pe.start(askReq("q", nil))
+	p := pe.ask()
+	if p.TimeoutS > 4 {
+		t.Fatalf("timeout_s %d past the 4-second cap", p.TimeoutS)
+	}
+	time.Sleep(1500 * time.Millisecond)
+	if code, _ := pe.grant(p, permSecret, guard.DecideOnce, p.Value); code != 200 {
+		t.Fatal("grant refused")
+	}
+	er, took := waitErr(t, done, began)
+	if er.Error != "run timed out" || took < 2*time.Second || took > 6*time.Second {
+		t.Fatalf("ended %+v after %v; want run timed out at the cap", er, took)
 	}
 }

@@ -22,7 +22,7 @@ import (
 // ReleasePolicy is the release's ceiling and default policy for the chat agent (safety.ChatRelease) with every
 // model this VM runs.
 func ReleasePolicy(firm, tinfoilHost string) *safety.Policy {
-	return safety.ChatRelease(firm, tinfoilHost, slices.Sorted(maps.Keys(models)), int64(runTimeout/time.Second))
+	return safety.ChatRelease(firm, tinfoilHost, slices.Sorted(maps.Keys(models)), int64(RunTimeout/time.Second))
 }
 
 type maxTokensKey struct{}

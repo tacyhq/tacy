@@ -470,7 +470,8 @@ func main() {
 	}
 	host := &guard.Host{RT: rt, GW: rg, IDKey: idKey}
 	// Permission prompts: actions that send data out wait for the person's answer; the policy may cap their settings.
-	rg.prompts = &guard.Prompts{Release: rt.Release, Emit: host.Emit, Cap: permissionCap(st)}
+	// OnWait stops the run's running-time clock while a prompt waits for the person (v0.8.1).
+	rg.prompts = &guard.Prompts{Release: rt.Release, Emit: host.Emit, Cap: permissionCap(st), OnWait: sg.waiting}
 	s := &server{platform: p, id: id, agent: rg, rt: rt, rec: rec, token: p.Secret("AGENT_VM_TOKEN"), booted: time.Now().UTC(),
 		sched: newScheduler(lim), lim: lim, quotes: make(chan struct{}, 8), safety: st, gw: gw, safetySlots: make(chan struct{}, 4),
 		host: host, prompts: rg.prompts}

@@ -26,6 +26,8 @@ import (
 // against the signed controls it verified itself before the guard sees them:
 //   - admission: the space isn't stopped, a policy covers it (when admin keys are pinned), the model is allowed,
 //     the day's budget isn't used up; the policy narrows the task's tools and its deadline;
+//   - running time: a run ends when its running time reaches the run's limit (the policy's run wall_seconds, at
+//     most the release's 5 minutes); time it only waits for its person (a permission prompt) doesn't count (watch);
 //   - budgets: each model call and action reserves what it may use from the run's and the space's day budget,
 //     under one lock, before it runs (parallel requests can't each see room only one has), then commits what it
 //     used;
@@ -41,6 +43,8 @@ type safeGateway struct {
 	st     *safety.State
 	ledger *safety.Ledger
 	cancel func(task, reason string) // the runtime's Cancel (set once the runtime exists)
+	// runTimeout is the release's running-time limit (guard.RunTimeout; 0: that). Tests shorten it.
+	runTimeout time.Duration
 
 	mu    sync.Mutex
 	tasks map[string]*safeTask
@@ -49,6 +53,8 @@ type safeGateway struct {
 type safeTask struct {
 	space     string
 	code, msg string // the first control that refused something (Why)
+	timer     *time.Timer
+	timedOut  bool // watch cancelled it: its running time reached the release's limit (TimedOut)
 }
 
 var (
@@ -81,7 +87,8 @@ func coded(err error) (string, string) {
 
 // StartFor applies the policy to a chat request before the guard makes its task: stopped, no policy, a model the
 // policy doesn't allow and a used-up day are refused (*safety.Error); tools the policy doesn't allow are taken
-// out (the model never sees them); the deadline is the earliest of the run's, the policy's and the day's.
+// out (the model never sees them); the deadline (the run's overall cap, guard.RunCap) is moved earlier when the
+// day's running time has less left. The run's own running-time limit isn't a deadline: watch enforces it.
 func (g *safeGateway) StartFor(r *proto.RunRequest) (harness.Start, guard.TaskOptions, error) {
 	const space = "s_chat" // guard.StartFor's (one space until step 8)
 	e, err := g.st.Check(space, false)
@@ -128,6 +135,7 @@ func (g *safeGateway) Open(id string, opts guard.TaskOptions, emit func(proto.Ev
 	g.mu.Lock()
 	g.tasks[id] = &safeTask{space: opts.Space}
 	g.mu.Unlock()
+	g.watch(id)
 	return &safeSession{Session: g.inner.Open(id, opts, emit), g: g, id: id, space: opts.Space}
 }
 
@@ -160,8 +168,71 @@ func (s *safeSession) Close() {
 	s.Session.Close()
 	s.g.ledger.End(s.id)
 	s.g.mu.Lock()
+	if t := s.g.tasks[s.id]; t != nil && t.timer != nil {
+		t.timer.Stop()
+	}
 	delete(s.g.tasks, s.id)
 	s.g.mu.Unlock()
+}
+
+// runLimit is how much running time a run in space may use: the policy's run wall_seconds, at most the release's
+// guard.RunTimeout (the release's own policy has that, so the effective policy never allows more).
+func (g *safeGateway) runLimit(space string) time.Duration {
+	limit := g.releaseLimit()
+	if e, err := g.st.Policy(space); err == nil {
+		if w := e.Budget().Run.WallSeconds; w > 0 {
+			limit = min(limit, time.Duration(w)*time.Second)
+		}
+	}
+	return limit
+}
+
+func (g *safeGateway) releaseLimit() time.Duration { return cmp.Or(g.runTimeout, guard.RunTimeout) }
+
+// watch cancels a run ("deadline") once its running time (safety.Ledger.Elapsed) reaches runLimit. Waiting for
+// the person stops that clock, so the end isn't a fixed time: the timer looks again when it fires, and sets
+// itself for what is left. The overall cap (the task's deadline, guard.RunCap) is the runtime's.
+func (g *safeGateway) watch(id string) {
+	g.mu.Lock()
+	t := g.tasks[id]
+	if t == nil { // ended
+		g.mu.Unlock()
+		return
+	}
+	el, ok := g.ledger.Elapsed(id)
+	if !ok {
+		g.mu.Unlock()
+		return
+	}
+	if left := g.runLimit(t.space) - el; left > 0 {
+		t.timer = time.AfterFunc(left, func() { g.watch(id) })
+		g.mu.Unlock()
+		return
+	}
+	t.timedOut = true
+	g.mu.Unlock()
+	if g.cancel != nil {
+		g.cancel(id, "deadline")
+	}
+}
+
+// waiting is guard.Prompts.OnWait: a prompt of the task opened (open) or closed; the ledger's clock stops while one
+// is open and nothing of the run is in flight.
+func (g *safeGateway) waiting(task string, open bool) {
+	if open {
+		g.ledger.Pause(task)
+	} else {
+		g.ledger.Unpause(task)
+	}
+}
+
+// TimedOut says whether watch cancelled the task at the release's running-time limit (the error people see says
+// the run timed out, as at the deadline).
+func (g *safeGateway) TimedOut(task string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	t := g.tasks[task]
+	return t != nil && t.timedOut
 }
 
 // trip records the first control that refused something in a task (what Why says if the run fails).
@@ -188,14 +259,14 @@ func (g *safeGateway) Why(task string) (string, string) {
 	if t.code != "" {
 		return t.code, t.msg
 	}
-	// The deadline came from a running-time budget tighter than the run's own 5 minutes, or the day's.
+	// The run ended at a running-time budget tighter than the release's own 5 minutes, or at the day's.
 	e, err := g.st.Policy(t.space)
 	el, ok := g.ledger.Elapsed(task)
 	if err != nil || !ok {
 		return "", ""
 	}
 	b := e.Budget()
-	runOut := b.Run.WallSeconds > 0 && b.Run.WallSeconds < 300 && el >= time.Duration(b.Run.WallSeconds)*time.Second
+	runOut := b.Run.WallSeconds > 0 && time.Duration(b.Run.WallSeconds)*time.Second < g.releaseLimit() && el >= time.Duration(b.Run.WallSeconds)*time.Second
 	_, dayErr := g.ledger.Admit(t.space, b)
 	if runOut || b.Day.WallSeconds > 0 && dayErr != nil {
 		return coded(&safety.Error{Code: safety.CodeBudgetExceeded, Msg: "running time"})

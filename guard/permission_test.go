@@ -3,6 +3,7 @@ package guard
 import (
 	"context"
 	"encoding/json"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -154,5 +155,58 @@ func TestPromptsResumeAsksAgain(t *testing.T) {
 	p.Forget("tk_r")
 	if _, ok := p.Outcome("tk_r", "r1"); ok {
 		t.Fatal("forget")
+	}
+}
+
+// v0.8.1: a chat run's deadline is its overall cap (RunCap, 30 minutes), not its 5 minutes of running time, so a
+// prompt waits the full 10 minutes; a prompt still never waits past the deadline less a minute; agentd is told when
+// each prompt opens and closes (answered, timed out, dropped) to stop the run's clock meanwhile.
+func TestPromptWaitsTenMinutesUnderTheCap(t *testing.T) {
+	start, _, err := StartFor(&proto.RunRequest{Messages: []proto.Message{{Role: "user", Content: "hi"}}}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	end, _ := time.Parse(time.RFC3339, start.Limits.Deadline)
+	if d := time.Until(end); d < RunCap-time.Minute || d > RunCap+time.Second || RunCap != 30*time.Minute {
+		t.Fatalf("deadline in %v, want the 30-minute cap", d)
+	}
+	var mu sync.Mutex
+	var shown []proto.Event
+	var waits []bool
+	p := &Prompts{Release: func(string, string, bool, string) error { return nil },
+		Emit:   func(_ string, e proto.Event) { mu.Lock(); shown = append(shown, e); mu.Unlock() },
+		OnWait: func(_ string, open bool) { mu.Lock(); waits = append(waits, open); mu.Unlock() }}
+	opts, _ := json.Marshal(TaskOptions{RunSecret: testSecret})
+	ti := &harness.TaskInfo{ID: "tk_w", Start: &start, Options: opts}
+	search := &harness.Action{Name: "web.search", Call: "c1", Args: []byte(`{"query":"q"}`)}
+	if sub := p.Hold(ti, "r1", search); sub != harness.WaitPermission {
+		t.Fatalf("not held: %q", sub)
+	}
+	mu.Lock()
+	if len(shown) != 1 || shown[0].Permission.TimeoutS != 600 || len(waits) != 1 || !waits[0] {
+		t.Fatalf("shown %+v, waits %v: want a 600 s prompt and the clock told", shown, waits)
+	}
+	mu.Unlock()
+	gr := Grant{Task: "tk_w", Request: "r1", Kind: "web.search", Decision: DecideDeny}
+	gr.MAC = GrantMAC(testSecret, gr)
+	if _, err := p.Answer(gr); err != nil {
+		t.Fatal(err)
+	}
+	// The cap still bounds a prompt: 5 minutes left gives 4 minutes; one that times out closes too; so does Forget.
+	short := start
+	short.Limits.Deadline = time.Now().Add(5 * time.Minute).UTC().Format(time.RFC3339)
+	ti2 := &harness.TaskInfo{ID: "tk_w", Start: &short, Options: opts}
+	p.Hold(ti2, "r2", search)
+	p.Timeout = 50 * time.Millisecond
+	p.Hold(ti2, "r3", search)
+	time.Sleep(300 * time.Millisecond)
+	p.Forget("tk_w")
+	mu.Lock()
+	defer mu.Unlock()
+	if s := shown[2].Permission.TimeoutS; s < 235 || s > 240 {
+		t.Fatalf("prompt with 5 minutes left waits %d s, want about 4 minutes", s)
+	}
+	if want := []bool{true, false, true, true, false, false}; !slices.Equal(waits, want) {
+		t.Fatalf("waits %v, want %v", waits, want)
 	}
 }

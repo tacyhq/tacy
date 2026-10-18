@@ -13,7 +13,7 @@ type Usage struct {
 	Tokens     int64 `json:"tokens,omitzero"`
 	ToolCalls  int64 `json:"tool_calls,omitzero"`
 	CostMicros int64 `json:"cost_usd_micros,omitzero"`
-	WallMs     int64 `json:"wall_ms,omitzero"` // days only: finished runs' time
+	WallMs     int64 `json:"wall_ms,omitzero"` // days only: finished runs' running time (Ledger.Elapsed)
 }
 
 func (u *Usage) add(v Usage, sign int64) {
@@ -42,6 +42,33 @@ type ledgerRun struct {
 	space          string
 	start          time.Time
 	used, reserved Usage
+	// Running time leaves out the time the run only waits for its person (docs/27 section 6): while at least one
+	// of its prompts is open (asks) and none of its requests is between Reserve and commit (inflight), the clock
+	// stops. waited is the time stopped so far; since is when the current stop began (zero: running).
+	asks, inflight int
+	waited         time.Duration
+	since          time.Time
+}
+
+// elapsed is the run's running time at now: from its start, less the time it only waited for its person.
+func (r *ledgerRun) elapsed(now time.Time) time.Duration {
+	w := r.waited
+	if !r.since.IsZero() {
+		w += now.Sub(r.since)
+	}
+	return max(0, now.Sub(r.start)-w)
+}
+
+// clock stops or restarts the run's clock after asks or inflight changed.
+func (r *ledgerRun) clock(now time.Time) {
+	stopped := r.asks > 0 && r.inflight == 0
+	switch {
+	case stopped && r.since.IsZero():
+		r.since = now
+	case !stopped && !r.since.IsZero():
+		r.waited += now.Sub(r.since)
+		r.since = time.Time{}
+	}
 }
 
 type ledgerDay struct {
@@ -86,12 +113,14 @@ func (l *Ledger) day(space string) *ledgerDay {
 	return d
 }
 
-// dayWall is the space's running time today: finished runs plus the ones running now.
+// dayWall is the space's running time today: finished runs plus the ones running now (time waiting for a person
+// left out, as for a run).
 func (l *Ledger) dayWall(space string, d *ledgerDay) time.Duration {
 	w := time.Duration(d.Used.WallMs) * time.Millisecond
+	now := l.Now()
 	for _, r := range l.runs {
 		if r.space == space {
-			w += l.Now().Sub(r.start)
+			w += r.elapsed(now)
 		}
 	}
 	return w
@@ -121,8 +150,9 @@ func (l *Ledger) Begin(task, space string) {
 }
 
 // Resume registers a run that was begun before a restart (a task taken up again): it started at start and has
-// used what used says, so its run budget and running time go on from there instead of starting over. A run already
-// registered is left as it is.
+// used what used says, so its run budget and running time go on from there instead of starting over. Time it
+// waited for its person before the restart isn't known here, so it counts as running time: a restart can only
+// shorten a run, never lengthen it. A run already registered is left as it is.
 func (l *Ledger) Resume(task, space string, start time.Time, used Usage) {
 	l.init()
 	l.mu.Lock()
@@ -136,7 +166,9 @@ func (l *Ledger) Resume(task, space string, start time.Time, used Usage) {
 }
 
 // Admit refuses a new run when the space's day budget is already used up, and returns the latest a run may go on
-// (zero: no limit), from the run's and the day's running time. task, when given, is a run already begun.
+// (zero: no limit), from the day's running time. task, when given, is a run already begun. The run's own running
+// time isn't a fixed end: time waiting for the person doesn't count (Pause), so Elapsed is checked as it goes
+// (Reserve, and the caller's timer). The day's end is computed as if nothing paused: never later than it should be.
 func (l *Ledger) Admit(space string, b Budgets, task ...string) (time.Time, error) {
 	l.init()
 	l.mu.Lock()
@@ -148,19 +180,9 @@ func (l *Ledger) Admit(space string, b Budgets, task ...string) (time.Time, erro
 	if what := over(b.Day, held, Usage{Tokens: 1, CostMicros: 1}, l.dayWall(space, d)); what != "" {
 		return time.Time{}, budgetError("daily", what)
 	}
-	now, start := l.Now(), l.Now()
-	if len(task) > 0 && l.runs[task[0]] != nil {
-		start = l.runs[task[0]].start
-	}
 	var end time.Time
-	if b.Run.WallSeconds > 0 {
-		end = start.Add(time.Duration(b.Run.WallSeconds) * time.Second)
-	}
 	if b.Day.WallSeconds > 0 {
-		left := time.Duration(b.Day.WallSeconds)*time.Second - l.dayWall(space, d)
-		if e := now.Add(left); end.IsZero() || e.Before(end) {
-			end = e
-		}
+		end = l.Now().Add(time.Duration(b.Day.WallSeconds)*time.Second - l.dayWall(space, d))
 	}
 	return end, nil
 }
@@ -180,7 +202,7 @@ func (l *Ledger) Reserve(task string, want Usage, b Budgets) (commit func(used U
 	d := l.day(r.space)
 	held := r.used
 	held.add(r.reserved, 1)
-	if what := over(b.Run, held, want, l.Now().Sub(r.start)); what != "" {
+	if what := over(b.Run, held, want, r.elapsed(l.Now())); what != "" {
 		return nil, budgetError("run's", what)
 	}
 	held = d.Used
@@ -190,6 +212,8 @@ func (l *Ledger) Reserve(task string, want Usage, b Budgets) (commit func(used U
 	}
 	r.reserved.add(want, 1)
 	d.reserved.add(want, 1)
+	r.inflight++ // working: the clock runs while the request does, even with a prompt open
+	r.clock(l.Now())
 	var once sync.Once
 	return func(used Usage) {
 		once.Do(func() {
@@ -199,6 +223,8 @@ func (l *Ledger) Reserve(task string, want Usage, b Budgets) (commit func(used U
 			d.reserved.add(want, -1)
 			r.used.add(used, 1)
 			d.Used.add(used, 1)
+			r.inflight--
+			r.clock(l.Now())
 			l.save()
 		})
 	}, nil
@@ -240,15 +266,37 @@ func (l *Ledger) Used(task string) (Usage, bool) {
 	return Usage{}, false
 }
 
-// Elapsed is how long the run has been going, and whether the ledger knows it.
+// Elapsed is the run's running time (how long it has been going, less the time it only waited for its person:
+// Pause), and whether the ledger knows it.
 func (l *Ledger) Elapsed(task string) (time.Duration, bool) {
 	l.init()
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if r := l.runs[task]; r != nil {
-		return l.Now().Sub(r.start), true
+		return r.elapsed(l.Now()), true
 	}
 	return 0, false
+}
+
+// Pause notes that a prompt of the run waits for its person (a permission prompt), Unpause that one was
+// answered, timed out or dropped. While at least one waits and none of the run's requests is in flight, the run's
+// running time (Elapsed, the run's and the day's running-time budgets) stops. A run the ledger doesn't know is
+// ignored; Unpause without a Pause does nothing.
+func (l *Ledger) Pause(task string) { l.ask(task, 1) }
+
+// Unpause: see Pause.
+func (l *Ledger) Unpause(task string) { l.ask(task, -1) }
+
+func (l *Ledger) ask(task string, d int) {
+	l.init()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	r := l.runs[task]
+	if r == nil {
+		return
+	}
+	r.asks = max(0, r.asks+d)
+	r.clock(l.Now())
 }
 
 // End adds the run's time to its space's day and forgets it.
@@ -261,7 +309,7 @@ func (l *Ledger) End(task string) {
 		return
 	}
 	delete(l.runs, task)
-	l.day(r.space).Used.WallMs += l.Now().Sub(r.start).Milliseconds()
+	l.day(r.space).Used.WallMs += r.elapsed(l.Now()).Milliseconds()
 	l.save()
 }
 

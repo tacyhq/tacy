@@ -98,9 +98,13 @@ func (s *Server) conn(c *net.UnixConn) {
 			return
 		}
 	}
+	// The slot is freed once the sandbox is gone and before the client is told so (gone, below): a client that
+	// saw its sandbox end can start the next one at once. Deferred too, for the paths that tell nobody.
+	var freeOnce sync.Once
+	free := func() { freeOnce.Do(func() { <-s.slots }) }
 	select {
 	case s.slots <- struct{}{}:
-		defer func() { <-s.slots }()
+		defer free()
 	default:
 		fail("limit", fmt.Errorf("%d sandboxes running", cap(s.slots)))
 		return
@@ -131,6 +135,7 @@ func (s *Server) conn(c *net.UnixConn) {
 			sb.Close()
 		}
 	}
+	gone := func() { destroy(); free() } // Close is idempotent and returns once the sandbox is destroyed
 	defer func() {
 		destroy()
 		s.logf("runner: %s %s destroyed after %s", req.Profile, id, time.Since(start).Round(time.Millisecond))
@@ -153,6 +158,7 @@ func (s *Server) conn(c *net.UnixConn) {
 			<-inst.Done()
 			code := inst.ExitCode()
 			s.logf("runner: %s %s exited (%d)", req.Profile, id, code)
+			gone()
 			send(&Reply{Exited: &code})
 			c.Close() // ends the read below
 		}()
@@ -169,7 +175,7 @@ func (s *Server) conn(c *net.UnixConn) {
 		}
 		switch {
 		case r.Op == OpDestroy && r.Profile == "" && len(r.Argv) == 0:
-			destroy()
+			gone()
 			send(&Reply{OK: true})
 			return
 		case r.Op == OpExec && sb != nil && r.Profile == "":
@@ -185,6 +191,7 @@ func (s *Server) conn(c *net.UnixConn) {
 			}
 			if !sb.Alive() {
 				code := 137
+				gone()
 				send(&Reply{Exited: &code})
 				return
 			}

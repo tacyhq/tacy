@@ -121,13 +121,11 @@ func main() {
 		if *keyPath == "" {
 			die("heartbeat -key K")
 		}
-		l := safety.StopList{Type: safety.StopType, Issuer: safety.IssuerOperator, Seq: *seq, IssuedAt: now,
-			ExpiresAt: now.Add(*ttl), All: *all}
-		if err := l.Validate(); err != nil {
+		e, err := safety.Heartbeat(readKey(*keyPath), *seq, now, *ttl, *all)
+		if err != nil {
 			die("%v", err)
 		}
-		b, _ := json.Marshal(l)
-		out(safety.Sign(safety.KindStop, b, readKey(*keyPath)))
+		out(e)
 	case "stop":
 		if *keyPath == "" {
 			die("stop -key K -firm F [-space S | -all]")

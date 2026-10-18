@@ -91,6 +91,9 @@ func (g *Guard) ModelCall(ctx context.Context, ti *harness.TaskInfo, req *harnes
 		if outBytes += int64(len(delta)); maxOut > 0 && outBytes/3 > maxOut {
 			return fmt.Errorf("%s: the model's answer passed the %d tokens reserved for it", safety.CodeBudgetExceeded, maxOut)
 		}
+		if kind == "tool_call" {
+			return nil // counted only: the calls are shown once complete (tool_call events below)
+		}
 		if leased != nil {
 			delta = string(exactRedact([]byte(delta), leased))
 		}
@@ -106,7 +109,8 @@ func (g *Guard) ModelCall(ctx context.Context, ti *harness.TaskInfo, req *harnes
 	}
 	stream.Close()
 	// For the activity record: one request to the model's host (the key's lease names it), the request's bytes
-	// before EHBP encryption and the answer's as it streamed back.
+	// before EHBP encryption and the answer's as it streamed back (text, reasoning and tool calls' names and
+	// arguments).
 	FactsFrom(ctx).model(int64(len(raw)), outBytes)
 	if err != nil {
 		return failed(err)

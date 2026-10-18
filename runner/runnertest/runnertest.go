@@ -61,6 +61,7 @@ func Start(t testing.TB) *Env {
 		f.Init = FakeBrain
 		l = f
 	}
+	logf := Logf(t)
 	rec := &recorder{l: l, live: map[sandbox.Instance]bool{}}
 	dir, err := os.MkdirTemp("", "rn") // short: unix socket paths are limited to about 100 bytes
 	if err != nil {
@@ -71,7 +72,7 @@ func Start(t testing.TB) *Env {
 		t.Fatal(err)
 	}
 	srv := &runner.Server{Profiles: map[string]runner.Profile{"brain": {Launch: rec, Files: 1, Prefix: "b-"}},
-		PeerUID: -1, Max: 8, Logf: t.Logf}
+		PeerUID: -1, Max: 8, Logf: logf}
 	if runtime.GOOS == "linux" {
 		srv.PeerUID = os.Getuid()
 	}
@@ -82,6 +83,25 @@ func Start(t testing.TB) *Env {
 		os.RemoveAll(dir)
 	})
 	return &Env{Client: &runner.Client{Path: dir + "/runner.sock"}, Kind: kind, rec: rec}
+}
+
+// Logf logs to t until t's cleanups end, then drops lines: runnerd's goroutines may log a sandbox's end after the
+// test is over, which t.Logf turns into a panic. Call it before registering cleanups that should still log.
+func Logf(t testing.TB) func(format string, args ...any) {
+	var mu sync.Mutex
+	done := false
+	t.Cleanup(func() {
+		mu.Lock()
+		done = true
+		mu.Unlock()
+	})
+	return func(format string, args ...any) {
+		mu.Lock()
+		defer mu.Unlock()
+		if !done {
+			t.Logf(format, args...)
+		}
+	}
 }
 
 // KillBrains kills every running brain sandbox (a crash, as the brain sees it: nothing more is sent) and returns

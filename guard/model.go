@@ -280,6 +280,12 @@ func readStream(r io.Reader, onDelta func(kind, delta string) error) (*stepResul
 				call.Function.Name += tc.Function.Name
 				call.Function.Arguments += tc.Function.Arguments
 				size += len(tc.Function.Arguments)
+				// Counted like text (the activity record's bytes in, the output cap), never shown as a delta.
+				if n := tc.Function.Name + tc.Function.Arguments; n != "" {
+					if err := onDelta("tool_call", n); err != nil {
+						return nil, err
+					}
+				}
 			}
 			if ch.FinishReason != "" {
 				res.finish = ch.FinishReason

@@ -138,14 +138,16 @@ var bins = []struct{ name, pkg string }{
 }
 
 // Safety trust roots (docs/23-safety-controls.md), pinned here so the attested compose names them; the same in
-// agentd, gatewayd and vaultd. Public keys only ("ed25519:<base64>"). Empty until the production keys are made
-// offline (stage 2): then the release policy applies alone and side effects fail closed (no operator stop list
-// can be checked). safetyURL: where gatewayd pulls the signed stop lists (empty: pushes to POST /safety only).
+// agentd, gatewayd and vaultd. Public keys only ("ed25519:<base64>"). Stage 2 (v0.6.0): both made offline on
+// 2026-10-18. The admin key signs policies (and the firm's stop lists); its private half never goes online. The
+// operator key signs the heartbeat and the global stop; its private half is only the chat Worker's secret. With admin keys pinned nothing runs until a signed policy covers the space
+// (policy_missing). safetyURL: the chat Worker's route that serves the newest heartbeat and the signed policy;
+// gatewayd pulls it every 10 s (empty: pushes to POST /safety only). Changing any of these is a release.
 const (
 	safetyFirm  = "f_chat"
-	operatorKey = ""
-	adminKeys   = ""
-	safetyURL   = ""
+	operatorKey = "ed25519:UjnT9P6APMBeNg5pJlGCLbwOKDlVJQO3m3+yDzby2os="
+	adminKeys   = "ed25519:Ii1apdLLHa+9d1d/vAjiipxNV7fS9m2lwFva67v4VFg="
+	safetyURL   = "https://chat.tacy.io/api/safety/docs"
 )
 
 // safetyArgs are the trust-root flags every guard process gets.

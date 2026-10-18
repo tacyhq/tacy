@@ -141,6 +141,19 @@ func testActivityChain(t *testing.T, behindRunner bool) {
 		fetch.Hosts[0].Requests != 1 || fetch.Hosts[0].BytesIn == 0 || fetch.Connector != "web" || end.Usage == nil || end.Usage.ToolCalls != 2 {
 		t.Fatalf("tool run: %+v", end)
 	}
+	// The first model call answered only with tool calls: its bytes in are their names and arguments.
+	var callsIn int64
+	for _, c := range end.Calls {
+		if c.Kind == "model" {
+			for _, h := range c.Hosts {
+				callsIn += h.BytesIn
+			}
+			break
+		}
+	}
+	if want := int64(len(modelTool("web_search") + `{"query":"jane doe divorce settlement"}` + modelTool("fetch_page") + `{"url":"` + pageURL + `"}`)); callsIn != want {
+		t.Fatalf("the tool-call model call's bytes in: %d, want %d", callsIn, want)
+	}
 	all = append(all, runs...)
 
 	// 3. Refused at the door (a firm stop): one refused record.

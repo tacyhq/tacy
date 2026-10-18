@@ -112,6 +112,14 @@ func (s *Sandbox) Exec(ctx context.Context, argv []string, stdin []byte, timeout
 		}
 		return r.Exec, nil
 	case <-s.done:
+		// runnerd sends the last command's result, then the sandbox's end (an out-of-memory kill): keep the result.
+		select {
+		case r := <-s.replies:
+			if r.Error == "" && r.Exec != nil {
+				return r.Exec, nil
+			}
+		default:
+		}
 		return nil, errors.New("runner: the sandbox is gone")
 	case <-ctx.Done():
 		s.c.Close() // runnerd destroys the sandbox with the connection

@@ -1,6 +1,8 @@
 package safety
 
 import (
+	"crypto/ed25519"
+	"encoding/json/v2"
 	"errors"
 	"time"
 )
@@ -82,4 +84,23 @@ func (l *StopList) stops(firm, space string) bool {
 		}
 	}
 	return false
+}
+
+// Heartbeat is the operator's stop list signed at now: seq (0: now in ms), expiring ttl later, all stopping
+// everything. cmd/safetysign and the operator's Worker (WebCrypto) make it; both give the same bytes for the same
+// inputs (testdata/heartbeat-golden.json pins them, and the Worker's test checks that file).
+func Heartbeat(key ed25519.PrivateKey, seq uint64, now time.Time, ttl time.Duration, all bool) (Envelope, error) {
+	now = now.UTC()
+	if seq == 0 {
+		seq = uint64(now.UnixMilli())
+	}
+	l := StopList{Type: StopType, Issuer: IssuerOperator, Seq: seq, IssuedAt: now, ExpiresAt: now.Add(ttl), All: all}
+	if err := l.Validate(); err != nil {
+		return Envelope{}, err
+	}
+	b, err := json.Marshal(l)
+	if err != nil {
+		return Envelope{}, err
+	}
+	return Sign(KindStop, b, key), nil
 }

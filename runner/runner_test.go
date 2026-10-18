@@ -8,6 +8,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 // serve runs a runner server with the given profiles on a fresh socket.
 func serve(t *testing.T, profiles map[string]runner.Profile, max int) *runner.Client {
 	t.Helper()
+	logf := runnertest.Logf(t)
 	dir, err := os.MkdirTemp("", "rn")
 	if err != nil {
 		t.Fatal(err)
@@ -30,7 +32,7 @@ func serve(t *testing.T, profiles map[string]runner.Profile, max int) *runner.Cl
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { l.Close() })
-	srv := &runner.Server{Profiles: profiles, PeerUID: -1, Max: max, Logf: t.Logf}
+	srv := &runner.Server{Profiles: profiles, PeerUID: -1, Max: max, Logf: logf}
 	if runtime.GOOS == "linux" {
 		srv.PeerUID = os.Getuid()
 	}
@@ -134,7 +136,8 @@ func TestBrainDestroyedWithConnection(t *testing.T) {
 	f := sandbox.NewFake()
 	f.Init = echoInit
 	cl := serve(t, brainProfile(f), 4)
-	_, remote, _ := runner.SocketPair()
+	local, remote, _ := runner.SocketPair()
+	defer local.Close() // dropped, the garbage collector may close it and the fake brain exit by itself (as in TestLimit)
 	sb, err := cl.Create(t.Context(), "brain", remote)
 	remote.Close()
 	if err != nil {
@@ -161,8 +164,7 @@ func TestLimit(t *testing.T) {
 	if _, err := cl.Create(t.Context(), "brain", r2); err == nil || !strings.Contains(err.Error(), "limit") {
 		t.Fatalf("second sandbox: %v", err)
 	}
-	sb.Close()
-	waitLive(t, f, 0)
+	sb.Close() // returns once runnerd freed the slot: no wait here
 	_, r3, _ := runner.SocketPair()
 	sb3, err := cl.Create(t.Context(), "brain", r3)
 	if err != nil {
@@ -170,6 +172,83 @@ func TestLimit(t *testing.T) {
 	}
 	sb3.Close()
 }
+
+// A sandbox's slot is free by the time its client learns the sandbox is gone, however it ended: destroyed, the
+// brain exiting by itself, or the hands dying. A run that starts right after another ends is never refused.
+func TestSlotFreeWhenGone(t *testing.T) {
+	f := sandbox.NewFake()
+	f.Init = echoInit
+	hands := dyingRuntime{sandbox.NewFake()}
+	cl := serve(t, map[string]runner.Profile{"brain": {Launch: f, Files: 1, Prefix: "b-"}, "hands": {Start: hands, Prefix: "h-"}}, 1)
+	ctx := t.Context()
+	brain := func() (net.Conn, *runner.Sandbox) {
+		t.Helper()
+		local, remote, err := runner.SocketPair()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer remote.Close()
+		sb, err := cl.Create(ctx, "brain", remote)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return local, sb
+	}
+	gone := func(sb *runner.Sandbox) {
+		t.Helper()
+		select {
+		case <-sb.Done():
+		case <-time.After(5 * time.Second):
+			t.Fatal("not gone")
+		}
+	}
+	for range 50 {
+		local, sb := brain() // destroyed
+		sb.Close()
+		local.Close()
+
+		local, sb = brain() // exits by itself
+		io.WriteString(local, "exit 3\n")
+		gone(sb)
+		local.Close()
+
+		h, err := cl.Create(ctx, "hands") // dies
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.Exec(ctx, []string{"die"}, nil, time.Second); err != nil {
+			t.Fatal(err)
+		}
+		gone(h)
+		h.Close()
+	}
+}
+
+// dyingRuntime's sandboxes die (as an out-of-memory kill would) on the command "die".
+type dyingRuntime struct{ *sandbox.Fake }
+
+func (r dyingRuntime) Start(ctx context.Context, id string) (sandbox.Sandbox, error) {
+	sb, err := r.Fake.Start(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	return &dyingSandbox{Sandbox: sb}, nil
+}
+
+type dyingSandbox struct {
+	sandbox.Sandbox
+	dead atomic.Bool
+}
+
+func (s *dyingSandbox) Exec(ctx context.Context, req sandbox.Request) (*sandbox.Result, error) {
+	if len(req.Argv) > 0 && req.Argv[0] == "die" {
+		s.dead.Store(true)
+		return &sandbox.Result{Exit: 137, OOM: true}, nil
+	}
+	return s.Sandbox.Exec(ctx, req)
+}
+
+func (s *dyingSandbox) Alive() bool { return !s.dead.Load() && s.Sandbox.Alive() }
 
 // Requests runnerd refuses: no arbitrary profile, flag, descriptor or op.
 func TestRefusals(t *testing.T) {

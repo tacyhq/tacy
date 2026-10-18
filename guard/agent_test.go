@@ -58,7 +58,9 @@ data: [DONE]
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Join(got, ",") != "reasoning:think,text:Hel,text:lo" || res.text != "Hello" || res.finish != "tool_calls" {
+	// Tool calls' names and arguments come through as "tool_call" deltas (counted for the record and the output
+	// cap, never shown).
+	if strings.Join(got, ",") != `reasoning:think,text:Hel,text:lo,tool_call:web_search{"qu,tool_call:ery":"x"}` || res.text != "Hello" || res.finish != "tool_calls" {
 		t.Fatalf("deltas %v, text %q, finish %q", got, res.text, res.finish)
 	}
 	if len(res.calls) != 1 || res.calls[0].ID != "c1" || res.calls[0].Function.Arguments != `{"query":"x"}` {

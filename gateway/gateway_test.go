@@ -283,7 +283,7 @@ func TestReaderAcrossTheSocket(t *testing.T) {
 	model := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		answer := `{"summary":"A sentence about a fox [Q1].","facts":["A fox jumps."],"entities":[],"dates":[],"amounts":[],` +
 			`"source":{"kind":"other","title":"T","publisher":"","published":""},` +
-			`"quotes":[{"id":1,"location":"p","topic":"fox","text":"The quick brown fox jumps over the lazy dog"}],` +
+			`"quotes":[{"id":1,"from":2,"to":2,"location":"p","topic":"fox"}],` + // span 1 is the title, 2 the sentence
 			`"wording":"","instructions_found":false,"instruction_count":0}`
 		b, _ := json.Marshal(answer)
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -321,7 +321,7 @@ func TestReaderAcrossTheSocket(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(quotes) != 1 || quotes[0].Text != "The quick brown fox jumps over the lazy dog" || quotes[0].Index != 1 {
+	if len(quotes) != 1 || quotes[0].Text != "The quick brown fox jumps over the lazy dog, every single morning." || quotes[0].Index != 1 {
 		t.Fatalf("quotes in the stream %+v", quotes)
 	}
 	if !c.Untrusted(ti, &harness.Action{Name: "web.fetch"}) || c.Untrusted(ti, &harness.ModelCall{}) {

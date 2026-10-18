@@ -53,7 +53,8 @@ func answerJSON(t *testing.T, edit func(m map[string]any)) string {
 
 // Anything that doesn't fit the schema exactly is refused whole, never repaired.
 func TestReaderSchemaRefusal(t *testing.T) {
-	if _, err := decodeReader([]byte(answerJSON(t, nil))); err != nil {
+	legacy := &ReaderConfig{}
+	if _, err := decodeReader([]byte(answerJSON(t, nil)), legacy); err != nil {
 		t.Fatalf("a good answer refused: %v", err)
 	}
 	long := strings.Repeat("x", maxSummaryRunes+1)
@@ -81,7 +82,7 @@ func TestReaderSchemaRefusal(t *testing.T) {
 		"too large":          `{"summary":"` + strings.Repeat("y", maxReaderOutBytes) + `"}`,
 	}
 	for name, b := range bad {
-		if _, err := decodeReader([]byte(b)); err == nil {
+		if _, err := decodeReader([]byte(b), legacy); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
 	}
@@ -168,7 +169,7 @@ func (m *splitModel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	msgs, _ := body["messages"].([]any)
 	first, _ := msgs[0].(map[string]any)
-	if first["content"] == readerSystem {
+	if sys, _ := first["content"].(string); strings.HasPrefix(sys, readerStart) {
 		prompt := msgs[1].(map[string]any)["content"].(string)
 		m.mu.Lock()
 		m.readReqs = append(m.readReqs, body)
@@ -234,11 +235,16 @@ type readerE2E struct {
 	store *taintStore
 }
 
+// newReaderE2E runs the reader with quotes copied (the v0.7.0 reader, kept for cmd/readereval's comparison);
+// newReaderE2EWith with any config (DefaultReader: quotes by reference).
 func newReaderE2E(t *testing.T, sm *splitModel, pages stubWeb) *readerE2E {
+	return newReaderE2EWith(t, sm, pages, ReaderConfig{Model: ReaderModel, Effort: "low", MaxOut: readerMaxOut})
+}
+
+func newReaderE2EWith(t *testing.T, sm *splitModel, pages stubWeb, rc ReaderConfig) *readerE2E {
 	srv := httptest.NewServer(sm)
 	t.Cleanup(srv.Close)
 	e := &readerE2E{sm: sm, web: &recordingWeb{stubWeb: pages}, fs: &fakeSearch{}, store: &taintStore{MemStore: harness.NewMemStore()}}
-	rc := ReaderConfig{Model: ReaderModel, Effort: "low", MaxOut: readerMaxOut}
 	e.g = New(Config{Up: &plainUpstream{url: srv.URL, http: srv.Client()}, Search: e.fs, CacheSecret: "boot",
 		Fetcher: &http.Client{Transport: e.web}, Reader: &rc, Now: func() time.Time { return time.Date(2026, 10, 18, 0, 0, 0, 0, time.UTC) }})
 	e.rt = &harness.Runtime{Guard: e.g, Store: e.store}
@@ -535,7 +541,8 @@ func TestReaderSearch(t *testing.T) {
 	}
 	// [R1] is result 2 (the page was 1), [Q1] is the task's quote 2 (the page's quote was 1), [R7] doesn't exist,
 	// the link is gone; the made-up quote was dropped.
-	if view.Read.Summary != "R1 is the dstack v0.6.1 release [2][quote 2]; see also  and (link removed)." ||
+	// The reader counted an instruction, so its sentence with a link goes whole (injectionTalkRe).
+	if view.Read.Summary != "R1 is the dstack v0.6.1 release [2][quote 2]; …" ||
 		!slices.Equal(view.Read.Facts, []string{"dstack v0.6.1 is out [2]."}) {
 		t.Fatalf("read %+v", view.Read)
 	}

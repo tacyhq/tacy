@@ -5,6 +5,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -21,9 +23,12 @@ import (
 // refuses the action before anything is fetched.
 
 func readerAnswer(prompt string) string {
+	// Quotes by reference: the span holding the sentence (the last ⟦n⟧ marker before it).
 	quotes := []map[string]any{}
-	if strings.Contains(prompt, "Release v0.6.1 is out") {
-		quotes = append(quotes, map[string]any{"id": 1, "location": "body", "topic": "release", "text": "Release v0.6.1 is out"})
+	if i := strings.Index(prompt, "Release v0.6.1 is out"); i >= 0 {
+		ms := regexp.MustCompile(`⟦(\d+)⟧`).FindAllStringSubmatch(prompt[:i], -1)
+		n, _ := strconv.Atoi(ms[len(ms)-1][1])
+		quotes = append(quotes, map[string]any{"id": 1, "from": n, "to": n, "location": "body", "topic": "release"})
 	}
 	b, _ := json.Marshal(map[string]any{"summary": "A release note [Q1].", "facts": []string{"v0.6.1 is out."}, "entities": []string{},
 		"dates": []string{}, "amounts": []string{}, "source": map[string]any{"kind": "docs", "title": "Release", "publisher": "", "published": ""},
@@ -47,14 +52,16 @@ func TestReaderBudgetAndRecord(t *testing.T) {
 	e.mustPost(e.policy(1, nil), e.heartbeat())
 	priv, _ := recipientKey(t)
 	evs := runParity(t, e.s, e.recorded(priv, proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("is v0.6.1 out?")}))
-	if evs[len(evs)-1].Type != "done" || e.readerReqs.Load() != 2 || hits.Load() < 2 {
+	// The second fetch gets the same page: the task's read cache answers it (one reader call).
+	if evs[len(evs)-1].Type != "done" || e.readerReqs.Load() != 1 || hits.Load() < 2 {
 		t.Fatalf("run %s; reader calls %d, page hits %d", types(evs), e.readerReqs.Load(), hits.Load())
 	}
 	runs := openedActivity(t, evs, priv, e.rec.Signer.Public())
 	end := runs[1]
-	// Budget: three acting model calls (10+5, 10+5, 20+6 tokens) and two reader calls (1500+400 each), two tool calls.
-	wantTokens := int64(15 + 15 + 26 + 2*1900)
-	wantCost := 2*safety.ModelCost("gpt-oss-120b", 10, 5) + safety.ModelCost("gpt-oss-120b", 20, 6) + 2*safety.ModelCost(guard.ReaderModel, 1500, 400)
+	// Budget: three acting model calls (10+5, 10+5, 20+6 tokens) and one reader call (1500+400; the second read is
+	// the cache's, free), two tool calls.
+	wantTokens := int64(15 + 15 + 26 + 1900)
+	wantCost := 2*safety.ModelCost("gpt-oss-120b", 10, 5) + safety.ModelCost("gpt-oss-120b", 20, 6) + safety.ModelCost(guard.ReaderModel, 1500, 400)
 	if end.Usage == nil || end.Usage.Tokens != wantTokens || end.Usage.ToolCalls != 2 || end.Usage.CostMicros != wantCost {
 		t.Fatalf("usage %+v, want %d tokens, $%d µ", end.Usage, wantTokens, wantCost)
 	}
@@ -73,6 +80,9 @@ func TestReaderBudgetAndRecord(t *testing.T) {
 	if first.Reader == nil || *first.Reader != (activity.Reader{Model: guard.ReaderModel, Prompt: 1500, Completion: 400, Ms: first.Reader.Ms,
 		Outcome: "ok", Quotes: 1}) {
 		t.Fatalf("reader on the record: %+v", first.Reader)
+	}
+	if second.Reader == nil || *second.Reader != (activity.Reader{Model: guard.ReaderModel, Outcome: "ok", Why: "cached", Quotes: 1}) {
+		t.Fatalf("cached read on the record: %+v", second.Reader)
 	}
 	// The first fetch brought outside content in; the second was proposed after the agent had read it.
 	if !first.Untrusted || first.Tainted || !second.Untrusted || !second.Tainted || !end.Tainted {

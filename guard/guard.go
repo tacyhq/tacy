@@ -142,6 +142,8 @@ type task struct {
 	// was written after outside content: the task is tainted whatever agentd says (permit). Calls proposed together
 	// in one step don't taint each other.
 	returned, outside bool
+
+	reads readCache // the reader's answers for this task (readcache.go)
 }
 
 // taintFor says whether an action was proposed after outside content reached the brain. One of the latest model

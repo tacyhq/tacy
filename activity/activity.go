@@ -183,7 +183,7 @@ type Reader struct {
 	Completion int    `json:"completion"`
 	Ms         int64  `json:"ms"`
 	Outcome    string `json:"outcome"`      // ok | refused | failed
-	Why        string `json:"why,omitzero"` // refused, failed: schema, tool_call, length, empty, policy, model
+	Why        string `json:"why,omitzero"` // refused: schema, span, tool_call, length, empty; failed: policy, model, timeout; ok: cached
 	// Quotes kept and dropped (not found in the source), injections the reader counted, verbatim passages cut.
 	Quotes       int `json:"quotes,omitzero"`
 	Dropped      int `json:"dropped,omitzero"`

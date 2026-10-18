@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"encoding/json/jsontext"
+	"slices"
 	"strings"
 	"time"
 
@@ -92,6 +93,14 @@ func (g *Guard) Action(ctx context.Context, ti *harness.TaskInfo, id string, req
 	if ctx.Err() != nil {
 		return nil, ctx.Err() // cancelled: the runtime answers "cancelled"
 	}
+	// The quarantined reader (reader.go) reads the page or the results before anything is numbered, in parallel
+	// with the step's other calls; the model then gets its fields, never the text.
+	if d := g.readerDoc(ctx, ti.ID, id, req.Name, &p); d != nil {
+		p.read = g.read(ctx, t, step, d)
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+	}
 	// Citation numbers go in the order calls finish (decided): the runtime can't see the brain's
 	// steps. The model and people see the same numbers, and a replay gets the journaled ones.
 	// The lock is held until the result is shown, so people see the numbers in order even when calls finish
@@ -112,13 +121,47 @@ func (g *Guard) Action(ctx context.Context, ti *harness.TaskInfo, id string, req
 			URL: im.URL, Type: "image/jpeg", Width: im.Width, Height: im.Height, Data: im.JPEG}})
 	}
 	t.emit(proto.Event{Type: "tool_result", ID: call, Name: app, Args: shown, Masked: out.masked,
-		Result: json.RawMessage(out.content), Citations: out.citations})
+		Result: json.RawMessage(out.content), Citations: out.citations, Quotes: out.quotes})
 	t.numbering.Unlock()
 	t.icons.add(sourceURLs(out)...)
 	if m := toolMetric(app, step, out, ms); m != nil {
 		t.emit(proto.Event{Type: "metrics", Metrics: m})
 	}
 	return actionResult(out), nil
+}
+
+// readerDoc is what the reader reads for an action's outcome: a fetched page, or a search's results (titles and
+// snippets), with credentials redacted as they would be from what the brain sees. nil: nothing for the reader
+// (the reader is off, the tool failed, no results, an image search).
+func (g *Guard) readerDoc(ctx context.Context, task, id, action string, p *pending) *readerDoc {
+	if g.cfg.Reader == nil || p.out.content != "" {
+		return nil
+	}
+	var ids []string
+	add := func(s string) string {
+		r, found := redactForReader(s)
+		ids = append(ids, found...)
+		return r
+	}
+	var d *readerDoc
+	switch {
+	case p.page != nil:
+		d = &readerDoc{kind: "page", title: add(p.page.title), url: p.page.final, text: add(p.page.text)}
+	case len(p.results) > 0:
+		d = &readerDoc{kind: "search"}
+		for _, r := range p.results {
+			d.results = append(d.results, SearchResult{Title: add(r.Title), Snippet: add(r.Snippet)})
+		}
+	default:
+		return nil
+	}
+	if len(ids) > 0 {
+		slices.Sort(ids)
+		ids = slices.Compact(ids)
+		g.record(Egress{Task: task, Action: id, Op: action, Decision: "redacted", Rule: "leak_scan", Patterns: ids})
+		FactsFrom(ctx).leak(false, ids)
+	}
+	return d
 }
 
 // actionResult is the protocol's view of a tool outcome. A tool that failed answers {"error": ...} (errorOutcome);

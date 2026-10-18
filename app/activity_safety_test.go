@@ -51,7 +51,7 @@ func TestActivityPolicyDecisionsOnTheRecord(t *testing.T) {
 	page := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hits.Add(1); io.WriteString(w, "secret page") }))
 	defer page.Close()
 	e := newSafeEnv(t,
-		pCalls([3]string{"c1", "web_search", `{"query":"acme merger target price"}`}, [3]string{"c2", "fetch_page", `{"url":"` + page.URL + `/deal-room/q3"}`}),
+		pCalls([3]string{"c1", "web_search", `{"query":"acme merger target price"}`}, [3]string{"c2", "fetch_page", `{"url":"` + page.URL + `/deal-room/quarter-three"}`}),
 		pText("couldn't"))
 	e.mustPost(e.policy(1, func(p *safety.Policy) {
 		p.Models = []string{"gpt-oss-120b"}
@@ -89,7 +89,7 @@ func TestActivityPolicyDecisionsOnTheRecord(t *testing.T) {
 		fetch[0].Hosts[0].Refused != 1 || fetch[0].Hosts[0].Requests != 0 || hits.Load() != 0 {
 		t.Fatalf("fetch outside the policy: %+v (hits %d)", fetch, hits.Load())
 	}
-	noContent(t, runs, "acme", "merger", "target price", "deal-room", "q3", "secret page", "couldn't")
+	noContent(t, runs, "acme", "merger", "target price", "deal-room", "quarter-three", "secret page", "couldn't")
 }
 
 func TestActivityStaleAndBudgetOnTheRecord(t *testing.T) {

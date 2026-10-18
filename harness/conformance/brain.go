@@ -526,6 +526,73 @@ func RunBrain(t *testing.T, brain Brain) {
 		e.clean()
 	})
 
+	// A request held for a person's decision (an approval) when the runtime restarts stays held: the brain
+	// resumes, re-sends it under the same id and simply waits; once approved it runs once and the task finishes. A
+	// held request's result is just late: the brain mustn't time out on it or treat the wait as a failure.
+	t.Run("held request across a runtime restart", func(t *testing.T) {
+		e := newEnv(t, brain)
+		script := harness.Script(harness.Calls(call("c1", "mail.send", `{"to":"client"}`)), harness.Text("sent"))
+		f1 := e.f
+		f1.Model = script
+		f1.Holds = map[string]string{"mail.send": harness.WaitApproval}
+		e.launch()
+		f1.Start("t1", Task("mail.send"))
+		waitHeld := func(f *harness.Fake) {
+			t.Helper()
+			for deadline := time.Now().Add(wait); ; time.Sleep(5 * time.Millisecond) {
+				st, _ := f.Status("t1")
+				if st.State == harness.StateWaiting && len(st.Held) == 1 {
+					return
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("the mail wasn't held: %+v", st)
+				}
+			}
+		}
+		waitHeld(f1)
+		e.crash() // the brain's connection goes with the runtime
+
+		f2 := harness.NewFakeWith(f1.Mem)
+		f2.Model = script
+		f2.Holds = f1.Holds
+		e.use(f2)
+		if ids, err := f2.Restore(); err != nil || len(ids) != 1 {
+			t.Fatalf("restored %v, %v", ids, err)
+		}
+		e.launch()
+		// The brain re-sends the held action (same id): it waits, held, not interrupted.
+		e.waitFor("the held action again", func(fs []frame) bool {
+			n := 0
+			for _, f := range fs {
+				if f.in && f.e.Type == harness.TypeAction && f.e.Task == "t1" {
+					n++
+				}
+			}
+			return n >= 2
+		})
+		waitHeld(f2)
+		time.Sleep(100 * time.Millisecond) // a brain that gives up on a late result would do it now
+		if st, _ := f2.Status("t1"); st.State != harness.StateWaiting {
+			t.Fatalf("while held: %+v", st)
+		}
+		held, _ := f2.Status("t1")
+		if err := f2.Release("t1", held.Held[0].ID, true, ""); err != nil {
+			t.Fatal(err)
+		}
+		o := e.outcome("t1")
+		if o.State != harness.OutcomeSucceeded || o.Done.Text != "sent" {
+			t.Fatalf("outcome %+v", o)
+		}
+		if n := f1.ActionRuns("t1", "mail.send") + f2.ActionRuns("t1", "mail.send"); n != 1 {
+			t.Errorf("mail.send ran %d times, want once", n)
+		}
+		calls := modelCalls(t, e.snapshot(), "t1")
+		if last := calls[len(calls)-1]; toolResult(last, "c1", harness.CodeInterrupted) || toolResult(last, "c1", harness.CodeCancelled) {
+			t.Error("the model was told the held mail was interrupted")
+		}
+		e.clean()
+	})
+
 	// Arguments the model wrote that don't parse come as {} with bad_args and the model's own text (raw_args). The
 	// brain doesn't run the action, tells the model, and gives the tool call back unchanged in its next model call,
 	// so the model sees what it wrote.

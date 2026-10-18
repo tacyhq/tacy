@@ -2,7 +2,11 @@
 //
 //	GET  /attest?nonce=<64 hex>   TDX quote whose report_data binds the nonce and this boot's HPKE key, plus dstack
 //	                              info (app compose, event log). Format: proto.Attestation, proto.ReportData.
-//	POST /run                     EHBP-encrypted proto.RunRequest -> EHBP-encrypted SSE stream of proto.Event.
+//	POST /tasks, /tasks/status, /tasks/events, /tasks/cancel
+//	                              the task API (tasks.go, docs/27): start a task, see it, follow its events from any
+//	                              point, cancel it. EHBP bodies and the bearer token, as /run.
+//	POST /run                     EHBP-encrypted proto.RunRequest -> EHBP-encrypted SSE stream of proto.Event: a
+//	                              shim over the task API (start, then follow; cancelled when the tab goes away).
 //	                              Needs "Authorization: Bearer <AGENT_VM_TOKEN>" (cost control; the relay holds it).
 //	                              Optional "X-Agent-User: <hex>": the relay's opaque per-user tag, for fairness
 //	                              only (limits.go). Required "X-Agent-Model: <model id>": the run's model in
@@ -26,8 +30,9 @@
 // guard can run in this process instead.
 //
 // The HPKE private key is generated at boot and lives only in memory; requests and responses are never logged. A
-// run's task (its input, options and journal) is in the queue on the VM's encrypted disk only while it runs and is
-// deleted when it ends; tasks a previous process left open are ended at boot (nobody can see their answer).
+// /run's task (its input, options, journal and events) is in the queue on the VM's encrypted disk only while it
+// runs and is deleted when it ends; /run tasks a previous process left open are ended at boot (nobody can see their
+// answer). A POST /tasks task is kept until it ends plus a day, and goes on after a restart.
 // compose.yaml embeds this source (cmd/compose), and the CVM runs binaries whose SHA-256 are pinned in the
 // compose, so the attested compose hash covers the exact code.
 package main
@@ -36,7 +41,9 @@ import (
 	"cmp"
 	"context"
 	"crypto/ecdh"
+	"crypto/hkdf"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
@@ -53,6 +60,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -89,6 +97,10 @@ type server struct {
 	safety      *safety.State      // signed policies and stop lists agentd verified (step 6, safety.go)
 	gw          guard.Gateway      // the guard under the safety checks (pushSafety reaches gatewayd through it)
 	safetySlots chan struct{}      // concurrent POST /safety limit
+
+	host     *guard.Host // tasks (tasks.go); made on first use when nil
+	hostOnce sync.Once
+	follows  chan struct{} // concurrent POST /tasks/events limit
 }
 
 type ticketKey struct{}
@@ -263,7 +275,7 @@ func (s *server) run(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	guard.Run(r.Context(), s.rt, s.agent, userFrom(r.Context()), &req, emit)
+	s.tasks().Run(r.Context(), userFrom(r.Context()), &req, emit)
 	out.done()
 }
 
@@ -391,7 +403,8 @@ func main() {
 		}
 		searchName = search.Name()
 		fetcher := guard.NewFetcher(*devFetchAny)
-		gw = guard.New(guard.Config{Up: up, Search: search, Fetcher: fetcher,
+		reader := guard.DefaultReader // the quarantined reader, as in gatewayd
+		gw = guard.New(guard.Config{Up: up, Search: search, Fetcher: fetcher, Reader: &reader,
 			Icons:  fetcher, // site icons go through the same guarded client (guard/favicons.go)
 			Limits: &lim, CacheSecret: randomHex(32), Now: func() time.Time { return time.Now().UTC() }, Safety: st})
 	}
@@ -443,12 +456,21 @@ func main() {
 	if err != nil {
 		log.Fatalf("queue: %v", err)
 	}
-	if n := guard.Abandon(rt, ids); n > 0 {
-		log.Printf("ended %d runs a previous process left open", n)
+	// Once-only task ids (docs/27): a key only this app gets from dstack's KMS, per firm.
+	tk, err := p.TaskIDKey(context.Background())
+	if err != nil {
+		log.Fatalf("tasks: id key: %v", err)
+	}
+	idKey, err := hkdf.Key(sha256.New, tk, nil, "tacy/task-ids/v1\x00"+st.Firm(), 32)
+	clear(tk)
+	if err != nil {
+		log.Fatalf("tasks: %v", err)
 	}
 	s := &server{platform: p, id: id, agent: rg, rt: rt, rec: rec, token: p.Secret("AGENT_VM_TOKEN"), booted: time.Now().UTC(),
-		sched: newScheduler(lim), lim: lim, quotes: make(chan struct{}, 8), safety: st, gw: gw, safetySlots: make(chan struct{}, 4)}
+		sched: newScheduler(lim), lim: lim, quotes: make(chan struct{}, 8), safety: st, gw: gw, safetySlots: make(chan struct{}, 4),
+		host: &guard.Host{RT: rt, GW: rg, IDKey: idKey}}
 	ctx := context.Background()
+	s.resumeTasks(ctx, ids, log.Printf)
 	go sg.enforce(ctx, 2*time.Second)
 	go pruneActivity(ctx, astore)
 	go func() { // gatewayd (and through it the vault) gets agentd's documents now and every 10 s
@@ -484,6 +506,7 @@ func main() {
 	mux.HandleFunc("GET "+ehbpproto.KeysPath, id.ConfigHandler)
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) { fmt.Fprintln(w, "ok") })
 	mux.Handle("POST /run", s.guard(id.Middleware()(http.HandlerFunc(s.run))))
+	s.taskRoutes(mux, id)
 	mux.HandleFunc("GET /activity", s.activityOut) // sealed activity records, for the relay (docs/24)
 	// Signed policies and stop lists; the signature is the authorization. Only served when the compose pins a key
 	// (stage 2): without one nothing could verify, so there's nothing to take.

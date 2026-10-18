@@ -81,6 +81,14 @@ func (c *Client) PushDocs(ctx context.Context, docs []safety.Envelope) error {
 // ReplaySafe: as the guard's (it depends on the request only).
 func (c *Client) ReplaySafe(_ *harness.TaskInfo, req any) bool { return guard.ReplaySafe(req) }
 
+// Untrusted: as the guard's (it depends on the request only; docs/27 section 5).
+func (c *Client) Untrusted(_ *harness.TaskInfo, req any) bool { return guard.Untrusted(req) }
+
+// TaintedAtStart: as the guard's (guard.StartTaint).
+func (c *Client) TaintedAtStart(s *harness.Start) string { return guard.StartTaint(s) }
+
+var _ harness.StartTaintGuard = (*Client)(nil)
+
 // Exec: the chat agent has no hands sandbox (the runtime refuses exec before this).
 func (c *Client) Exec(context.Context, *harness.TaskInfo, string, *harness.Exec) (*harness.ExecResult, error) {
 	return nil, harness.Errf(harness.CodeNotAllowed, "no hands sandbox")

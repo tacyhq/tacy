@@ -90,6 +90,9 @@ func redactOutcome(out *toolOutcome) []string {
 	for i := range out.images {
 		str(&out.images[i].Title)
 	}
+	for i := range out.quotes {
+		str(&out.quotes[i].Text)
+	}
 	slices.Sort(ids)
 	return ids
 }

@@ -400,3 +400,30 @@ func TestAgentImageSearchUnsupportedProvider(t *testing.T) {
 		}
 	}
 }
+
+// With the quarantined reader on, an image search gives the model no titles (the provider's and pages' text) and
+// only each image's page host; people still see the titles in the gallery (docs/27 section 5).
+func TestAgentImageSearchReaderTitles(t *testing.T) {
+	a, fm, is, _ := newImageAgent(t,
+		toolCallSSE("c1", "web_images", `{"query":"Arrival poster","count":3}`),
+		textSSE("Here are three posters."))
+	a.newTools = func() *Tools { return &Tools{search: is, fetcher: newFetcher(nil), reader: true} }
+	evs := collect(t, a, proto.RunRequest{Messages: []proto.Message{{Role: "user", Content: "show me posters of Arrival"}}})
+	var res *proto.Event
+	for i := range evs {
+		if evs[i].Type == "tool_result" {
+			res = &evs[i]
+		}
+		if evs[i].Type == "image" && !strings.HasPrefix(evs[i].Image.Title, "Poster") {
+			t.Fatalf("gallery title %+v", evs[i].Image)
+		}
+	}
+	if res == nil || strings.Contains(string(res.Result), "Poster") || strings.Contains(string(res.Result), "posters.example/") ||
+		!strings.Contains(string(res.Result), `"source":"posters.example"`) {
+		t.Fatalf("tool result %v", res)
+	}
+	b, _ := json.Marshal(fm.requests)
+	if strings.Contains(string(b), "Poster 0") {
+		t.Fatal("an image title reached the model")
+	}
+}

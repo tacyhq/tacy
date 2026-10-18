@@ -105,13 +105,16 @@ type Event struct {
 	Masked    []string        `json:"masked,omitempty"` // PII kinds replaced before the query left the VM
 	Result    json.RawMessage `json:"result,omitempty"`
 	Citations []Citation      `json:"citations,omitempty"`
-	Image     *Image          `json:"image,omitempty"`
-	Favicon   *Favicon        `json:"favicon,omitempty"`
-	Usage     *Usage          `json:"usage,omitempty"`
-	Meta      *Meta           `json:"meta,omitempty"`
-	Metrics   *Metric         `json:"metrics,omitempty"`
-	Error     string          `json:"error,omitempty"`
-	Code      string          `json:"code,omitempty"` // error: why a safety control ended the run (stopped, stop_list_stale, policy_missing, policy_denied, budget_exceeded, rate_limited)
+	// Quotes: tool_result of a source the quarantined reader read (docs/27 section 5): the exact passages the
+	// answer may cite as [quote N]. The acting model never sees their text; the browser shows it.
+	Quotes  []Quote  `json:"quotes,omitempty"`
+	Image   *Image   `json:"image,omitempty"`
+	Favicon *Favicon `json:"favicon,omitempty"`
+	Usage   *Usage   `json:"usage,omitempty"`
+	Meta    *Meta    `json:"meta,omitempty"`
+	Metrics *Metric  `json:"metrics,omitempty"`
+	Error   string   `json:"error,omitempty"`
+	Code    string   `json:"code,omitempty"` // error: why a safety control ended the run (stopped, stop_list_stale, policy_missing, policy_denied, budget_exceeded, rate_limited)
 	// Activity: the run's sealed activity records (its start and end, or the one record of a refused run), sent
 	// right before done or error. Each is signed by Meta.Activity.Key and sealed to RunRequest.RecordTo.
 	Activity     []json.RawMessage `json:"activity,omitempty"`
@@ -125,6 +128,16 @@ type Citation struct {
 	URL     string `json:"url"`
 	Snippet string `json:"snippet,omitempty"`
 	Age     string `json:"age,omitempty"`
+}
+
+// Quote is an exact passage of a source, as the source has it (checked by the guard's code, not the reader's
+// word). Untrusted web text: display only.
+type Quote struct {
+	ID       int    `json:"id"`       // the N of [quote N], per task
+	Index    int    `json:"index"`    // the [n] of the source it is from (Citation.Index)
+	Location string `json:"location"` // where in the source (the reader's words)
+	Topic    string `json:"topic"`    // what it is about (the reader's words)
+	Text     string `json:"text"`
 }
 
 // Image is one picture image_search shows: a JPEG the VM decoded, scaled to at most 1024 px and re-encoded from
@@ -196,7 +209,7 @@ type Controls struct {
 // still reports what finished). The chat's browser decrypts it and reports the numbers for the admin's
 // performance view. Numbers and fixed names only: never content, search queries, URLs or hosts.
 type Metric struct {
-	Kind       string `json:"kind"`                 // "model" (one model call), "search" (web_search), "fetch" (fetch_page), "images" (image_search), "favicons" (the run's site icons), "queue" (the run started)
+	Kind       string `json:"kind"`                 // "model" (one model call), "search" (web_search), "fetch" (fetch_page), "images" (image_search), "favicons" (the run's site icons), "queue" (the run started), "reader" (the quarantined reader's call for a page or a search)
 	Step       int    `json:"step"`                 // the model call this belongs to (1, 2, ...)
 	Ms         int64  `json:"ms"`                   // duration in milliseconds (queue: time waiting for a slot, 0 if none)
 	FirstMs    int64  `json:"first_ms,omitempty"`   // model: request sent -> first token (reasoning, text or a tool call)

@@ -94,7 +94,10 @@ func main() {
 	lim := guard.DefaultLimits
 	var logMu sync.Mutex
 	enc := json.NewEncoder(os.Stdout)
-	g := guard.New(guard.Config{Up: guard.NewTinfoilUpstream(tc, lease), Search: search, Fetcher: fetcher,
+	// The quarantined reader (docs/27 section 5): pages and search results reach the acting model only as the
+	// reader's fields and quote references.
+	reader := guard.DefaultReader
+	g := guard.New(guard.Config{Up: guard.NewTinfoilUpstream(tc, lease), Search: search, Fetcher: fetcher, Reader: &reader,
 		Icons: fetcher, Limits: &lim, CacheSecret: randomHex(32), Now: func() time.Time { return time.Now().UTC() }, Safety: st,
 		Record: func(e guard.Egress) { // metadata only: ids, operation, decision, pattern ids
 			logMu.Lock()

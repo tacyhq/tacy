@@ -271,3 +271,59 @@ func TestFactsCrossTheSocket(t *testing.T) {
 		t.Fatalf("facts hold the path: %s", b)
 	}
 }
+
+// The quarantined reader in gatewayd: its numbers come back with the action's facts (agentd commits them to the
+// budget), the quotes reach the person's stream, and the result agentd's runtime gets has no page text.
+func TestReaderAcrossTheSocket(t *testing.T) {
+	page := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("<html><head><title>T</title></head><body><p>The quick brown fox jumps over the lazy dog, every single morning.</p></body></html>"))
+	}))
+	defer page.Close()
+	model := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		answer := `{"summary":"A sentence about a fox [Q1].","facts":["A fox jumps."],"entities":[],"dates":[],"amounts":[],` +
+			`"source":{"kind":"other","title":"T","publisher":"","published":""},` +
+			`"quotes":[{"id":1,"location":"p","topic":"fox","text":"The quick brown fox jumps over the lazy dog"}],` +
+			`"wording":"","instructions_found":false,"instruction_count":0}`
+		b, _ := json.Marshal(answer)
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":%s},\"finish_reason\":\"stop\"}]}\n\n", b)
+		w.Write([]byte("data: {\"choices\":[],\"usage\":{\"prompt_tokens\":700,\"completion_tokens\":90,\"total_tokens\":790}}\n\ndata: [DONE]\n\n"))
+	}))
+	defer model.Close()
+	path := socketPath(t)
+	rc := guard.DefaultReader
+	serve(t, path, guard.New(guard.Config{Up: guard.NewPlainUpstream(model.URL, model.Client()), Search: searchN{},
+		Fetcher: guard.NewFetcher(true), Reader: &rc, Now: time.Now}))
+	c := &Client{Path: path, Wait: 5 * time.Second}
+	var mu sync.Mutex
+	var quotes []proto.Quote
+	s := c.Open("t_r", guard.TaskOptions{Question: "what does the fox do?"}, func(e proto.Event) error {
+		mu.Lock()
+		quotes = append(quotes, e.Quotes...)
+		mu.Unlock()
+		return nil
+	})
+	defer s.Close()
+	ti := &harness.TaskInfo{ID: "t_r", Start: &harness.Start{Tools: guard.ToolDefs("web.fetch")}}
+	f := &guard.Facts{}
+	ctx := guard.WithFacts(harness.WithRequestID(context.Background(), "a1"), f)
+	res, err := c.Action(ctx, ti, "a1", &harness.Action{Name: "web.fetch", Args: jsontext.Value(`{"url":"` + page.URL + `/p"}`)})
+	if err != nil || res.Status != harness.ActionDone {
+		t.Fatalf("%+v %v", res, err)
+	}
+	if strings.Contains(string(res.Output), "quick brown fox") || !strings.Contains(string(res.Output), `[quote 1]`) {
+		t.Fatalf("the brain's result: %s", res.Output)
+	}
+	d := f.Data()
+	if len(d.Reader) != 1 || d.Reader[0].Prompt != 700 || d.Reader[0].Completion != 90 || d.Reader[0].Outcome != "ok" || !d.Reader[0].Sent {
+		t.Fatalf("reader facts %+v", d.Reader)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(quotes) != 1 || quotes[0].Text != "The quick brown fox jumps over the lazy dog" || quotes[0].Index != 1 {
+		t.Fatalf("quotes in the stream %+v", quotes)
+	}
+	if !c.Untrusted(ti, &harness.Action{Name: "web.fetch"}) || c.Untrusted(ti, &harness.ModelCall{}) {
+		t.Fatal("Untrusted")
+	}
+}

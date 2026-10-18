@@ -13,6 +13,9 @@ import (
 	"sync"
 	"time"
 
+	"encoding/json/jsontext"
+	jsonv2 "encoding/json/v2"
+
 	"github.com/tacyhq/tacy/guard"
 	"github.com/tacyhq/tacy/harness"
 	"github.com/tacyhq/tacy/proto"
@@ -278,17 +281,56 @@ func (g *safeGateway) Action(ctx context.Context, ti *harness.TaskInfo, id strin
 	if req.Name == "web.search" || req.Name == "web.images" {
 		want.CostMicros = safety.SearchCost
 	}
-	commit, err := g.ledger.Reserve(ti.ID, want, e.Budget())
+	// The quarantined reader's model call for a page or a search (guard/reader.go) is reserved with the action, at
+	// its largest: an action whose reader the budget can't cover doesn't run (the model never gets raw text instead).
+	reader := readerReserve(req.Name, e)
+	commit, err := g.ledger.Reserve(ti.ID, addUsage(want, reader), e.Budget())
 	if err != nil {
 		return nil, g.refuse(ti.ID, harness.CodeLimit, err)
 	}
+	f := guard.FactsFrom(ctx)
+	if f == nil {
+		f = &guard.Facts{}
+		ctx = guard.WithFacts(ctx, f)
+	}
 	res, err := g.inner.Action(ctx, ti, id, req)
-	commit(want) // a tool call counts whether or not it worked
+	commit(addUsage(want, readerUsed(f.Data().Reader, reader))) // a tool call counts whether or not it worked
 	g.tripFromGuard(ti.ID, err)
 	if res != nil && res.Error != "" && strings.HasPrefix(res.Error, safety.CodeRateLimited) {
 		g.trip(ti.ID, &safety.Error{Code: safety.CodeRateLimited, Msg: strings.TrimPrefix(res.Error, safety.CodeRateLimited+": ")})
 	}
 	return res, err
+}
+
+// readerReserve is the budget the reader's call for action may use (zero for actions it doesn't read, or when the
+// policy doesn't allow its model: gatewayd then refuses the reader and shows nothing of the source).
+func readerReserve(action string, e *safety.Effective) safety.Usage {
+	model, p, c, ok := guard.ReaderReserve(action)
+	if !ok || !e.AllowsModel(model) {
+		return safety.Usage{}
+	}
+	return safety.Usage{Tokens: p + c, CostMicros: safety.ModelCost(model, p, c)}
+}
+
+// readerUsed is what the reader's calls cost: the model's own counts, or, for a call that reached the model
+// without counts (it may be billed), the whole reservation, never less.
+func readerUsed(calls []guard.ReaderUse, reserved safety.Usage) safety.Usage {
+	var u safety.Usage
+	for _, c := range calls {
+		switch {
+		case c.Prompt+c.Completion > 0:
+			p, q := int64(c.Prompt), int64(c.Completion)
+			u = addUsage(u, safety.Usage{Tokens: p + q, CostMicros: safety.ModelCost(c.Model, p, q)})
+		case c.Sent:
+			u = addUsage(u, reserved)
+		}
+	}
+	return u
+}
+
+func addUsage(a, b safety.Usage) safety.Usage {
+	return safety.Usage{Tokens: a.Tokens + b.Tokens, ToolCalls: a.ToolCalls + b.ToolCalls, CostMicros: a.CostMicros + b.CostMicros,
+		WallMs: a.WallMs + b.WallMs}
 }
 
 // tripFromGuard notes a refusal gatewayd or the vault made on its own ("stopped: …", "rate_limited: …").
@@ -313,6 +355,78 @@ func (g *safeGateway) Exec(ctx context.Context, ti *harness.TaskInfo, id string,
 }
 
 func (g *safeGateway) ReplaySafe(_ *harness.TaskInfo, req any) bool { return guard.ReplaySafe(req) }
+
+// Untrusted: the web connector's results taint the task (guard.Untrusted; docs/27 section 5).
+func (g *safeGateway) Untrusted(_ *harness.TaskInfo, req any) bool { return guard.Untrusted(req) }
+
+// TaintedAtStart: an earlier assistant turn in the input taints the task from its start (guard.StartTaint).
+func (g *safeGateway) TaintedAtStart(s *harness.Start) string { return guard.StartTaint(s) }
+
+var _ harness.StartTaintGuard = (*safeGateway)(nil)
+
+var _ guard.TaskResumer = (*safeGateway)(nil)
+
+// ResumeTask takes up a task's budget after an agentd restart (guard.TaskResumer): what its journal shows it used
+// counts against its run budget again, and its running time counts from when it started. Without it a restart would
+// hand a task a fresh budget. The session it then opens registers it for the kill switch, as any task.
+func (g *safeGateway) ResumeTask(task string, start *harness.Start, opts guard.TaskOptions, started time.Time, journal []harness.Record) {
+	g.ledger.Resume(task, cmp.Or(opts.Space, start.Space), started, journalUsage(journal))
+}
+
+// journalUsage is what a task's journal shows it used, counted as the checks above count it: each model call by
+// the model's own usage (one without a result, which may have been billed, by its prompt's estimate), each action
+// that ran or may have run as a tool call (searches with their cost). Refusals and denials used nothing.
+func journalUsage(recs []harness.Record) safety.Usage {
+	var u safety.Usage
+	for _, r := range recs {
+		switch r.Kind {
+		case harness.TypeModelCall:
+			var req harness.ModelCall
+			jsonv2.Unmarshal(r.Req, &req)
+			var res harness.ModelResult
+			if r.Done && r.Err == nil && jsonv2.Unmarshal(r.Body, &res) == nil && res.Usage.Prompt+res.Usage.Completion > 0 {
+				p, c := int64(res.Usage.Prompt), int64(res.Usage.Completion)
+				u.Tokens += p + c
+				u.CostMicros += safety.ModelCost(req.Model, p, c)
+			} else if !r.Done || r.Err != nil && r.Err.Code == harness.CodeInternal {
+				p := safety.EstimateTokens(len(r.Req))
+				u.Tokens += p
+				u.CostMicros += safety.ModelCost(req.Model, p, 0)
+			}
+		case harness.TypeAction:
+			var req harness.Action
+			jsonv2.Unmarshal(r.Req, &req)
+			var res harness.ActionResult
+			ran := !r.Done && r.Held == "" || r.Done && r.Err == nil && jsonv2.Unmarshal(r.Body, &res) == nil && res.Status != harness.ActionDenied
+			if ran {
+				u.ToolCalls++
+				if req.Name == "web.search" || req.Name == "web.images" {
+					u.CostMicros += safety.SearchCost
+				}
+				// The reader read its source (its answer or its refusal is in the output): counted at its
+				// reservation, since the journal doesn't keep the reader's own counts. On the high side, never low.
+				if readOutput(res.Output) {
+					if model, p, c, ok := guard.ReaderReserve(req.Name); ok {
+						u.Tokens += p + c
+						u.CostMicros += safety.ModelCost(model, p, c)
+					}
+				}
+			}
+		}
+	}
+	return u
+}
+
+// readOutput: a journaled web action's output came from the quarantined reader (it has "read" or "reader").
+func readOutput(out []byte) bool {
+	var o map[string]jsontext.Value
+	if len(out) == 0 || jsonv2.Unmarshal(out, &o) != nil {
+		return false
+	}
+	_, read := o["read"]
+	_, reader := o["reader"]
+	return read || reader
+}
 
 // enforce is the kill switch: whenever the controls change, and every few seconds (staleness comes with time),
 // every running task whose space may no longer run is cancelled.

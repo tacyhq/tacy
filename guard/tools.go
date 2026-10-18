@@ -1,6 +1,7 @@
 package guard
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -71,8 +72,9 @@ type toolOutcome struct {
 	provider string
 	failed   string
 	wait     time.Duration
-	images   []shownImage // image_search: the images to send (image events), in order
-	istats   *imageStats  // image_search: numbers for the metrics event
+	images   []shownImage  // image_search: the images to send (image events), in order
+	istats   *imageStats   // image_search: numbers for the metrics event
+	quotes   []proto.Quote // read by the quarantined reader: the exact passages, for the person only (tool_result)
 }
 
 // pending is one tool call's result before citation numbers are given (Finish). Calls of a step run in
@@ -82,6 +84,9 @@ type pending struct {
 	query   string      // web_search: the masked query sent
 	results []SearchResult
 	page    *fetched // fetch_page
+	// read is the quarantined reader's checked answer for the page or the results (reader.go); nil when the reader
+	// is off. With it, the model gets the reader's fields and quote references instead of the text and snippets.
+	read *readerResult
 }
 
 type fetched struct{ title, text, final string }
@@ -92,6 +97,10 @@ type Tools struct {
 	search  SearchProvider
 	fetcher *http.Client
 	cites   int
+	quotes  int // quote numbers given so far ([quote N], per task)
+	// reader: the quarantined reader is on, so no provider text reaches the model: image results go without their
+	// titles, and with only their page's host (docs/27 section 5).
+	reader bool
 	// decodes bounds image decodes at once across the VM (shared by every run; nil = no bound).
 	decodes    chan struct{}
 	mu         sync.Mutex
@@ -236,7 +245,7 @@ func (t *Tools) Finish(p pending) toolOutcome {
 	case out.istats != nil: // image_search
 		type item struct {
 			N      int    `json:"n"`
-			Title  string `json:"title"`
+			Title  string `json:"title,omitempty"`
 			Source string `json:"source,omitempty"`
 			Size   string `json:"size"`
 		}
@@ -246,15 +255,29 @@ func (t *Tools) Finish(p pending) toolOutcome {
 			Shown  int    `json:"shown"`
 			Images []item `json:"images"`
 		}{Note: imagesNote, Query: p.query, Shown: len(out.images), Images: []item{}}
+		if t.reader {
+			res.Note = imagesReaderNote
+		}
 		if len(out.images) == 0 {
 			res.Note = "No images could be loaded for this query (none found, or they were too large, not JPEG/PNG/GIF/WebP, or unreachable). Say so briefly or try a different query."
 		}
 		for i, im := range out.images {
-			res.Images = append(res.Images, item{i + 1, im.Title, im.Source, fmt.Sprintf("%dx%d", im.Width, im.Height)})
+			it := item{N: i + 1, Title: im.Title, Source: im.Source, Size: fmt.Sprintf("%dx%d", im.Width, im.Height)}
+			if t.reader {
+				// An image's title and its page's address are the provider's and the page author's text: with the
+				// reader on, the model gets neither, only the page's host (people see the titles in the gallery).
+				it.Title, it.Source = "", hostOf(im.Source)
+			}
+			res.Images = append(res.Images, it)
 		}
 		b, _ := json.Marshal(res)
 		out.content = string(b)
 		return out
+	case p.page != nil && p.read != nil:
+		t.cites++
+		// The page's own title is its text too: the model gets the reader's (read.source.title), people the page's.
+		return t.finishRead(p, out, []int{t.cites}, map[string]any{"note": readerNote, "n": t.cites, "url": p.page.final},
+			[]proto.Citation{{Index: t.cites, Title: p.page.title, URL: p.page.final, Snippet: capRunes(p.page.text, 200)}})
 	case p.page != nil:
 		t.cites++
 		b, _ := json.Marshal(map[string]any{"note": untrustedNote, "n": t.cites, "url": p.page.final, "title": p.page.title, "text": p.page.text})
@@ -269,6 +292,25 @@ func (t *Tools) Finish(p pending) toolOutcome {
 		Snippet string `json:"snippet"`
 		Age     string `json:"age,omitempty"`
 	}
+	if p.read != nil {
+		// The model gets each result's number, URL and age (code's) and the reader's fields over the titles and
+		// snippets (the provider's text, which a page's author writes: people see them, the model doesn't).
+		type ritem struct {
+			N   int    `json:"n"`
+			URL string `json:"url"`
+			Age string `json:"age,omitempty"`
+		}
+		rs := []ritem{}
+		var ns []int
+		var cites []proto.Citation
+		for _, r := range p.results {
+			t.cites++
+			rs = append(rs, ritem{t.cites, r.URL, r.Age})
+			ns = append(ns, t.cites)
+			cites = append(cites, proto.Citation{Index: t.cites, Title: r.Title, URL: r.URL, Snippet: r.Snippet, Age: r.Age})
+		}
+		return t.finishRead(p, out, ns, map[string]any{"note": readerNote, "query": p.query, "results": rs}, cites)
+	}
 	res := struct {
 		Note    string `json:"note"`
 		Query   string `json:"query"`
@@ -280,6 +322,25 @@ func (t *Tools) Finish(p pending) toolOutcome {
 		out.citations = append(out.citations, proto.Citation{Index: t.cites, Title: r.Title, URL: r.URL, Snippet: r.Snippet, Age: r.Age})
 	}
 	b, _ := json.Marshal(res)
+	out.content = string(b)
+	return out
+}
+
+// finishRead builds what the model sees for a source the reader read: head (code's: the page's number and address,
+// or the results' numbers, URLs and ages) plus the reader's fields under "read", or, when the reader failed, the
+// reason under "reader" and nothing from the text. The quotes' text and the titles go to the person only.
+func (t *Tools) finishRead(p pending, out toolOutcome, sources []int, head map[string]any, cites []proto.Citation) toolOutcome {
+	out.citations = cites
+	if p.read.err != "" || len(sources) == 0 {
+		head["note"] = readerFailNote
+		head["read"] = nil
+		head["reader"] = cmp.Or(p.read.err, "nothing to read")
+	} else {
+		v, quotes := p.read.view(sources, &t.quotes)
+		head["read"] = v
+		out.quotes = quotes
+	}
+	b, _ := json.Marshal(head)
 	out.content = string(b)
 	return out
 }

@@ -28,6 +28,9 @@ type FactsData struct {
 	Leases   []activity.Lease `json:"leases,omitzero"`
 	Blocked  []string         `json:"blocked,omitzero"`  // leak-scan pattern ids that blocked the request
 	Redacted []string         `json:"redacted,omitzero"` // leak-scan pattern ids redacted from the response
+	// Reader: the quarantined reader's calls for this action (reader.go): model, tokens, outcome, counts. agentd
+	// commits them to the budget it reserved (ReaderReserve).
+	Reader []ReaderUse `json:"reader,omitzero"`
 }
 
 type factsKey struct{}
@@ -51,13 +54,13 @@ func (f *Facts) Data() FactsData {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return FactsData{Hosts: slices.Clone(f.d.Hosts), Leases: slices.Clone(f.d.Leases), Blocked: slices.Clone(f.d.Blocked),
-		Redacted: slices.Clone(f.d.Redacted)}
+		Redacted: slices.Clone(f.d.Redacted), Reader: slices.Clone(f.d.Reader)}
 }
 
 // Ptr is Data as a pointer, nil when nothing was collected (nil f too): what gateway/v0 sends.
 func (f *Facts) Ptr() *FactsData {
 	d := f.Data()
-	if len(d.Hosts) == 0 && len(d.Leases) == 0 && len(d.Blocked) == 0 && len(d.Redacted) == 0 {
+	if len(d.Hosts) == 0 && len(d.Leases) == 0 && len(d.Blocked) == 0 && len(d.Redacted) == 0 && len(d.Reader) == 0 {
 		return nil
 	}
 	return &d
@@ -80,6 +83,7 @@ func (f *Facts) Merge(d FactsData) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.d.Leases = append(f.d.Leases, d.Leases...)
+	f.d.Reader = append(f.d.Reader, d.Reader...)
 	f.d.Blocked = addIDs(f.d.Blocked, d.Blocked)
 	f.d.Redacted = addIDs(f.d.Redacted, d.Redacted)
 }
@@ -134,6 +138,15 @@ func (f *Facts) model(out, in int64) {
 	}
 	f.mu.Unlock()
 	f.host(host, 1, 0, out, in)
+}
+
+func (f *Facts) reader(u ReaderUse) {
+	if f == nil {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.d.Reader = append(f.d.Reader, u)
 }
 
 func (f *Facts) lease(l activity.Lease) {

@@ -120,6 +120,21 @@ func (l *Ledger) Begin(task, space string) {
 	}
 }
 
+// Resume registers a run that was begun before a restart (a task taken up again): it started at start and has
+// used what used says, so its run budget and running time go on from there instead of starting over. A run already
+// registered is left as it is.
+func (l *Ledger) Resume(task, space string, start time.Time, used Usage) {
+	l.init()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.runs[task] == nil {
+		if start.IsZero() || start.After(l.Now()) {
+			start = l.Now()
+		}
+		l.runs[task] = &ledgerRun{space: space, start: start, used: used}
+	}
+}
+
 // Admit refuses a new run when the space's day budget is already used up, and returns the latest a run may go on
 // (zero: no limit), from the run's and the day's running time. task, when given, is a run already begun.
 func (l *Ledger) Admit(space string, b Budgets, task ...string) (time.Time, error) {

@@ -96,6 +96,9 @@ type Run struct {
 	Background []Host `json:"background,omitzero"`
 	// StartSeq is the sequence number of the run's start record in this chain (end, interrupted).
 	StartSeq uint64 `json:"start_seq,omitzero"`
+	// Tainted (end): the run received outside content (web pages, search results), so anything it proposed after that
+	// is marked tainted (docs/27 section 5).
+	Tainted bool `json:"tainted,omitzero"`
 }
 
 // Agent identifies the agent definition the run ran.
@@ -160,6 +163,27 @@ type Call struct {
 	// Leak-scan decisions on this call: pattern ids only, never the match.
 	Blocked  []string `json:"blocked,omitzero"`
 	Redacted []string `json:"redacted,omitzero"`
+	// Taint (docs/27 section 5): Untrusted, this call's result brought outside content to the agent (a page, search
+	// results); Tainted, the run had already received outside content when the agent proposed this call.
+	Untrusted bool `json:"untrusted,omitzero"`
+	Tainted   bool `json:"tainted,omitzero"`
+	// Reader is the quarantined reader's model call for this action (a page or search results read for the agent).
+	Reader *Reader `json:"reader,omitzero"`
+}
+
+// Reader is one quarantined reader call: numbers and fixed words only.
+type Reader struct {
+	Model      string `json:"model"`
+	Prompt     int    `json:"prompt"`
+	Completion int    `json:"completion"`
+	Ms         int64  `json:"ms"`
+	Outcome    string `json:"outcome"`      // ok | refused | failed
+	Why        string `json:"why,omitzero"` // refused, failed: schema, tool_call, length, empty, policy, model
+	// Quotes kept and dropped (not found in the source), injections the reader counted, verbatim passages cut.
+	Quotes       int `json:"quotes,omitzero"`
+	Dropped      int `json:"dropped,omitzero"`
+	Instructions int `json:"instructions,omitzero"`
+	Verbatim     int `json:"verbatim,omitzero"`
 }
 
 // Host is egress to one host: requests made (and refused by the policy before connecting) and bytes each way.

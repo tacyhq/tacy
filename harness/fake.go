@@ -5,6 +5,7 @@ import (
 	"encoding/json/jsontext"
 	"net"
 	"sync"
+	"time"
 )
 
 // MemStore is a Store in memory: the fake runtime's, and the reference for the SQLite one (../queue). Several
@@ -16,6 +17,9 @@ type MemStore struct {
 	recs   map[string]*Record
 	order  map[string][]string // request ids per task, in the order begun
 	cps    map[string]*Checkpoint
+	events map[string][]StoredEvent
+	// Now is the clock for created and ended times; nil: time.Now.
+	Now func() time.Time
 }
 
 type memTask struct {
@@ -25,7 +29,14 @@ type memTask struct {
 
 func NewMemStore() *MemStore {
 	return &MemStore{tasks: map[string]*memTask{}, recs: map[string]*Record{}, order: map[string][]string{},
-		cps: map[string]*Checkpoint{}}
+		cps: map[string]*Checkpoint{}, events: map[string][]StoredEvent{}}
+}
+
+func (m *MemStore) now() time.Time {
+	if m.Now != nil {
+		return m.Now().UTC()
+	}
+	return time.Now().UTC()
 }
 
 func (m *MemStore) AddTask(id string, start, opts jsontext.Value) error {
@@ -34,16 +45,34 @@ func (m *MemStore) AddTask(id string, start, opts jsontext.Value) error {
 	if m.tasks[id] != nil {
 		return errf("task %s exists", id)
 	}
-	m.tasks[id] = &memTask{st: StoredTask{ID: id, Start: start.Clone(), Options: opts.Clone()}}
+	m.tasks[id] = &memTask{st: StoredTask{ID: id, Start: start.Clone(), Options: opts.Clone(), State: StateQueued, Created: m.now()}}
 	m.torder = append(m.torder, id)
 	return nil
 }
 
-func (m *MemStore) SetAttempt(id string, n int) error {
+func (m *MemStore) SetAttempt(id string, attempt, failures int) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if t := m.tasks[id]; t != nil {
-		t.st.Attempt = n
+		t.st.Attempt, t.st.Failures = attempt, failures
+	}
+	return nil
+}
+
+func (m *MemStore) SetState(id, state, sub string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if t := m.tasks[id]; t != nil && !t.ended {
+		t.st.State, t.st.Sub = state, sub
+	}
+	return nil
+}
+
+func (m *MemStore) SetTaint(id, by string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if t := m.tasks[id]; t != nil && t.st.Taint == "" {
+		t.st.Taint = by
 	}
 	return nil
 }
@@ -57,11 +86,12 @@ func (m *MemStore) AddSteer(id string, st Steer) error {
 	return nil
 }
 
-func (m *MemStore) EndTask(id string, _ Outcome) error {
+func (m *MemStore) EndTask(id string, o Outcome) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if t := m.tasks[id]; t != nil {
+	if t := m.tasks[id]; t != nil && !t.ended {
 		t.ended = true
+		t.st.Outcome, t.st.State, t.st.Sub, t.st.Ended = o.State, EndState(o.State), "", m.now()
 	}
 	return nil
 }
@@ -75,6 +105,30 @@ func (m *MemStore) OpenTasks() ([]StoredTask, error) {
 			st := t.st
 			st.Steers = append([]Steer(nil), t.st.Steers...)
 			out = append(out, st)
+		}
+	}
+	return out, nil
+}
+
+func (m *MemStore) Task(id string) (*StoredTask, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t := m.tasks[id]
+	if t == nil {
+		return nil, nil
+	}
+	st := t.st
+	st.Steers = nil
+	return &st, nil
+}
+
+func (m *MemStore) EndedBefore(before time.Time) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []string
+	for _, id := range m.torder {
+		if t := m.tasks[id]; t != nil && t.ended && t.st.Ended.Before(before) {
+			out = append(out, id)
 		}
 	}
 	return out, nil
@@ -95,6 +149,7 @@ func (m *MemStore) DeleteTask(id string) error {
 	}
 	delete(m.order, id)
 	delete(m.cps, id)
+	delete(m.events, id)
 	return nil
 }
 
@@ -108,6 +163,15 @@ func (m *MemStore) Begin(task, id, kind string, hash [32]byte, req jsontext.Valu
 	m.recs[task+"\x00"+id] = r
 	m.order[task] = append(m.order[task], id)
 	return *r, true, nil
+}
+
+func (m *MemStore) Hold(task, id, sub string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if r := m.recs[task+"\x00"+id]; r != nil && !r.Done {
+		r.Held = sub
+	}
+	return nil
 }
 
 func (m *MemStore) Journal(task string) ([]Record, error) {
@@ -148,6 +212,32 @@ func (m *MemStore) Checkpoint(task string) (*Checkpoint, error) {
 	return nil, nil
 }
 
+func (m *MemStore) AddEvents(task string, evs []StoredEvent) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur := m.events[task]
+	for _, e := range evs {
+		if n := len(cur); n > 0 && e.Seq <= cur[n-1].Seq {
+			return errf("event %d out of order", e.Seq)
+		}
+		cur = append(cur, StoredEvent{Seq: e.Seq, Data: append([]byte(nil), e.Data...)})
+	}
+	m.events[task] = cur
+	return nil
+}
+
+func (m *MemStore) Events(task string, after, limit int) ([]StoredEvent, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []StoredEvent
+	for _, e := range m.events[task] {
+		if e.Seq > after && len(out) < limit {
+			out = append(out, StoredEvent{Seq: e.Seq, Data: append([]byte(nil), e.Data...)})
+		}
+	}
+	return out, nil
+}
+
 // Fake is the runtime for local development (no gVisor, no network, no model) and for the conformance suite: the
 // real protocol engine (Runtime) with a MemStore and a scripted guard. Replace Model, Actions and Exec to script
 // it; the defaults echo.
@@ -163,6 +253,13 @@ type Fake struct {
 	// Safe names the actions that are "replay: safe" (rerun after a runtime restart interrupted them). Model calls
 	// always are; exec never.
 	Safe map[string]bool
+	// Holds names the actions held for a decision (Release) before they run, with the wait sub-state.
+	Holds map[string]string
+	// Untrusted names the actions whose results bring untrusted content in (TaintGuard): the task is tainted once
+	// one of them is done.
+	Untrusted map[string]bool
+	// StartTaint says why a task is tainted from its start (StartTaintGuard); nil: never.
+	StartTaint func(*Start) string
 
 	mu     sync.Mutex
 	runs   map[string]int // actions run, by task\x00name
@@ -268,6 +365,39 @@ func (g fakeGuard) ReplaySafe(_ *TaskInfo, req any) bool {
 	}
 	return false
 }
+
+func (g fakeGuard) Hold(_ *TaskInfo, _ string, req any) string {
+	a, ok := req.(*Action)
+	if !ok {
+		return ""
+	}
+	g.f.mu.Lock()
+	defer g.f.mu.Unlock()
+	return g.f.Holds[a.Name]
+}
+
+var _ HoldGuard = fakeGuard{}
+
+func (g fakeGuard) Untrusted(_ *TaskInfo, req any) bool {
+	a, ok := req.(*Action)
+	if !ok {
+		return false
+	}
+	g.f.mu.Lock()
+	defer g.f.mu.Unlock()
+	return g.f.Untrusted[a.Name]
+}
+
+var _ TaintGuard = fakeGuard{}
+
+func (g fakeGuard) TaintedAtStart(s *Start) string {
+	if g.f.StartTaint == nil {
+		return ""
+	}
+	return g.f.StartTaint(s)
+}
+
+var _ StartTaintGuard = fakeGuard{}
 
 func (g fakeGuard) Exec(ctx context.Context, t *TaskInfo, _ string, req *Exec) (*ExecResult, error) {
 	if g.f.Exec != nil {

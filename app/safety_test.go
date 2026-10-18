@@ -40,6 +40,7 @@ type safeEnv struct {
 	admin, operator ed25519.PrivateKey
 	model           *parityModel
 	modelReqs       atomic.Int32
+	readerReqs      atomic.Int32
 	fs              *fakeSearch
 	seq             uint64
 	rec             *activity.Recorder
@@ -62,6 +63,9 @@ type safeOpts struct {
 	search       guard.SearchProvider
 	keyless      bool
 	behindRunner bool
+	// reader turns the quarantined reader on (as gatewayd runs it); the model server answers its calls with
+	// reader(prompt) and counts them in readerReqs.
+	reader func(prompt string) string
 }
 
 func newSafeEnvWith(t *testing.T, o safeOpts, replies ...string) *safeEnv {
@@ -69,6 +73,22 @@ func newSafeEnvWith(t *testing.T, o safeOpts, replies ...string) *safeEnv {
 	_, e.admin, _ = ed25519.GenerateKey(rand.Reader)
 	_, e.operator, _ = ed25519.GenerateKey(rand.Reader)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if o.reader != nil {
+			body, _ := io.ReadAll(r.Body)
+			var req struct {
+				Messages []struct{ Content string } `json:"messages"`
+			}
+			json.Unmarshal(body, &req)
+			if len(req.Messages) == 2 && strings.HasPrefix(req.Messages[0].Content, "You are Tacy's quarantined reader.") {
+				e.readerReqs.Add(1)
+				w.Header().Set("Content-Type", "text/event-stream")
+				b, _ := json.Marshal(o.reader(req.Messages[1].Content))
+				fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":%s},\"finish_reason\":\"stop\"}]}\n\n", b)
+				io.WriteString(w, "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1500,\"completion_tokens\":400,\"total_tokens\":1900}}\n\ndata: [DONE]\n\n")
+				return
+			}
+			r.Body = io.NopCloser(bytes.NewReader(body))
+		}
 		e.modelReqs.Add(1)
 		e.model.ServeHTTP(w, r)
 	}))
@@ -88,9 +108,14 @@ func newSafeEnvWith(t *testing.T, o safeOpts, replies ...string) *safeEnv {
 		search = o.search
 	}
 	lim := defaultLimits
+	var reader *guard.ReaderConfig
+	if o.reader != nil {
+		rc := guard.DefaultReader
+		reader = &rc
+	}
 	g := guard.New(guard.Config{Up: guard.NewPlainUpstream(srv.URL, srv.Client()), Search: search, Fetcher: guard.NewFetcher(true),
 		Limits: &lim, CacheSecret: "boot-secret", Now: func() time.Time { return time.Date(2026, 10, 17, 0, 0, 0, 0, time.UTC) },
-		Safety: st})
+		Safety: st, Reader: reader})
 	sg := newSafeGateway(g, st, &safety.Ledger{})
 	signer, _ := activity.DeriveSigner(bytes.Repeat([]byte{5}, 32), "f_chat")
 	e.rec = &activity.Recorder{Signer: signer, Store: activity.NewMemStore()}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"crypto/ecdh"
 	"encoding/hex"
@@ -43,6 +44,9 @@ type recGateway struct {
 	mu    sync.Mutex
 	bg    map[string]guard.FactsData // site icons' egress per task, from the session's End
 	calls map[string]int             // calls in the guard per task
+	// history: recorded tasks tainted from their start (an earlier assistant turn in the input; guard.StartTaint),
+	// so their end record says tainted even if no call of theirs brought outside content.
+	history map[string]bool
 }
 
 var (
@@ -104,6 +108,20 @@ func (g *recGateway) RunStarted(task string, start *harness.Start, opts guard.Ta
 	if opts.RecordTo == "" {
 		return
 	}
+	g.noteHistory(task, start)
+	rec, err := g.rec.Begin(recordStart(task, start, opts, controlsOf(meta.Controls), "relay"))
+	if err != nil {
+		log.Printf("activity: start record not written: %v", err) // the run goes on; its record's absence shows in the chain
+		return
+	}
+	h, _, _ := activity.Check(rec, nil)
+	if h != nil {
+		meta.Activity = &proto.Activity{Key: g.rec.Signer.Public(), Chain: h.Chain, Seq: h.Seq - 1, Head: h.Prev}
+	}
+}
+
+// recordStart is a task's start record: who it runs as, under which controls, with what it may use; sizes only.
+func recordStart(task string, start *harness.Start, opts guard.TaskOptions, controls *activity.Controls, via string) activity.Start {
 	in := activity.Input{Messages: len(start.Input)}
 	for _, m := range start.Input {
 		in.Bytes += len(m.Content)
@@ -112,19 +130,29 @@ func (g *recGateway) RunStarted(task string, start *harness.Start, opts guard.Ta
 	for _, t := range start.Tools {
 		tools = append(tools, t.Name)
 	}
-	s := activity.Start{Run: task, Space: start.Space, To: opts.RecordTo,
+	return activity.Start{Run: task, Space: start.Space, To: opts.RecordTo,
 		Agent:   activity.Agent{ID: start.Agent.ID, Version: start.Agent.Version, Digest: start.Agent.Digest},
-		Trigger: activity.Trigger{Kind: "chat", Via: "relay"}, Controls: controlsOf(meta.Controls), Models: start.Models, Tools: tools,
+		Trigger: activity.Trigger{Kind: "chat", Via: via}, Controls: controls, Models: start.Models, Tools: tools,
 		Limits: activity.Limits{MaxSteps: start.Limits.MaxSteps, MaxModelCalls: start.Limits.MaxModelCalls, Deadline: start.Limits.Deadline},
 		Input:  in}
-	rec, err := g.rec.Begin(s)
-	if err != nil {
-		log.Printf("activity: start record not written: %v", err) // the run goes on; its record's absence shows in the chain
+}
+
+var _ guard.TaskResumer = (*recGateway)(nil)
+
+// ResumeTask takes up a task after an agentd restart (guard.TaskResumer): its budget (safeGateway), and its record.
+// The old process's part of the run was ended "interrupted" at boot (Recorder.Recover); what the task does from here
+// is a new start record under the same task id (trigger via "resume"), ended when the task ends, so the chain shows
+// both parts and what happened while the VM was down is never claimed.
+func (g *recGateway) ResumeTask(task string, start *harness.Start, opts guard.TaskOptions, started time.Time, journal []harness.Record) {
+	g.safeGateway.ResumeTask(task, start, opts, started, journal)
+	if opts.RecordTo == "" {
 		return
 	}
-	h, _, _ := activity.Check(rec, nil)
-	if h != nil {
-		meta.Activity = &proto.Activity{Key: g.rec.Signer.Public(), Chain: h.Chain, Seq: h.Seq - 1, Head: h.Prev}
+	g.noteHistory(task, start)
+	st := g.st.StatusOf(cmp.Or(opts.Space, start.Space))
+	c := &activity.Controls{Policy: st.Policy, ReleasePolicy: st.Release, OperatorSeq: st.OperatorSeq, FirmSeq: st.FirmSeq, Fresh: st.Fresh}
+	if _, err := g.rec.Begin(recordStart(task, start, opts, c, "resume")); err != nil {
+		log.Printf("activity: resumed start record not written: %v", err)
 	}
 }
 
@@ -150,6 +178,8 @@ func (g *recGateway) RunEnded(task string, e guard.RunEnd) []proto.Event {
 	}
 	g.mu.Lock()
 	end.Background = g.bg[task].Hosts
+	end.Tainted = g.history[task]
+	delete(g.history, task)
 	g.mu.Unlock()
 	recs, err := g.rec.Finish(task, end)
 	if err != nil {
@@ -157,6 +187,19 @@ func (g *recGateway) RunEnded(task string, e guard.RunEnd) []proto.Event {
 		return nil
 	}
 	return []proto.Event{activityEvent(recs...)}
+}
+
+// noteHistory remembers a recorded task that is tainted from its start (guard.StartTaint).
+func (g *recGateway) noteHistory(task string, start *harness.Start) {
+	if guard.StartTaint(start) == "" {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.history == nil {
+		g.history = map[string]bool{}
+	}
+	g.history[task] = true
 }
 
 func activityEvent(recs ...activity.Sealed) proto.Event {
@@ -185,7 +228,7 @@ func (g *recGateway) Refused(r *proto.RunRequest, err error) (proto.Event, bool)
 	for _, m := range r.Messages {
 		in.Bytes += len(m.Content)
 	}
-	rec, rerr := g.rec.Refused(activity.Start{Run: "t_" + randomHex(12), Space: space, To: r.RecordTo,
+	rec, rerr := g.rec.Refused(activity.Start{Run: harness.NewTaskID(), Space: space, To: r.RecordTo,
 		Agent: activity.Agent{ID: "a_chat", Version: "1", Digest: "unsigned"}, Trigger: activity.Trigger{Kind: "chat", Via: "relay"},
 		Controls: &activity.Controls{Policy: st.Policy, ReleasePolicy: st.Release, OperatorSeq: st.OperatorSeq, FirmSeq: st.FirmSeq, Fresh: st.Fresh},
 		Models:   []string{model}, Input: in}, activity.Status{Code: code, Detail: msg})
@@ -208,13 +251,18 @@ func (g *recGateway) begin(ti *harness.TaskInfo, id, kind, name, connector strin
 	}
 	t0 := time.Now()
 	c := activity.Call{ID: id, Kind: kind, Name: name, Connector: connector, AtMs: t0.Sub(g.rec.StartedAt(ti.ID)).Milliseconds(),
-		ReqBytes: jsonSize(req)}
+		ReqBytes: jsonSize(req), Tainted: ti.Tainted && kind != "model"}
 	i := g.rec.CallStart(ti.ID, c)
 	g.inflight(ti.ID, 1)
 	return func(f *guard.Facts, res any, err error, ok func(c *activity.Call)) {
 		defer g.inflight(ti.ID, -1)
 		d := f.Data()
 		c.Hosts, c.Blocked, c.Redacted, c.Ms = d.Hosts, d.Blocked, d.Redacted, time.Since(t0).Milliseconds()
+		if n := len(d.Reader); n > 0 {
+			u := d.Reader[n-1]
+			c.Reader = &activity.Reader{Model: u.Model, Prompt: u.Prompt, Completion: u.Completion, Ms: u.Ms, Outcome: u.Outcome,
+				Why: u.Why, Quotes: u.Quotes, Dropped: u.Dropped, Instructions: u.Instructions, Verbatim: u.Verbatim}
+		}
 		if err == nil {
 			c.RespBytes = jsonSize(res)
 			c.Outcome = "ok"
@@ -315,6 +363,8 @@ func (g *recGateway) Action(ctx context.Context, ti *harness.TaskInfo, id string
 			c.Outcome, c.Code = "denied", controlCode(res.Error)
 		case harness.ActionFailed:
 			c.Outcome, c.Code = "failed", controlCode(res.Error)
+		case harness.ActionDone:
+			c.Untrusted = guard.Untrusted(req)
 		}
 	})
 	return res, err

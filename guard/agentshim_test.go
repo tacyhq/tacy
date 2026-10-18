@@ -33,11 +33,16 @@ type Agent struct {
 func (a *Agent) Run(ctx context.Context, r *proto.RunRequest, emit func(proto.Event) error) error {
 	var search SearchProvider
 	var fetcher *http.Client
+	var reader *ReaderConfig
 	if a.newTools != nil {
 		tl := a.newTools()
 		search, fetcher = tl.search, tl.fetcher
+		if tl.reader { // the quarantined reader on (its own tests: reader_test.go)
+			rc := DefaultReader
+			reader = &rc
+		}
 	}
-	g := New(Config{Up: a.up, Search: search, Fetcher: fetcher, Icons: a.icons, CacheSecret: a.cacheSecret, Now: a.now})
+	g := New(Config{Up: a.up, Search: search, Fetcher: fetcher, Icons: a.icons, CacheSecret: a.cacheSecret, Now: a.now, Reader: reader})
 	g.gates = a.gates
 	rt := &harness.Runtime{Guard: g, Store: harness.NewMemStore(),
 		Limits: harness.Limits{MaxInflight: cmp.Or(a.runTools, DefaultLimits.RunTools)}}
@@ -65,7 +70,7 @@ func systemPrompt(tools []string, now time.Time) string {
 	for _, t := range tools {
 		actions = append(actions, webAction(t))
 	}
-	return chatInstructions(actions, now)
+	return chatInstructions(actions, now, false)
 }
 
 type userKey struct{}

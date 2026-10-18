@@ -134,3 +134,117 @@ func (c *Conn) Run(ctx context.Context, req proto.RunRequest, on func(proto.Even
 	}
 	return errors.New("stream ended without [DONE]")
 }
+
+// ---- the task API (docs/27; agentd's app/tasks.go) ----------------------------------------------------------
+
+// Task is a task's state as POST /tasks and /tasks/status answer it.
+type Task struct {
+	Task     string `json:"task"`
+	State    string `json:"state"`
+	Sub      string `json:"sub,omitempty"`
+	Attempt  int    `json:"attempt"`
+	Events   int    `json:"events"`
+	Held     int    `json:"held,omitempty"`
+	Outcome  string `json:"outcome,omitempty"`
+	Existing bool   `json:"existing,omitempty"`
+}
+
+// post sends one EHBP-encrypted task call and returns the decrypted response.
+func (c *Conn) post(ctx context.Context, path, model string, v any) (*http.Response, error) {
+	body, _ := json.Marshal(v)
+	r, _ := http.NewRequestWithContext(ctx, "POST", c.Base+path, bytes.NewReader(body))
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("Authorization", "Bearer "+c.Token)
+	if model != "" {
+		r.Header.Set("X-Agent-Model", model)
+	}
+	if c.User != "" {
+		r.Header.Set("X-Agent-User", c.User)
+	}
+	res, err := c.http.Do(r)
+	if err != nil {
+		return nil, err
+	}
+	if res.StatusCode != 200 {
+		b, _ := io.ReadAll(io.LimitReader(res.Body, 2000))
+		res.Body.Close()
+		return nil, fmt.Errorf("%s: HTTP %d: %s", path, res.StatusCode, strings.TrimSpace(string(b)))
+	}
+	return res, nil
+}
+
+func (c *Conn) taskCall(ctx context.Context, path, model string, v any) (*Task, error) {
+	res, err := c.post(ctx, path, model, v)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	var t Task
+	if err := json.NewDecoder(io.LimitReader(res.Body, 64<<10)).Decode(&t); err != nil {
+		return nil, err
+	}
+	return &t, nil
+}
+
+// StartTask starts req as a task. key, when set, makes the start once-only (a retry finds the same task).
+func (c *Conn) StartTask(ctx context.Context, req proto.RunRequest, key string) (*Task, error) {
+	if req.Model == "" {
+		req.Model = proto.DefaultModel
+	}
+	model := req.Model
+	if c.Model != "" {
+		model = c.Model
+	}
+	return c.taskCall(ctx, "/tasks", model, struct {
+		proto.RunRequest
+		Key string `json:"key,omitempty"`
+	}{req, key})
+}
+
+// TaskStatus is a task's state.
+func (c *Conn) TaskStatus(ctx context.Context, id string) (*Task, error) {
+	return c.taskCall(ctx, "/tasks/status", "", map[string]any{"task": id})
+}
+
+// CancelTask cancels a task.
+func (c *Conn) CancelTask(ctx context.Context, id string) (*Task, error) {
+	return c.taskCall(ctx, "/tasks/cancel", "", map[string]any{"task": id})
+}
+
+// FollowTask calls on for each of the task's events after seq after, until the task ended ([DONE], nil) or ctx
+// ends. Reconnect with the last seq on saw to continue.
+func (c *Conn) FollowTask(ctx context.Context, id string, after int, on func(seq int, e proto.Event)) error {
+	res, err := c.post(ctx, "/tasks/events", "", map[string]any{"task": id, "after": after})
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	sc := bufio.NewScanner(res.Body)
+	sc.Buffer(make([]byte, 0, 64<<10), 8<<20)
+	seq := 0
+	for sc.Scan() {
+		line := sc.Text()
+		if v, ok := strings.CutPrefix(line, "id: "); ok {
+			if _, err := fmt.Sscan(v, &seq); err != nil {
+				return fmt.Errorf("bad event id %q", v)
+			}
+			continue
+		}
+		data, ok := strings.CutPrefix(line, "data: ")
+		if !ok {
+			continue
+		}
+		if data == "[DONE]" {
+			return nil
+		}
+		var e proto.Event
+		if err := json.Unmarshal([]byte(data), &e); err != nil {
+			return fmt.Errorf("bad event: %w", err)
+		}
+		on(seq, e)
+	}
+	if err := sc.Err(); err != nil {
+		return err
+	}
+	return errors.New("stream ended without [DONE]")
+}

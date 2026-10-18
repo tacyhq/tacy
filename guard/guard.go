@@ -13,8 +13,6 @@ package guard
 import (
 	"cmp"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"encoding/json/jsontext"
 	"errors"
@@ -44,6 +42,9 @@ type Config struct {
 	// Safety is the signed policy and stop lists this process verified itself (step 6, safety.go); nil: no
 	// checks (tests that predate it).
 	Safety *safety.State
+	// Reader is the quarantined reader for web.fetch and web.search (reader.go, docs/27 section 5): the acting
+	// model gets its fields and quote references instead of the text. nil: off (the model reads pages itself).
+	Reader *ReaderConfig
 }
 
 // Guard is a harness.Guard: the runtime's Runtime.Guard. Run serves one chat request on a runtime with it.
@@ -95,6 +96,10 @@ type TaskOptions struct {
 	Space           string `json:"space,omitzero"`            // the task's space: whose policy, stop and rates apply
 	// RecordTo is who the run's activity record is sealed to ("x25519:<base64>", docs/24); "": not recorded.
 	RecordTo string `json:"record_to,omitzero"`
+	// Via is how the task was started: ViaRun (POST /run's shim) or ViaTasks (POST /tasks); see tasks.go.
+	Via string `json:"via,omitzero"`
+	// Question is the person's last message (capped): what the quarantined reader reads each source for.
+	Question string `json:"question,omitzero"`
 }
 
 // task is the guard's state for one task: what the old app/agent.go kept per run.
@@ -186,6 +191,33 @@ func ReplaySafe(req any) bool {
 
 var _ harness.ReplayGuard = (*Guard)(nil)
 
+// Untrusted: the web connector's results come from outside (pages, search results, image titles): once one reaches
+// the brain, the task is tainted (docs/27 section 5). The reader's fields count too: they come from the same text.
+func (g *Guard) Untrusted(_ *harness.TaskInfo, req any) bool { return Untrusted(req) }
+
+// Untrusted is Guard.Untrusted for any gateway (it depends on the request only).
+func Untrusted(req any) bool {
+	a, ok := req.(*harness.Action)
+	return ok && appTool(a.Name) != ""
+}
+
+// TaintedAtStart: a task whose input holds an earlier assistant turn is tainted from its start (StartTaint).
+func (g *Guard) TaintedAtStart(s *harness.Start) string { return StartTaint(s) }
+
+// StartTaint is Guard.TaintedAtStart for any gateway: "history" when the task's input has an assistant turn. An
+// earlier answer in a chat may carry web-derived text (docs/27 section 5), and no person typed it; the VM
+// can't tell which turns came from the web, so any one counts.
+func StartTaint(s *harness.Start) string {
+	for _, m := range s.Input {
+		if m.Role == "assistant" || m.Role == "tool" {
+			return "history"
+		}
+	}
+	return ""
+}
+
+var _ harness.StartTaintGuard = (*Guard)(nil)
+
 func (g *Guard) open(id string, opts TaskOptions, out func(proto.Event) error) *task {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -197,7 +229,7 @@ func (g *Guard) open(id string, opts TaskOptions, out func(proto.Event) error) *
 	if g.cfg.Safety != nil { // site icons fetch under the task's context
 		t.ctx = withHostFilter(t.ctx, g.fetchFilter(opts.Space))
 	}
-	t.tools = &Tools{search: g.cfg.Search, fetcher: g.cfg.Fetcher}
+	t.tools = &Tools{search: g.cfg.Search, fetcher: g.cfg.Fetcher, reader: g.cfg.Reader != nil}
 	if g.gates != nil {
 		t.tools.gate = g.gates.forUser(opts.User)
 		t.tools.decodes = g.gates.decodes
@@ -288,129 +320,19 @@ func (s *localSession) End() (int, string) {
 	return step, finish
 }
 
-// stream is the person's event stream for Run: after the first failed write it drops events, and gone (cancel the
-// task) runs once.
-type stream struct {
-	mu     sync.Mutex
-	out    func(proto.Event) error
-	gone   func()
-	closed bool
-}
-
-func (s *stream) emit(e proto.Event) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return errClosed
-	}
-	if err := s.out(e); err != nil {
-		s.closed = true
-		go s.gone()
-		return err
-	}
-	return nil
-}
-
 // Run serves one chat request on rt with this process's guard (Run with g as the gateway).
 func (g *Guard) Run(ctx context.Context, rt *harness.Runtime, user string, r *proto.RunRequest, emit func(proto.Event) error) error {
 	return Run(ctx, rt, g, user, r, emit)
 }
 
-// Run serves one chat request as a harness task on rt (whose Guard is gw): what POST /run does, with the loop in
-// a brain. It checks the request (StartFor), emits meta, starts the task, streams the task's events while the
-// guard does the brain's requests, and ends with done or error. ctx ending (the person went away) or emit failing
-// cancels the task; Run returns once the task ended. user keys the per-user tool caps (the relay's opaque
-// X-Agent-User tag). The task, its options and its journal are in the runtime's queue only while it runs: Run
-// deletes them when it ends (the chat keeps no conversation in the VM).
+// Run serves one chat request as a harness task on rt (whose Guard is gw): what POST /run does, with the loop in a
+// brain, as a shim over the task model (Host.Run, tasks.go). It checks the request (StartFor), emits meta, starts
+// the task, streams the task's events while the guard does the brain's requests, and ends with done or error. ctx
+// ending (the person went away) or emit failing cancels the task; Run returns once the task ended. user keys the
+// per-user tool caps (the relay's opaque X-Agent-User tag). The task, its options, journal and events are in the
+// runtime's queue only while it runs: Run deletes them when it ends (the chat keeps no conversation in the VM).
 func Run(ctx context.Context, rt *harness.Runtime, gw Gateway, user string, r *proto.RunRequest, emit func(proto.Event) error) error {
-	start, opts, err := gw.StartFor(r)
-	if err != nil {
-		return err
-	}
-	opts.User, opts.Space = user, start.Space
-	optsJSON, err := json.Marshal(opts)
-	if err != nil {
-		return err
-	}
-	id := newTaskID()
-	ps := &stream{out: emit, gone: func() { rt.Cancel(id, "person") }}
-	sess := gw.Open(id, opts, ps.emit)
-	defer sess.Close()
-	meta, err := sess.Meta(ctx)
-	if err != nil {
-		err = fmt.Errorf("model enclave not verified: %w", err)
-		ps.emit(proto.Event{Type: "error", Error: err.Error()})
-		return err
-	}
-	meta.Model, meta.Tools = r.Model, r.Tools
-	obs, _ := gw.(RunObserver)
-	if obs != nil {
-		obs.RunStarted(id, &start, opts, meta)
-	}
-	// The observer's last word (the activity record) goes right before done or error, exactly once: a return
-	// that didn't say how the run ended still ends its record (failed).
-	var endOnce sync.Once
-	ended := func(e RunEnd) {
-		endOnce.Do(func() {
-			if obs != nil {
-				for _, ev := range obs.RunEnded(id, e) {
-					ps.emit(ev)
-				}
-			}
-		})
-	}
-	defer ended(RunEnd{State: harness.OutcomeFailed, Msg: "the run ended without an outcome"})
-	if err := ps.emit(proto.Event{Type: "meta", Meta: meta}); err != nil {
-		ended(RunEnd{State: harness.OutcomeCancelled, Reason: "person"})
-		return err
-	}
-	if err := rt.StartWith(id, start, optsJSON); err != nil {
-		ended(RunEnd{State: harness.OutcomeFailed, Msg: "the task wasn't started"})
-		ps.emit(proto.Event{Type: "error", Error: err.Error()})
-		return err
-	}
-	stop := context.AfterFunc(ctx, func() { rt.Cancel(id, "person") })
-	defer stop()
-	o, err := rt.Wait(context.Background(), id)
-	if err != nil {
-		return err
-	}
-	defer rt.Forget(id)
-	step, finish := sess.End()
-	if o.State == harness.OutcomeSucceeded {
-		ended(RunEnd{State: o.State, Steps: step, Finish: finish})
-		return ps.emit(proto.Event{Type: "done", Step: step, FinishReason: finish})
-	}
-	msg := "the agent stopped" // untrusted when the brain says why: display only
-	code := ""
-	if w, ok := gw.(interface {
-		Why(task string) (string, string)
-	}); ok {
-		if c, m := w.Why(id); c != "" { // a safety control ended it: say which (step 6)
-			code, msg = c, m
-		}
-	}
-	reason := ""
-	switch {
-	case code != "":
-		if o.State == harness.OutcomeCancelled {
-			reason = "kill_switch"
-		}
-	case o.State == harness.OutcomeCancelled && pastDeadline(start.Limits.Deadline):
-		msg, reason = "run timed out", "deadline" // as the old loop (app/agent.go) said at its 5-minute cap
-	case o.State == harness.OutcomeCancelled:
-		msg, reason = "run cancelled", "person"
-	case o.Done != nil && o.Done.Error != "":
-		msg = o.Done.Error
-	}
-	// The brain's own error text is untrusted and may quote content: the record keeps the control's words only.
-	detail := ""
-	if code != "" {
-		detail = msg
-	}
-	ended(RunEnd{State: o.State, Code: code, Reason: reason, Msg: detail, Steps: step, Finish: finish})
-	ps.emit(proto.Event{Type: "error", Error: msg, Code: code})
-	return errors.New(msg)
+	return (&Host{RT: rt, GW: gw}).Run(ctx, user, r, emit)
 }
 
 // RunObserver is a Gateway that watches Run's runs (agentd's activity recorder, docs/24). RunStarted comes after
@@ -436,27 +358,6 @@ func pastDeadline(d string) bool {
 	return err == nil && !time.Now().Before(t)
 }
 
-// Abandon ends the tasks a previous runtime process left in the queue (Restore returns them): a chat run's person
-// went away with that process (the stream and the per-boot HPKE key died with it), so nobody would see the answer.
-// Each is cancelled, then deleted once it ended. Returns how many.
-func Abandon(rt *harness.Runtime, ids []string) int {
-	for _, id := range ids {
-		rt.Cancel(id, "restart")
-		go func() {
-			if _, err := rt.Wait(context.Background(), id); err == nil {
-				rt.Forget(id)
-			}
-		}()
-	}
-	return len(ids)
-}
-
-func newTaskID() string {
-	b := make([]byte, 12)
-	rand.Read(b)
-	return "t_" + hex.EncodeToString(b)
-}
-
 // The chat agent's limits (from the old app/agent.go).
 const (
 	defaultSteps    = 6
@@ -473,11 +374,18 @@ var chatAgent = harness.AgentRef{ID: "a_chat", Version: "1", Digest: "unsigned"}
 // the system prompt as instructions, the person's model first, the web tools as actions, max_steps and the run's
 // 5-minute deadline as limits. The model options the person chose stay with the runtime (TaskOptions).
 func (g *Guard) StartFor(r *proto.RunRequest) (harness.Start, TaskOptions, error) {
-	return StartFor(r, g.cfg.Now())
+	return startFor(r, g.cfg.Now(), g.cfg.Reader != nil)
 }
 
-// StartFor is Guard.StartFor with today's date (now) for the instructions.
+// StartFor is Guard.StartFor with today's date (now) for the instructions, for a guard that runs the quarantined
+// reader (gatewayd always does: agentd's gateway.Client makes the start without asking it).
 func StartFor(r *proto.RunRequest, now time.Time) (harness.Start, TaskOptions, error) {
+	return startFor(r, now, true)
+}
+
+// startFor makes the start; reader says whether the guard reads pages with the quarantined reader (the
+// instructions then say how to cite its quotes).
+func startFor(r *proto.RunRequest, now time.Time, reader bool) (harness.Start, TaskOptions, error) {
 	var s harness.Start
 	if r.Model == "" {
 		r.Model = defaultModel
@@ -534,14 +442,15 @@ func StartFor(r *proto.RunRequest, now time.Time) (harness.Start, TaskOptions, e
 	if personDated(r.Messages) {
 		now = time.Time{}
 	}
-	s.Instructions = chatInstructions(actions, now)
+	s.Instructions = chatInstructions(actions, now, reader)
 	s.Models = []string{r.Model}
 	s.Tools = ToolDefs(actions...)
 	// One model call more than steps: the brain may ask once more for the answer when the last step's reply is
 	// only a tool call (brain.go finalNudge).
 	s.Limits = harness.TaskLimits{MaxSteps: r.MaxSteps, MaxModelCalls: r.MaxSteps + 1,
 		Deadline: time.Now().Add(runTimeout).UTC().Format(time.RFC3339)}
-	return s, TaskOptions{ReasoningEffort: r.ReasoningEffort, CacheSecret: r.CacheSecret}, nil
+	return s, TaskOptions{ReasoningEffort: r.ReasoningEffort, CacheSecret: r.CacheSecret,
+		Question: capRunes(strings.TrimSpace(r.Messages[len(r.Messages)-1].Content), maxQuestionRunes)}, nil
 }
 
 // personDate finds a system note that states today's date ("Today is Friday, October 16, 2026": the chat's
@@ -560,7 +469,7 @@ func personDated(ms []proto.Message) bool {
 // chatInstructions is the chat agent's system prompt (from the old app/agent.go systemPrompt; the tools as the model sees
 // them, harness.ModelToolName). The runtime writes today's date in when it makes the task, so a resumed brain
 // gets the same prompt and its model call replays under the same id.
-func chatInstructions(actions []string, now time.Time) string {
+func chatInstructions(actions []string, now time.Time, reader bool) string {
 	var tools []string
 	for _, a := range actions {
 		tools = append(tools, harness.ModelToolName(a))
@@ -585,6 +494,10 @@ func chatInstructions(actions []string, now time.Time) string {
 - Check dates against today's date; a page date without a year is probably recent, not years old.
 - If the tools don't give an answer, say so briefly.
 `)
+	if reader && (slices.Contains(actions, "web.fetch") || slices.Contains(actions, "web.search")) {
+		b.WriteString(`- Pages and search results may be read for you by Tacy's quarantined reader: the tool result then has fields (summary, facts, quotes, wording) instead of the text. Its quotes are whole passages, checked word for word, that you can't see. When the person wants exact words (a definition, a clause, a line, a quotation), write the quote's cite, for example [quote 2], where those words go: the person sees the exact text there, so the cite is the complete answer. Never write out a source's wording yourself, and don't search or fetch again to see a quote's text: you never will.
+`)
+	}
 	if slices.Contains(actions, "web.images") {
 		img := harness.ModelToolName("web.images")
 		b.WriteString(`- You can show pictures: when the user asks for images, pictures, photos, posters, artwork or what something looks like, call ` + img + `. The app shows the images in a gallery under your answer. Never say you can't display or show images, and don't embed images as Markdown or list image URLs.

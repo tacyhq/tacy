@@ -8,7 +8,7 @@ import (
 
 // rebuild restores the task's per-task state from its journal (decided: no separate store). It
 // runs once per task in this process, before the guard does anything for it, so every finished entry it finds
-// was done by an earlier runtime process: after a restart, citation numbers continue where they stopped, the image slots
+// was done by an earlier runtime process: after a restart, citation and quote numbers continue where they stopped, the image slots
 // stay taken, the sites whose icons were shown aren't fetched again, and steps keep counting. Entries are
 // untrusted only as far as the guard's own outputs are (it wrote them); anything unreadable is skipped.
 func (t *task) rebuild(ti *harness.TaskInfo) {
@@ -19,7 +19,7 @@ func (t *task) rebuild(ti *harness.TaskInfo) {
 	if err != nil || len(recs) == 0 {
 		return
 	}
-	steps, cites, images := 0, 0, 0
+	steps, cites, images, quotes := 0, 0, 0, 0
 	var sites []string
 	for _, r := range recs {
 		switch r.Kind {
@@ -39,7 +39,7 @@ func (t *task) rebuild(ti *harness.TaskInfo) {
 				continue
 			}
 			n, used, urls := journaledOutput(req.Name, res.Output)
-			cites, images = max(cites, n), images+used
+			cites, images, quotes = max(cites, n), images+used, max(quotes, journaledQuotes(res.Output))
 			sites = append(sites, urls...)
 		}
 	}
@@ -48,6 +48,7 @@ func (t *task) rebuild(ti *harness.TaskInfo) {
 	t.mu.Unlock()
 	t.numbering.Lock()
 	t.tools.cites = max(t.tools.cites, cites)
+	t.tools.quotes = max(t.tools.quotes, quotes)
 	t.numbering.Unlock()
 	t.tools.reserveImages(images)
 	t.icons.markSeen(sites...)
@@ -93,6 +94,24 @@ func journaledOutput(action string, out []byte) (cite, images int, urls []string
 		}
 	}
 	return cite, images, urls
+}
+
+// journaledQuotes is the highest quote number in a journaled output the reader made ("read": {"quotes": [...]}).
+func journaledQuotes(out []byte) int {
+	var o struct {
+		Read *struct {
+			Quotes []struct {
+				ID int `json:"id"`
+			} `json:"quotes"`
+		} `json:"read"`
+	}
+	n := 0
+	if json.Unmarshal(out, &o) == nil && o.Read != nil {
+		for _, q := range o.Read.Quotes {
+			n = max(n, q.ID)
+		}
+	}
+	return n
 }
 
 // markSeen counts these URLs' sites as seen without fetching their icons: they were shown before a restart.

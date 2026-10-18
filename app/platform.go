@@ -32,6 +32,10 @@ type Platform interface {
 	// ActivityKey is key material only this attested app gets, for the activity signing key (docs/24): dstack's
 	// KMS-derived key for a fixed path, the same after a restart. Locally, random per boot.
 	ActivityKey(ctx context.Context) ([]byte, error)
+	// TaskIDKey is key material for once-only task ids (docs/27 section 1): dstack's KMS-derived key at
+	// "tacy/task-ids/v1", the same after a restart, so a repeated start finds its task across restarts. Locally,
+	// random per boot.
+	TaskIDKey(ctx context.Context) ([]byte, error)
 }
 
 // dstack: Phala Cloud, or open-source dstack on Google Cloud. Secrets are dstack's encrypted environment
@@ -97,7 +101,16 @@ func (d *dstack) Evidence(ctx context.Context, reportData []byte) (json.RawMessa
 // proves the key to dstack's KMS) isn't needed here: the browser learns the derived public key over EHBP from the
 // attested VM (meta.activity).
 func (d *dstack) ActivityKey(ctx context.Context) ([]byte, error) {
-	b, err := d.call(ctx, "POST", "/GetKey", map[string]string{"path": "tacy/activity/v1", "purpose": "signing"})
+	return d.appKey(ctx, "tacy/activity/v1", "signing")
+}
+
+// TaskIDKey asks the guest agent for the app's key at path "tacy/task-ids/v1" (as ActivityKey).
+func (d *dstack) TaskIDKey(ctx context.Context) ([]byte, error) {
+	return d.appKey(ctx, "tacy/task-ids/v1", "task-ids")
+}
+
+func (d *dstack) appKey(ctx context.Context, path, purpose string) ([]byte, error) {
+	b, err := d.call(ctx, "POST", "/GetKey", map[string]string{"path": path, "purpose": purpose})
 	if err != nil {
 		return nil, err
 	}
@@ -126,6 +139,7 @@ func (local) ActivityKey(context.Context) ([]byte, error) {
 	_, err := rand.Read(k)
 	return k, err
 }
+func (local) TaskIDKey(ctx context.Context) ([]byte, error) { return local{}.ActivityKey(ctx) }
 func (local) Evidence(context.Context, []byte) (json.RawMessage, json.RawMessage, error) {
 	return nil, nil, nil
 }

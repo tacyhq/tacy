@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -27,6 +29,9 @@ type Platform interface {
 	// StoragePath is a directory on the platform's encrypted disk for later tools, or "" when there's none.
 	// Nothing uses it yet: the service is stateless.
 	StoragePath() string
+	// ActivityKey is key material only this attested app gets, for the activity signing key (docs/24): dstack's
+	// KMS-derived key for a fixed path, the same after a restart. Locally, random per boot.
+	ActivityKey(ctx context.Context) ([]byte, error)
 }
 
 // dstack: Phala Cloud, or open-source dstack on Google Cloud. Secrets are dstack's encrypted environment
@@ -87,6 +92,28 @@ func (d *dstack) Evidence(ctx context.Context, reportData []byte) (json.RawMessa
 	return q, info, nil
 }
 
+// ActivityKey asks the guest agent for the app's key at path "tacy/activity/v1" (dstack derives it from the KMS
+// root, the app id and the path; it never leaves the CVM). The response's key is hex; its signature chain (which
+// proves the key to dstack's KMS) isn't needed here: the browser learns the derived public key over EHBP from the
+// attested VM (meta.activity).
+func (d *dstack) ActivityKey(ctx context.Context) ([]byte, error) {
+	b, err := d.call(ctx, "POST", "/GetKey", map[string]string{"path": "tacy/activity/v1", "purpose": "signing"})
+	if err != nil {
+		return nil, err
+	}
+	var r struct {
+		Key string `json:"key"`
+	}
+	if err := json.Unmarshal(b, &r); err != nil {
+		return nil, err
+	}
+	k, err := hex.DecodeString(strings.TrimPrefix(r.Key, "0x"))
+	if err != nil || len(k) < 32 {
+		return nil, errors.New("dstack GetKey: no usable key")
+	}
+	return k, nil
+}
+
 // local is for development on a laptop: secrets from the environment, no attestation. The verifier refuses it
 // unless told to skip attestation.
 type local struct{}
@@ -94,6 +121,11 @@ type local struct{}
 func (local) Name() string              { return "local" }
 func (local) Secret(name string) string { return os.Getenv(name) }
 func (local) StoragePath() string       { return "" }
+func (local) ActivityKey(context.Context) ([]byte, error) {
+	k := make([]byte, 32)
+	_, err := rand.Read(k)
+	return k, err
+}
 func (local) Evidence(context.Context, []byte) (json.RawMessage, json.RawMessage, error) {
 	return nil, nil, nil
 }

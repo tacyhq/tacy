@@ -140,6 +140,8 @@ type session struct {
 	cn     *conn
 	closed bool
 	step   int // the last step event relayed (End's answer if gatewayd can't give one)
+	// background is the task's egress outside any request (site icons), from End's result.
+	background guard.FactsData
 }
 
 type conn struct {
@@ -303,6 +305,9 @@ func (s *session) call(ctx context.Context, ti *harness.TaskInfo, f *frame) (*fr
 		}
 		return nil, harness.Errf(harness.CodeInternal, "gateway connection lost")
 	}
+	if r.Facts != nil && f.T != tEnd { // what gatewayd did for it goes to the request's activity record
+		guard.FactsFrom(ctx).Merge(*r.Facts)
+	}
 	if r.Err != nil {
 		if r.Err.Code == harness.CodeCancelled && ctx.Err() != nil {
 			return nil, ctx.Err()
@@ -381,7 +386,19 @@ func (s *session) End() (int, string) {
 		defer s.mu.Unlock()
 		return s.step, "stop"
 	}
+	if r.Facts != nil {
+		s.mu.Lock()
+		s.background = *r.Facts
+		s.mu.Unlock()
+	}
 	return r.Step, r.Finish
+}
+
+// Background is the task's egress outside any request (site icons), as gatewayd reported it at End.
+func (s *session) Background() guard.FactsData {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.background
 }
 
 // Close ends the session (gatewayd forgets the task).

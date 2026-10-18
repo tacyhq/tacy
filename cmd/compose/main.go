@@ -28,7 +28,8 @@
 // gVisor (runsc and the sidecars it runs from gvisor-bin/) is Google's release tarball, downloaded once into the
 // user's cache and checked against the tarball's sha256 and each binary's (sandbox/gvisor.go) before it goes into
 // runnerd's image, as its own layer (it changes less often than runnerd and the brain, so an update pulls only the
-// small layer). Same pinned bytes, same layer: the image stays reproducible.
+// small layer), with gVisor's LICENSE next to the binaries (cmd/compose/gvisor-LICENSE, pinned by sha256: the
+// tarball has none). Same pinned bytes, same layer: the image stays reproducible.
 //
 //	go run ./cmd/compose                  # after editing anything the binaries build from
 //	go run ./cmd/compose --check          # verify compose.yaml matches the source (no write)
@@ -44,9 +45,11 @@ package main
 import (
 	"archive/tar"
 	"bytes"
+	"cmp"
 	"compress/bzip2"
 	"compress/gzip"
 	"crypto/sha256"
+	_ "embed"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -216,6 +219,7 @@ var epoch = time.Unix(0, 0).UTC()
 type file struct {
 	path string
 	data []byte
+	mode int64 // 0: 0555 (a binary)
 }
 
 // filesLayer is a deterministic gzip'd tar holding the files under /tacy/ (0555) in sorted order, each after its
@@ -252,7 +256,8 @@ func filesLayer(files []file) ([]byte, error) {
 				}
 			}
 		}
-		if err := write(&tar.Header{Name: "tacy/" + f.path, Typeflag: tar.TypeReg, Mode: 0o555, Size: int64(len(f.data))}, f.data); err != nil {
+		mode := cmp.Or(f.mode, 0o555)
+		if err := write(&tar.Header{Name: "tacy/" + f.path, Typeflag: tar.TypeReg, Mode: mode, Size: int64(len(f.data))}, f.data); err != nil {
 			return nil, err
 		}
 	}
@@ -267,7 +272,7 @@ func filesLayer(files []file) ([]byte, error) {
 
 // binaryLayer is the layer of an image holding one binary: /tacy/ (0755) and /tacy/<name> (0555).
 func binaryLayer(name string, bin []byte) ([]byte, error) {
-	return filesLayer([]file{{name, bin}})
+	return filesLayer([]file{{path: name, data: bin}})
 }
 
 // layer is one gzip'd layer of an image and its history line.
@@ -436,9 +441,26 @@ func gvisorTarball() ([]byte, error) {
 	return b, nil
 }
 
+// gVisor's license (Apache-2.0, with the BSD note for some files) as published in its repository at the release's
+// tag (gvisorLicenseURL); the tarball has none. It ships next to the binaries, at /tacy/gvisor/LICENSE in runnerd's
+// image, from this copy (cmd/compose/gvisor-LICENSE), checked against gvisorLicenseSHA256. Here rather than in
+// sandbox/gvisor.go so runnerd's binary doesn't change with it.
+const (
+	gvisorLicenseURL    = "https://raw.githubusercontent.com/google/gvisor/release-" + sandbox.GVisorRelease + "/LICENSE"
+	gvisorLicenseSHA256 = "0fbab5c58efbdf6d31e8085214f2dd821659c03d73cff3ed2b08e98826ea1cd9"
+)
+
+//go:embed gvisor-LICENSE
+var gvisorLicense []byte
+
 // gvisorLayer is the layer holding gVisor's binaries at /tacy/gvisor (runsc, gvisor-bin/...): taken from the
-// pinned tarball, each checked against its own pin (sandbox.GVisorFiles), nothing else from the tarball.
+// pinned tarball, each checked against its own pin (sandbox.GVisorFiles), nothing else from the tarball; and its
+// license next to them (/tacy/gvisor/LICENSE, 0444), which the tarball doesn't carry.
 func gvisorLayer(tarball []byte) ([]byte, error) {
+	if h := sha256.Sum256(gvisorLicense); hex.EncodeToString(h[:]) != gvisorLicenseSHA256 {
+		return nil, fmt.Errorf("gVisor LICENSE: sha256 %x isn't the pinned %s", h, gvisorLicenseSHA256)
+	}
+	gvisorRel := strings.TrimPrefix(gvisorDir, "/tacy/")
 	want := map[string]string{}
 	for _, f := range sandbox.GVisorFiles {
 		want[f[0]] = f[1]
@@ -468,11 +490,12 @@ func gvisorLayer(tarball []byte) ([]byte, error) {
 			return nil, fmt.Errorf("gVisor %s: sha256 %x isn't the pinned %s", h.Name, got, sum)
 		}
 		delete(want, h.Name)
-		files = append(files, file{strings.TrimPrefix(gvisorDir, "/tacy/") + "/" + h.Name, b})
+		files = append(files, file{path: gvisorRel + "/" + h.Name, data: b})
 	}
 	for n := range want {
 		return nil, fmt.Errorf("gVisor tarball has no %s", n)
 	}
+	files = append(files, file{path: gvisorRel + "/LICENSE", data: gvisorLicense, mode: 0o444})
 	return filesLayer(files)
 }
 
@@ -509,9 +532,9 @@ func build() (*Release, error) {
 			}
 			layers = append(layers, layer{gz, "tacy cmd/compose: " + gvisorDir + " (gVisor " + sandbox.GVisorRelease + ", " + sandbox.GVisorURL + ")"})
 		}
-		files := []file{{im.name, bin[im.name]}}
+		files := []file{{path: im.name, data: bin[im.name]}}
 		for _, w := range im.with {
-			files = append(files, file{w, bin[w]})
+			files = append(files, file{path: w, data: bin[w]})
 		}
 		by := "tacy cmd/compose:"
 		for _, f := range files {
@@ -562,8 +585,9 @@ func generate(r *Release) (string, error) {
 # Every image is named by digest only: the pinned distroless base (` + baseImage + `)
 # plus one layer with the binaries at /tacy/<name>; runnerd's image also holds the brain and, in a layer of its own,
 # gVisor ` + sandbox.GVisorRelease + ` at ` + gvisorDir + ` (Google's release ` + sandbox.GVisorURL + `,
-# sha256 ` + sandbox.GVisorTarSHA256 + `, each binary checked). Rebuild them from the tagged
-# source (scripts/reproduce.sh) to get the same digests. Binaries (linux/amd64, sha256):
+# sha256 ` + sandbox.GVisorTarSHA256 + `, each binary checked; its Apache-2.0 LICENSE at
+# ` + gvisorDir + `/LICENSE). Rebuild them from the tagged source (scripts/reproduce.sh) to get the same digests.
+# Binaries (linux/amd64, sha256):
 `)
 	for _, bin := range r.Binaries {
 		fmt.Fprintf(&b, "#   %-8s %s\n", bin.Name, bin.SHA256)
@@ -794,6 +818,7 @@ func main() {
 			for _, f := range sandbox.GVisorFiles {
 				m.GVisor.Files[f[0]] = f[1]
 			}
+			m.GVisor.Files["LICENSE"] = gvisorLicenseSHA256
 		}
 	}
 	for _, im := range rel.Images {

@@ -77,6 +77,7 @@ func (g *Guard) ModelCall(ctx context.Context, ti *harness.TaskInfo, req *harnes
 	}
 	stream, err := g.cfg.Up.Stream(ctx, raw)
 	if err != nil {
+		FactsFrom(ctx).model(0, 0)
 		return failed(err)
 	}
 	// The key this call was made with never comes back out, in any encoding: each delta people see, and the
@@ -104,6 +105,9 @@ func (g *Guard) ModelCall(ctx context.Context, ti *harness.TaskInfo, req *harnes
 		}
 	}
 	stream.Close()
+	// For the activity record: one request to the model's host (the key's lease names it), the request's bytes
+	// before EHBP encryption and the answer's as it streamed back.
+	FactsFrom(ctx).model(int64(len(raw)), outBytes)
 	if err != nil {
 		return failed(err)
 	}

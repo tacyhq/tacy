@@ -396,7 +396,7 @@ func layerEntries(t *testing.T, gz []byte) (map[string]int64, map[string]string,
 // A layer of several files: sorted, each after its directories (0755), files 0555; one file gives exactly the
 // single-binary layer's bytes (the other images' digests don't move). Bad paths are refused.
 func TestFilesLayer(t *testing.T) {
-	gz, err := filesLayer([]file{{"runnerd", []byte("r")}, {"gvisor/gvisor-bin/x", []byte("x")}, {"brain", []byte("b")}, {"gvisor/runsc", []byte("s")}})
+	gz, err := filesLayer([]file{{path: "runnerd", data: []byte("r")}, {path: "gvisor/gvisor-bin/x", data: []byte("x")}, {path: "brain", data: []byte("b")}, {path: "gvisor/runsc", data: []byte("s")}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -410,19 +410,19 @@ func TestFilesLayer(t *testing.T) {
 			t.Errorf("%s: %o", n, m)
 		}
 	}
-	one, _ := filesLayer([]file{{"agentd", []byte("a")}})
+	one, _ := filesLayer([]file{{path: "agentd", data: []byte("a")}})
 	bin, _ := binaryLayer("agentd", []byte("a"))
 	if !bytes.Equal(one, bin) {
 		t.Fatal("single-file layer differs")
 	}
 	for _, bad := range []string{"", "/abs", "dir/", "../x", "a/../../x"} {
-		if _, err := filesLayer([]file{{bad, []byte("x")}}); err == nil {
+		if _, err := filesLayer([]file{{path: bad, data: []byte("x")}}); err == nil {
 			t.Errorf("path %q accepted", bad)
 		}
 	}
 }
 
-// gVisor in runnerd's image: exactly the pinned binaries from the pinned tarball, under /tacy/gvisor; a tarball
+// gVisor in runnerd's image: exactly the pinned binaries from the pinned tarball and its license, under /tacy/gvisor; a tarball
 // that isn't the pinned one is refused, wherever it comes from. Skipped with -short (downloads 167 MB once, then
 // the user's cache).
 func TestGVisorLayer(t *testing.T) {
@@ -438,8 +438,12 @@ func TestGVisorLayer(t *testing.T) {
 		t.Fatal(err)
 	}
 	modes, sums, _ := layerEntries(t, gz)
-	if len(modes) != 3+len(sandbox.GVisorFiles) || modes["tacy/"] != 0o755 || modes["tacy/gvisor/"] != 0o755 || modes["tacy/gvisor/gvisor-bin/"] != 0o755 {
+	if len(modes) != 4+len(sandbox.GVisorFiles) || modes["tacy/"] != 0o755 || modes["tacy/gvisor/"] != 0o755 || modes["tacy/gvisor/gvisor-bin/"] != 0o755 {
 		t.Fatalf("entries %v", modes)
+	}
+	// gVisor's license ships next to its binaries, read-only, the pinned text.
+	if p := "tacy/gvisor/LICENSE"; sums[p] != gvisorLicenseSHA256 || modes[p] != 0o444 {
+		t.Errorf("%s: %s %o", p, sums[p], modes[p])
 	}
 	for _, f := range sandbox.GVisorFiles {
 		if p := "tacy/gvisor/" + f[0]; sums[p] != f[1] || modes[p] != 0o555 {

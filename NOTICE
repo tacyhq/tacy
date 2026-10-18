@@ -5,4 +5,6 @@ This product is licensed under the Apache License, Version 2.0 (LICENSE).
 wasm/loggershim and wasm/intotoshim are copies of third-party Apache-2.0 code; their own LICENSE files apply.
 leakscan/ ports IronClaw's leak-detection patterns (Copyright 2026 NEAR AI, MIT); leakscan/NOTICE has the license.
 runnerd's image (built by cmd/compose) contains gVisor release binaries (runsc and gvisor-bin/, Copyright The gVisor Authors,
-Apache-2.0, https://github.com/google/gvisor), unmodified, checked against the hashes in sandbox/gvisor.go.
+Apache-2.0, https://github.com/google/gvisor), unmodified, checked against the hashes in sandbox/gvisor.go; gVisor's license
+text ships next to them in the image at /tacy/gvisor/LICENSE (cmd/compose/gvisor-LICENSE, from gVisor's repository at the
+release tag).

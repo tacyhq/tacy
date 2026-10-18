@@ -199,6 +199,7 @@ func (s *Server) serve(c net.Conn) {
 func (s *Server) do(ctx context.Context, sess guard.Session, ti *harness.TaskInfo, f *frame) *frame {
 	var res frame
 	var err error
+	var facts *guard.Facts // what gatewayd saw and did for a model call or an action (its activity record)
 	switch f.T {
 	case tMeta:
 		res.Meta, err = sess.Meta(ctx)
@@ -208,12 +209,20 @@ func (s *Server) do(ctx context.Context, sess guard.Session, ti *harness.TaskInf
 		return &res
 	case tEnd:
 		res.Step, res.Finish = sess.End()
+		if b, ok := sess.(guard.BackgroundSession); ok {
+			if d := b.Background(); len(d.Hosts) > 0 {
+				res.Facts = &d
+			}
+		}
 		return &res
 	case tModel:
-		res.ModelResult, err = s.G.ModelCall(guard.WithMaxTokens(harness.WithRequestID(ctx, f.ID), f.MaxTokens), ti, f.Model)
+		facts = &guard.Facts{}
+		res.ModelResult, err = s.G.ModelCall(guard.WithFacts(guard.WithMaxTokens(harness.WithRequestID(ctx, f.ID), f.MaxTokens), facts), ti, f.Model)
 	case tAction:
-		res.ActionResult, err = s.G.Action(harness.WithRequestID(ctx, f.ID), ti, f.ID, f.Action)
+		facts = &guard.Facts{}
+		res.ActionResult, err = s.G.Action(guard.WithFacts(harness.WithRequestID(ctx, f.ID), facts), ti, f.ID, f.Action)
 	}
+	res.Facts = facts.Ptr()
 	if err != nil {
 		var pe *harness.Error
 		switch {
@@ -223,7 +232,7 @@ func (s *Server) do(ctx context.Context, sess guard.Session, ti *harness.TaskInf
 		default:
 			pe = harness.Errf(harness.CodeInternal, "")
 		}
-		return &frame{Err: pe}
+		res = frame{Err: pe, Facts: res.Facts}
 	}
 	return &res
 }

@@ -12,6 +12,7 @@
 //	                              events); a full queue is a plaintext 429 {"error":"queue_full"|"user_queue_full"}.
 //	GET  /.well-known/hpke-keys   the same HPKE key in RFC 9458 form (EHBP discovery). Only trust it after
 //	                              checking it equals the attested key.
+//	GET  /activity?chain=&after=  sealed activity records of one chain (docs/24), for the relay (bearer token).
 //	GET  /health                  "ok" once listening.
 //
 // This is agentd (docs/21-gateway-v0.md): the front door and the runtime. A run is a harness/v1 task
@@ -34,6 +35,7 @@ package main
 import (
 	"cmp"
 	"context"
+	"crypto/ecdh"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
@@ -58,6 +60,7 @@ import (
 	ehbpidentity "github.com/tinfoilsh/encrypted-http-body-protocol/identity"
 	ehbpproto "github.com/tinfoilsh/encrypted-http-body-protocol/protocol"
 
+	"github.com/tacyhq/tacy/activity"
 	"github.com/tacyhq/tacy/brain"
 	"github.com/tacyhq/tacy/gateway"
 	"github.com/tacyhq/tacy/guard"
@@ -82,9 +85,10 @@ type server struct {
 	quotes   chan struct{} // concurrent /attest limit
 	runsDone atomic.Int64  // finished runs (local platform stats only)
 
-	safety      *safety.State // signed policies and stop lists agentd verified (step 6, safety.go)
-	gw          guard.Gateway // the guard under the safety checks (pushSafety reaches gatewayd through it)
-	safetySlots chan struct{} // concurrent POST /safety limit
+	rec         *activity.Recorder // the runs' activity records (activity.go, docs/24)
+	safety      *safety.State      // signed policies and stop lists agentd verified (step 6, safety.go)
+	gw          guard.Gateway      // the guard under the safety checks (pushSafety reaches gatewayd through it)
+	safetySlots chan struct{}      // concurrent POST /safety limit
 }
 
 type ticketKey struct{}
@@ -202,6 +206,12 @@ func (s *server) run(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, "body must be a JSON RunRequest")
 		return
 	}
+	// The relay charged for the model in the header: a body that asks for another one is refused before
+	// anything runs or is recorded (this response is encrypted, so the reason only reaches the browser).
+	if h := r.Header.Get(ModelHeader); h != cmp.Or(req.Model, proto.DefaultModel) {
+		fail(w, 400, "model_mismatch: the X-Agent-Model header doesn't match the run's model")
+		return
+	}
 	if _, _, err := s.agent.StartFor(&req); err != nil { // the request checks (Run makes the task from it again)
 		if safety.CodeOf(err) != "" { // stopped, no policy, a model it doesn't allow, the day used up: say why
 			w.Header().Set("Content-Type", "text/event-stream")
@@ -209,18 +219,17 @@ func (s *server) run(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(200)
 			out := newEventStream(w, keepaliveEvery)
 			code, msg := coded(err)
+			if rg, ok := s.agent.(*recGateway); ok { // the refusal goes on the record too
+				if ev, ok := rg.Refused(&req, err); ok {
+					out.emit(ev)
+				}
+			}
 			out.emit(proto.Event{Type: "error", Error: msg, Code: code})
 			out.done()
 			out.stop()
 			return
 		}
 		fail(w, 400, err.Error())
-		return
-	}
-	// The relay charged for the model in the header: a body that asks for another one is refused before
-	// anything runs (this response is encrypted, so the reason only reaches the browser).
-	if h := r.Header.Get(ModelHeader); h != req.Model {
-		fail(w, 400, "model_mismatch: the X-Agent-Model header doesn't match the run's model")
 		return
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -370,7 +379,7 @@ func main() {
 		gw = &gateway.Client{Path: *gatewaySocket, Now: func() time.Time { return time.Now().UTC() }, Docs: st.Docs}
 	} else {
 		// Local development and the load test: the guard in this process, keys from the environment.
-		keys := guard.StaticKeys(p.Secret)
+		keys := guard.RecordLeases(guard.StaticKeys(p.Secret))
 		tc = tinfoil.NewClient(p.Secret("TINFOIL_ENCLAVE"), "")
 		up := guard.NewTinfoilUpstream(tc, keys)
 		if *devModel != "" {
@@ -387,6 +396,39 @@ func main() {
 			Limits: &lim, CacheSecret: randomHex(32), Now: func() time.Time { return time.Now().UTC() }, Safety: st})
 	}
 	sg := newSafeGateway(gw, st, &safety.Ledger{Dir: safetyDir})
+	// Activity records (docs/24): signed with a key derived from dstack's KMS for this app and firm (locally, a
+	// key per boot), kept on the encrypted disk.
+	ikm, err := p.ActivityKey(context.Background())
+	if err != nil {
+		log.Fatalf("activity: signing key: %v", err)
+	}
+	signer, err := activity.DeriveSigner(ikm, st.Firm())
+	clear(ikm)
+	if err != nil {
+		log.Fatalf("activity: %v", err)
+	}
+	var astore activity.Store = activity.NewMemStore()
+	if dir := p.StoragePath(); dir != "" {
+		if astore, err = activity.OpenStore(filepath.Join(dir, "activity", "activity.db")); err != nil {
+			log.Fatalf("activity: %v", err)
+		}
+	}
+	rec := &activity.Recorder{Signer: signer, Store: astore}
+	if n, err := rec.Recover(); err != nil {
+		log.Fatalf("activity: %v", err)
+	} else if n > 0 {
+		log.Printf("activity: ended %d runs a previous process left open (interrupted)", n)
+	}
+	skb, err := id.PrivateKey().Bytes()
+	if err != nil {
+		log.Fatalf("activity: %v", err)
+	}
+	vmKey, err := ecdh.X25519().NewPrivateKey(skb)
+	clear(skb)
+	if err != nil {
+		log.Fatalf("activity: %v", err)
+	}
+	rg := newRecGateway(sg, rec, vmKey)
 	var store harness.Store = harness.NewMemStore()
 	if dir := p.StoragePath(); dir != "" {
 		q, err := queue.Open(filepath.Join(dir, "queue.db"))
@@ -395,7 +437,7 @@ func main() {
 		}
 		store = q
 	}
-	rt := newRuntime(sg, store, lim)
+	rt := newRuntime(rg, store, lim)
 	sg.cancel = func(id, reason string) { rt.Cancel(id, reason) }
 	ids, err := rt.Restore()
 	if err != nil {
@@ -404,10 +446,11 @@ func main() {
 	if n := guard.Abandon(rt, ids); n > 0 {
 		log.Printf("ended %d runs a previous process left open", n)
 	}
-	s := &server{platform: p, id: id, agent: sg, rt: rt, token: p.Secret("AGENT_VM_TOKEN"), booted: time.Now().UTC(),
+	s := &server{platform: p, id: id, agent: rg, rt: rt, rec: rec, token: p.Secret("AGENT_VM_TOKEN"), booted: time.Now().UTC(),
 		sched: newScheduler(lim), lim: lim, quotes: make(chan struct{}, 8), safety: st, gw: gw, safetySlots: make(chan struct{}, 4)}
 	ctx := context.Background()
 	go sg.enforce(ctx, 2*time.Second)
+	go pruneActivity(ctx, astore)
 	go func() { // gatewayd (and through it the vault) gets agentd's documents now and every 10 s
 		for {
 			s.pushSafety()
@@ -441,6 +484,7 @@ func main() {
 	mux.HandleFunc("GET "+ehbpproto.KeysPath, id.ConfigHandler)
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) { fmt.Fprintln(w, "ok") })
 	mux.Handle("POST /run", s.guard(id.Middleware()(http.HandlerFunc(s.run))))
+	mux.HandleFunc("GET /activity", s.activityOut) // sealed activity records, for the relay (docs/24)
 	// Signed policies and stop lists; the signature is the authorization. Only served when the compose pins a key
 	// (stage 2): without one nothing could verify, so there's nothing to take.
 	if scfg.Operator != nil || len(scfg.Admins) > 0 {

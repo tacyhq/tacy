@@ -1,5 +1,6 @@
 # Tests on every push and pull request, plus a reproducibility check: compose.yaml, the binaries and their OCI images
-# (digests and layouts) must come out byte for byte the same on the runner and in the pinned Go container.
+# (digests and layouts) must come out byte for byte the same on the runner and in the pinned Go container; and the
+# brain in real gVisor (sandbox-runsc).
 # Least privilege: read-only token, no secrets, actions pinned by commit.
 name: ci
 
@@ -64,3 +65,67 @@ jobs:
         run: |
           diff "$RUNNER_TEMP/runner.txt" "$RUNNER_TEMP/container.txt"
           sudo diff -r "$RUNNER_TEMP/oci-runner" "$RUNNER_TEMP/oci-container"
+
+  # Real gVisor (docs/22-sandbox-runner.md), required on main by a ruleset. The brain in gVisor as the VM's runner
+  # runs it (rootless runsc, uid 10004, no capabilities, no_new_privs, Docker's seccomp off, no network, read-only
+  # root, its memory and pids limits): runner/v0 and the harness/v1 brain conformance suite, agentd's parity
+  # scenarios, the brain-crash recovery, the safety controls and the activity records behind the runner. Then the
+  # hands' sandbox runtime as root with CAP_SYS_ADMIN and delegated cgroups (not in a release yet). gVisor is the
+  # pinned release (sha256 of the tarball and of each binary, the same pins as sandbox/gvisor.go, which a test
+  # compares), never "latest".
+  sandbox-runsc:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.2" # = mise.toml
+          check-latest: false
+          cache: false
+      - name: gVisor release 20260928.0 (pinned)
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/gvisor.tar.bz2" https://storage.googleapis.com/gvisor/releases/release/20260928.0/x86_64/gvisor.tar.bz2
+          echo "f3ed9131bc252259df150e270154180188f9df56b73a2312940325e1f522a2d6  $RUNNER_TEMP/gvisor.tar.bz2" | sha256sum -c
+          mkdir -p "$RUNNER_TEMP/gvisor"
+          tar -xjf "$RUNNER_TEMP/gvisor.tar.bz2" -C "$RUNNER_TEMP/gvisor" runsc gvisor-bin/gvisor_sentry gvisor-bin/gvisor-sentry-prewarmer gvisor-bin/runsc-fd-parking
+          cd "$RUNNER_TEMP/gvisor" && sha256sum -c <<'SUMS'
+          88a87d5d6d06160d4c144f51f95ec6dd6fe0fc6b02697eb877876683c5b57a91  runsc
+          e10e6e8072a0822f5e80dc203d156f0602b15fab90b85fac1d7bffd79477b267  gvisor-bin/gvisor_sentry
+          3315d7ad7c2d3751d349e4976fa02da1da6fd7e41746c35622304e5fabe4fce0  gvisor-bin/gvisor-sentry-prewarmer
+          03af90d07ea466c10ecc3e3ba839b2a59540959dd3286aea3886917cba850c11  gvisor-bin/runsc-fd-parking
+          SUMS
+      - name: build the test binaries and the brain
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          for p in sandbox runner app; do CGO_ENABLED=0 go test -c -o "$RUNNER_TEMP/bin/$p.test" ./$p; done
+          CGO_ENABLED=0 go build -trimpath -buildvcs=false -o "$RUNNER_TEMP/bin/brain" ./cmd/brain
+      - name: the brain in gVisor, as the CVM's runner (rootless, no capabilities)
+        run: |
+          # dstack's kernel has no AppArmor: here Ubuntu's restriction on unprivileged user namespaces and Docker's
+          # docker-default profile (it refuses runsc's mounts) would stop rootless runsc, so both are off, as on the CVM.
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0; fi
+          runner() {
+            docker run --rm --user 10004:10003 --cap-drop ALL --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
+              --security-opt no-new-privileges:true \
+              --network none --read-only --tmpfs /tmp:exec,size=256m --memory 640m --memory-swap 640m --pids-limit 512 \
+              -e TACY_RUNSC=/opt/gvisor/runsc -e TACY_BRAIN_BIN=/b/brain -e TACY_RUNSC_ROOTLESS=1 -e TACY_RUNSC_PLATFORM=systrap \
+              -e TACY_REQUIRE_RUNSC=1 -v "$RUNNER_TEMP/gvisor:/opt/gvisor:ro" -v "$RUNNER_TEMP/bin:/b:ro" -v "$PWD:/src:ro" "$@"
+          }
+          runner -w /tmp alpine:3.22@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8 /b/runner.test -test.v -test.count=1
+          runner -w /src/app alpine:3.22@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8 \
+            /b/app.test -test.v -test.count=1 -test.run 'TestParity|TestBrainCrashBehindRunner|TestSafetyBehindRunner|TestActivityBehindRunner'
+      - name: hands against runsc as root (systrap, then ptrace)
+        run: |
+          for p in systrap ptrace; do
+            docker run --rm --cap-add SYS_ADMIN --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
+              --network none -e TACY_RUNSC=/opt/gvisor/runsc -e TACY_HANDS_ROOTFS=/hands/rootfs \
+              -e TACY_CGROUP_PARENT=hands -e TACY_RUNSC_PLATFORM=$p \
+              -v "$RUNNER_TEMP/gvisor:/opt/gvisor:ro" -v "$RUNNER_TEMP/bin/sandbox.test:/sandbox.test:ro" \
+              alpine:3.22@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8 \
+              sh -c 'mkdir -p /hands/rootfs && cp -a /bin /sbin /lib /usr /etc /hands/rootfs/ && /sandbox.test -test.v -test.count=1'
+          done

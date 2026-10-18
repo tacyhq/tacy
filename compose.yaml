@@ -8,11 +8,12 @@
 # Every image is named by digest only: the pinned distroless base (gcr.io/distroless/static-debian13@sha256:2293b36c7c9082bf4115aab724b4d2cddec82c8eba39bf27ac0517e159acf150)
 # plus one layer with the binaries at /tacy/<name>; runnerd's image also holds the brain and, in a layer of its own,
 # gVisor 20260928.0 at /tacy/gvisor (Google's release https://storage.googleapis.com/gvisor/releases/release/20260928.0/x86_64/gvisor.tar.bz2,
-# sha256 f3ed9131bc252259df150e270154180188f9df56b73a2312940325e1f522a2d6, each binary checked). Rebuild them from the tagged
-# source (scripts/reproduce.sh) to get the same digests. Binaries (linux/amd64, sha256):
-#   agentd   738125250d614b53017e4c109fe0a47f5a4c83a84c317db3da54cd9f09f9a677
+# sha256 f3ed9131bc252259df150e270154180188f9df56b73a2312940325e1f522a2d6, each binary checked; its Apache-2.0 LICENSE at
+# /tacy/gvisor/LICENSE). Rebuild them from the tagged source (scripts/reproduce.sh) to get the same digests.
+# Binaries (linux/amd64, sha256):
+#   agentd   eed4ed27ed8e9b03ba0e16215b2b31fe507807481e32100f5cde397519ed5078
 #   brain    a83578ad2e78fc5b45d60b7e418bb03dc14a13f6add4d41084b495edc147fbe6
-#   gatewayd e42bd66ffe9fce9ea8e0d456510f3c5f3c4b1aa5c6cb12f0daf2aeec92483f19
+#   gatewayd dde0de10b6ac8c774d935393987e9d9a03c8c72d23b094d5ffc71608c52c4df6
 #   runnerd  9fc9ceaaa6a4b627327fe65b57defd22dc31ab8f71c50f1383a17b48bfed733c
 #   setup    80f380d97b1cc77da758d69ba978e5f09c720f10ef853f6afa06e06ffa006de6
 #   vaultd   452f9aa74b2996cd680e7d2999b56278a869c08c7fb61ff40247700f6760ad0c
@@ -38,7 +39,7 @@ services:
       - state:/state
     command: ["-dir", "/run/tacy/agent=10003:10001:0770", "-dir", "/run/tacy/vault=10002:10001:0750", "-dir", "/run/tacy/runner=10004:10003:0750", "-remove", "/state/queue.db", "-remove", "/state/queue.db-wal", "-remove", "/state/queue.db-shm", "-remove", "/state/queue.db-journal", "-tree", "/state/agentd=10003:10003:0700"]
   agentd:
-    image: ghcr.io/tacyhq/tacy/agentd@sha256:9440dd50cc0520016aab085dc5e26ccf6c7cadcdaaf3a1644e2fcba8bd6b3e68
+    image: ghcr.io/tacyhq/tacy/agentd@sha256:854df00274f97cb44371a630e5544b985269e484d3a4cb567e24af44f56f2162
     entrypoint: ["/tacy/agentd"]
     network_mode: none
     restart: unless-stopped
@@ -59,7 +60,7 @@ services:
       AGENT_VM_TOKEN: ${AGENT_VM_TOKEN}
     command: ["-storage", "/state/agentd", "-runner-socket", "/run/tacy/runner/runner.sock", "-gateway-socket", "/run/tacy/agent/gateway.sock", "-listen-unix", "/run/tacy/agent/http.sock", "-listen-uid", "10001", "-listen-gid", "10001", "-mem-limit-mib", "600", "-firm", "f_chat"]
   runner:
-    image: ghcr.io/tacyhq/tacy/runnerd@sha256:4efbf76d7da0570c12428193c36b316d8ecc900c99af0dd5cc5ee167734b5aac
+    image: ghcr.io/tacyhq/tacy/runnerd@sha256:213a64e5a043964f18e04d9b0b5b2138b692224bd5709ff6088737c74e53e040
     entrypoint: ["/tacy/runnerd"]
     network_mode: none
     restart: unless-stopped
@@ -78,7 +79,7 @@ services:
       - runnersock:/run/tacy/runner
     command: ["-socket", "/run/tacy/runner/runner.sock", "-agent-uid", "10003", "-gvisor", "/tacy/gvisor", "-gvisor-release", "20260928.0", "-runsc-sha256", "88a87d5d6d06160d4c144f51f95ec6dd6fe0fc6b02697eb877876683c5b57a91", "-brain", "/tacy/brain", "-brain-sha256", "a83578ad2e78fc5b45d60b7e418bb03dc14a13f6add4d41084b495edc147fbe6", "-dir", "/run/runner", "-platform", "systrap", "-rootless"]
   agentvm:
-    image: ghcr.io/tacyhq/tacy/gatewayd@sha256:66b7724260065bf5718fd602b9137aea52c694e0c59eee8ba6b31b07f2b29a83
+    image: ghcr.io/tacyhq/tacy/gatewayd@sha256:fc12b703b768804ddf465cbff08c351ff251eefca5c34a59399de1cd79d255e9
     entrypoint: ["/tacy/gatewayd"]
     restart: unless-stopped
     depends_on:

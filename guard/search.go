@@ -38,7 +38,7 @@ type brave struct {
 }
 
 func newBrave(lease Lease) *brave {
-	return &brave{lease: lease, base: "https://api.search.brave.com/res/v1/web/search", http: &http.Client{Timeout: 20 * time.Second}}
+	return &brave{lease: lease, base: "https://api.search.brave.com/res/v1/web/search", http: recordingClient(&http.Client{Timeout: 20 * time.Second})}
 }
 
 const (
@@ -131,7 +131,7 @@ type tavily struct {
 }
 
 func newTavily(lease Lease) *tavily {
-	return &tavily{lease: lease, base: "https://api.tavily.com/search", http: &http.Client{Timeout: 20 * time.Second}}
+	return &tavily{lease: lease, base: "https://api.tavily.com/search", http: recordingClient(&http.Client{Timeout: 20 * time.Second})}
 }
 
 func (t *tavily) Name() string { return "tavily" }

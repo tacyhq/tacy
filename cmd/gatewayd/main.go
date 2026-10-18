@@ -87,7 +87,7 @@ func main() {
 		log.Fatal(err)
 	}
 	toVault := vaultPusher(vc, st)
-	lease := retryLease(guard.VaultLease(vc), toVault)
+	lease := guard.RecordLeases(retryLease(guard.VaultLease(vc), toVault)) // every decision goes on the activity record
 	tc := tinfoil.NewClient(os.Getenv("TINFOIL_ENCLAVE"), "")
 	search := guard.NewSearch(os.Getenv("SEARCH_PROVIDER"), func(n string) bool { return slices.Contains(names, n) }, lease)
 	fetcher := guard.NewFetcher(false)

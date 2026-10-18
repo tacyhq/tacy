@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/tacyhq/tacy/guard"
 	"github.com/tacyhq/tacy/harness"
 	"github.com/tacyhq/tacy/proto"
 	"github.com/tacyhq/tacy/safety"
@@ -77,6 +78,9 @@ type frame struct {
 	Step         int                   `json:"step,omitzero"`
 	Finish       string                `json:"finish,omitzero"`
 	Err          *harness.Error        `json:"error,omitzero"`
+	// result of model and action: what gatewayd saw and did for it (hosts, bytes, leases, leak-scan ids); of end:
+	// the task's egress outside any request (site icons). Metadata only, for the activity record (docs/24).
+	Facts *guard.FactsData `json:"facts,omitzero"`
 }
 
 // record is a journal entry as gatewayd needs it to rebuild a task's state (guard/rebuild.go): actions whole, model

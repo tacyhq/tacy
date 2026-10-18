@@ -243,3 +243,31 @@ func TestParallelRequests(t *testing.T) {
 		t.Error(err)
 	}
 }
+
+// What gatewayd saw and did for a request comes back with its result (the activity record's facts): the page's
+// host and sizes, nothing of the URL's path.
+func TestFactsCrossTheSocket(t *testing.T) {
+	page := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("<html><head><title>T</title></head><body><p>" + strings.Repeat("words ", 200) + "</p></body></html>"))
+	}))
+	defer page.Close()
+	path := socketPath(t)
+	serve(t, path, guard.New(guard.Config{Up: guard.NewPlainUpstream("http://unused", nil), Search: searchN{}, Fetcher: guard.NewFetcher(true), Now: time.Now}))
+	c := &Client{Path: path, Wait: 5 * time.Second}
+	s := c.Open("t_f", guard.TaskOptions{}, func(proto.Event) error { return nil })
+	defer s.Close()
+	ti := &harness.TaskInfo{ID: "t_f", Start: &harness.Start{Tools: guard.ToolDefs("web.fetch")}}
+	f := &guard.Facts{}
+	ctx := guard.WithFacts(harness.WithRequestID(context.Background(), "a1"), f)
+	res, err := c.Action(ctx, ti, "a1", &harness.Action{Name: "web.fetch", Args: jsontext.Value(`{"url":"` + page.URL + `/secret/path"}`)})
+	if err != nil || res.Status != harness.ActionDone {
+		t.Fatalf("%+v %v", res, err)
+	}
+	d := f.Data()
+	if len(d.Hosts) != 1 || d.Hosts[0].Host != "127.0.0.1" || d.Hosts[0].Requests != 1 || d.Hosts[0].BytesIn < 1000 {
+		t.Fatalf("facts: %+v", d)
+	}
+	if b, _ := json.Marshal(d); strings.Contains(string(b), "secret") {
+		t.Fatalf("facts hold the path: %s", b)
+	}
+}

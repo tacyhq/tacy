@@ -145,6 +145,14 @@ func (s *safeSession) Meta(ctx context.Context) (*proto.Meta, error) {
 	return m, err
 }
 
+// Background passes on the guard session's egress outside any request (site icons).
+func (s *safeSession) Background() guard.FactsData {
+	if b, ok := s.Session.(guard.BackgroundSession); ok {
+		return b.Background()
+	}
+	return guard.FactsData{}
+}
+
 func (s *safeSession) Close() {
 	s.Session.Close()
 	s.g.ledger.End(s.id)

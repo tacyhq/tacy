@@ -76,6 +76,8 @@ func New(cfg Config) *Guard {
 	if cfg.Safety != nil {
 		cfg.Fetcher, cfg.Icons = withPolicyTransport(cfg.Fetcher), withPolicyTransport(cfg.Icons)
 	}
+	// Every fetch is counted for the activity record (facts.go): host, bytes, policy refusals.
+	cfg.Fetcher, cfg.Icons = recordingClient(cfg.Fetcher), recordingClient(cfg.Icons)
 	g := &Guard{cfg: cfg, tasks: map[string]*task{}}
 	if cfg.Limits != nil {
 		g.gates = newToolGates(*cfg.Limits)
@@ -91,16 +93,20 @@ type TaskOptions struct {
 	CacheSecret     string `json:"cache_secret,omitzero"`     // scopes Tinfoil's prompt cache (user_cache_secret); "": the guard's per-boot one
 	User            string `json:"user,omitzero"`             // whose tool caps (the relay's opaque X-Agent-User tag)
 	Space           string `json:"space,omitzero"`            // the task's space: whose policy, stop and rates apply
+	// RecordTo is who the run's activity record is sealed to ("x25519:<base64>", docs/24); "": not recorded.
+	RecordTo string `json:"record_to,omitzero"`
 }
 
 // task is the guard's state for one task: what the old app/agent.go kept per run.
 type task struct {
-	id     string
-	opts   TaskOptions
-	ctx    context.Context // ends when the task does (site icons stop)
-	cancel context.CancelFunc
-	tools  *Tools     // citation numbers and image slots, per task
-	icons  *siteIcons // nil: none
+	id   string
+	opts TaskOptions
+	ctx  context.Context // ends when the task does (site icons stop)
+	// background collects the egress made under ctx outside any request (site icons), for the activity record.
+	background *Facts
+	cancel     context.CancelFunc
+	tools      *Tools     // citation numbers and image slots, per task
+	icons      *siteIcons // nil: none
 
 	emitMu sync.Mutex
 	out    func(proto.Event) error // the person's stream; nil: nobody watches
@@ -196,6 +202,8 @@ func (g *Guard) open(id string, opts TaskOptions, out func(proto.Event) error) *
 		t.tools.gate = g.gates.forUser(opts.User)
 		t.tools.decodes = g.gates.decodes
 	}
+	t.background = &Facts{} // the site icons' egress, for the activity record
+	t.ctx = WithFacts(t.ctx, t.background)
 	t.icons = newSiteIcons(t.ctx, g.cfg.Icons, g.gates.iconGate(), t.tools.decodes, t.emit)
 	g.tasks[id] = t
 	return t
@@ -260,6 +268,9 @@ type localSession struct {
 	g *Guard
 	t *task
 }
+
+// Background is the task's egress outside any request (site icons).
+func (s *localSession) Background() FactsData { return s.t.background.Data() }
 
 func (s *localSession) Meta(ctx context.Context) (*proto.Meta, error) { return s.g.cfg.Up.Meta(ctx) }
 func (s *localSession) Close()                                        { s.g.close(s.t) }
@@ -332,10 +343,29 @@ func Run(ctx context.Context, rt *harness.Runtime, gw Gateway, user string, r *p
 		return err
 	}
 	meta.Model, meta.Tools = r.Model, r.Tools
+	obs, _ := gw.(RunObserver)
+	if obs != nil {
+		obs.RunStarted(id, &start, opts, meta)
+	}
+	// The observer's last word (the activity record) goes right before done or error, exactly once: a return
+	// that didn't say how the run ended still ends its record (failed).
+	var endOnce sync.Once
+	ended := func(e RunEnd) {
+		endOnce.Do(func() {
+			if obs != nil {
+				for _, ev := range obs.RunEnded(id, e) {
+					ps.emit(ev)
+				}
+			}
+		})
+	}
+	defer ended(RunEnd{State: harness.OutcomeFailed, Msg: "the run ended without an outcome"})
 	if err := ps.emit(proto.Event{Type: "meta", Meta: meta}); err != nil {
+		ended(RunEnd{State: harness.OutcomeCancelled, Reason: "person"})
 		return err
 	}
 	if err := rt.StartWith(id, start, optsJSON); err != nil {
+		ended(RunEnd{State: harness.OutcomeFailed, Msg: "the task wasn't started"})
 		ps.emit(proto.Event{Type: "error", Error: err.Error()})
 		return err
 	}
@@ -348,6 +378,7 @@ func Run(ctx context.Context, rt *harness.Runtime, gw Gateway, user string, r *p
 	defer rt.Forget(id)
 	step, finish := sess.End()
 	if o.State == harness.OutcomeSucceeded {
+		ended(RunEnd{State: o.State, Steps: step, Finish: finish})
 		return ps.emit(proto.Event{Type: "done", Step: step, FinishReason: finish})
 	}
 	msg := "the agent stopped" // untrusted when the brain says why: display only
@@ -359,17 +390,45 @@ func Run(ctx context.Context, rt *harness.Runtime, gw Gateway, user string, r *p
 			code, msg = c, m
 		}
 	}
+	reason := ""
 	switch {
 	case code != "":
+		if o.State == harness.OutcomeCancelled {
+			reason = "kill_switch"
+		}
 	case o.State == harness.OutcomeCancelled && pastDeadline(start.Limits.Deadline):
-		msg = "run timed out" // as the old loop (app/agent.go) said at its 5-minute cap
+		msg, reason = "run timed out", "deadline" // as the old loop (app/agent.go) said at its 5-minute cap
 	case o.State == harness.OutcomeCancelled:
-		msg = "run cancelled"
+		msg, reason = "run cancelled", "person"
 	case o.Done != nil && o.Done.Error != "":
 		msg = o.Done.Error
 	}
+	// The brain's own error text is untrusted and may quote content: the record keeps the control's words only.
+	detail := ""
+	if code != "" {
+		detail = msg
+	}
+	ended(RunEnd{State: o.State, Code: code, Reason: reason, Msg: detail, Steps: step, Finish: finish})
 	ps.emit(proto.Event{Type: "error", Error: msg, Code: code})
 	return errors.New(msg)
+}
+
+// RunObserver is a Gateway that watches Run's runs (agentd's activity recorder, docs/24). RunStarted comes after
+// the meta was made and before it is emitted (it may add to it); RunEnded once the run ended, and the events it
+// returns are emitted right before the run's done or error.
+type RunObserver interface {
+	RunStarted(task string, start *harness.Start, opts TaskOptions, meta *proto.Meta)
+	RunEnded(task string, e RunEnd) []proto.Event
+}
+
+// RunEnd is how a run ended, as Run tells its observer.
+type RunEnd struct {
+	State  string // harness outcome: succeeded | failed | cancelled
+	Code   string // the safety control that ended it, if one did
+	Reason string // a cancel's reason: person | deadline | kill_switch
+	Msg    string // the control's words (only with Code)
+	Steps  int
+	Finish string
 }
 
 func pastDeadline(d string) bool {

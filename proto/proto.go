@@ -65,6 +65,12 @@ type RunRequest struct {
 	// CacheSecret scopes Tinfoil's prompt cache (user_cache_secret); the chat sends its per-user secret.
 	// When empty, a per-boot random secret is used.
 	CacheSecret string `json:"cache_secret,omitempty"`
+	// RecordTo is the X25519 key the run's activity record is sealed to ("x25519:<base64>", docs/24): the
+	// person's own activity key until spaces have keys. Without one the run isn't recorded.
+	RecordTo string `json:"record_to,omitempty"`
+	// RecordProof shows the sender holds RecordTo's private key (activity.RecordProof, base64): without it the VM
+	// refuses a run that names record_to.
+	RecordProof []byte `json:"record_proof,omitempty"`
 }
 
 // Event is one server-sent event in the (EHBP-encrypted) /run response: `data: <json>\n\n`, ending with
@@ -85,27 +91,31 @@ type RunRequest struct {
 //	usage        token counts, summed over all steps so far
 //	metrics      timing of one model call or tool call that just ended, or of the queue when the run started
 //	             (Metric): numbers and fixed names only
+//	activity     the run's sealed activity records (Activity), right before done or error
 //	error        a fatal error; the stream ends after it. code says when a safety control ended the run
 //	done         finish_reason and step count; last event before [DONE]
 type Event struct {
-	Type         string          `json:"type"`
-	Step         int             `json:"step,omitempty"`
-	Position     int             `json:"position,omitempty"` // queue: place in the queue, 1 = next
-	Delta        string          `json:"delta,omitempty"`
-	ID           string          `json:"id,omitempty"`
-	Name         string          `json:"name,omitempty"`
-	Args         json.RawMessage `json:"args,omitempty"`
-	Masked       []string        `json:"masked,omitempty"` // PII kinds replaced before the query left the VM
-	Result       json.RawMessage `json:"result,omitempty"`
-	Citations    []Citation      `json:"citations,omitempty"`
-	Image        *Image          `json:"image,omitempty"`
-	Favicon      *Favicon        `json:"favicon,omitempty"`
-	Usage        *Usage          `json:"usage,omitempty"`
-	Meta         *Meta           `json:"meta,omitempty"`
-	Metrics      *Metric         `json:"metrics,omitempty"`
-	Error        string          `json:"error,omitempty"`
-	Code         string          `json:"code,omitempty"` // error: why a safety control ended the run (stopped, stop_list_stale, policy_missing, policy_denied, budget_exceeded, rate_limited)
-	FinishReason string          `json:"finish_reason,omitempty"`
+	Type      string          `json:"type"`
+	Step      int             `json:"step,omitempty"`
+	Position  int             `json:"position,omitempty"` // queue: place in the queue, 1 = next
+	Delta     string          `json:"delta,omitempty"`
+	ID        string          `json:"id,omitempty"`
+	Name      string          `json:"name,omitempty"`
+	Args      json.RawMessage `json:"args,omitempty"`
+	Masked    []string        `json:"masked,omitempty"` // PII kinds replaced before the query left the VM
+	Result    json.RawMessage `json:"result,omitempty"`
+	Citations []Citation      `json:"citations,omitempty"`
+	Image     *Image          `json:"image,omitempty"`
+	Favicon   *Favicon        `json:"favicon,omitempty"`
+	Usage     *Usage          `json:"usage,omitempty"`
+	Meta      *Meta           `json:"meta,omitempty"`
+	Metrics   *Metric         `json:"metrics,omitempty"`
+	Error     string          `json:"error,omitempty"`
+	Code      string          `json:"code,omitempty"` // error: why a safety control ended the run (stopped, stop_list_stale, policy_missing, policy_denied, budget_exceeded, rate_limited)
+	// Activity: the run's sealed activity records (its start and end, or the one record of a refused run), sent
+	// right before done or error. Each is signed by Meta.Activity.Key and sealed to RunRequest.RecordTo.
+	Activity     []json.RawMessage `json:"activity,omitempty"`
+	FinishReason string            `json:"finish_reason,omitempty"`
 }
 
 // Citation is a source a tool returned. Index is the [n] the model is told to cite.
@@ -155,8 +165,21 @@ type Meta struct {
 	TinfoilMeasure string   `json:"tinfoil_measurement"` // SEV-SNP launch measurement, equal to the release's
 	TinfoilHPKEKey string   `json:"tinfoil_hpke_key"`    // key the request was encrypted to
 	Tools          []string `json:"tools"`
-	// Controls are the signed controls the run started under (step 6, docs/23-safety-controls.md).
+	// Controls are the signed controls the run started under (docs/23-safety-controls.md).
 	Controls *Controls `json:"controls,omitempty"`
+	// Activity says where the run's activity record goes (docs/24); nil when it isn't recorded.
+	Activity *Activity `json:"activity,omitempty"`
+}
+
+// Activity names the key that signs this VM's activity records and the chain the run's records go to. It arrives
+// in the meta event, which EHBP authenticates to the attested key: the browser learns the signing key from the
+// attested VM itself, and the chain's head before this run (so records our servers keep can be checked for gaps
+// and truncation).
+type Activity struct {
+	Key   string `json:"key"`   // "ed25519:<base64>": the VM's activity signing key (derived in the VM, never leaves it)
+	Chain string `json:"chain"` // the chain id (32 hex)
+	Seq   uint64 `json:"seq"`   // the chain's last sequence number before this run (0: none)
+	Head  string `json:"head"`  // that record's hash ("" when seq is 0)
 }
 
 // Controls name the policy and stop lists a run ran under, so the browser can show which policy applied. Hashes

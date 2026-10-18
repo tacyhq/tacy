@@ -79,6 +79,7 @@ func (g *Guard) Action(ctx context.Context, ti *harness.TaskInfo, id string, req
 	// action (denied), like a URL with personal data.
 	if ids := outboundLeak(req.Args); ids != nil {
 		g.record(Egress{Task: ti.ID, Action: id, Op: req.Name, Decision: "denied", Rule: "leak_scan", Patterns: ids})
+		FactsFrom(ctx).leak(true, ids)
 		provider := ""
 		if app != "fetch_page" {
 			provider = t.tools.search.Name()
@@ -100,6 +101,7 @@ func (g *Guard) Action(ctx context.Context, ti *harness.TaskInfo, id string, req
 	// What came back is redacted before the brain (and people) see it.
 	if ids := redactOutcome(&out); len(ids) > 0 {
 		g.record(Egress{Task: ti.ID, Action: id, Op: req.Name, Decision: "redacted", Rule: "leak_scan", Patterns: ids})
+		FactsFrom(ctx).leak(false, ids)
 	}
 	if !json.Valid(shown) {
 		shown = json.RawMessage(`null`)

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ecdh"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
@@ -20,6 +21,7 @@ import (
 
 	ehbpidentity "github.com/tinfoilsh/encrypted-http-body-protocol/identity"
 
+	"github.com/tacyhq/tacy/activity"
 	"github.com/tacyhq/tacy/guard"
 	"github.com/tacyhq/tacy/harness"
 	"github.com/tacyhq/tacy/proto"
@@ -40,14 +42,29 @@ type safeEnv struct {
 	modelReqs       atomic.Int32
 	fs              *fakeSearch
 	seq             uint64
+	rec             *activity.Recorder
+	vmKey           *ecdh.PrivateKey
 }
 
 func newSafeEnv(t *testing.T, replies ...string) *safeEnv {
-	return newSafeEnvBrain(t, false, replies...)
+	return newSafeEnvWith(t, safeOpts{}, replies...)
 }
 
 // newSafeEnvBrain: behindRunner puts the brain in a sandbox a runnerd starts (runnertest), as on the CVM.
 func newSafeEnvBrain(t *testing.T, behindRunner bool, replies ...string) *safeEnv {
+	return newSafeEnvWith(t, safeOpts{behindRunner: behindRunner}, replies...)
+}
+
+// safeOpts change newSafeEnv's agentd: another search provider (the real one over a test lease), no keys
+// pinned (stage 1: the release policy alone, as the live compose), or the brain behind a runnerd (runnertest),
+// as on the CVM.
+type safeOpts struct {
+	search       guard.SearchProvider
+	keyless      bool
+	behindRunner bool
+}
+
+func newSafeEnvWith(t *testing.T, o safeOpts, replies ...string) *safeEnv {
 	e := &safeEnv{t: t, model: &parityModel{replies: replies}, fs: &fakeSearch{}}
 	_, e.admin, _ = ed25519.GenerateKey(rand.Reader)
 	_, e.operator, _ = ed25519.GenerateKey(rand.Reader)
@@ -56,21 +73,35 @@ func newSafeEnvBrain(t *testing.T, behindRunner bool, replies ...string) *safeEn
 		e.model.ServeHTTP(w, r)
 	}))
 	t.Cleanup(srv.Close)
-	st, err := safety.NewState(safety.Config{Firm: "f_chat", Operator: e.operator.Public().(ed25519.PublicKey),
+	cfg := safety.Config{Firm: "f_chat", Operator: e.operator.Public().(ed25519.PublicKey),
 		Admins: []ed25519.PublicKey{e.admin.Public().(ed25519.PublicKey)}, Release: guard.ReleasePolicy("f_chat", ""),
-		Dir: t.TempDir()})
+		Dir: t.TempDir()}
+	if o.keyless {
+		cfg.Operator, cfg.Admins = nil, nil
+	}
+	st, err := safety.NewState(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
+	var search guard.SearchProvider = e.fs
+	if o.search != nil {
+		search = o.search
+	}
 	lim := defaultLimits
-	g := guard.New(guard.Config{Up: guard.NewPlainUpstream(srv.URL, srv.Client()), Search: e.fs, Fetcher: guard.NewFetcher(true),
+	g := guard.New(guard.Config{Up: guard.NewPlainUpstream(srv.URL, srv.Client()), Search: search, Fetcher: guard.NewFetcher(true),
 		Limits: &lim, CacheSecret: "boot-secret", Now: func() time.Time { return time.Date(2026, 10, 17, 0, 0, 0, 0, time.UTC) },
 		Safety: st})
 	sg := newSafeGateway(g, st, &safety.Ledger{})
-	rt := newRuntime(sg, harness.NewMemStore(), lim)
+	signer, _ := activity.DeriveSigner(bytes.Repeat([]byte{5}, 32), "f_chat")
+	e.rec = &activity.Recorder{Signer: signer, Store: activity.NewMemStore()}
+	id, _ := ehbpidentity.NewIdentity()
+	skb, _ := id.PrivateKey().Bytes()
+	e.vmKey, _ = ecdh.X25519().NewPrivateKey(skb)
+	rg := newRecGateway(sg, e.rec, e.vmKey) // the recorder on top, as in main (runs without record_to aren't recorded)
+	rt := newRuntime(rg, harness.NewMemStore(), lim)
 	sg.cancel = func(id, reason string) { rt.Cancel(id, reason) }
 	ctx, cancel := context.WithCancel(context.Background())
-	if behindRunner {
+	if o.behindRunner {
 		env := runnertest.Start(t)
 		t.Logf("brain sandbox: %s", env.Kind)
 		go runBrains(ctx, rt, env.Client)
@@ -79,8 +110,7 @@ func newSafeEnvBrain(t *testing.T, behindRunner bool, replies ...string) *safeEn
 	}
 	t.Cleanup(cancel) // before runnertest's cleanup: the brains stop first
 	go sg.enforce(ctx, 200*time.Millisecond)
-	id, _ := ehbpidentity.NewIdentity()
-	e.s = &server{platform: local{}, id: id, agent: sg, rt: rt, token: "tok", booted: time.Now(), sched: newScheduler(lim),
+	e.s = &server{platform: local{}, id: id, agent: rg, rt: rt, rec: e.rec, token: "tok", booted: time.Now(), sched: newScheduler(lim),
 		lim: lim, quotes: make(chan struct{}, 4), safety: st, gw: g, safetySlots: make(chan struct{}, 2)}
 	return e
 }
@@ -411,7 +441,7 @@ func TestSafetyOutputCapAndMissingUsage(t *testing.T) {
 	e2 := newSafeEnv(t, `data: {"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}`+"\n\ndata: [DONE]\n\n")
 	e2.mustPost(e2.policy(1, nil), e2.heartbeat())
 	runParity(t, e2.s, proto.RunRequest{Messages: user1("hi")})
-	sg := e2.s.agent.(*safeGateway)
+	sg := e2.s.agent.(*recGateway).safeGateway
 	if _, err := sg.ledger.Admit("s_chat", safety.Budgets{Day: safety.Limits{Tokens: safety.CompletionReserve}}); safety.CodeOf(err) != safety.CodeBudgetExceeded {
 		t.Fatal("a call without reported usage was counted as less than its reservation")
 	}

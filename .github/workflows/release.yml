@@ -1,5 +1,5 @@
-# Release: on a tag vX.Y.Z, build the release (compose.yaml naming one OCI image per binary by digest: agentd,
-# brain, gatewayd, vaultd and setup; release.json; the images as OCI layouts), push the images to ghcr.io, check
+# Release: on a tag vX.Y.Z, build the release (compose.yaml naming one OCI image per process by digest: agentd,
+# runnerd (with the brain and gVisor), gatewayd, vaultd and setup; release.json; the images as OCI layouts), push the images to ghcr.io, check
 # that each one pulls without credentials, sign everything with Sigstore through GitHub artifact attestations, and
 # publish it. README.md ("Releases and signing") has the format and the signing identity the verifier pins:
 #   https://github.com/tacyhq/tacy/.github/workflows/release.yml@refs/tags/vX.Y.Z

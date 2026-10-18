@@ -4,13 +4,16 @@
 // mode 0555). Same binaries, same base: same image digests, on any machine. The compose names every image by
 // digest only (no tag, no build:), so the CVM's attested compose hash covers exactly the binaries that run.
 //
-// Four processes (docs/21-gateway-v0.md), each its own container with its own uid, linked only by unix
-// sockets in volumes shared by exactly two containers:
+// Four processes (docs/21-gateway-v0.md, docs/22-sandbox-runner.md), each its own container with its own uid,
+// linked only by unix sockets in volumes shared by exactly two containers:
 //
 //   - agentd (./app, service "agentd"): the front door and the runtime (journal and queue, the harness to the
 //     brain). No network at all (network_mode none) and no keys: it gets only AGENT_VM_TOKEN, which it checks.
-//   - brain (./cmd/brain): our agent loop, untrusted. No network, uid 65534, no secrets; its only link is agentd's
-//     socket (harness/v1).
+//   - runnerd (./cmd/runnerd, service "runner"): runs the brain (./cmd/brain, our agent loop, untrusted) in a gVisor
+//     sandbox for agentd: no network, no keys, no capabilities, rootless runsc, Docker's seccomp profile off (runsc
+//     brings its own), memory and process limits on the container. The brain's sandbox has a root holding only its
+//     binary, no network, and its one link to agentd, a socketpair end passed in as fd 3 (harness/v1). Its image
+//     holds runnerd, the brain and gVisor (Google's release, pinned by sha256: see gvisorLayer).
 //   - gatewayd (./cmd/gatewayd, service "agentvm"): the only container with a network. The model gateway and the
 //     web connector; it leases each key from vaultd per call, scans and redacts (leakscan), and forwards the
 //     published port to agentd's HTTP socket. The service keeps the name "agentvm" because it owns port 8080, as
@@ -21,6 +24,11 @@
 //
 // A one-shot "setup" container (./cmd/setup: root, no network, three capabilities) gives the processes their
 // directories on the shared volumes first; every other container waits for it to exit cleanly.
+//
+// gVisor (runsc and the sidecars it runs from gvisor-bin/) is Google's release tarball, downloaded once into the
+// user's cache and checked against the tarball's sha256 and each binary's (sandbox/gvisor.go) before it goes into
+// runnerd's image, as its own layer (it changes less often than runnerd and the brain, so an update pulls only the
+// small layer). Same pinned bytes, same layer: the image stays reproducible.
 //
 //	go run ./cmd/compose                  # after editing anything the binaries build from
 //	go run ./cmd/compose --check          # verify compose.yaml matches the source (no write)
@@ -36,6 +44,7 @@ package main
 import (
 	"archive/tar"
 	"bytes"
+	"compress/bzip2"
 	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
@@ -43,6 +52,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -60,6 +70,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/tarball"
 	"github.com/google/go-containerregistry/pkg/v1/types"
 
+	"github.com/tacyhq/tacy/sandbox"
 	"github.com/tacyhq/tacy/verifier"
 )
 
@@ -78,7 +89,7 @@ const modulePath = "github.com/tacyhq/tacy"
 
 // The CVM's Phala encrypted environment variables (names only; values never touch the compose), by the one
 // container each goes to: the keys to vaultd only, the run token to agentd (it checks it, never sends it), the
-// search provider choice (not a secret) to gatewayd. The brain and setup get none.
+// search provider choice (not a secret) to gatewayd. runnerd, the brain and setup get none.
 var (
 	vaultEnv   = []string{"TINFOIL_API_KEY", "BRAVE_SEARCH_API_KEY", "TAVILY_API_KEY"}
 	agentEnv   = []string{"AGENT_VM_TOKEN"}
@@ -94,22 +105,31 @@ var (
 // Rollback: an older compose runs agentd as root without capabilities (no DAC override), which can't open files
 // this uid owns with mode 0600. So the new layout leaves what an older agentd uses as it was: the queue moves to
 // /state/agentd (the older one used /state/queue.db, which setup removes; the runs it held ended with the process
-// anyway), and the brain's socket directory is a new volume (brainsock2; brainsock stays root's). The agent socket
-// directory is reset at every start, so it needs nothing. The build-on-CVM composes' volumes (bin, gocache, gomod)
-// aren't named here and stay on disk unused, so a rollback to one finds its cached binaries.
+// anyway). Since v0.4.0 runnerd's socket directory is a new volume (runnersock); the brain's (brainsock2, and
+// brainsock before it) is no longer named and stays on disk as it was, for a rollback. The agent socket directory is
+// reset at every start, so it needs nothing. The build-on-CVM composes' volumes (bin, gocache, gomod) aren't named
+// here and stay on disk unused, so a rollback to one finds its cached binaries.
 const (
 	agentdUID   = "10003"
-	brainUID    = "65534" // nobody
 	gatewaydUID = "10001"
 	vaultdUID   = "10002"
+	runnerdUID  = "10004" // its primary group is agentd's, so its socket is agentd's to open
 )
 
-// bins are the binaries, one image each: name (the image's name under Registry and its path /tacy/<name>) and
-// package. Adding one: an entry here and a service below that uses its image (README "Adding a process or binary").
+// The brain runs as 65534 (nobody) inside its sandbox (sandbox/runsc.go), in a user namespace of runnerd's.
+
+// The runner's container limits, which bound every sandbox in it (rootless runsc runs with --ignore-cgroups).
+const (
+	runnerMem  = "640m"
+	runnerPids = "512"
+)
+
+// bins are the binaries: name (its path /tacy/<name> in an image) and package.
 var bins = []struct{ name, pkg string }{
 	{"agentd", "./app"},
 	{"brain", "./cmd/brain"},
 	{"gatewayd", "./cmd/gatewayd"},
+	{"runnerd", "./cmd/runnerd"},
 	{"setup", "./cmd/setup"},
 	{"vaultd", "./cmd/vaultd"},
 }
@@ -136,6 +156,25 @@ func safetyArgs() []string {
 	}
 	return a
 }
+
+// images are the images: name (under Registry; its entrypoint is the binary of that name), the other binaries in
+// its layer, and whether it carries gVisor (its own layer, /tacy/gvisor). Every binary is in exactly one image; the
+// brain runs inside runnerd's sandbox, so it ships in runnerd's image. Adding a binary: an entry in bins, here, and
+// a service below that uses its image (README "Adding a process or binary").
+var images = []struct {
+	name   string
+	with   []string
+	gvisor bool
+}{
+	{name: "agentd"},
+	{name: "gatewayd"},
+	{name: "runnerd", with: []string{"brain"}, gvisor: true},
+	{name: "setup"},
+	{name: "vaultd"},
+}
+
+// gvisorDir is where runnerd's image holds gVisor: runsc, and gvisor-bin/ next to it.
+const gvisorDir = "/tacy/gvisor"
 
 func run(env []string, name string, args ...string) (string, error) {
 	cmd := exec.Command(name, args...)
@@ -173,27 +212,48 @@ func buildBinary(pkg string) ([]byte, error) {
 // epoch is every time in a layer and in the image config.
 var epoch = time.Unix(0, 0).UTC()
 
-// binaryLayer is a deterministic gzip'd tar holding /tacy/ (0755) and /tacy/<name> (0555), owner 0:0, time 0.
-// compress/gzip's output depends only on the input and the Go version, which is pinned.
-func binaryLayer(name string, bin []byte) ([]byte, error) {
+// file is one file of a layer: its path under /tacy/ and its bytes (mode 0555).
+type file struct {
+	path string
+	data []byte
+}
+
+// filesLayer is a deterministic gzip'd tar holding the files under /tacy/ (0555) in sorted order, each after its
+// directories (0755), owner 0:0, time 0. compress/gzip's output depends only on the input and the Go version, which
+// is pinned.
+func filesLayer(files []file) ([]byte, error) {
+	files = append([]file(nil), files...)
+	sort.Slice(files, func(i, j int) bool { return files[i].path < files[j].path })
 	var buf bytes.Buffer
 	gz, err := gzip.NewWriterLevel(&buf, gzip.BestCompression)
 	if err != nil {
 		return nil, err
 	}
 	tw := tar.NewWriter(gz)
-	for _, h := range []*tar.Header{
-		{Name: "tacy/", Typeflag: tar.TypeDir, Mode: 0o755},
-		{Name: "tacy/" + name, Typeflag: tar.TypeReg, Mode: 0o555, Size: int64(len(bin))},
-	} {
+	dirs := map[string]bool{}
+	write := func(h *tar.Header, data []byte) error {
 		h.ModTime, h.Format = epoch, tar.FormatUSTAR
 		if err := tw.WriteHeader(h); err != nil {
-			return nil, err
+			return err
 		}
-		if h.Typeflag == tar.TypeReg {
-			if _, err := tw.Write(bin); err != nil {
-				return nil, err
+		_, err := tw.Write(data)
+		return err
+	}
+	for _, f := range files {
+		if f.path == "" || strings.HasPrefix(f.path, "/") || strings.HasSuffix(f.path, "/") || strings.Contains(f.path, "..") {
+			return nil, fmt.Errorf("bad layer path %q", f.path)
+		}
+		parts := strings.Split("tacy/"+f.path, "/")
+		for i := 1; i < len(parts); i++ {
+			if d := strings.Join(parts[:i], "/") + "/"; !dirs[d] {
+				dirs[d] = true
+				if err := write(&tar.Header{Name: d, Typeflag: tar.TypeDir, Mode: 0o755}, nil); err != nil {
+					return nil, err
+				}
 			}
+		}
+		if err := write(&tar.Header{Name: "tacy/" + f.path, Typeflag: tar.TypeReg, Mode: 0o555, Size: int64(len(f.data))}, f.data); err != nil {
+			return nil, err
 		}
 	}
 	if err := tw.Close(); err != nil {
@@ -205,6 +265,17 @@ func binaryLayer(name string, bin []byte) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// binaryLayer is the layer of an image holding one binary: /tacy/ (0755) and /tacy/<name> (0555).
+func binaryLayer(name string, bin []byte) ([]byte, error) {
+	return filesLayer([]file{{name, bin}})
+}
+
+// layer is one gzip'd layer of an image and its history line.
+type layer struct {
+	gz []byte
+	by string
+}
+
 // buildImage is base plus the binary's layer, with /tacy/<name> as the entrypoint and fixed times. The digest
 // depends only on base and bin.
 func buildImage(base v1.Image, name string, bin []byte) (v1.Image, error) {
@@ -212,15 +283,24 @@ func buildImage(base v1.Image, name string, bin []byte) (v1.Image, error) {
 	if err != nil {
 		return nil, err
 	}
-	layer, err := tarball.LayerFromOpener(func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(gz)), nil },
-		tarball.WithMediaType(types.OCILayer))
-	if err != nil {
-		return nil, err
-	}
-	img, err := mutate.Append(base, mutate.Addendum{Layer: layer, MediaType: types.OCILayer,
-		History: v1.History{Created: v1.Time{Time: epoch}, CreatedBy: "tacy cmd/compose: /tacy/" + name}})
-	if err != nil {
-		return nil, err
+	return buildLayers(base, name, layer{gz, "tacy cmd/compose: /tacy/" + name})
+}
+
+// buildLayers is base plus the layers in order, with /tacy/<name> as the entrypoint and fixed times. The digest
+// depends only on base and the layers' bytes.
+func buildLayers(base v1.Image, name string, layers ...layer) (v1.Image, error) {
+	img := base
+	for _, l := range layers {
+		gz := l.gz
+		tl, err := tarball.LayerFromOpener(func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(gz)), nil },
+			tarball.WithMediaType(types.OCILayer))
+		if err != nil {
+			return nil, err
+		}
+		if img, err = mutate.Append(img, mutate.Addendum{Layer: tl, MediaType: types.OCILayer,
+			History: v1.History{Created: v1.Time{Time: epoch}, CreatedBy: l.by}}); err != nil {
+			return nil, err
+		}
 	}
 	cf, err := img.ConfigFile()
 	if err != nil {
@@ -253,12 +333,32 @@ func fetchBase() (v1.Image, error) {
 	return img, nil
 }
 
-// Image is one built binary and its image.
-type Image struct {
+// Binary is one built binary.
+type Binary struct {
 	Name   string
-	SHA256 string // the binary's
-	Ref    string // Registry/<name>@sha256:<digest>
-	img    v1.Image
+	SHA256 string
+}
+
+// Image is one built image.
+type Image struct {
+	Name string
+	Ref  string // Registry/<name>@sha256:<digest>
+	img  v1.Image
+}
+
+// Release is what build makes: every binary and every image.
+type Release struct {
+	Binaries []Binary
+	Images   []Image
+}
+
+func (r *Release) binary(name string) string {
+	for _, b := range r.Binaries {
+		if b.Name == name {
+			return b.SHA256
+		}
+	}
+	return ""
 }
 
 // MaxCompose is the most compose.yaml may take: Phala refuses a compose that, with its pre-launch script (~1 KiB),
@@ -283,8 +383,101 @@ func refusedWord(s string) string {
 	return ""
 }
 
-// build builds every binary and its image.
-func build() ([]Image, error) {
+// gvisorTarball returns Google's gVisor release tarball, checked against its pin (sandbox.GVisorTarSHA256): from
+// $TACY_GVISOR_TARBALL if set, else from the user's cache, else downloaded (then cached). Wherever it comes from,
+// only the pinned bytes are used.
+func gvisorTarball() ([]byte, error) {
+	check := func(b []byte, from string) ([]byte, error) {
+		if h := sha256.Sum256(b); hex.EncodeToString(h[:]) != sandbox.GVisorTarSHA256 {
+			return nil, fmt.Errorf("gVisor tarball from %s: sha256 %x isn't the pinned %s", from, h, sandbox.GVisorTarSHA256)
+		}
+		return b, nil
+	}
+	if p := os.Getenv("TACY_GVISOR_TARBALL"); p != "" {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			return nil, err
+		}
+		return check(b, p)
+	}
+	cache := ""
+	if d, err := os.UserCacheDir(); err == nil {
+		cache = filepath.Join(d, "tacy", "gvisor-"+sandbox.GVisorRelease+"-x86_64.tar.bz2")
+		if b, err := os.ReadFile(cache); err == nil {
+			if b, err := check(b, cache); err == nil {
+				return b, nil
+			}
+		}
+	}
+	resp, err := http.Get(sandbox.GVisorURL)
+	if err != nil {
+		return nil, fmt.Errorf("gVisor tarball: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("gVisor tarball %s: %s", sandbox.GVisorURL, resp.Status)
+	}
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 512<<20))
+	if err != nil {
+		return nil, fmt.Errorf("gVisor tarball: %w", err)
+	}
+	if b, err = check(b, sandbox.GVisorURL); err != nil {
+		return nil, err
+	}
+	if cache != "" && os.MkdirAll(filepath.Dir(cache), 0o755) == nil {
+		if tmp, err := os.CreateTemp(filepath.Dir(cache), ".gvisor-*"); err == nil {
+			_, werr := tmp.Write(b)
+			if cerr := tmp.Close(); werr == nil && cerr == nil {
+				os.Rename(tmp.Name(), cache)
+			}
+			os.Remove(tmp.Name())
+		}
+	}
+	return b, nil
+}
+
+// gvisorLayer is the layer holding gVisor's binaries at /tacy/gvisor (runsc, gvisor-bin/...): taken from the
+// pinned tarball, each checked against its own pin (sandbox.GVisorFiles), nothing else from the tarball.
+func gvisorLayer(tarball []byte) ([]byte, error) {
+	want := map[string]string{}
+	for _, f := range sandbox.GVisorFiles {
+		want[f[0]] = f[1]
+	}
+	var files []file
+	tr := tar.NewReader(bzip2.NewReader(bytes.NewReader(tarball)))
+	for len(want) > 0 {
+		h, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("gVisor tarball: %w", err)
+		}
+		sum, ok := want[h.Name]
+		if !ok {
+			continue
+		}
+		if h.Typeflag != tar.TypeReg {
+			return nil, fmt.Errorf("gVisor tarball: %s isn't a regular file", h.Name)
+		}
+		b, err := io.ReadAll(tr)
+		if err != nil {
+			return nil, err
+		}
+		if got := sha256.Sum256(b); hex.EncodeToString(got[:]) != sum {
+			return nil, fmt.Errorf("gVisor %s: sha256 %x isn't the pinned %s", h.Name, got, sum)
+		}
+		delete(want, h.Name)
+		files = append(files, file{strings.TrimPrefix(gvisorDir, "/tacy/") + "/" + h.Name, b})
+	}
+	for n := range want {
+		return nil, fmt.Errorf("gVisor tarball has no %s", n)
+	}
+	return filesLayer(files)
+}
+
+// build builds every binary and every image.
+func build() (*Release, error) {
 	if v, err := run(nil, "go", "env", "GOVERSION"); err != nil || strings.TrimSpace(v) != goVersion() {
 		return nil, fmt.Errorf("go is %q, want %s (the toolchain image's; reproducible binaries need the same version): %v",
 			strings.TrimSpace(v), goVersion(), err)
@@ -293,13 +486,46 @@ func build() ([]Image, error) {
 	if err != nil {
 		return nil, err
 	}
-	var out []Image
+	r := &Release{}
+	bin := map[string][]byte{}
 	for _, b := range bins {
-		bin, err := buildBinary(b.pkg)
+		if bin[b.name], err = buildBinary(b.pkg); err != nil {
+			return nil, err
+		}
+		h := sha256.Sum256(bin[b.name])
+		r.Binaries = append(r.Binaries, Binary{b.name, hex.EncodeToString(h[:])})
+	}
+	used := map[string]bool{}
+	for _, im := range images {
+		var layers []layer
+		if im.gvisor {
+			tb, err := gvisorTarball()
+			if err != nil {
+				return nil, err
+			}
+			gz, err := gvisorLayer(tb)
+			if err != nil {
+				return nil, err
+			}
+			layers = append(layers, layer{gz, "tacy cmd/compose: " + gvisorDir + " (gVisor " + sandbox.GVisorRelease + ", " + sandbox.GVisorURL + ")"})
+		}
+		files := []file{{im.name, bin[im.name]}}
+		for _, w := range im.with {
+			files = append(files, file{w, bin[w]})
+		}
+		by := "tacy cmd/compose:"
+		for _, f := range files {
+			if f.data == nil || used[f.path] {
+				return nil, fmt.Errorf("image %s: binary %s isn't built or is in another image", im.name, f.path)
+			}
+			used[f.path] = true
+			by += " /tacy/" + f.path
+		}
+		gz, err := filesLayer(files)
 		if err != nil {
 			return nil, err
 		}
-		img, err := buildImage(base, b.name, bin)
+		img, err := buildLayers(base, im.name, append(layers, layer{gz, by})...)
 		if err != nil {
 			return nil, err
 		}
@@ -307,32 +533,43 @@ func build() ([]Image, error) {
 		if err != nil {
 			return nil, err
 		}
-		h := sha256.Sum256(bin)
-		out = append(out, Image{Name: b.name, SHA256: hex.EncodeToString(h[:]), Ref: Registry + "/" + b.name + "@" + d.String(), img: img})
+		r.Images = append(r.Images, Image{Name: im.name, Ref: Registry + "/" + im.name + "@" + d.String(), img: img})
 	}
-	return out, nil
+	if len(used) != len(bins) {
+		return nil, fmt.Errorf("%d binaries, %d in images", len(bins), len(used))
+	}
+	return r, nil
 }
 
-// generate returns compose.yaml for the images.
-func generate(images []Image) (string, error) {
+// generate returns compose.yaml for the release's images.
+func generate(r *Release) (string, error) {
 	ref := map[string]string{}
-	for _, im := range images {
+	for _, im := range r.Images {
 		ref[im.Name] = im.Ref
+	}
+	brainSum, runscSum := r.binary("brain"), sandbox.GVisorFiles[0][1]
+	if brainSum == "" || sandbox.GVisorFiles[0][0] != "runsc" {
+		return "", fmt.Errorf("no brain binary or runsc pin")
 	}
 	var b strings.Builder
 	b.WriteString(`# Generated by go run ./cmd/compose from the agent VM source. Don't edit by hand.
 #
-# Four processes, each in its own container with its own uid, linked only by unix sockets: agentd (front door
-# and runtime; no network, no keys), brain (no network, no secrets), gatewayd (service "agentvm": the only network
-# and the published port) and vaultd (the keys; no network). A one-shot setup container (root, no network) gives
-# them their directories first.
+# Four processes (docs/22), each in its own container with its own uid, linked only by unix sockets: agentd
+# (front door and runtime; no network, no keys), runner (runnerd: the brain in a gVisor sandbox, rootless runsc; no
+# network, no keys, no capabilities), gatewayd (service "agentvm": the only network and the published port) and
+# vaultd (the keys; no network). A one-shot setup container (root, no network) gives them their directories first.
 #
 # Every image is named by digest only: the pinned distroless base (` + baseImage + `)
-# plus one layer with the binary at /tacy/<name>. Rebuild them from the tagged source (scripts/reproduce.sh) to get
-# the same digests. Binaries (linux/amd64, sha256):
+# plus one layer with the binaries at /tacy/<name>; runnerd's image also holds the brain and, in a layer of its own,
+# gVisor ` + sandbox.GVisorRelease + ` at ` + gvisorDir + ` (Google's release ` + sandbox.GVisorURL + `,
+# sha256 ` + sandbox.GVisorTarSHA256 + `, each binary checked). Rebuild them from the tagged
+# source (scripts/reproduce.sh) to get the same digests. Binaries (linux/amd64, sha256):
 `)
-	for _, im := range images {
-		fmt.Fprintf(&b, "#   %-8s %s\n", im.Name, im.SHA256)
+	for _, bin := range r.Binaries {
+		fmt.Fprintf(&b, "#   %-8s %s\n", bin.Name, bin.SHA256)
+	}
+	for _, f := range sandbox.GVisorFiles {
+		fmt.Fprintf(&b, "#   %-8s %s (gVisor %s)\n", "", f[1], f[0])
 	}
 	env := func(names []string) {
 		b.WriteString("    environment:\n")
@@ -348,11 +585,15 @@ func generate(images []Image) (string, error) {
 		}
 		b.WriteString("    command: [" + strings.Join(q, ", ") + "]\n")
 	}
-	// service: a long-running process's container.
-	service := func(svc, bin, user string, network bool) {
-		b.WriteString("  " + svc + ":\n    image: " + ref[bin] + "\n    entrypoint: [\"/tacy/" + bin + "\"]\n")
+	// service: a long-running process's container. opts are extra security options (the runner's).
+	service := func(svc, img, user string, network bool, opts ...string) {
+		b.WriteString("  " + svc + ":\n    image: " + ref[img] + "\n    entrypoint: [\"/tacy/" + img + "\"]\n")
 		if !network {
 			b.WriteString("    network_mode: none\n")
+		}
+		sec := `"no-new-privileges:true"`
+		for _, o := range opts {
+			sec += `, "` + o + `"`
 		}
 		b.WriteString(`    restart: unless-stopped
     depends_on:
@@ -361,14 +602,14 @@ func generate(images []Image) (string, error) {
     user: "` + user + `"
     read_only: true
     cap_drop: [ALL]
-    security_opt: ["no-new-privileges:true"]
+    security_opt: [` + sec + `]
 `)
 	}
 	// setup: root, no network, only the capabilities chown, chmod and rm on others' files need. Socket directories,
 	// each in a volume only its two containers mount: agentd's HTTP socket and gatewayd's gateway/v0 socket (agentd,
-	// gatewayd by group); vaultd's socket (gatewayd may only enter); the brain's socket (agentd listens, the brain
-	// may only enter). agentd's queue on the encrypted disk is its uid's only; the queue a root agentd kept (before
-	// VM release 2, or after a rollback) is removed: its runs ended with that process.
+	// gatewayd by group); vaultd's socket (gatewayd may only enter); runnerd's socket (runnerd listens, agentd may
+	// only enter). agentd's queue on the encrypted disk is its uid's only; the queue a root agentd kept (before VM
+	// release 2, or after a rollback) is removed: its runs ended with that process.
 	b.WriteString(`services:
   setup:
     image: ` + ref["setup"] + `
@@ -383,32 +624,43 @@ func generate(images []Image) (string, error) {
     volumes:
       - agentsock:/run/tacy/agent
       - vaultsock:/run/tacy/vault
-      - brainsock2:/run/tacy/brain
+      - runnersock:/run/tacy/runner
       - state:/state
 `)
 	args("-dir", "/run/tacy/agent="+agentdUID+":"+gatewaydUID+":0770",
 		"-dir", "/run/tacy/vault="+vaultdUID+":"+gatewaydUID+":0750",
-		"-dir", "/run/tacy/brain="+agentdUID+":"+brainUID+":0750",
+		"-dir", "/run/tacy/runner="+runnerdUID+":"+agentdUID+":0750",
 		"-remove", "/state/queue.db", "-remove", "/state/queue.db-wal", "-remove", "/state/queue.db-shm",
 		"-remove", "/state/queue.db-journal",
 		"-tree", "/state/agentd="+agentdUID+":"+agentdUID+":0700")
 	service("agentd", "agentd", agentdUID+":"+agentdUID, false)
-	b.WriteString(`    group_add: ["` + brainUID + `", "` + gatewaydUID + `"]
+	b.WriteString(`    group_add: ["` + gatewaydUID + `"]
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
       - state:/state
-      - brainsock2:/run/tacy/brain
+      - runnersock:/run/tacy/runner
       - agentsock:/run/tacy/agent
 `)
 	env(agentEnv)
-	args(append([]string{"-storage", "/state/agentd", "-brain-socket", "/run/tacy/brain/brain.sock", "-brain-uid", brainUID, "-brain-gid", brainUID,
+	args(append([]string{"-storage", "/state/agentd", "-runner-socket", "/run/tacy/runner/runner.sock",
 		"-gateway-socket", "/run/tacy/agent/gateway.sock", "-listen-unix", "/run/tacy/agent/http.sock", "-listen-uid", gatewaydUID,
 		"-listen-gid", gatewaydUID, "-mem-limit-mib", "600"}, safetyArgs()...)...)
-	service("brain", "brain", brainUID+":"+brainUID, false)
-	b.WriteString(`    volumes:
-      - brainsock2:/run/tacy/brain
+	// runner: rootless runsc needs no capabilities, only Docker's seccomp profile off (it refuses the user and mount
+	// namespaces runsc makes; runsc filters its own sandbox and gofer). The container's memory and pids limits bound
+	// every sandbox in it (runsc runs with --ignore-cgroups). A tmpfs holds runsc's state and the brain's root; it
+	// must allow exec (Docker's default tmpfs is noexec, and gVisor maps the brain's binary from it). runnerd checks
+	// that the gVisor release and runsc hash it's given are the ones it was built with, and the brain's hash.
+	service("runner", "runnerd", runnerdUID+":"+agentdUID, false, "seccomp:unconfined")
+	b.WriteString(`    mem_limit: ` + runnerMem + `
+    memswap_limit: ` + runnerMem + `
+    pids_limit: ` + runnerPids + `
+    tmpfs: ["/run/runner:exec,size=64m,mode=0700,uid=` + runnerdUID + `,gid=` + agentdUID + `", "/tmp:size=16m"]
+    volumes:
+      - runnersock:/run/tacy/runner
 `)
-	args("--socket", "/run/tacy/brain/brain.sock")
+	args("-socket", "/run/tacy/runner/runner.sock", "-agent-uid", agentdUID,
+		"-gvisor", gvisorDir, "-gvisor-release", sandbox.GVisorRelease, "-runsc-sha256", runscSum,
+		"-brain", "/tacy/brain", "-brain-sha256", brainSum, "-dir", "/run/runner", "-platform", "systrap", "-rootless")
 	service("agentvm", "gatewayd", gatewaydUID+":"+gatewaydUID, true)
 	b.WriteString(`    ports:
       - "8080:8080"
@@ -433,7 +685,7 @@ func generate(images []Image) (string, error) {
 	args(append([]string{"-socket", "/run/tacy/vault/vault.sock", "-gateway-uid", gatewaydUID, "-group-mode"}, safetyArgs()...)...)
 	b.WriteString(`volumes:
   state:
-  brainsock2:
+  runnersock:
   agentsock:
   vaultsock:
 `)
@@ -474,7 +726,17 @@ type Manifest struct {
 	Images        map[string]string `json:"images"`         // name -> Registry/<name>@sha256:<digest>, as compose.yaml names them
 	BaseImage     string            `json:"base_image"`     // every image's base, by digest
 	GoVersion     string            `json:"go_version"`
-	BuildImage    string            `json:"build_image"` // the toolchain image the release builds in
+	BuildImage    string            `json:"build_image"`      // the toolchain image the release builds in
+	GVisor        *GVisor           `json:"gvisor,omitempty"` // the gVisor release in runnerd's image (since v0.4.0)
+}
+
+// GVisor is the third-party release an image carries: Google's tarball and the binaries taken from it.
+type GVisor struct {
+	Release       string            `json:"release"`
+	URL           string            `json:"url"`
+	TarballSHA256 string            `json:"tarball_sha256"`
+	Files         map[string]string `json:"files"` // path under the image's /tacy/gvisor -> sha256
+	Image         string            `json:"image"` // the image holding it
 }
 
 // Schema is release.json's schema.
@@ -495,11 +757,11 @@ func main() {
 	if *manifest != "" && (*version == "" || *commit == "") {
 		fail(fmt.Errorf("--manifest needs --version and --commit"))
 	}
-	images, err := build()
+	rel, err := build()
 	if err != nil {
 		fail(err)
 	}
-	out, err := generate(images)
+	out, err := generate(rel)
 	if err != nil {
 		fail(err)
 	}
@@ -521,9 +783,22 @@ func main() {
 	m := Manifest{Schema: Schema, Repository: "https://" + modulePath, Version: *version, Commit: *commit,
 		ComposeSHA256: hex.EncodeToString(h[:]), Binaries: map[string]string{}, Images: map[string]string{},
 		BaseImage: baseImage, GoVersion: goVersion(), BuildImage: image}
+	for _, b := range rel.Binaries {
+		m.Binaries[b.Name] = b.SHA256
+		fmt.Printf("%-8s binary sha256 %s\n", b.Name, b.SHA256)
+	}
 	for _, im := range images {
-		m.Binaries[im.Name], m.Images[im.Name] = im.SHA256, im.Ref
-		fmt.Printf("%-8s binary sha256 %s\n%-8s image %s\n", im.Name, im.SHA256, "", im.Ref)
+		if im.gvisor {
+			m.GVisor = &GVisor{Release: sandbox.GVisorRelease, URL: sandbox.GVisorURL, TarballSHA256: sandbox.GVisorTarSHA256,
+				Files: map[string]string{}, Image: im.name}
+			for _, f := range sandbox.GVisorFiles {
+				m.GVisor.Files[f[0]] = f[1]
+			}
+		}
+	}
+	for _, im := range rel.Images {
+		m.Images[im.Name] = im.Ref
+		fmt.Printf("%-8s image %s\n", im.Name, im.Ref)
 		if *ociDir != "" {
 			if err := writeLayout(filepath.Join(*ociDir, im.Name), im.img); err != nil {
 				fail(err)
@@ -531,8 +806,8 @@ func main() {
 		}
 	}
 	if *ociDir != "" {
-		names := make([]string, 0, len(images))
-		for _, im := range images {
+		names := make([]string, 0, len(rel.Images))
+		for _, im := range rel.Images {
 			names = append(names, im.Name)
 		}
 		sort.Strings(names)

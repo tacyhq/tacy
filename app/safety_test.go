@@ -23,11 +23,14 @@ import (
 	"github.com/tacyhq/tacy/guard"
 	"github.com/tacyhq/tacy/harness"
 	"github.com/tacyhq/tacy/proto"
+	"github.com/tacyhq/tacy/runner/runnertest"
 	"github.com/tacyhq/tacy/safety"
 )
 
 // Step 6 end to end in agentd (the in-process guard, as on -platform local): signed policy, the kill switch,
-// budgets, and the adversarial cases (forged and replayed documents, stale stop lists, parallel calls).
+// budgets, and the adversarial cases (forged and replayed documents, stale stop lists, parallel calls). The kill
+// switch and the budgets also run with the brain behind a runnerd (TestSafetyBehindRunner: the CVM's layout since
+// v0.4.0; real gVisor when runnertest finds runsc, else the fake sandbox).
 
 type safeEnv struct {
 	t               *testing.T
@@ -40,6 +43,11 @@ type safeEnv struct {
 }
 
 func newSafeEnv(t *testing.T, replies ...string) *safeEnv {
+	return newSafeEnvBrain(t, false, replies...)
+}
+
+// newSafeEnvBrain: behindRunner puts the brain in a sandbox a runnerd starts (runnertest), as on the CVM.
+func newSafeEnvBrain(t *testing.T, behindRunner bool, replies ...string) *safeEnv {
 	e := &safeEnv{t: t, model: &parityModel{replies: replies}, fs: &fakeSearch{}}
 	_, e.admin, _ = ed25519.GenerateKey(rand.Reader)
 	_, e.operator, _ = ed25519.GenerateKey(rand.Reader)
@@ -62,8 +70,14 @@ func newSafeEnv(t *testing.T, replies ...string) *safeEnv {
 	rt := newRuntime(sg, harness.NewMemStore(), lim)
 	sg.cancel = func(id, reason string) { rt.Cancel(id, reason) }
 	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	go localBrain(ctx, rt)
+	if behindRunner {
+		env := runnertest.Start(t)
+		t.Logf("brain sandbox: %s", env.Kind)
+		go runBrains(ctx, rt, env.Client)
+	} else {
+		go localBrain(ctx, rt)
+	}
+	t.Cleanup(cancel) // before runnertest's cleanup: the brains stop first
 	go sg.enforce(ctx, 200*time.Millisecond)
 	id, _ := ehbpidentity.NewIdentity()
 	e.s = &server{platform: local{}, id: id, agent: sg, rt: rt, token: "tok", booted: time.Now(), sched: newScheduler(lim),
@@ -200,8 +214,17 @@ func TestSafetyForgedAndReplayedPolicies(t *testing.T) {
 	}
 }
 
-func TestSafetyKillSwitchCancelsRunningRun(t *testing.T) {
-	e := newSafeEnv(t, pCalls([3]string{"c1", "fetch_page", `{"url":"https://docs.example.org/slow"}`}), pText("never"))
+// TestSafetyBehindRunner: the kill switch and the budgets with the brain in its sandbox, as on the CVM.
+func TestSafetyBehindRunner(t *testing.T) {
+	t.Run("KillSwitch", func(t *testing.T) { testSafetyKillSwitch(t, true) })
+	t.Run("BudgetParallelToolCalls", func(t *testing.T) { testSafetyBudgetParallel(t, true) })
+	t.Run("TokenBudget", func(t *testing.T) { testSafetyTokenBudget(t, true) })
+}
+
+func TestSafetyKillSwitchCancelsRunningRun(t *testing.T) { testSafetyKillSwitch(t, false) }
+
+func testSafetyKillSwitch(t *testing.T, behindRunner bool) {
+	e := newSafeEnvBrain(t, behindRunner, pCalls([3]string{"c1", "fetch_page", `{"url":"https://docs.example.org/slow"}`}), pText("never"))
 	// A page that never answers: the run is stuck in an action when the stop comes.
 	block := make(chan struct{})
 	page := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -297,12 +320,14 @@ func TestSafetyStaleStopList(t *testing.T) {
 	}
 }
 
-func TestSafetyBudgetParallelToolCalls(t *testing.T) {
+func TestSafetyBudgetParallelToolCalls(t *testing.T) { testSafetyBudgetParallel(t, false) }
+
+func testSafetyBudgetParallel(t *testing.T, behindRunner bool) {
 	calls := [][3]string{}
 	for _, id := range []string{"c1", "c2", "c3", "c4"} {
 		calls = append(calls, [3]string{id, "web_search", `{"query":"q ` + id + `"}`})
 	}
-	e := newSafeEnv(t, pCalls(calls...), pText("done"))
+	e := newSafeEnvBrain(t, behindRunner, pCalls(calls...), pText("done"))
 	e.mustPost(e.policy(1, func(p *safety.Policy) { p.Budget.Run.ToolCalls = 2 }), e.heartbeat())
 	evs := runParity(t, e.s, proto.RunRequest{Messages: user1("search a lot")})
 	if evs[len(evs)-1].Type != "done" {
@@ -325,8 +350,10 @@ func TestSafetyBudgetParallelToolCalls(t *testing.T) {
 	}
 }
 
-func TestSafetyTokenBudgetEndsRun(t *testing.T) {
-	e := newSafeEnv(t, pText("never"))
+func TestSafetyTokenBudgetEndsRun(t *testing.T) { testSafetyTokenBudget(t, false) }
+
+func testSafetyTokenBudget(t *testing.T, behindRunner bool) {
+	e := newSafeEnvBrain(t, behindRunner, pText("never"))
 	e.mustPost(e.policy(1, func(p *safety.Policy) { p.Budget.Run.Tokens = 300 }), e.heartbeat())
 	evs := runParity(t, e.s, proto.RunRequest{Messages: user1("hi")})
 	if er, ok := lastError(evs); !ok || er.Code != safety.CodeBudgetExceeded || e.modelReqs.Load() != 0 {

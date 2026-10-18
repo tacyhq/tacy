@@ -297,14 +297,23 @@ func TestImageComposeOffline(t *testing.T) {
 	if len(res.Checks) != 16 || res.Checks[15].Name != ImagesCheck || hex.EncodeToString(res.HPKEPublicKey) != a.HPKEPublicKey {
 		t.Fatalf("%d checks, last %q", len(res.Checks), res.Checks[len(res.Checks)-1].Name)
 	}
-	for _, svc := range []string{"setup", "agentd", "brain", "agentvm", "vaultd"} {
+	for _, svc := range []string{"setup", "agentd", "runner", "agentvm", "vaultd"} {
 		if !strings.HasPrefix(res.Facts["image "+svc], "ghcr.io/tacyhq/tacy/") || !strings.Contains(res.Facts["image "+svc], "@sha256:") {
 			t.Errorf("image %s: %q", svc, res.Facts["image "+svc])
 		}
 	}
+	// The brain in gVisor (since v0.4.0): the runner's image is pinned like the others, and its sandbox is a fact.
+	if !strings.HasPrefix(res.Facts["image runner"], "ghcr.io/tacyhq/tacy/runnerd@sha256:") || res.Facts["image brain"] != "" ||
+		!strings.HasSuffix(res.Facts["brain sandbox"], "(systrap, rootless runsc), no network") || len(res.Facts["gvisor runsc sha256"]) != 64 ||
+		!strings.Contains(res.Checks[15].Detail, "the brain in gVisor "+res.Facts["gvisor release"]) {
+		t.Errorf("runner facts %v, detail %q", res.Facts, res.Checks[15].Detail)
+	}
 	// The same VM with one image's digest swapped for a tag: compose-hash and RTMR3 consistent again, and refused
 	// by the image rule even with that compose expected.
 	i := strings.Index(string(compose), "\n    image: ")
+	if r := strings.Index(string(compose), "\n  runner:\n    image: "); r > 0 {
+		i = r + len("\n  runner:") // the runner's image (runnerd and gVisor) is the one swapped
+	}
 	j := i + strings.Index(string(compose[i:]), "@sha256:")
 	tagged := string(compose[:j]) + ":latest" + string(compose[j+len("@sha256:")+64:])
 	appCompose = withAppCompose(t, a, func(ac map[string]any) { ac["docker_compose_file"] = tagged })

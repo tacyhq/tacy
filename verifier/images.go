@@ -69,16 +69,77 @@ func ComposeImages(compose string) (map[string]string, error) {
 // ImagesCheck is the name of the check ComposeImages backs (the last one).
 const ImagesCheck = "docker compose pins every image by digest (no tag, no build, extends or include)"
 
+// SandboxFacts reads, from a compose whose brain runs in gVisor (since v0.4.0, docs/22: the "runner" service, runnerd),
+// what the Security panel shows about the brain's sandbox: "brain sandbox" ("gVisor <release> (<platform>, rootless
+// runsc), no network"), "gvisor release", "gvisor runsc sha256" and "brain binary sha256", from runnerd's
+// arguments. runnerd refuses to start unless the release and runsc's hash are the ones built into it and the brain
+// in its image has that hash, and the image is pinned by digest, so these describe what runs. Facts only: an older
+// compose (the brain in its own container) has none, and nothing here passes or fails a check.
+func SandboxFacts(compose string) map[string]string {
+	var doc struct {
+		Services map[string]struct {
+			NetworkMode string   `yaml:"network_mode"`
+			Command     []string `yaml:"command"`
+		} `yaml:"services"`
+	}
+	facts := map[string]string{}
+	if yaml.Unmarshal([]byte(compose), &doc) != nil {
+		return facts
+	}
+	runner, ok := doc.Services["runner"]
+	if !ok {
+		return facts
+	}
+	arg, rootless := map[string]string{}, false
+	for i, a := range runner.Command {
+		if a == "-rootless" || a == "-rootless=true" {
+			rootless = true
+		} else if strings.HasPrefix(a, "-") && i+1 < len(runner.Command) && !strings.HasPrefix(runner.Command[i+1], "-") {
+			arg[a] = runner.Command[i+1]
+		}
+	}
+	hex64 := regexp.MustCompile(`^[0-9a-f]{64}$`)
+	rel, platform := arg["-gvisor-release"], arg["-platform"]
+	if !regexp.MustCompile(`^[0-9]{8}\.[0-9]+$`).MatchString(rel) || !regexp.MustCompile(`^[a-z]+$`).MatchString(platform) {
+		return facts
+	}
+	facts["gvisor release"] = rel
+	sb := "gVisor " + rel + " (" + platform
+	if rootless {
+		sb += ", rootless runsc"
+	}
+	sb += ")"
+	if runner.NetworkMode == "none" {
+		sb += ", no network"
+	}
+	facts["brain sandbox"] = sb
+	if hex64.MatchString(arg["-runsc-sha256"]) {
+		facts["gvisor runsc sha256"] = arg["-runsc-sha256"]
+	}
+	if hex64.MatchString(arg["-brain-sha256"]) {
+		facts["brain binary sha256"] = arg["-brain-sha256"]
+	}
+	return facts
+}
+
 // checkImages runs ComposeImages on the attested compose, records each service's image as the fact
-// "image <service>", and adds the check.
+// "image <service>" and the brain's sandbox (SandboxFacts), and adds the check.
 func (r *Result) checkImages(compose string) bool {
 	images, err := ComposeImages(compose)
 	for svc, img := range images {
 		r.Facts["image "+svc] = img
 	}
+	if err == nil {
+		for k, v := range SandboxFacts(compose) {
+			r.Facts[k] = v
+		}
+	}
 	detail := ""
 	if err == nil {
 		detail = fmt.Sprintf("%d services, each name@sha256", len(images))
+		if rel := r.Facts["gvisor release"]; rel != "" {
+			detail += "; the brain in gVisor " + rel + " from the runner's image"
+		}
 	}
 	return r.add(ImagesCheck, err, detail)
 }

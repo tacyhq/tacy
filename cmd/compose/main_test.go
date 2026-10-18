@@ -4,8 +4,12 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -16,6 +20,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/types"
 	"go.yaml.in/yaml/v3"
 
+	"github.com/tacyhq/tacy/sandbox"
 	"github.com/tacyhq/tacy/verifier"
 )
 
@@ -26,11 +31,11 @@ func TestComposeCurrent(t *testing.T) {
 		t.Skip("builds the binaries and fetches the base image")
 	}
 	os.Chdir("../..")
-	images, err := build()
+	rel, err := build()
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err := generate(images)
+	out, err := generate(rel)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,8 +73,11 @@ type service struct {
 	DependsOn   map[string]struct {
 		Condition string `yaml:"condition"`
 	} `yaml:"depends_on"`
-	Restart string   `yaml:"restart"`
-	Tmpfs   []string `yaml:"tmpfs"`
+	Restart      string   `yaml:"restart"`
+	Tmpfs        []string `yaml:"tmpfs"`
+	MemLimit     string   `yaml:"mem_limit"`
+	MemswapLimit string   `yaml:"memswap_limit"`
+	PidsLimit    int      `yaml:"pids_limit"`
 }
 
 func services(t *testing.T) map[string]service {
@@ -85,9 +93,10 @@ func services(t *testing.T) map[string]service {
 	return doc.Services
 }
 
-// The process layout of docs/21: only gatewayd (service agentvm) has a network; agentd, the brain, vaultd and setup
-// have none. The keys go to vaultd only, the run token to agentd only. Every image is ours, by digest, and runs
-// the binary of its name.
+// The process layout (docs/21, docs/22): only gatewayd (service agentvm) has a network; agentd, the runner (the
+// brain's gVisor sandbox), vaultd and setup have none. The keys go to vaultd only, the run token to agentd only.
+// Every image is ours, by digest, and runs the binary of its name. Only setup adds capabilities; only the runner
+// has Docker's seccomp profile off.
 func TestComposeLayout(t *testing.T) {
 	out := readCompose(t)
 	if len(out) > MaxCompose {
@@ -98,7 +107,7 @@ func TestComposeLayout(t *testing.T) {
 		t.Fatal(err)
 	}
 	byName := services(t)
-	binOf := map[string]string{"setup": "setup", "agentd": "agentd", "brain": "brain", "agentvm": "gatewayd", "vaultd": "vaultd"}
+	binOf := map[string]string{"setup": "setup", "agentd": "agentd", "runner": "runnerd", "agentvm": "gatewayd", "vaultd": "vaultd"}
 	if len(byName) != len(binOf) || len(images) != len(binOf) {
 		t.Fatalf("%d services", len(byName))
 	}
@@ -116,8 +125,12 @@ func TestComposeLayout(t *testing.T) {
 		if (len(s.Ports) > 0) != (name == "agentvm") {
 			t.Errorf("%s: published ports", name)
 		}
-		if !s.ReadOnly || len(s.CapDrop) != 1 || s.CapDrop[0] != "ALL" || len(s.SecurityOpt) != 1 || s.SecurityOpt[0] != "no-new-privileges:true" {
-			t.Errorf("%s isn't hardened", name)
+		sec := []string{"no-new-privileges:true"}
+		if name == "runner" {
+			sec = append(sec, "seccomp:unconfined")
+		}
+		if !s.ReadOnly || len(s.CapDrop) != 1 || s.CapDrop[0] != "ALL" || strings.Join(s.SecurityOpt, ",") != strings.Join(sec, ",") {
+			t.Errorf("%s isn't hardened: %v", name, s.SecurityOpt)
 		}
 		if (len(s.CapAdd) > 0) != (name == "setup") {
 			t.Errorf("%s: cap_add %v", name, s.CapAdd)
@@ -154,13 +167,17 @@ func TestComposeLayout(t *testing.T) {
 	if agentd.User != agentdUID+":"+agentdUID || !strings.Contains(strings.Join(gw.Command, " "), "-agent-uid "+agentdUID+" ") {
 		t.Error("agentd's uid and gatewayd's -agent-uid differ")
 	}
-	if byName["brain"].User != brainUID+":"+brainUID || byName["vaultd"].User != vaultdUID+":"+gatewaydUID || gw.User != gatewaydUID+":"+gatewaydUID {
+	if byName["runner"].User != runnerdUID+":"+agentdUID || byName["vaultd"].User != vaultdUID+":"+gatewaydUID || gw.User != gatewaydUID+":"+gatewaydUID {
 		t.Error("uids")
 	}
-	// agentd's queue directory and the brain's socket directory are its own, set by setup.
+	if strings.Join(agentd.GroupAdd, ",") != gatewaydUID {
+		t.Errorf("agentd's groups %v", agentd.GroupAdd)
+	}
+	// agentd's queue directory and runnerd's socket directory, set by setup.
 	if !strings.Contains(strings.Join(agentd.Command, " "), "-storage /state/agentd ") ||
+		!strings.Contains(strings.Join(agentd.Command, " "), "-runner-socket /run/tacy/runner/runner.sock ") ||
 		!strings.Contains(setup, "-tree /state/agentd="+agentdUID+":"+agentdUID+":0700") ||
-		!strings.Contains(setup, "-dir /run/tacy/brain="+agentdUID+":"+brainUID+":0750") ||
+		!strings.Contains(setup, "-dir /run/tacy/runner="+runnerdUID+":"+agentdUID+":0750") ||
 		!strings.Contains(setup, "-dir /run/tacy/agent="+agentdUID+":"+gatewaydUID+":0770") ||
 		!strings.Contains(setup, "-dir /run/tacy/vault="+vaultdUID+":"+gatewaydUID+":0750") ||
 		!strings.Contains(setup, "-remove /state/queue.db ") {
@@ -168,9 +185,9 @@ func TestComposeLayout(t *testing.T) {
 	}
 	// Each socket directory is mounted only by its two containers (and setup).
 	for vol, who := range map[string]string{"agentsock": "agentd agentvm setup", "vaultsock": "agentvm setup vaultd",
-		"brainsock2": "agentd brain setup", "state": "agentd setup"} {
+		"runnersock": "agentd runner setup", "state": "agentd setup"} {
 		var got []string
-		for _, name := range []string{"agentd", "agentvm", "brain", "setup", "vaultd"} {
+		for _, name := range []string{"agentd", "agentvm", "runner", "setup", "vaultd"} {
 			for _, v := range byName[name].Volumes {
 				if strings.HasPrefix(v, vol+":") {
 					got = append(got, name)
@@ -180,6 +197,54 @@ func TestComposeLayout(t *testing.T) {
 		if strings.Join(got, " ") != who {
 			t.Errorf("volume %s mounted by %v", vol, got)
 		}
+	}
+}
+
+// The runner (docs/22): rootless runsc on systrap from its own image's gVisor, the pinned release and runsc named
+// (runnerd refuses others), the brain from its image with its pin, only agentd's uid allowed, container limits that
+// bound its sandboxes, an exec tmpfs for runsc's state and the brain's root, and nothing of the other processes:
+// only its socket volume, no environment.
+func TestComposeRunner(t *testing.T) {
+	r := services(t)["runner"]
+	cmd := " " + strings.Join(r.Command, " ") + " "
+	brain := ""
+	for _, ln := range strings.Split(string(readCompose(t)), "\n") {
+		if f := strings.Fields(ln); len(f) == 3 && f[0] == "#" && f[1] == "brain" {
+			brain = f[2]
+		}
+	}
+	if len(brain) != 64 {
+		t.Fatal("no brain hash in the header")
+	}
+	for _, want := range []string{" -socket /run/tacy/runner/runner.sock ", " -agent-uid " + agentdUID + " ",
+		" -gvisor " + gvisorDir + " ", " -gvisor-release " + sandbox.GVisorRelease + " ", " -runsc-sha256 " + sandbox.GVisorFiles[0][1] + " ",
+		" -brain /tacy/brain ", " -brain-sha256 " + brain + " ", " -dir /run/runner ", " -platform systrap ", " -rootless "} {
+		if !strings.Contains(cmd, want) {
+			t.Errorf("runner's command lacks %q: %s", want, cmd)
+		}
+	}
+	if sandbox.CheckPins(sandbox.GVisorRelease, sandbox.GVisorFiles[0][1]) != nil || sandbox.CheckPins("20250101.0", sandbox.GVisorFiles[0][1]) == nil ||
+		sandbox.CheckPins(sandbox.GVisorRelease, strings.Repeat("0", 64)) == nil {
+		t.Error("CheckPins")
+	}
+	if r.MemLimit != runnerMem || r.MemswapLimit != runnerMem || fmt.Sprint(r.PidsLimit) != runnerPids {
+		t.Errorf("limits %s %s %d", r.MemLimit, r.MemswapLimit, r.PidsLimit)
+	}
+	if strings.Join(r.Tmpfs, " ") != "/run/runner:exec,size=64m,mode=0700,uid="+runnerdUID+",gid="+agentdUID+" /tmp:size=16m" {
+		t.Errorf("tmpfs %v", r.Tmpfs)
+	}
+	if strings.Join(r.Volumes, " ") != "runnersock:/run/tacy/runner" || len(r.Environment) != 0 || len(r.GroupAdd) != 0 || len(r.Ports) != 0 {
+		t.Errorf("runner: volumes %v env %v groups %v", r.Volumes, r.Environment, r.GroupAdd)
+	}
+	// Nothing else privileged anywhere (the strict decoder above refuses unknown keys such as privileged, pid,
+	// userns_mode, devices or cgroup).
+	for _, ln := range strings.Split(string(readCompose(t)), "\n") {
+		if strings.Contains(ln, "seccomp") && !strings.Contains(ln, `security_opt: ["no-new-privileges:true", "seccomp:unconfined"]`) {
+			t.Errorf("seccomp line %q", ln)
+		}
+	}
+	if n := strings.Count(string(readCompose(t)), "seccomp:unconfined"); n != 1 {
+		t.Errorf("seccomp:unconfined %d times", n)
 	}
 }
 
@@ -294,5 +359,106 @@ func TestBinaryLayerDeterministic(t *testing.T) {
 	b, _ := binaryLayer("x", []byte("abc"))
 	if !bytes.Equal(a, b) {
 		t.Fatal("layer isn't deterministic")
+	}
+}
+
+// layerEntries lists a gzip'd tar layer: name -> mode, and each file's sha256; it fails on anything not 0:0 at time 0.
+func layerEntries(t *testing.T, gz []byte) (map[string]int64, map[string]string, []string) {
+	t.Helper()
+	zr, err := gzip.NewReader(bytes.NewReader(gz))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := tar.NewReader(zr)
+	modes, sums, order := map[string]int64{}, map[string]string{}, []string{}
+	for {
+		h, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if h.Uid != 0 || h.Gid != 0 || h.ModTime.Unix() != 0 || h.Uname != "" || h.Gname != "" {
+			t.Errorf("%s: owner %d:%d, time %v", h.Name, h.Uid, h.Gid, h.ModTime)
+		}
+		modes[h.Name] = h.Mode
+		order = append(order, h.Name)
+		if h.Typeflag == tar.TypeReg {
+			b, _ := io.ReadAll(tr)
+			s := sha256.Sum256(b)
+			sums[h.Name] = hex.EncodeToString(s[:])
+		}
+	}
+	return modes, sums, order
+}
+
+// A layer of several files: sorted, each after its directories (0755), files 0555; one file gives exactly the
+// single-binary layer's bytes (the other images' digests don't move). Bad paths are refused.
+func TestFilesLayer(t *testing.T) {
+	gz, err := filesLayer([]file{{"runnerd", []byte("r")}, {"gvisor/gvisor-bin/x", []byte("x")}, {"brain", []byte("b")}, {"gvisor/runsc", []byte("s")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	modes, _, order := layerEntries(t, gz)
+	want := "tacy/ tacy/brain tacy/gvisor/ tacy/gvisor/gvisor-bin/ tacy/gvisor/gvisor-bin/x tacy/gvisor/runsc tacy/runnerd"
+	if strings.Join(order, " ") != want {
+		t.Fatalf("entries %v", order)
+	}
+	for n, m := range modes {
+		if (strings.HasSuffix(n, "/") && m != 0o755) || (!strings.HasSuffix(n, "/") && m != 0o555) {
+			t.Errorf("%s: %o", n, m)
+		}
+	}
+	one, _ := filesLayer([]file{{"agentd", []byte("a")}})
+	bin, _ := binaryLayer("agentd", []byte("a"))
+	if !bytes.Equal(one, bin) {
+		t.Fatal("single-file layer differs")
+	}
+	for _, bad := range []string{"", "/abs", "dir/", "../x", "a/../../x"} {
+		if _, err := filesLayer([]file{{bad, []byte("x")}}); err == nil {
+			t.Errorf("path %q accepted", bad)
+		}
+	}
+}
+
+// gVisor in runnerd's image: exactly the pinned binaries from the pinned tarball, under /tacy/gvisor; a tarball
+// that isn't the pinned one is refused, wherever it comes from. Skipped with -short (downloads 167 MB once, then
+// the user's cache).
+func TestGVisorLayer(t *testing.T) {
+	if testing.Short() {
+		t.Skip("needs gVisor's release tarball")
+	}
+	tb, err := gvisorTarball()
+	if err != nil {
+		t.Fatal(err)
+	}
+	gz, err := gvisorLayer(tb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	modes, sums, _ := layerEntries(t, gz)
+	if len(modes) != 3+len(sandbox.GVisorFiles) || modes["tacy/"] != 0o755 || modes["tacy/gvisor/"] != 0o755 || modes["tacy/gvisor/gvisor-bin/"] != 0o755 {
+		t.Fatalf("entries %v", modes)
+	}
+	for _, f := range sandbox.GVisorFiles {
+		if p := "tacy/gvisor/" + f[0]; sums[p] != f[1] || modes[p] != 0o555 {
+			t.Errorf("%s: %s %o", p, sums[p], modes[p])
+		}
+	}
+	again, _ := gvisorLayer(tb)
+	if !bytes.Equal(gz, again) {
+		t.Fatal("gVisor layer isn't deterministic")
+	}
+	// Another tarball: refused by its hash; a damaged one (its pin aside) by the binaries' hashes or bzip2.
+	bad := filepath.Join(t.TempDir(), "gvisor.tar.bz2")
+	os.WriteFile(bad, append(append([]byte{}, tb[:len(tb)/2]...), 0), 0o644)
+	t.Setenv("TACY_GVISOR_TARBALL", bad)
+	if _, err := gvisorTarball(); err == nil || !strings.Contains(err.Error(), "isn't the pinned") {
+		t.Fatalf("other tarball: %v", err)
+	}
+	cut := append([]byte{}, tb[:len(tb)/3]...)
+	if _, err := gvisorLayer(cut); err == nil {
+		t.Fatal("cut tarball accepted")
 	}
 }

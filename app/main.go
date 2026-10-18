@@ -16,8 +16,9 @@
 //
 // This is agentd (docs/21-gateway-v0.md): the front door and the runtime. A run is a harness/v1 task
 // (docs/20-harness-protocol.md): this process is the runtime (../harness, the queue in ../queue); the agent loop is
-// the brain (../brain, cmd/brain), a separate process in its own container with no network and no secrets, reached
-// only over the unix socket -brain-socket; every model call and action the runtime accepts goes to gatewayd
+// the brain (../brain, cmd/brain), untrusted, in a gVisor sandbox that runnerd (cmd/runnerd, -runner-socket) starts
+// for it with no network and no secrets, reached only over a socketpair this process makes (brains.go); every
+// model call and action the runtime accepts goes to gatewayd
 // (../gateway, cmd/gatewayd) over -gateway-socket, which leases keys from vaultd per call. In the CVM this process
 // has no network at all (its container's network_mode is none) and no keys: requests reach it through gatewayd,
 // which forwards the published port's connections to -listen-unix. Locally (-platform local) the brain and the
@@ -65,6 +66,7 @@ import (
 	"github.com/tacyhq/tacy/internal/tinfoil"
 	"github.com/tacyhq/tacy/proto"
 	"github.com/tacyhq/tacy/queue"
+	"github.com/tacyhq/tacy/runner"
 	"github.com/tacyhq/tacy/safety"
 )
 
@@ -292,9 +294,7 @@ func main() {
 	platformName := flag.String("platform", "dstack", "dstack | local (no attestation; development only)")
 	sock := flag.String("dstack-sock", "/var/run/dstack.sock", "dstack guest agent socket")
 	storage := flag.String("storage", "", "directory on the encrypted disk for the runtime's queue (queue.db); empty: in memory")
-	brainSocket := flag.String("brain-socket", "", "unix socket the brain connects to; empty: run the brain in this process (local only)")
-	brainUID := flag.Int("brain-uid", -1, "the only uid allowed to connect to -brain-socket (owns it, mode 0600, unless -brain-gid); -1: no check")
-	brainGID := flag.Int("brain-gid", -1, "group of -brain-socket (mode 0660; this process must be in it): no chown to the brain's uid needed")
+	runnerSocket := flag.String("runner-socket", "", "runnerd's socket: the brain runs in a gVisor sandbox it starts (required on dstack); empty: the brain in this process (local only)")
 	lim := defaultLimits
 	flag.IntVar(&lim.MaxRuns, "max-runs", lim.MaxRuns, "runs at once")
 	flag.IntVar(&lim.MaxQueue, "max-queue", lim.MaxQueue, "runs waiting for a slot")
@@ -332,8 +332,8 @@ func main() {
 		if *devModel != "" || *devSearch != "" || *devFetchAny {
 			log.Fatal("-dev-* flags are for -platform local only")
 		}
-		if *brainSocket == "" {
-			log.Fatal("-brain-socket is required on dstack: the brain runs in its own container")
+		if *runnerSocket == "" {
+			log.Fatal("-runner-socket is required on dstack: the brain runs in a gVisor sandbox (runnerd)")
 		}
 		if *gatewaySocket == "" {
 			log.Fatal("-gateway-socket is required on dstack: model calls and actions go through gatewayd")
@@ -417,10 +417,10 @@ func main() {
 			}
 		}
 	}()
-	if *brainSocket == "" {
+	if *runnerSocket == "" {
 		go localBrain(ctx, rt)
-	} else if err := serveBrains(ctx, rt, *brainSocket, *brainUID, *brainGID); err != nil {
-		log.Fatalf("brain socket: %v", err)
+	} else {
+		go runBrains(ctx, rt, &runner.Client{Path: *runnerSocket})
 	}
 
 	// Verify Tinfoil's router now, so the first request doesn't wait for it (gatewayd does its own).
@@ -473,7 +473,7 @@ func main() {
 		log.Fatalf("listen: %v", err)
 	}
 	log.Printf("agent VM listening on %s (platform %s, hpke key %s, run token set: %v, search %s, brain %s, queue %s, limits %+v)",
-		where, p.Name(), id.MarshalPublicKeyHex(), s.token != "", searchName, cmp.Or(*brainSocket, "in process"),
+		where, p.Name(), id.MarshalPublicKeyHex(), s.token != "", searchName, cmp.Or(*runnerSocket, "in process"),
 		cmp.Or(p.StoragePath(), "in memory"), lim)
 	log.Fatal(srv.Serve(l))
 }
@@ -497,55 +497,6 @@ func newRuntime(g harness.Guard, store harness.Store, lim Limits) *harness.Runti
 	return &harness.Runtime{Guard: g, Store: store, Info: harness.Info{Name: "tacy-runtime", Version: "0.1"},
 		Limits:   harness.Limits{MaxTasks: lim.MaxRuns, MaxInflight: max(1, lim.RunTools)},
 		OnReject: func(err error) { log.Printf("brain frame refused: %v", err) }}
-}
-
-// serveBrains listens on the brain's unix socket: owned by brainUID with mode 0600, or with group brainGID and mode
-// 0660 (the CVM: this process is in the brain's group and needs no chown), and checked per connection on Linux
-// (SO_PEERCRED), in a directory only the brain's container shares. One brain connection at a time: a new one
-// replaces the old (a restarted brain), and the runtime resumes its tasks from their checkpoints.
-func serveBrains(ctx context.Context, rt *harness.Runtime, path string, brainUID, brainGID int) error {
-	var l net.Listener
-	var err error
-	if brainGID >= 0 {
-		l, err = listenSocket(path, brainGID)
-	} else {
-		os.Remove(path) // a socket the previous process left
-		if l, err = net.Listen("unix", path); err == nil && brainUID >= 0 {
-			if err = os.Chown(path, brainUID, brainUID); err != nil {
-				l.Close()
-			}
-		}
-		if err == nil {
-			if err = os.Chmod(path, 0o600); err != nil {
-				l.Close()
-			}
-		}
-	}
-	if err != nil {
-		return err
-	}
-	go func() {
-		for {
-			c, err := l.Accept()
-			if err != nil {
-				log.Printf("brain socket: %v", err)
-				return
-			}
-			if brainUID >= 0 {
-				if err := checkPeer(c, brainUID); err != nil {
-					log.Printf("brain socket: %v", err)
-					c.Close()
-					continue
-				}
-			}
-			go func() {
-				if err := rt.Serve(ctx, c); err != nil {
-					log.Printf("brain connection ended: %v", err)
-				}
-			}()
-		}
-	}()
-	return nil
 }
 
 // listenSocket listens on a unix socket at path (a stale one is removed): group gid and mode 0660, so the one

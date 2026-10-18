@@ -6,12 +6,14 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/tacyhq/tacy/gateway"
 	"github.com/tacyhq/tacy/guard"
 	"github.com/tacyhq/tacy/harness"
+	"github.com/tacyhq/tacy/runner/runnertest"
 )
 
 // This tree's side of parity_test.go: the server as main builds it (guard, runtime, in-process brain), on the
@@ -31,25 +33,39 @@ func modelTool(app string) string {
 	return app
 }
 
-// parityModes: the guard in this process, and the CVM's layout: agentd's gateway client talking gateway/v0
-// to a gatewayd server over a real unix socket. The events must be the same either way.
-var parityModes = []string{"in-process", "gatewayd"}
+// parityModes: the guard in this process; the gateway split's layout: agentd's gateway client talking
+// gateway/v0 to a gatewayd server over a real unix socket; and the CVM's layout since v0.4.0: that, with the brain in
+// a sandbox that a runnerd starts (runner/v0, its harness socket passed in), in real gVisor when TACY_RUNSC and
+// TACY_BRAIN_BIN are set (runnertest), else in the fake sandbox. The events must be the same every way.
+var parityModes = []string{"in-process", "gatewayd", "gatewayd+runner"}
 
-func parityServer(t *testing.T, mode string, model *httptest.Server, ps *paritySearch, web http.RoundTripper) *server {
+func parityServer(t *testing.T, mode string, model *httptest.Server, ps guard.SearchProvider, web http.RoundTripper) *server {
+	s, _ := parityServerEnv(t, mode, model, ps, web)
+	return s
+}
+
+func parityServerEnv(t *testing.T, mode string, model *httptest.Server, ps guard.SearchProvider, web http.RoundTripper) (*server, *runnertest.Env) {
 	lim := defaultLimits
 	client := &http.Client{Transport: web}
 	now := func() time.Time { return time.Date(2026, 10, 13, 0, 0, 0, 0, time.UTC) }
 	g := guard.New(guard.Config{Up: guard.NewPlainUpstream(model.URL, model.Client()), Search: ps, Fetcher: client, Icons: client,
 		Limits: &lim, CacheSecret: "boot-secret", Now: now})
 	var gw guard.Gateway = g
-	if mode == "gatewayd" {
+	if strings.HasPrefix(mode, "gatewayd") {
 		gw = startGatewayd(t, g, now)
 	}
 	rt := newRuntime(gw, harness.NewMemStore(), lim)
 	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	go localBrain(ctx, rt)
-	return &server{platform: local{}, agent: gw, rt: rt, sched: newScheduler(lim), lim: lim, quotes: make(chan struct{}, 4)}
+	var env *runnertest.Env
+	if strings.HasSuffix(mode, "+runner") {
+		env = runnertest.Start(t)
+		t.Logf("brain sandbox: %s", env.Kind)
+		go runBrains(ctx, rt, env.Client)
+	} else {
+		go localBrain(ctx, rt)
+	}
+	t.Cleanup(cancel) // before runnertest's cleanup: the brains stop first
+	return &server{platform: local{}, agent: gw, rt: rt, sched: newScheduler(lim), lim: lim, quotes: make(chan struct{}, 4)}, env
 }
 
 // startGatewayd serves g as gatewayd does, on a unix socket, and returns agentd's client for it.

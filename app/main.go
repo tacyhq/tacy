@@ -4,9 +4,12 @@
 //	                              info (app compose, event log). Format: proto.Attestation, proto.ReportData.
 //	POST /tasks, /tasks/status, /tasks/events, /tasks/cancel
 //	                              the task API (tasks.go, docs/27): start a task, see it, follow its events from any
-//	                              point, cancel it. EHBP bodies and the bearer token, as /run.
+//	                              point, cancel it. EHBP bodies and the bearer token, as /run. Plaintext billing
+//	                              witness headers for the relay (X-Agent-Task, X-Agent-Bill, X-Agent-Refundable).
+//	GET  /tasks/open              {"open": n}: open tasks, for the relay's idle timer (bearer token; a count only).
 //	POST /run                     EHBP-encrypted proto.RunRequest -> EHBP-encrypted SSE stream of proto.Event: a
 //	                              shim over the task API (start, then follow; cancelled when the tab goes away).
+//	                              Kept one release after the chat moved to /tasks (temporary chats still use it).
 //	                              Needs "Authorization: Bearer <AGENT_VM_TOKEN>" (cost control; the relay holds it).
 //	                              Optional "X-Agent-User: <hex>": the relay's opaque per-user tag, for fairness
 //	                              only (limits.go). Required "X-Agent-Model: <model id>": the run's model in

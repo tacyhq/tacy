@@ -114,7 +114,7 @@ func (t *tinfoilUpstream) Stream(ctx context.Context, body []byte) (io.ReadClose
 			res.Body.Close()
 			b = exactRedact(b, []*vault.Secret{key})
 			key.Wipe()
-			return nil, fmt.Errorf("model returned %d: %s", res.StatusCode, upstreamError(b))
+			return nil, &StatusError{Status: res.StatusCode, Msg: upstreamError(b)}
 		}
 		return &leasedBody{ReadCloser: res.Body, key: key}, nil
 	}
@@ -159,7 +159,7 @@ func (p *plainUpstream) Stream(ctx context.Context, body []byte) (io.ReadCloser,
 	if res.StatusCode != 200 {
 		b, _ := io.ReadAll(io.LimitReader(res.Body, 2000))
 		res.Body.Close()
-		return nil, fmt.Errorf("model returned %d: %s", res.StatusCode, upstreamError(b))
+		return nil, &StatusError{Status: res.StatusCode, Msg: upstreamError(b)}
 	}
 	return res.Body, nil
 }
@@ -193,6 +193,11 @@ type chunk struct {
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 	Usage *chunkUsage `json:"usage"`
+	// Error: an error the provider sent inside the stream (an OpenAI-style error object). Only "overloaded" before
+	// any token is acted on (errOverloadedStream); others are ignored, as before.
+	Error *struct {
+		Message string `json:"message"`
+	} `json:"error"`
 }
 
 // chunkUsage is OpenAI's usage object: the counts the run sums (proto.Usage) plus the cached prompt tokens, which
@@ -237,6 +242,9 @@ func readStream(r io.Reader, onDelta func(kind, delta string) error) (*stepResul
 		var c chunk
 		if err := json.Unmarshal([]byte(data), &c); err != nil {
 			return nil, errors.New("model stream: malformed chunk")
+		}
+		if c.Error != nil && res.firstAt.IsZero() && strings.Contains(strings.ToLower(c.Error.Message), "overloaded") {
+			return nil, errOverloadedStream
 		}
 		if c.Usage != nil {
 			u := c.Usage.Usage

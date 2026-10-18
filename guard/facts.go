@@ -31,6 +31,18 @@ type FactsData struct {
 	// Reader: the quarantined reader's calls for this action (reader.go): model, tokens, outcome, counts. agentd
 	// commits them to the budget it reserved (ReaderReserve).
 	Reader []ReaderUse `json:"reader,omitzero"`
+	// Model: a model call's model as it ran (it differs from the one the brain asked for after a switch to a
+	// fallback, fallback.go). Abandoned: the calls given up first as slow or overloaded.
+	Model     string         `json:"model,omitzero"`
+	Abandoned []ModelAttempt `json:"abandoned,omitzero"`
+}
+
+// ModelAttempt is a model call given up for a fallback (fallback.go): its model, why (abandoned_slow or
+// overloaded) and how long it had run. No tokens: nothing of it was used.
+type ModelAttempt struct {
+	Model   string `json:"model"`
+	Outcome string `json:"outcome"`
+	Ms      int64  `json:"ms"`
 }
 
 type factsKey struct{}
@@ -54,13 +66,14 @@ func (f *Facts) Data() FactsData {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return FactsData{Hosts: slices.Clone(f.d.Hosts), Leases: slices.Clone(f.d.Leases), Blocked: slices.Clone(f.d.Blocked),
-		Redacted: slices.Clone(f.d.Redacted), Reader: slices.Clone(f.d.Reader)}
+		Redacted: slices.Clone(f.d.Redacted), Reader: slices.Clone(f.d.Reader), Model: f.d.Model, Abandoned: slices.Clone(f.d.Abandoned)}
 }
 
 // Ptr is Data as a pointer, nil when nothing was collected (nil f too): what gateway/v0 sends.
 func (f *Facts) Ptr() *FactsData {
 	d := f.Data()
-	if len(d.Hosts) == 0 && len(d.Leases) == 0 && len(d.Blocked) == 0 && len(d.Redacted) == 0 && len(d.Reader) == 0 {
+	if len(d.Hosts) == 0 && len(d.Leases) == 0 && len(d.Blocked) == 0 && len(d.Redacted) == 0 && len(d.Reader) == 0 &&
+		d.Model == "" && len(d.Abandoned) == 0 {
 		return nil
 	}
 	return &d
@@ -84,6 +97,10 @@ func (f *Facts) Merge(d FactsData) {
 	defer f.mu.Unlock()
 	f.d.Leases = append(f.d.Leases, d.Leases...)
 	f.d.Reader = append(f.d.Reader, d.Reader...)
+	f.d.Abandoned = append(f.d.Abandoned, d.Abandoned...)
+	if d.Model != "" {
+		f.d.Model = d.Model
+	}
 	f.d.Blocked = addIDs(f.d.Blocked, d.Blocked)
 	f.d.Redacted = addIDs(f.d.Redacted, d.Redacted)
 }
@@ -138,6 +155,26 @@ func (f *Facts) model(out, in int64) {
 	}
 	f.mu.Unlock()
 	f.host(host, 1, 0, out, in)
+}
+
+// abandoned notes a model call given up for a fallback.
+func (f *Facts) abandoned(a ModelAttempt) {
+	if f == nil {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.d.Abandoned = append(f.d.Abandoned, a)
+}
+
+// used notes the model a model call ran on.
+func (f *Facts) used(model string) {
+	if f == nil {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.d.Model = model
 }
 
 func (f *Facts) reader(u ReaderUse) {

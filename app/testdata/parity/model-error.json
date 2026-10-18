@@ -30,7 +30,7 @@
   },
   {
    "type": "error",
-   "error": "model returned 500: upstream overloaded"
+   "error": "model returned 500: upstream failed"
   }
  ],
  "favicons": null

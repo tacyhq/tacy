@@ -182,6 +182,16 @@ type Task struct {
 	Held     int    `json:"held,omitempty"`
 	Outcome  string `json:"outcome,omitempty"`
 	Existing bool   `json:"existing,omitempty"`
+	// Billing is what the VM told the relay in plaintext headers on this call (app/tasks.go): not in the body.
+	Billing TaskBilling `json:"-"`
+}
+
+// TaskBilling is the VM's plaintext billing witness for the relay: the task's opaque bill id (X-Agent-Bill), whether
+// a start made a new task (X-Agent-Task: new | existing), and whether a cancel may be refunded (X-Agent-Refundable).
+type TaskBilling struct {
+	Bill       string
+	Start      string
+	Refundable bool
 }
 
 // post sends one EHBP-encrypted task call and returns the decrypted response.
@@ -218,6 +228,8 @@ func (c *Conn) taskCall(ctx context.Context, path, model string, v any) (*Task, 
 	if err := json.NewDecoder(io.LimitReader(res.Body, 64<<10)).Decode(&t); err != nil {
 		return nil, err
 	}
+	t.Billing = TaskBilling{Bill: res.Header.Get("X-Agent-Bill"), Start: res.Header.Get("X-Agent-Task"),
+		Refundable: res.Header.Get("X-Agent-Refundable") == "1"}
 	return &t, nil
 }
 

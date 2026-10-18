@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
+	"errors"
 	"fmt"
 	"slices"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/tacyhq/tacy/harness"
 	"github.com/tacyhq/tacy/proto"
 	"github.com/tacyhq/tacy/safety"
+	"github.com/tacyhq/tacy/vault"
 )
 
 // ModelCall is the model gateway: one streamed completion from the verified upstream for a brain's model.call.
@@ -54,39 +56,47 @@ func (g *Guard) ModelCall(ctx context.Context, ti *harness.TaskInfo, req *harnes
 	t.mu.Unlock()
 	t.emit(proto.Event{Type: "step", Step: step})
 
+	// The model it goes to: the one the task switched to after a slow call, if it did (fallback.go), with the
+	// effort that model accepts; and the fallback this call may switch to.
+	model, fallback := g.route(t, req.Model)
+	if model != req.Model {
+		effort = effortFor(model, effort)
+	}
 	// The request as the old app/agent.go built it.
-	body := map[string]any{"model": req.Model, "messages": toModel(req.Messages), "stream": true,
-		"stream_options": map[string]any{"include_usage": true}}
-	if secret := cmp.Or(t.opts.CacheSecret, g.cfg.CacheSecret); secret != "" {
-		body["user_cache_secret"] = secret
+	build := func(model, effort string) []byte {
+		body := map[string]any{"model": model, "messages": toModel(req.Messages), "stream": true,
+			"stream_options": map[string]any{"include_usage": true}}
+		if secret := cmp.Or(t.opts.CacheSecret, g.cfg.CacheSecret); secret != "" {
+			body["user_cache_secret"] = secret
+		}
+		if effort != "" {
+			body["reasoning_effort"] = effort
+		}
+		if len(defs) > 0 {
+			body["tools"] = defs
+			body["parallel_tool_calls"] = true // all six models accept it (checked 2026-10-14)
+		}
+		raw, _ := json.Marshal(body)
+		return raw
 	}
-	if effort != "" {
-		body["reasoning_effort"] = effort
-	}
-	if len(defs) > 0 {
-		body["tools"] = defs
-		body["parallel_tool_calls"] = true // all six models accept it (checked 2026-10-14)
-	}
-	raw, _ := json.Marshal(body)
+	raw := build(model, effort)
 	t0 := time.Now()
 	failed := func(err error) (*harness.ModelResult, error) {
-		t.emit(proto.Event{Type: "metrics", Metrics: &proto.Metric{Kind: "model", Step: step, Ms: msSince(t0), Outcome: "error"}})
+		t.emit(proto.Event{Type: "metrics", Metrics: &proto.Metric{Kind: "model", Step: step, Model: model, Ms: msSince(t0), Outcome: "error"}})
 		if ctx.Err() != nil {
 			return nil, ctx.Err() // cancelled: the runtime answers "cancelled"
 		}
+		var pe *harness.Error
+		if errors.As(err, &pe) {
+			return nil, pe // model_overloaded: our words, never the provider's
+		}
 		return nil, harness.Errf(harness.CodeInternal, "%v", err)
-	}
-	stream, err := g.cfg.Up.Stream(ctx, raw)
-	if err != nil {
-		FactsFrom(ctx).model(0, 0)
-		return failed(err)
 	}
 	// The key this call was made with never comes back out, in any encoding: each delta people see, and the
 	// whole message the brain gets (a key split across deltas is caught there). Model output isn't pattern-scanned
 	// (docs/21 section 2: the model is attested and the answer is the point).
-	leased := leasedOf(stream)
 	maxOut, outBytes := MaxTokensFrom(ctx), int64(0)
-	res, err := readStream(stream, func(kind, delta string) error {
+	onDelta := func(kind, delta string, leased []*vault.Secret) error {
 		// The output cap agentd reserved budget for (step 6): counted from the bytes streamed back (about 3 per
 		// token, on the high side), so a call can't run past its budget even if the upstream would.
 		if outBytes += int64(len(delta)); maxOut > 0 && outBytes/3 > maxOut {
@@ -100,23 +110,34 @@ func (g *Guard) ModelCall(ctx context.Context, ti *harness.TaskInfo, req *harnes
 		}
 		t.emit(proto.Event{Type: kind, Delta: delta})
 		return nil // a person who went away cancels the task (Run); the model call itself finishes
-	})
-	if err == nil && leased != nil {
-		res.text = string(exactRedact([]byte(res.text), leased))
-		res.reasoning = string(exactRedact([]byte(res.reasoning), leased))
-		for i := range res.calls {
-			res.calls[i].Function.Arguments = string(exactRedact([]byte(res.calls[i].Function.Arguments), leased))
-		}
 	}
-	stream.Close()
+	a := g.try(ctx, t, step, model, raw, fallback, onDelta)
 	// For the activity record: one request to the model's host (the key's lease names it), the request's bytes
 	// before EHBP encryption and the answer's as it streamed back (text, reasoning and tool calls' names and
 	// arguments).
 	FactsFrom(ctx).model(int64(len(raw)), outBytes)
-	if err != nil {
-		return failed(err)
+	if a.abandon != "" {
+		// Given up as slow or overloaded (Auto): on the record as such, with its time and no tokens; the metric says
+		// slow_switched (the chat counts it toward its model_slow alert). The step runs again, once, on the
+		// fallback, which the task's later calls go straight to; that one is never switched again.
+		ms := msSince(t0)
+		FactsFrom(ctx).abandoned(ModelAttempt{Model: model, Outcome: a.abandon, Ms: ms})
+		t.emit(proto.Event{Type: "metrics", Metrics: &proto.Metric{Kind: "model", Step: step, Model: model, Ms: ms, Outcome: "slow_switched"}})
+		t.mu.Lock()
+		t.switched = fallback
+		t.mu.Unlock()
+		t.emit(proto.Event{Type: "model_switched", Step: step, From: model, To: fallback})
+		model, effort = fallback, effortFor(fallback, effort)
+		raw, t0, outBytes = build(model, effort), time.Now(), 0
+		a = g.try(ctx, t, step, model, raw, "", onDelta)
+		FactsFrom(ctx).model(int64(len(raw)), outBytes)
 	}
-	m := &proto.Metric{Kind: "model", Step: step, Ms: msSince(t0), Outcome: "ok"}
+	FactsFrom(ctx).used(model)
+	if a.err != nil {
+		return failed(a.err)
+	}
+	res := a.res
+	m := &proto.Metric{Kind: "model", Step: step, Model: model, Ms: msSince(t0), Outcome: "ok"}
 	if !res.firstAt.IsZero() {
 		m.FirstMs = res.firstAt.Sub(t0).Milliseconds()
 	}

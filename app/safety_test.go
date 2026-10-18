@@ -66,6 +66,9 @@ type safeOpts struct {
 	// reader turns the quarantined reader on (as gatewayd runs it); the model server answers its calls with
 	// reader(prompt) and counts them in readerReqs.
 	reader func(prompt string) string
+	// wrapUp wraps the model upstream (fake slow or overloaded models); slowAfter is the guard's first-token wait.
+	wrapUp    func(guard.Upstream) guard.Upstream
+	slowAfter time.Duration
 }
 
 func newSafeEnvWith(t *testing.T, o safeOpts, replies ...string) *safeEnv {
@@ -113,9 +116,13 @@ func newSafeEnvWith(t *testing.T, o safeOpts, replies ...string) *safeEnv {
 		rc := guard.DefaultReader
 		reader = &rc
 	}
-	g := guard.New(guard.Config{Up: guard.NewPlainUpstream(srv.URL, srv.Client()), Search: search, Fetcher: guard.NewFetcher(true),
+	up := guard.NewPlainUpstream(srv.URL, srv.Client())
+	if o.wrapUp != nil {
+		up = o.wrapUp(up)
+	}
+	g := guard.New(guard.Config{Up: up, Search: search, Fetcher: guard.NewFetcher(true),
 		Limits: &lim, CacheSecret: "boot-secret", Now: func() time.Time { return time.Date(2026, 10, 17, 0, 0, 0, 0, time.UTC) },
-		Safety: st, Reader: reader})
+		Safety: st, Reader: reader, SlowAfter: o.slowAfter})
 	sg := newSafeGateway(g, st, &safety.Ledger{})
 	signer, _ := activity.DeriveSigner(bytes.Repeat([]byte{5}, 32), "f_chat")
 	e.rec = &activity.Recorder{Signer: signer, Store: activity.NewMemStore()}

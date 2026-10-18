@@ -46,6 +46,9 @@ func main() {
 	memLimit := flag.Int("mem-limit-mib", 900, "Go soft memory limit (GOMEMLIMIT), MiB; 0 = none")
 	safetyURL := flag.String("safety-url", "", "https URL to pull the signed stop lists and policies from (empty: agentd's pushes only)")
 	safetyEvery := flag.Duration("safety-every", 10*time.Second, "how often to pull -safety-url")
+	// Test only: cmd/e2e's overlay is the only thing that sets it (a release compose never does, and the attested
+	// compose hash covers the command line, so the verifier would see another compose).
+	modelFault := flag.String("e2e-model-fault", "", "e2e test only: <model>=slow|overloaded,... makes calls to those models slow (no byte before the slow threshold) or answer 503 overloaded")
 	var sf safety.Flags
 	sf.Register(flag.CommandLine)
 	flag.Parse()
@@ -89,6 +92,13 @@ func main() {
 	toVault := vaultPusher(vc, st)
 	lease := guard.RecordLeases(retryLease(guard.VaultLease(vc), toVault)) // every decision goes on the activity record
 	tc := tinfoil.NewClient(os.Getenv("TINFOIL_ENCLAVE"), "")
+	faults, err := guard.ParseModelFaults(*modelFault)
+	if err != nil {
+		log.Fatalf("gatewayd: -e2e-model-fault: %v", err)
+	}
+	if len(faults) > 0 {
+		log.Printf("gatewayd: E2E TEST MODEL FAULTS ON (never in a release): %v", faults)
+	}
 	search := guard.NewSearch(os.Getenv("SEARCH_PROVIDER"), func(n string) bool { return slices.Contains(names, n) }, lease)
 	fetcher := guard.NewFetcher(false)
 	lim := guard.DefaultLimits
@@ -97,7 +107,7 @@ func main() {
 	// The quarantined reader (docs/27 section 5): pages and search results reach the acting model only as the
 	// reader's fields and quote references.
 	reader := guard.DefaultReader
-	g := guard.New(guard.Config{Up: guard.NewTinfoilUpstream(tc, lease), Search: search, Fetcher: fetcher, Reader: &reader,
+	g := guard.New(guard.Config{Up: guard.WithModelFaults(guard.NewTinfoilUpstream(tc, lease), faults), Search: search, Fetcher: fetcher, Reader: &reader,
 		Icons: fetcher, Limits: &lim, CacheSecret: randomHex(32), Now: func() time.Time { return time.Now().UTC() }, Safety: st,
 		Record: func(e guard.Egress) { // metadata only: ids, operation, decision, pattern ids
 			logMu.Lock()

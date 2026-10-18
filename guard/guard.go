@@ -46,6 +46,8 @@ type Config struct {
 	// Reader is the quarantined reader for web.fetch and web.search (reader.go, docs/27 section 5): the acting
 	// model gets its fields and quote references instead of the text. nil: off (the model reads pages itself).
 	Reader *ReaderConfig
+	// SlowAfter is the base of a model call's first-token wait (SlowThreshold); 0: DefaultSlowAfter. Tests shorten it.
+	SlowAfter time.Duration
 }
 
 // Guard is a harness.Guard: the runtime's Runtime.Guard. Run serves one chat request on a runtime with it.
@@ -109,6 +111,11 @@ type TaskOptions struct {
 	// Links are the addresses in the person's own messages (personLinks): a fetch of one came from the person, not
 	// from the model (ComposedFetch).
 	Links []string `json:"links,omitzero"`
+	// AutoFallback: on Auto (proto.RunRequest.AutoFallback) a slow or overloaded step switches to the first allowed
+	// of Fallbacks (fallback.go). Fallbacks are the run's fallback models as the guard kept them (startFor), in the
+	// chat's order; the guard checks each against the policy again before it switches.
+	AutoFallback bool     `json:"auto_fallback,omitzero"`
+	Fallbacks    []string `json:"fallbacks,omitzero"`
 }
 
 // task is the guard's state for one task: what the old app/agent.go kept per run.
@@ -136,7 +143,10 @@ type task struct {
 	step   int         // fresh model calls so far: the step people see
 	usage  proto.Usage // summed over the task
 	finish string      // the latest model call's finish_reason
-	open   []openCall  // tool calls of the latest model result, for their tool_result events
+	// switched: the model a slow or overloaded call switched the task to (fallback.go); its later model calls go
+	// there. "": none.
+	switched string
+	open     []openCall // tool calls of the latest model result, for their tool_result events
 	// returned: a web action of this task returned its result (outside content, or a refusal) in this process, or
 	// its journal has one. outside: one had returned when the latest model call started, so what that call proposes
 	// was written after outside content: the task is tainted whatever agentd says (permit). Calls proposed together
@@ -508,7 +518,14 @@ func startFor(r *proto.RunRequest, now time.Time, reader bool) (harness.Start, T
 		now = time.Time{}
 	}
 	s.Instructions = chatInstructions(actions, now, reader)
-	s.Models = []string{r.Model}
+	// The run's model first (the brain always calls it), then the fallbacks it may switch to on Auto: they are
+	// what the start record lists as the models the run may call. Without Auto there are none.
+	var fallbacks []string
+	if r.AutoFallback {
+		fallbacks = fallbackModels(r.Model, r.FallbackModels)
+	}
+	r.FallbackModels = fallbacks
+	s.Models = append([]string{r.Model}, fallbacks...)
 	s.Tools = ToolDefs(actions...)
 	// One model call more than steps: the brain may ask once more for the answer when the last step's reply is
 	// only a tool call (brain.go finalNudge).
@@ -516,7 +533,8 @@ func startFor(r *proto.RunRequest, now time.Time, reader bool) (harness.Start, T
 		Deadline: time.Now().Add(RunCap).UTC().Format(time.RFC3339)}
 	return s, TaskOptions{ReasoningEffort: r.ReasoningEffort, CacheSecret: r.CacheSecret,
 		Question:  capRunes(strings.TrimSpace(r.Messages[len(r.Messages)-1].Content), maxQuestionRunes),
-		RunSecret: r.RunSecret, Permissions: maps.Clone(r.Permissions), Links: personLinks(r.Messages)}, nil
+		RunSecret: r.RunSecret, Permissions: maps.Clone(r.Permissions), Links: personLinks(r.Messages),
+		AutoFallback: r.AutoFallback, Fallbacks: fallbacks}, nil
 }
 
 // personDate finds a system note that states today's date ("Today is Friday, October 16, 2026": the chat's

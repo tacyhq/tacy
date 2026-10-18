@@ -79,6 +79,15 @@ type RunRequest struct {
 	// Permissions are the person's settings per kind of outgoing data: "web.search", "web.fetch",
 	// "web.images" -> "ask" | "always" | "never". A kind not named is "ask". A firm's policy may cap them.
 	Permissions map[string]string `json:"permissions,omitempty"`
+	// FallbackModels are the models the run may switch to when its model is slow or overloaded, in the chat's order
+	// (the browser fills them from the plan; the VM never reorders them). The VM keeps only those its signed policy
+	// and its own model list allow, not the run's model, no duplicates, at most 5; the others are dropped silently.
+	// Used only with AutoFallback.
+	FallbackModels []string `json:"fallback_models,omitempty"`
+	// AutoFallback: the person chose Auto, so a step whose model is slow (no first token in time) or overloaded is
+	// retried once on the first allowed fallback (model_slow, model_switched). False for a hand-picked model: a slow
+	// one is waited for, an overloaded one ends the run (code model_overloaded).
+	AutoFallback bool `json:"auto_fallback,omitempty"`
 }
 
 // Event is one server-sent event in the (EHBP-encrypted) /run response: `data: <json>\n\n`, ending with
@@ -104,7 +113,14 @@ type RunRequest struct {
 //	             permission has the kind and exactly what would go out. Sent again with permission.decision once
 //	             it is settled (allowed_once, allowed_always, denied, timed_out, never, unavailable). Never sent
 //	             for a kind set to Always allow.
-//	error        a fatal error; the stream ends after it. code says when a safety control ended the run
+//	model_slow   a model call (step) got no first token in time (20 s, more for big requests), or the provider
+//	             answered 503/429 or "overloaded": model, waited_ms, fallback (the model the step switches to; empty
+//	             when there is none or the run isn't on Auto). Once per step at most; the provider's own text is never
+//	             sent. Without a switch a slow call is still waited for.
+//	model_switched  Auto only: the slow or overloaded call was given up and the step runs again, once, on the
+//	             fallback: from, to. Later steps of the run go straight to it; it is never switched again.
+//	error        a fatal error; the stream ends after it. code says when a safety control ended the run, or
+//	             model_overloaded (a hand-picked model was overloaded: the provider's side; error is our own words)
 //	done         finish_reason and step count; last event before [DONE]
 type Event struct {
 	Type      string          `json:"type"`
@@ -126,13 +142,20 @@ type Event struct {
 	Meta    *Meta    `json:"meta,omitempty"`
 	Metrics *Metric  `json:"metrics,omitempty"`
 	Error   string   `json:"error,omitempty"`
-	Code    string   `json:"code,omitempty"` // error: why a safety control ended the run (stopped, stop_list_stale, policy_missing, policy_denied, budget_exceeded, rate_limited)
+	Code    string   `json:"code,omitempty"` // error: why a safety control ended the run (stopped, stop_list_stale, policy_missing, policy_denied, budget_exceeded, rate_limited), or model_overloaded
 	// Activity: the run's sealed activity records (its start and end, or the one record of a refused run), sent
 	// right before done or error. Each is signed by Meta.Activity.Key and sealed to RunRequest.RecordTo.
 	Activity     []json.RawMessage `json:"activity,omitempty"`
 	FinishReason string            `json:"finish_reason,omitempty"`
 	// Permission: a permission prompt or its outcome.
 	Permission *Permission `json:"permission,omitempty"`
+	// model_slow: the model that was slow or overloaded, how long the call had waited, and the model the step
+	// switches to ("" when none). model_switched: from, to.
+	Model    string `json:"model,omitempty"`
+	WaitedMs int64  `json:"waited_ms,omitempty"`
+	Fallback string `json:"fallback,omitempty"`
+	From     string `json:"from,omitempty"`
+	To       string `json:"to,omitempty"`
 }
 
 // Permission is a permission prompt: before data of a kind leaves the VM, the person allows it once, always (that kind,
@@ -256,5 +279,6 @@ type Metric struct {
 	FetchMs    int64  `json:"fetch_ms,omitempty"`   // images: download + decode + encode time, summed over the images tried; favicons: the same over the sites
 	WaitMs     int64  `json:"wait_ms,omitempty"`    // search, fetch, images, favicons: time waiting for the per-user and global tool caps (not in ms)
 	Running    int    `json:"running,omitempty"`    // queue: runs running on the VM when this one started, itself included
-	Outcome    string `json:"outcome"`              // ok | error | refused (fetch: the URL held personal data)
+	Model      string `json:"model,omitempty"`      // model: the model this call went to
+	Outcome    string `json:"outcome"`              // ok | error | refused (fetch: the URL held personal data) | slow_switched (model: given up as slow or overloaded, the step ran again on the fallback)
 }

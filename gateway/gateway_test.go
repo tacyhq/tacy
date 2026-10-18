@@ -5,7 +5,9 @@ import (
 	"encoding/binary"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -403,5 +405,75 @@ func TestTaintAcrossTheSocket(t *testing.T) {
 		if tainted && (res.Status != harness.ActionDenied || hits.Load() != 0) || !tainted && (res.Status != harness.ActionDone || hits.Load() != 1) {
 			t.Fatalf("tainted %v: %+v (hits %d)", tainted, res, hits.Load())
 		}
+	}
+}
+
+// slowUp: calls to deepseek-v4-1-flash wait until cancelled; glm-5-3 answers 503; others answer "hi".
+type slowUp struct{}
+
+func (slowUp) Meta(context.Context) (*proto.Meta, error) { return &proto.Meta{}, nil }
+func (slowUp) Stream(ctx context.Context, body []byte) (io.ReadCloser, error) {
+	var b struct {
+		Model string `json:"model"`
+	}
+	json.Unmarshal(body, &b)
+	switch b.Model {
+	case "deepseek-v4-1-flash":
+		<-ctx.Done()
+		return nil, ctx.Err()
+	case "glm-5-3":
+		return nil, &guard.StatusError{Status: 503, Msg: "Model is overloaded. Retry after 60 seconds."}
+	}
+	return io.NopCloser(strings.NewReader(`data: {"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}` + "\n\ndata: [DONE]\n\n")), nil
+}
+
+// A switch to a fallback in gatewayd: the events cross, the facts name the model that answered and the call given
+// up; the task's next call goes straight to the fallback. A hand-picked overloaded model's error crosses in our
+// words only.
+func TestFallbackAcrossTheSocket(t *testing.T) {
+	path := socketPath(t)
+	serve(t, path, guard.New(guard.Config{Up: slowUp{}, Search: searchN{}, Now: time.Now, SlowAfter: 50 * time.Millisecond}))
+	c := &Client{Path: path, Wait: 5 * time.Second}
+	var mu sync.Mutex
+	var types []string
+	s := c.Open("t_s", guard.TaskOptions{AutoFallback: true, Fallbacks: []string{"gpt-oss-120b"}}, func(e proto.Event) error {
+		mu.Lock()
+		types = append(types, e.Type)
+		mu.Unlock()
+		return nil
+	})
+	defer s.Close()
+	ti := &harness.TaskInfo{ID: "t_s", Start: &harness.Start{Tools: guard.ToolDefs("web.search")}}
+	call := func(id string) guard.FactsData {
+		t.Helper()
+		f := &guard.Facts{}
+		res, err := c.ModelCall(guard.WithFacts(harness.WithRequestID(context.Background(), id), f), ti,
+			&harness.ModelCall{Model: "deepseek-v4-1-flash", Messages: []harness.Message{{Role: "user", Content: "q"}}})
+		if err != nil || res.Message.Content != "hi" {
+			t.Fatalf("%s: %+v %v", id, res, err)
+		}
+		return f.Data()
+	}
+	d := call("m1")
+	if d.Model != "gpt-oss-120b" || len(d.Abandoned) != 1 || d.Abandoned[0].Model != "deepseek-v4-1-flash" || d.Abandoned[0].Outcome != "abandoned_slow" {
+		t.Fatalf("facts %+v", d)
+	}
+	if d = call("m2"); d.Model != "gpt-oss-120b" || len(d.Abandoned) != 0 {
+		t.Fatalf("the next call: %+v", d)
+	}
+	mu.Lock()
+	got := strings.Join(types, ",")
+	mu.Unlock()
+	if !strings.Contains(got, "model_slow,metrics,model_switched") || strings.Count(got, "model_slow") != 1 {
+		t.Fatalf("events %s", got)
+	}
+
+	s2 := c.Open("t_o", guard.TaskOptions{}, func(proto.Event) error { return nil })
+	defer s2.Close()
+	_, err := c.ModelCall(harness.WithRequestID(context.Background(), "m1"), &harness.TaskInfo{ID: "t_o", Start: &harness.Start{}},
+		&harness.ModelCall{Model: "glm-5-3", Messages: []harness.Message{{Role: "user", Content: "q"}}})
+	var pe *harness.Error
+	if !errors.As(err, &pe) || pe.Message != guard.CodeModelOverloaded+": "+guard.OverloadedText("glm-5-3") {
+		t.Fatalf("overloaded: %v", err)
 	}
 }

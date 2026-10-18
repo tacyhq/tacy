@@ -198,7 +198,7 @@ func (m *parityModel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if m.replies[i] == "500" {
-		http.Error(w, `{"error":{"message":"upstream overloaded"}}`, 500)
+		http.Error(w, `{"error":{"message":"upstream failed"}}`, 500)
 		return
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -253,6 +253,7 @@ func normalize(evs []proto.Event) parityRecord {
 		if m := e.Metrics; m != nil {
 			c := *m
 			c.Ms, c.FirstMs, c.TextMs, c.FetchMs, c.WaitMs = 0, 0, 0, 0, 0
+			c.Model = "" // added after the old loop (the model metric names its model)
 			e.Metrics = &c
 		}
 		rec.Events = append(rec.Events, e)

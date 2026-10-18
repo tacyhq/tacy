@@ -36,13 +36,21 @@ import (
 //	                     as they come, then "data: [DONE]" once the task ended; reconnect with the last id seen.
 //	                     At most 8 streams at once per user, 64 in all.
 //	POST /tasks/cancel   {task, mac} -> {task, state}
+//	GET  /tasks/open     -> {"open": n}: how many tasks are open (not ended), for the relay's idle timer
+//	                     (bearer token; plaintext, a count only).
 //	POST /tasks/grant    {task, request, kind, decision, value, mac} -> {outcome}: the person's answer to a
 //	                     permission prompt (guard.Prompts) of a /tasks or /run task. The MAC with the run's
 //	                     secret is the authorization (only the tab that started the run has it). 404
 //	                     no_such_prompt (answered, timed out or never asked), 403 bad_grant, 400 bad_value.
 //
-// POST /run stays as a shim over this (guard.Host.Run) until the chat moves to /tasks, then goes one release later
-// (docs/27 section 8).
+// Billing witness (plaintext response headers the relay reads; the bodies stay encrypted): a start says
+// X-Agent-Task: new | existing (a repeated once-only key found the first task: nothing new runs, so the relay
+// gives that charge back) and X-Agent-Bill: the task's opaque bill id (guard.Host.Bill); a cancel says the same
+// bill id and X-Agent-Refundable: 1 when it was the task's first cancel, before any model output (guard.Host.Cancel).
+// The relay refunds only on that witness and its own clock, never on the browser's word.
+//
+// POST /run stays as a shim over this (guard.Host.Run) for one more release after the chat moved to /tasks
+// (the tasks-chat release), for tabs loaded before it; then it goes (docs/27 section 1).
 
 // taskStartRequest is POST /tasks's body: a chat request, and the start's once-only key.
 type taskStartRequest struct {
@@ -72,7 +80,26 @@ func (s *server) taskRoutes(mux *http.ServeMux, id *ehbpidentity.Identity) {
 	mux.Handle("POST /tasks/cancel", s.taskGuard(false, true, id.Middleware()(http.HandlerFunc(s.taskCancel))))
 	// A grant's MAC is its authorization; the tag is optional there, as the chat's relay sends it.
 	mux.Handle("POST /tasks/grant", s.taskGuard(false, false, id.Middleware()(http.HandlerFunc(s.taskGrant))))
+	mux.HandleFunc("GET /tasks/open", s.tasksOpen)
 }
+
+// tasksOpen: GET /tasks/open, for the relay's idle timer: a task with nobody following it still keeps the VM on.
+// Bearer token; a count only (no ids, users or states).
+func (s *server) tasksOpen(w http.ResponseWriter, r *http.Request) {
+	if !s.authorized(r) {
+		fail(w, 401, "unauthorized")
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, 200, map[string]int{"open": s.tasks().Open()})
+}
+
+// Billing witness headers (plaintext, for the relay).
+const (
+	billHeader       = "X-Agent-Bill"
+	taskStartHeader  = "X-Agent-Task"
+	refundableHeader = "X-Agent-Refundable"
+)
 
 // taskGrant is behind EHBP: POST /tasks/grant. Strict JSON; the grant's MAC, kind and value are checked by
 // guard.Prompts.Answer, and a prompt takes one answer.
@@ -217,6 +244,8 @@ func (s *server) taskStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	st.Existing = existed
+	w.Header().Set(billHeader, s.tasks().Bill(id))
+	w.Header().Set(taskStartHeader, map[bool]string{true: "existing", false: "new"}[existed])
 	writeJSON(w, 200, st)
 }
 
@@ -272,9 +301,14 @@ func (s *server) taskCancel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	user := userFrom(r.Context())
-	if err := s.tasks().Cancel(ref.Task, user); err != nil {
+	refundable, err := s.tasks().Cancel(ref.Task, user)
+	if err != nil {
 		taskFail(w, err)
 		return
+	}
+	w.Header().Set(billHeader, s.tasks().Bill(ref.Task))
+	if refundable {
+		w.Header().Set(refundableHeader, "1")
 	}
 	// The cancel is in; the task ends within the brain's grace period.
 	st, err := s.tasks().Status(ref.Task, user)

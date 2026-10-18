@@ -754,3 +754,109 @@ func TestTasksAuthAndStreamCaps(t *testing.T) {
 		t.Fatal("a freed slot wasn't given back")
 	}
 }
+
+// The billing witness the relay reads (plaintext headers; the bodies stay encrypted): a start says new or existing
+// and the task's bill id; a cancel before any model output is refundable once, and never after output.
+func TestTasksBillingWitness(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "queue.db")
+	m := newStepModel(t, "block")
+	p := bootTasks(t, path, m, &fakeSearch{}, false)
+	c := p.conn(t, tasksUser)
+	ctx := context.Background()
+	req := proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("a slow one")}
+	tk, err := c.StartTask(ctx, req, "key-1")
+	if err != nil || tk.Billing.Start != "new" || len(tk.Billing.Bill) != 32 {
+		t.Fatalf("start: %+v %v", tk, err)
+	}
+	again, err := c.StartTask(ctx, req, "key-1")
+	if err != nil || again.Task != tk.Task || again.Billing.Start != "existing" || again.Billing.Bill != tk.Billing.Bill {
+		t.Fatalf("repeated start: %+v %v", again, err)
+	}
+	if p.s.tasks().Bill(tk.Task) == p.s.tasks().Bill("tk_other") {
+		t.Fatal("bill ids must differ per task")
+	}
+	waitCalls(t, m, 1) // the model call is waiting: no output yet
+	if n := p.s.tasks().Open(); n != 1 {
+		t.Fatalf("open tasks %d, want 1", n)
+	}
+	got, err := c.CancelTask(ctx, tk.Task)
+	if err != nil || !got.Billing.Refundable || got.Billing.Bill != tk.Billing.Bill {
+		t.Fatalf("first cancel: %+v %v", got, err)
+	}
+	if got, err := c.CancelTask(ctx, tk.Task); err != nil || got.Billing.Refundable {
+		t.Fatalf("second cancel must not be refundable: %+v %v", got, err)
+	}
+	waitTask(t, c, tk.Task, func(s *agentclient.Task) bool { return s.Outcome != "" })
+	for deadline := time.Now().Add(5 * time.Second); p.s.tasks().Open() != 0; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("open tasks %d after the cancel, want 0", p.s.tasks().Open())
+		}
+	}
+
+	// After model output (a tool call), a cancel is never refundable.
+	m2 := newStepModel(t, pCalls([3]string{"c1", "web_search", `{"query":"x"}`}), "block")
+	p2 := bootTasks(t, filepath.Join(t.TempDir(), "queue.db"), m2, &fakeSearch{}, false)
+	c2 := p2.conn(t, tasksUser)
+	tk2, err := c2.StartTask(ctx, req, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitCalls(t, m2, 2)
+	if got, err := c2.CancelTask(ctx, tk2.Task); err != nil || got.Billing.Refundable {
+		t.Fatalf("cancel after output: %+v %v", got, err)
+	}
+}
+
+// GET /tasks/open: the relay's bearer token only, and a count only.
+func TestTasksOpenEndpoint(t *testing.T) {
+	p := bootTasks(t, filepath.Join(t.TempDir(), "queue.db"), newStepModel(t, "block"), &fakeSearch{}, false)
+	mux := http.NewServeMux()
+	p.s.taskRoutes(mux, p.s.id)
+	for _, tc := range []struct {
+		auth string
+		code int
+		body string
+	}{{"", 401, ""}, {"Bearer nope", 401, ""}, {"Bearer tok", 200, `{"open":0}`}} {
+		r := httptest.NewRequest("GET", "/tasks/open", nil)
+		if tc.auth != "" {
+			r.Header.Set("Authorization", tc.auth)
+		}
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, r)
+		if w.Code != tc.code || tc.body != "" && strings.TrimSpace(w.Body.String()) != tc.body {
+			t.Fatalf("%q: %d %s", tc.auth, w.Code, w.Body.String())
+		}
+	}
+}
+
+// The billing witness outlives an agentd restart: a task that had model output before it isn't refundable after it.
+func TestTasksBillingWitnessAfterRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "queue.db")
+	fs := &fakeSearch{}
+	m := newStepModel(t, pCalls([3]string{"c1", "web_search", `{"query":"x"}`}), "block", "block")
+	p1 := bootTasks(t, path, m, fs, false)
+	c1 := p1.conn(t, tasksUser)
+	tk, err := c1.StartTask(context.Background(), proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("q")}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitCalls(t, m, 2)
+	// Its events (the tool call among them) are in the queue before the process dies.
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		st, err := c1.TaskStatus(context.Background(), tk.Task)
+		if err == nil && st.Events >= 3 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("events not stored: %+v %v", st, err)
+		}
+	}
+	p1.kill()
+	p2 := bootTasks(t, path, m, fs, false)
+	c2 := p2.conn(t, tasksUser)
+	c2.SetTaskSecret(tk.Task, c1.TaskSecret(tk.Task))
+	got, err := c2.CancelTask(context.Background(), tk.Task)
+	if err != nil || got.Billing.Refundable {
+		t.Fatalf("cancel after a restart, with output before it: %+v %v", got, err)
+	}
+}

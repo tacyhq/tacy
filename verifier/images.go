@@ -30,7 +30,12 @@ const E2EDiagService = "e2ediag"
 // (ReleaseServices); every service has an image that is name@sha256:<64 hex> with no tag; no service has build:
 // (code built on the VM from a context the hash doesn't cover) or extends:, and there is no top-level include: (both
 // pull in another file); no service is privileged or shares a pid namespace (pid: host would let it see and
-// signal every process of the VM). It returns each service's image.
+// signal every process of the VM); no command sets the e2e test's model faults (E2EModelFaultFlag). It returns
+// each service's image.
+// E2EModelFaultFlag is gatewayd's test-only flag for fake slow and overloaded models: accepted only by
+// ComposeImagesE2E.
+const E2EModelFaultFlag = "e2e-model-fault"
+
 func ComposeImages(compose string) (map[string]string, error) { return composeImages(compose, false) }
 
 // ComposeImagesE2E is ComposeImages that also accepts the e2e overlay's diag service with its pid setting (test
@@ -74,6 +79,10 @@ func composeImages(compose string, e2e bool) (map[string]string, error) {
 		}
 		if _, ok := svc["pid"]; ok && !diag {
 			return nil, fmt.Errorf("service %s sets pid: (it would share a process namespace)", n)
+		}
+		// The e2e test's fake slow and overloaded models (gatewayd -e2e-model-fault): the e2e overlay's only.
+		if !e2e && strings.Contains(fmt.Sprint(svc["command"], svc["entrypoint"]), E2EModelFaultFlag) {
+			return nil, fmt.Errorf("service %s sets %s (an e2e test's fake slow models)", n, E2EModelFaultFlag)
 		}
 		for _, k := range []string{"build", "extends"} {
 			if _, ok := svc[k]; ok {

@@ -2,7 +2,11 @@ package guard
 
 import (
 	"context"
+	"crypto/hkdf"
 	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	jsonv2 "encoding/json/v2"
 	"errors"
@@ -58,9 +62,10 @@ type Host struct {
 	// MaxOpen caps the tasks one user may have open through POST /tasks (not ended); 0: 8.
 	MaxOpen int
 
-	once sync.Once
-	mu   sync.Mutex
-	live map[string]*hosted // tasks this process serves (started here, or resumed)
+	once    sync.Once
+	mu      sync.Mutex
+	live    map[string]*hosted // tasks this process serves (started here, or resumed)
+	billKey []byte             // Bill's key (from IDKey, or random per process without one)
 }
 
 // hosted is one task this process serves: its guard session and its event stream.
@@ -85,6 +90,10 @@ type hosted struct {
 	flushMu sync.Mutex
 	// sources: each citation number's address, as the task's events showed them to the person (Sources).
 	sources map[int]string
+	// output: a model call of the task sent something (reasoning, text or a tool call). cancelled: a person's
+	// cancel came in. Both are the billing witness Cancel gives (refundable: cancelled before any output).
+	output    bool
+	cancelled bool
 }
 
 type hostedEvent struct {
@@ -100,8 +109,50 @@ var ErrNoTask = errors.New("no such task")
 var ErrTooMany = errors.New("too many open tasks")
 
 func (h *Host) init() {
-	h.once.Do(func() { h.live = map[string]*hosted{} })
+	h.once.Do(func() {
+		h.live = map[string]*hosted{}
+		if len(h.IDKey) > 0 {
+			h.billKey, _ = hkdf.Key(sha256.New, h.IDKey, nil, "tacy/task-bill/v1", 32)
+		}
+		if len(h.billKey) == 0 {
+			h.billKey = make([]byte, 32)
+			rand.Read(h.billKey)
+		}
+	})
 }
+
+// Bill is a task's opaque billing id for the relay (32 hex): HMAC(a key derived from IDKey, the task id), so it
+// stays the same across agentd restarts, names the task without revealing its id, and only the VM can make it.
+// The relay binds a run's charge to it, so a refund for one task can't be claimed with another's (docs/27).
+func (h *Host) Bill(id string) string {
+	h.init()
+	m := hmac.New(sha256.New, h.billKey)
+	m.Write([]byte("tacy-bill/v1\x00" + id))
+	return hex.EncodeToString(m.Sum(nil)[:16])
+}
+
+// Open is how many tasks this process serves that haven't ended (POST /tasks and /run ones): the relay's idle
+// timer keeps the VM on while there are any, also when nobody follows them (metadata only: a count).
+func (h *Host) Open() int {
+	h.init()
+	h.mu.Lock()
+	ls := make([]*hosted, 0, len(h.live))
+	for _, l := range h.live {
+		ls = append(ls, l)
+	}
+	h.mu.Unlock()
+	n := 0
+	for _, l := range ls {
+		if !l.isEnded() {
+			n++
+		}
+	}
+	return n
+}
+
+// modelOutput: event types that are a model's output (the billing witness: a run cancelled before any of these
+// may be refunded by the relay).
+func modelOutput(t string) bool { return t == "reasoning" || t == "text" || t == "tool_call" }
 
 func (h *Host) keep() time.Duration {
 	if h.Keep > 0 {
@@ -125,6 +176,9 @@ func (l *hosted) emit(e proto.Event, flushEvery time.Duration) {
 	}
 	seq := l.base + len(l.evs) + 1
 	l.evs = append(l.evs, hostedEvent{seq: seq, ev: e, data: data})
+	if modelOutput(e.Type) {
+		l.output = true
+	}
 	l.addSources(e.Citations)
 	if l.stored && l.timer == nil {
 		l.timer = time.AfterFunc(flushEvery, l.flush)
@@ -631,19 +685,32 @@ func (h *Host) Status(id, user string) (TaskState, error) {
 	return out, nil
 }
 
-// Cancel cancels the starter's task ("person").
-func (h *Host) Cancel(id, user string) error {
+// Cancel cancels the starter's task ("person"). refundable is the billing witness for the relay: this was the
+// first cancel of a task this process serves, it hadn't ended, and none of its model calls had sent anything
+// (no reasoning, text or tool call). Only one cancel per task can be refundable, so a repeated cancel can't
+// claim a second refund; a task that ended by itself, or answered anything, never is.
+func (h *Host) Cancel(id, user string) (refundable bool, err error) {
 	if err := h.owned(id, user); err != nil {
-		return err
+		return false, err
+	}
+	h.init()
+	h.mu.Lock()
+	l := h.live[id]
+	h.mu.Unlock()
+	if l != nil {
+		l.mu.Lock()
+		refundable = !l.ended && !l.output && !l.cancelled
+		l.cancelled = true
+		l.mu.Unlock()
 	}
 	if err := h.RT.Cancel(id, "person"); err != nil {
 		var pe *harness.Error
 		if errors.As(err, &pe) && pe.Code == harness.CodeTaskClosed {
-			return nil // already ended: nothing to do
+			return false, nil // already ended: nothing to do
 		}
-		return err
+		return false, err
 	}
-	return nil
+	return refundable, nil
 }
 
 // lastSeq is the last event's seq in the queue (from after on).
@@ -687,13 +754,16 @@ func (h *Host) Resume(ids []string) (resumed, abandoned int) {
 		base := h.lastSeq(id, 0)
 		l := &hosted{id: id, user: opts.User, via: ViaTasks, start: start, opts: opts, changed: make(chan struct{}),
 			st: h.RT.Store, stored: true, base: base, flushed: base}
-		for after := 0; after < base; { // its sources, from the events an earlier process showed
+		for after := 0; after < base; { // its sources (and whether a model sent anything), from the events an earlier process showed
 			evs, err := h.stored(id, after, base)
 			if err != nil || len(evs) == 0 {
 				break
 			}
 			for _, e := range evs {
 				l.addSources(e.Ev.Citations)
+				if modelOutput(e.Ev.Type) { // the billing witness survives a restart: output before it counts
+					l.output = true
+				}
 				after = e.Seq
 			}
 		}

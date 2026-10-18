@@ -269,6 +269,9 @@ func (g *recGateway) begin(ti *harness.TaskInfo, id, kind, name, connector strin
 			c.Reader = &activity.Reader{Model: u.Model, Prompt: u.Prompt, Completion: u.Completion, Ms: u.Ms, Outcome: u.Outcome,
 				Why: u.Why, Quotes: u.Quotes, Dropped: u.Dropped, Instructions: u.Instructions, Verbatim: u.Verbatim}
 		}
+		if kind == "model" && d.Model != "" {
+			c.Name = d.Model // the model it ran on (a fallback after a switch, guard/fallback.go)
+		}
 		if err == nil {
 			c.RespBytes = jsonSize(res)
 			c.Outcome = "ok"
@@ -281,7 +284,27 @@ func (g *recGateway) begin(ti *harness.TaskInfo, id, kind, name, connector strin
 		if c.Outcome != "ok" && c.Code == "" && slices.ContainsFunc(c.Hosts, func(h activity.Host) bool { return h.Refused > 0 }) {
 			c.Code = safety.CodePolicyDenied
 		}
-		g.rec.CallEnd(ti.ID, i, c, d.Leases)
+		if len(d.Abandoned) == 0 {
+			g.rec.CallEnd(ti.ID, i, c, d.Leases)
+			return
+		}
+		// A model call given up as slow or overloaded, then made again on a fallback (guard/fallback.go): the
+		// given-up call first (its model, why, its time, no tokens), then the call that answered, with the egress
+		// and leases of both.
+		at := c.AtMs
+		for j, a := range d.Abandoned {
+			gave := activity.Call{ID: c.ID, Kind: c.Kind, Name: a.Model, Connector: c.Connector, Outcome: a.Outcome, AtMs: at,
+				Ms: a.Ms, ReqBytes: c.ReqBytes, Tainted: c.Tainted}
+			if j == 0 {
+				g.rec.CallEnd(ti.ID, i, gave, nil)
+			} else {
+				g.rec.Call(ti.ID, gave, nil)
+			}
+			at += a.Ms
+		}
+		c.Ms -= at - c.AtMs
+		c.AtMs = at
+		g.rec.Call(ti.ID, c, d.Leases)
 	}
 }
 
@@ -323,6 +346,9 @@ func errOutcome(err error) (string, string) {
 	var pe *harness.Error
 	if errors.Is(err, context.Canceled) || errors.As(err, &pe) && pe.Code == harness.CodeCancelled {
 		return "cancelled", harness.CodeCancelled
+	}
+	if pe != nil && strings.HasPrefix(pe.Message, guard.CodeModelOverloaded+":") {
+		return "overloaded", guard.CodeModelOverloaded // a hand-picked model the provider said is overloaded
 	}
 	if errors.As(err, &pe) {
 		if c := controlCode(pe.Message); c != "" {

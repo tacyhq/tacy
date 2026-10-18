@@ -44,6 +44,7 @@ func TestComposeImages(t *testing.T) {
 		"pid host":           "services:\n  agentd:\n    image: ghcr.io/a/b" + d + "\n    pid: host\n",
 		"pid service":        "services:\n  vaultd:\n    image: ghcr.io/a/b" + d + "\n    pid: \"service:agentd\"\n",
 		"e2e diag":           "services:\n  agentd:\n    image: ghcr.io/a/b" + d + "\n  e2ediag:\n    image: ghcr.io/a/c" + d + "\n    pid: host\n",
+		"e2e model fault":    "services:\n  agentvm:\n    image: ghcr.io/a/b" + d + "\n    command: [\"-socket\", \"/s\", \"-e2e-model-fault\", \"kimi-k3=slow\"]\n",
 	} {
 		if _, err := ComposeImages(bad); err == nil {
 			t.Errorf("%s: accepted", name)
@@ -56,6 +57,10 @@ func TestComposeImages(t *testing.T) {
 func TestComposeImagesE2E(t *testing.T) {
 	diag := "services:\n  agentd:\n    image: ghcr.io/a/b" + d + "\n  e2ediag:\n    image: ghcr.io/a/c" + d + "\n    pid: host\n"
 	if _, err := ComposeImagesE2E(diag); err != nil {
+		t.Fatal(err)
+	}
+	// The overlay's fake slow models (gatewayd -e2e-model-fault) are the e2e tools' only.
+	if _, err := ComposeImagesE2E(diag + "  agentvm:\n    image: ghcr.io/a/e" + d + "\n    command: [\"-e2e-model-fault\", \"kimi-k3=slow\"]\n"); err != nil {
 		t.Fatal(err)
 	}
 	for _, bad := range []string{diag + "    privileged: true\n", diag + "  miner:\n    image: ghcr.io/a/d" + d + "\n",

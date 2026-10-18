@@ -106,6 +106,16 @@ func (g *safeGateway) StartFor(r *proto.RunRequest) (harness.Start, guard.TaskOp
 	if !e.AllowsModel(model) {
 		return harness.Start{}, guard.TaskOptions{}, &safety.Error{Code: safety.CodePolicyDenied, Msg: "model " + model + " isn't allowed by the policy"}
 	}
+	// Fallback models (Auto, guard/fallback.go): only those the policy allows stay, in the chat's order; the others
+	// are dropped silently (never a refusal). The guard keeps those it runs, and checks the policy again before
+	// it switches.
+	var fallbacks []string
+	for _, m := range r.FallbackModels {
+		if e.AllowsModel(m) {
+			fallbacks = append(fallbacks, m)
+		}
+	}
+	r.FallbackModels = fallbacks
 	if r.Tools == nil {
 		r.Tools = guard.AllTools()
 	}
@@ -420,10 +430,20 @@ func addUsage(a, b safety.Usage) safety.Usage {
 		WallMs: a.WallMs + b.WallMs}
 }
 
-// tripFromGuard notes a refusal gatewayd or the vault made on its own ("stopped: …", "rate_limited: …").
+// tripFromGuard notes a refusal gatewayd or the vault made on its own ("stopped: …", "rate_limited: …"), and a
+// hand-picked model the provider said is overloaded ("model_overloaded: <our words>", guard.OverloadedText): the run's
+// error then says that, with code model_overloaded.
 func (g *safeGateway) tripFromGuard(task string, err error) {
 	var pe *harness.Error
 	if !errors.As(err, &pe) {
+		return
+	}
+	if msg, ok := strings.CutPrefix(pe.Message, guard.CodeModelOverloaded+": "); ok {
+		g.mu.Lock()
+		if t := g.tasks[task]; t != nil && t.code == "" {
+			t.code, t.msg = guard.CodeModelOverloaded, msg
+		}
+		g.mu.Unlock()
 		return
 	}
 	for code := range codeText {

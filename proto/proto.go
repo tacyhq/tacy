@@ -146,6 +146,9 @@ type Permission struct {
 	Decision string `json:"decision,omitempty"`  // "": waiting; allowed_once | allowed_always | denied | timed_out | never | unavailable
 	TimeoutS int    `json:"timeout_s,omitempty"` // waiting: seconds until no answer counts as denied
 	Edited   bool   `json:"edited,omitempty"`    // settled: the person changed the value before allowing
+	// Reason: why this prompt is shown although the person's setting is Always allow, in words for the person
+	// (fixed in the release): a page fetch, after outside content, of an address the model composed.
+	Reason string `json:"reason,omitempty"`
 }
 
 // Citation is a source a tool returned. Index is the [n] the model is told to cite.

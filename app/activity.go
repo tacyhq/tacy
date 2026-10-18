@@ -355,6 +355,9 @@ func (g *recGateway) ModelCall(ctx context.Context, ti *harness.TaskInfo, req *h
 	done(f, res, err, func(c *activity.Call) {
 		c.Prompt, c.Completion = res.Usage.Prompt, res.Usage.Completion
 	})
+	if err == nil && g.prompts != nil {
+		g.prompts.ModelCalled(ti, res) // the taint its tool calls are asked about with (a composed address)
+	}
 	return res, err
 }
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
@@ -16,12 +17,27 @@ import (
 // no variable (compose would interpolate it from the deployer's env).
 var digestRef = regexp.MustCompile(`^[a-z0-9]+(?:[._-][a-z0-9]+)*(?::[0-9]+)?(?:/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*)+@sha256:[0-9a-f]{64}$`)
 
+// ReleaseServices are the services a release's compose may have: the setup step, agentd, the brain's runner,
+// gatewayd (named agentvm) and vaultd. Anything else is code the release doesn't describe.
+var ReleaseServices = []string{"setup", "agentd", "runner", "agentvm", "vaultd"}
+
+// E2EDiagService is the end-to-end test's diag service (cmd/e2e overlay): accepted only by ComposeImagesE2E, with
+// its pid namespace (it kills processes to check crashes). Never in a release.
+const E2EDiagService = "e2ediag"
+
 // ComposeImages checks the docker compose a VM runs pins every container to an image digest, so the attested
-// compose hash covers exactly the code that runs: one YAML document; every service has an image that is
-// name@sha256:<64 hex> with no tag; no service has build: (code built on the VM from a context the hash doesn't
-// cover) or extends:, and there is no top-level include: (both pull in another file). It returns each service's
-// image.
-func ComposeImages(compose string) (map[string]string, error) {
+// compose hash covers exactly the code that runs: one YAML document; only the release's services
+// (ReleaseServices); every service has an image that is name@sha256:<64 hex> with no tag; no service has build:
+// (code built on the VM from a context the hash doesn't cover) or extends:, and there is no top-level include: (both
+// pull in another file); no service is privileged or shares a pid namespace (pid: host would let it see and
+// signal every process of the VM). It returns each service's image.
+func ComposeImages(compose string) (map[string]string, error) { return composeImages(compose, false) }
+
+// ComposeImagesE2E is ComposeImages that also accepts the e2e overlay's diag service with its pid setting (test
+// tools only, never the browser's verifier).
+func ComposeImagesE2E(compose string) (map[string]string, error) { return composeImages(compose, true) }
+
+func composeImages(compose string, e2e bool) (map[string]string, error) {
 	dec := yaml.NewDecoder(strings.NewReader(compose))
 	var doc map[string]any
 	if err := dec.Decode(&doc); err != nil {
@@ -49,6 +65,16 @@ func ComposeImages(compose string) (map[string]string, error) {
 		if !ok {
 			return nil, fmt.Errorf("service %s isn't a mapping", n)
 		}
+		diag := e2e && n == E2EDiagService
+		if !slices.Contains(ReleaseServices, n) && !diag {
+			return nil, fmt.Errorf("service %s isn't one of the release's (%s)", n, strings.Join(ReleaseServices, ", "))
+		}
+		if p, ok := svc["privileged"]; ok && p != false {
+			return nil, fmt.Errorf("service %s is privileged", n)
+		}
+		if _, ok := svc["pid"]; ok && !diag {
+			return nil, fmt.Errorf("service %s sets pid: (it would share a process namespace)", n)
+		}
 		for _, k := range []string{"build", "extends"} {
 			if _, ok := svc[k]; ok {
 				return nil, fmt.Errorf("service %s has %s: (code the compose hash doesn't cover)", n, k)
@@ -67,6 +93,7 @@ func ComposeImages(compose string) (map[string]string, error) {
 }
 
 // ImagesCheck is the name of the check ComposeImages backs (the last one).
+// The name stays as the browser's tests pin it; the check also covers the services, privileged and pid (above).
 const ImagesCheck = "docker compose pins every image by digest (no tag, no build, extends or include)"
 
 // SandboxFacts reads, from a compose whose brain runs in gVisor (since v0.4.0, docs/22: the "runner" service, runnerd),
@@ -124,8 +151,8 @@ func SandboxFacts(compose string) map[string]string {
 
 // checkImages runs ComposeImages on the attested compose, records each service's image as the fact
 // "image <service>" and the brain's sandbox (SandboxFacts), and adds the check.
-func (r *Result) checkImages(compose string) bool {
-	images, err := ComposeImages(compose)
+func (r *Result) checkImages(compose string, e2e bool) bool {
+	images, err := composeImages(compose, e2e)
 	for svc, img := range images {
 		r.Facts["image "+svc] = img
 	}

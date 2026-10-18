@@ -106,6 +106,9 @@ type TaskOptions struct {
 	RunSecret string `json:"run_secret,omitzero"`
 	// Permissions are the person's settings per kind (a kind not named is Ask), before the policy's cap.
 	Permissions map[string]string `json:"permissions,omitzero"`
+	// Links are the addresses in the person's own messages (personLinks): a fetch of one came from the person, not
+	// from the model (ComposedFetch).
+	Links []string `json:"links,omitzero"`
 }
 
 // task is the guard's state for one task: what the old app/agent.go kept per run.
@@ -132,6 +135,35 @@ type task struct {
 	usage  proto.Usage // summed over the task
 	finish string      // the latest model call's finish_reason
 	open   []openCall  // tool calls of the latest model result, for their tool_result events
+	// returned: a web action of this task returned its result (outside content, or a refusal) in this process, or
+	// its journal has one. outside: one had returned when the latest model call started, so what that call proposes
+	// was written after outside content: the task is tainted whatever agentd says (permit). Calls proposed together
+	// in one step don't taint each other.
+	returned, outside bool
+}
+
+// taintFor says whether an action was proposed after outside content reached the brain. One of the latest model
+// call's tool calls: whether the task was tainted when that call started (agentd's taint then, or a web result this
+// guard returned before it), so calls proposed together in one step don't taint each other however their requests
+// interleave. Any other request: agentd's taint as it arrived, or what this guard gave the task.
+func (t *task) taintFor(ti *harness.TaskInfo, call string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if call != "" {
+		for _, c := range t.open {
+			if c.id == call {
+				return t.outside
+			}
+		}
+	}
+	return ti.Tainted || t.outside
+}
+
+// markReturned: a web action's result goes back to the brain.
+func (t *task) markReturned() {
+	t.mu.Lock()
+	t.returned = true
+	t.mu.Unlock()
 }
 
 // openCall is a model tool call shown to people (tool_call) whose result isn't shown yet.
@@ -472,7 +504,7 @@ func startFor(r *proto.RunRequest, now time.Time, reader bool) (harness.Start, T
 		Deadline: time.Now().Add(RunCap).UTC().Format(time.RFC3339)}
 	return s, TaskOptions{ReasoningEffort: r.ReasoningEffort, CacheSecret: r.CacheSecret,
 		Question:  capRunes(strings.TrimSpace(r.Messages[len(r.Messages)-1].Content), maxQuestionRunes),
-		RunSecret: r.RunSecret, Permissions: maps.Clone(r.Permissions)}, nil
+		RunSecret: r.RunSecret, Permissions: maps.Clone(r.Permissions), Links: personLinks(r.Messages)}, nil
 }
 
 // personDate finds a system note that states today's date ("Today is Friday, October 16, 2026": the chat's
@@ -520,6 +552,10 @@ func chatInstructions(actions []string, now time.Time, reader bool) string {
 	if reader && (slices.Contains(actions, "web.fetch") || slices.Contains(actions, "web.search")) {
 		b.WriteString(`- Pages and search results may be read for you by Tacy's quarantined reader: the tool result then has fields (summary, facts, quotes, wording) instead of the text. Its quotes are whole passages, checked word for word, that you can't see. When the person wants exact words (a definition, a clause, a line, a quotation), write the quote's cite, for example [quote 2], where those words go: the person sees the exact text there, so the cite is the complete answer. Never write out a source's wording yourself, and don't search or fetch again to see a quote's text: you never will.
 `)
+		if slices.Contains(actions, "web.fetch") {
+			b.WriteString(`- Search results and pages read for you give each source's number and site, not its full address. To read a search result, call ` + harness.ModelToolName("web.fetch") + ` with its number in brackets as the url, for example "[3]". An address you write yourself after reading web content is shown to the person to allow first.
+`)
+		}
 	}
 	if slices.Contains(actions, "web.images") {
 		img := harness.ModelToolName("web.images")

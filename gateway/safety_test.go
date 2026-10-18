@@ -60,8 +60,13 @@ func TestGatewaydChecksDocumentsItself(t *testing.T) {
 	if _, err := search("a1"); err == nil || !strings.Contains(err.Error(), safety.CodePolicyMissing) {
 		t.Fatalf("forged policy from agentd: %v", err)
 	}
-	// A valid one with the session: taken, passed on (OnDocs), and the action runs.
-	docs = []safety.Envelope{policy(admin, 1)}
+	// A valid one with the session (and a fresh operator list: without one nothing goes out): taken, passed on
+	// (OnDocs), and the action runs.
+	hb, err := safety.Heartbeat(operator, 0, time.Now().Add(-time.Second), time.Minute, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	docs = []safety.Envelope{hb, policy(admin, 1)}
 	if res, err := search("a2"); err != nil || res.Status != harness.ActionDone {
 		t.Fatalf("valid policy: %+v %v", res, err)
 	}
@@ -70,7 +75,7 @@ func TestGatewaydChecksDocumentsItself(t *testing.T) {
 	}
 	// A stop pushed on its own connection refuses the next request.
 	now := time.Now().UTC()
-	b, _ := json.Marshal(&safety.StopList{Type: safety.StopType, Issuer: safety.IssuerOperator, Seq: 1, IssuedAt: now,
+	b, _ := json.Marshal(&safety.StopList{Type: safety.StopType, Issuer: safety.IssuerOperator, Seq: uint64(now.UnixMilli()), IssuedAt: now,
 		ExpiresAt: now.Add(time.Minute), All: true})
 	if err := c.PushDocs(context.Background(), []safety.Envelope{safety.Sign(safety.KindStop, b, operator)}); err != nil {
 		t.Fatal(err)

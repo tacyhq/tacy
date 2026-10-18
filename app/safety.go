@@ -31,8 +31,8 @@ import (
 //   - budgets: each model call and action reserves what it may use from the run's and the space's day budget,
 //     under one lock, before it runs (parallel requests can't each see room only one has), then commits what it
 //     used;
-//   - the kill switch: when a stop list stops a running task's space (or the stop list goes stale and the policy
-//     stops reads too), the task is cancelled ("kill_switch") within seconds;
+//   - the kill switch: when a stop list stops a running task's space, or the operator's list goes stale or silent
+//     (nothing goes out then, safety.State.Check), the task is cancelled ("kill_switch") within seconds;
 //   - people see why (proto.Event.Code) and which policy the run started under (meta.controls).
 // gatewayd and vaultd check the same documents again on their own.
 
@@ -43,6 +43,9 @@ type safeGateway struct {
 	st     *safety.State
 	ledger *safety.Ledger
 	cancel func(task, reason string) // the runtime's Cancel (set once the runtime exists)
+	// firstHeard: how long a start waits, right after boot, for the first delivery of the operator's list (the pull
+	// reaches agentd within seconds of gatewayd starting); 0: no wait.
+	firstHeard time.Duration
 	// runTimeout is the release's running-time limit (guard.RunTimeout; 0: that). Tests shorten it.
 	runTimeout time.Duration
 
@@ -91,6 +94,7 @@ func coded(err error) (string, string) {
 // day's running time has less left. The run's own running-time limit isn't a deadline: watch enforces it.
 func (g *safeGateway) StartFor(r *proto.RunRequest) (harness.Start, guard.TaskOptions, error) {
 	const space = "s_chat" // guard.StartFor's (one space until step 8)
+	g.waitFirstHeard()
 	e, err := g.st.Check(space, false)
 	if err != nil {
 		return harness.Start{}, guard.TaskOptions{}, err
@@ -127,6 +131,18 @@ func (g *safeGateway) StartFor(r *proto.RunRequest) (harness.Start, guard.TaskOp
 		start.Limits.Deadline = end.UTC().Format(time.RFC3339)
 	}
 	return start, opts, nil
+}
+
+// waitFirstHeard: a VM that just booted hasn't had the operator's list delivered yet, so everything would be
+// refused (stop_list_stale) for the few seconds until the first pull lands. A start waits for it, up to firstHeard.
+// Once a list was delivered, nothing waits: a stale or silent list refuses at once.
+func (g *safeGateway) waitFirstHeard() {
+	if g.firstHeard <= 0 {
+		return
+	}
+	for end := time.Now().Add(g.firstHeard); g.st.Blocked() && !g.st.Heard() && time.Now().Before(end); {
+		time.Sleep(200 * time.Millisecond)
+	}
 }
 
 // Open registers the task (budgets, kill switch) and wraps its session (meta carries the controls).

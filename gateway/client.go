@@ -97,7 +97,7 @@ func (c *Client) Exec(context.Context, *harness.TaskInfo, string, *harness.Exec)
 func (c *Client) ModelCall(ctx context.Context, ti *harness.TaskInfo, req *harness.ModelCall) (*harness.ModelResult, error) {
 	s, done := c.sessionFor(ti.ID)
 	defer done()
-	r, err := s.call(ctx, ti, &frame{T: tModel, ID: harness.RequestID(ctx), Model: req, MaxTokens: guard.MaxTokensFrom(ctx)})
+	r, err := s.call(ctx, ti, &frame{T: tModel, ID: harness.RequestID(ctx), Model: req, MaxTokens: guard.MaxTokensFrom(ctx), Tainted: ti.Tainted})
 	if err != nil {
 		return nil, err
 	}
@@ -110,7 +110,7 @@ func (c *Client) ModelCall(ctx context.Context, ti *harness.TaskInfo, req *harne
 func (c *Client) Action(ctx context.Context, ti *harness.TaskInfo, id string, req *harness.Action) (*harness.ActionResult, error) {
 	s, done := c.sessionFor(ti.ID)
 	defer done()
-	r, err := s.call(ctx, ti, &frame{T: tAction, ID: id, Action: req, Grant: guard.GrantFrom(ctx)})
+	r, err := s.call(ctx, ti, &frame{T: tAction, ID: id, Action: req, Grant: guard.GrantFrom(ctx), Tainted: ti.Tainted})
 	if err != nil {
 		return nil, err
 	}

@@ -55,6 +55,12 @@ func (l *StopList) Validate() error {
 		if l.Firm != "" || l.ExpiresAt.IsZero() || !l.ExpiresAt.After(l.IssuedAt) || l.ExpiresAt.Sub(l.IssuedAt) > MaxStopLifetime {
 			return errors.New("stop list: an operator list has no firm and expires within an hour of issue")
 		}
+		// Its seq is its signing time in ms (one more than the last when lists come faster). A seq far past its
+		// issued_at would raise the floor so high that no later list could pass it, and the VM would stay stale
+		// until its disk was wiped: refused.
+		if l.Seq > uint64(max(0, l.IssuedAt.Add(MaxSkew).UnixMilli())) {
+			return errors.New("stop list: an operator list's seq can't be ahead of its issued_at (in ms) by more than 5 minutes")
+		}
 	case IssuerFirm:
 		if !ValidID(l.Firm) {
 			return errors.New("stop list: a firm list names its firm")

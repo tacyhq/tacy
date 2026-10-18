@@ -12,7 +12,7 @@
 // hash and the brain's (the verifier shows them), and runnerd refuses to start unless they are the ones it was built
 // with (sandbox/gvisor.go) and the files it finds:
 //
-//	runnerd -socket /run/tacy/runner/runner.sock -agent-uid 10003 -gvisor /tacy/gvisor -gvisor-release 20260928.0 \
+//	runnerd -socket /run/tacy/runner/runner.sock -agent-uid 10003 -gvisor /tacy/gvisor -gvisor-release 20261012.0 \
 //	  -runsc-sha256 <sha256> -brain /tacy/brain -brain-sha256 <sha256> -dir /run/runner -platform systrap -rootless
 package main
 

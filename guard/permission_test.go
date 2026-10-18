@@ -90,18 +90,18 @@ func TestPermitChecksTheGrantItself(t *testing.T) {
 
 // What a prompt shows is exactly what goes out.
 func TestOutgoingAndValues(t *testing.T) {
-	if v, ok := Outgoing("web.search", []byte(`{"query":"  mail me at jane@example.com  "}`)); !ok || strings.Contains(v, "jane@") || strings.HasPrefix(v, " ") {
+	if v, ok := Outgoing("web.search", []byte(`{"query":"  mail me at jane@example.com  "}`), nil); !ok || strings.Contains(v, "jane@") || strings.HasPrefix(v, " ") {
 		t.Fatalf("search %q", v)
 	}
-	if v, ok := Outgoing("web.fetch", []byte(`{"url":"https://a.example/x?y=1"}`)); !ok || v != "https://a.example/x?y=1" {
+	if v, ok := Outgoing("web.fetch", []byte(`{"url":"https://a.example/x?y=1"}`), nil); !ok || v != "https://a.example/x?y=1" {
 		t.Fatalf("fetch %q", v)
 	}
 	for _, bad := range []string{`{}`, `{"query":"  "}`, `nope`} {
-		if _, ok := Outgoing("web.search", []byte(bad)); ok {
+		if _, ok := Outgoing("web.search", []byte(bad), nil); ok {
 			t.Errorf("outgoing for %s", bad)
 		}
 	}
-	if _, ok := Outgoing("mail.send", []byte(`{}`)); ok {
+	if _, ok := Outgoing("mail.send", []byte(`{}`), nil); ok {
 		t.Error("a non-permission action")
 	}
 	for _, c := range []struct {

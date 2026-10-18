@@ -79,6 +79,7 @@ func (g *Guard) Action(ctx context.Context, ti *harness.TaskInfo, id string, req
 		ctx = withHostFilter(ctx, g.fetchFilter(t.opts.Space))
 	}
 	call := t.claim(req.Call, id, app, args)
+	defer t.markReturned() // its result, whatever it is, reaches the brain: outside content for the next model call
 	step := t.currentStep()
 	t1 := time.Now()
 	var p pending

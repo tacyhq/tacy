@@ -109,8 +109,8 @@ func TestVaultSafetyLeases(t *testing.T) {
 	if err := vs.c.Push(ctx, []safety.Envelope{vs.policy(t, 2, nil)}); err != nil {
 		t.Fatal(err)
 	}
-	// Stale (no operator list): a read lease goes on, a side effect's doesn't.
-	if err := vs.lease("s_chat", false); err != nil {
+	// Stale (no operator list), with an operator key pinned: no lease at all, reads included.
+	if err := vs.lease("s_chat", false); !errors.Is(err, ErrStale) {
 		t.Fatalf("read while stale: %v", err)
 	}
 	if err := vs.lease("s_chat", true); !errors.Is(err, ErrStale) {

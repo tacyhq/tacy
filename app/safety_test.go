@@ -353,10 +353,11 @@ func TestSafetyGlobalStopAndOperatorCantLiftFirmStop(t *testing.T) {
 
 func TestSafetyStaleStopList(t *testing.T) {
 	e := newSafeEnv(t, pText("ok"), pText("ok"))
-	// No operator list ever arrived (the control plane is down): reads go on, as the policy allows.
+	// No operator list ever arrived (the control plane is down, or someone drops the pull): with an operator key
+	// pinned nothing goes out, though the policy allows reads while stale (the release's floor).
 	e.mustPost(e.policy(1, nil))
-	if evs := runParity(t, e.s, proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("hi")}); evs[len(evs)-1].Type != "done" {
-		t.Fatalf("stale, reads allowed: %+v", evs)
+	if er, ok := lastError(runParity(t, e.s, proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("hi")})); !ok || er.Code != safety.CodeStale {
+		t.Fatalf("stale, stale_reads on: %+v", er)
 	}
 	// A policy that stops reads too while stale.
 	e.mustPost(e.policy(2, func(p *safety.Policy) { p.StaleReads = false }))

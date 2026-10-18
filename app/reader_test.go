@@ -40,7 +40,9 @@ func TestReaderBudgetAndRecord(t *testing.T) {
 	defer page.Close()
 	e := newSafeEnvWith(t, safeOpts{reader: readerAnswer},
 		pCalls([3]string{"c1", "fetch_page", `{"url":"` + page.URL + `/a"}`}),
-		pCalls([3]string{"c2", "fetch_page", `{"url":"` + page.URL + `/b"}`}),
+		// The second fetch names the first page by its number (an address the model composed after reading it would
+		// be asked about, even under Always allow).
+		pCalls([3]string{"c2", "fetch_page", `{"url":"[1]"}`}),
 		pText("It is out: [quote 1] [1]."))
 	e.mustPost(e.policy(1, nil), e.heartbeat())
 	priv, _ := recipientKey(t)

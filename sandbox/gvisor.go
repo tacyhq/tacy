@@ -15,17 +15,17 @@ import (
 // pins by digest; runnerd checks them again before it runs one. An upgrade is new hashes by review, the real-gVisor
 // CI job, a throwaway CVM, then a release.
 const (
-	GVisorRelease   = "20260928.0"
+	GVisorRelease   = "20261012.0"
 	GVisorURL       = "https://storage.googleapis.com/gvisor/releases/release/" + GVisorRelease + "/x86_64/gvisor.tar.bz2"
-	GVisorTarSHA256 = "f3ed9131bc252259df150e270154180188f9df56b73a2312940325e1f522a2d6"
+	GVisorTarSHA256 = "180dd277f657c1478f09490e8a9a595f7378257510b43d1d3694a769aef9ed02"
 )
 
 // GVisorFiles are the binaries taken from the tarball (runsc and the sidecars it runs from gvisor-bin/), by path in
 // the tarball, with their SHA-256.
 var GVisorFiles = [][2]string{
-	{"runsc", "88a87d5d6d06160d4c144f51f95ec6dd6fe0fc6b02697eb877876683c5b57a91"},
-	{"gvisor-bin/gvisor_sentry", "e10e6e8072a0822f5e80dc203d156f0602b15fab90b85fac1d7bffd79477b267"},
-	{"gvisor-bin/gvisor-sentry-prewarmer", "3315d7ad7c2d3751d349e4976fa02da1da6fd7e41746c35622304e5fabe4fce0"},
+	{"runsc", "56996c546dbafd5716e1d09e307a131d97eb3b6483c22a1178631751f3e0392f"},
+	{"gvisor-bin/gvisor_sentry", "1755e10a4c9d1db4973c0155497348db3737543b4c2e6a9f663a271ee71433d5"},
+	{"gvisor-bin/gvisor-sentry-prewarmer", "46d5c028723ac5fbe40b863f95100f15a00d2aa0cd39c69d892500a988c930bd"},
 	{"gvisor-bin/runsc-fd-parking", "03af90d07ea466c10ecc3e3ba839b2a59540959dd3286aea3886917cba850c11"},
 }
 

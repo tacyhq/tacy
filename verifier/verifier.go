@@ -79,6 +79,7 @@ type Policy struct {
 	ProdImages      map[string]string // allowed os-image-hash values; nil = ProdImages
 	AllowStaleTCB   bool              // accept a TCB status other than UpToDate
 	SkipAttestation bool              // development only: accept platform "local" with no quote
+	AllowE2EDiag    bool              // test tools only: accept the e2e overlay's diag service (ComposeImagesE2E)
 	PreLaunch       map[string]string // allowed pre-launch script sha256s; nil = PreLaunchScripts
 	Boot            []BootMeasurement // allowed MRTD/RTMR0-2 sets; nil = BootMeasurements
 	// VerifyQuote checks a raw quote; nil = tdx.VerifyWith(Getter, Now) (needs Intel PCS). Tests replace it.
@@ -392,7 +393,7 @@ func Verify(ctx context.Context, att *proto.Attestation, nonce []byte, p Policy)
 			return failed()
 		}
 	}
-	if !r.checkImages(ac.DockerComposeFile) {
+	if !r.checkImages(ac.DockerComposeFile, p.AllowE2EDiag) {
 		return failed()
 	}
 	r.HPKEPublicKey = key

@@ -1,6 +1,7 @@
 package guard
 
 import (
+	"cmp"
 	"encoding/json/v2"
 
 	"github.com/tacyhq/tacy/harness"
@@ -21,6 +22,7 @@ func (t *task) rebuild(ti *harness.TaskInfo) {
 	}
 	steps, cites, images, quotes := 0, 0, 0, 0
 	var sites []string
+	outside := false
 	for _, r := range recs {
 		switch r.Kind {
 		case harness.TypeModelCall:
@@ -38,6 +40,7 @@ func (t *task) rebuild(ti *harness.TaskInfo) {
 			if json.Unmarshal(r.Req, &req) != nil || json.Unmarshal(r.Body, &res) != nil || res.Status != harness.ActionDone {
 				continue
 			}
+			outside = outside || Untrusted(&req)
 			n, used, urls := journaledOutput(req.Name, res.Output)
 			cites, images, quotes = max(cites, n), images+used, max(quotes, journaledQuotes(res.Output))
 			sites = append(sites, urls...)
@@ -45,6 +48,7 @@ func (t *task) rebuild(ti *harness.TaskInfo) {
 	}
 	t.mu.Lock()
 	t.step = max(t.step, steps)
+	t.returned, t.outside = t.returned || outside, t.outside || outside
 	t.mu.Unlock()
 	t.numbering.Lock()
 	t.tools.cites = max(t.tools.cites, cites)
@@ -55,29 +59,33 @@ func (t *task) rebuild(ti *harness.TaskInfo) {
 }
 
 // journaledOutput reads a web connector action's journaled output (what the model saw, tools.go's shapes): the
-// highest citation number in it, the image slots it took and the source URLs whose sites' icons were fetched.
+// highest citation number in it, the image slots it took and the source URLs whose sites' icons were fetched (with
+// the reader on, the model saw only each source's site: that is enough for its icon). Sources' full addresses
+// aren't in the journal (the model never had them), so after a restart a fetch of an earlier [n] is refused.
 func journaledOutput(action string, out []byte) (cite, images int, urls []string) {
 	switch action {
 	case "web.search":
 		var o struct {
 			Results []struct {
-				N   int    `json:"n"`
-				URL string `json:"url"`
+				N    int    `json:"n"`
+				URL  string `json:"url"`
+				Site string `json:"site"`
 			} `json:"results"`
 		}
 		if json.Unmarshal(out, &o) == nil {
 			for _, r := range o.Results {
 				cite = max(cite, r.N)
-				urls = append(urls, r.URL)
+				urls = append(urls, cmp.Or(r.URL, r.Site))
 			}
 		}
 	case "web.fetch":
 		var o struct {
-			N   int    `json:"n"`
-			URL string `json:"url"`
+			N    int    `json:"n"`
+			URL  string `json:"url"`
+			Site string `json:"site"`
 		}
 		if json.Unmarshal(out, &o) == nil {
-			cite, urls = o.N, []string{o.URL}
+			cite, urls = o.N, []string{cmp.Or(o.URL, o.Site)}
 		}
 	case "web.images":
 		var o struct {

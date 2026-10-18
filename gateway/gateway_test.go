@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -375,4 +376,32 @@ func (r recSearch) Search(_ context.Context, q string, n int) ([]guard.SearchRes
 	*r.q = append(*r.q, q)
 	r.mu.Unlock()
 	return []guard.SearchResult{{Title: "t", URL: "https://a.example/", Snippet: "s"}}, nil
+}
+
+// agentd's taint travels with each action: on a tainted task gatewayd won't fetch an address the model composed under
+// Always allow (nothing reaches the page); the same request untainted goes.
+func TestTaintAcrossTheSocket(t *testing.T) {
+	var hits atomic.Int32
+	page := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Write([]byte("<html><body><p>ok</p></body></html>"))
+	}))
+	defer page.Close()
+	path := socketPath(t)
+	serve(t, path, guard.New(guard.Config{Up: guard.NewPlainUpstream("http://unused", nil), Search: searchN{}, Fetcher: guard.NewFetcher(true), Now: time.Now}))
+	c := &Client{Path: path, Wait: 5 * time.Second}
+	s := c.Open("t_t", guard.TaskOptions{Permissions: guard.AllowAll()}, func(proto.Event) error { return nil })
+	defer s.Close()
+	for i, tainted := range []bool{true, false} {
+		ti := &harness.TaskInfo{ID: "t_t", Start: &harness.Start{Tools: guard.ToolDefs("web.fetch")}, Tainted: tainted}
+		id := fmt.Sprintf("a%d", i)
+		res, err := c.Action(harness.WithRequestID(context.Background(), id), ti, id,
+			&harness.Action{Name: "web.fetch", Args: jsontext.Value(`{"url":"` + page.URL + `/x?d=secret"}`)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tainted && (res.Status != harness.ActionDenied || hits.Load() != 0) || !tainted && (res.Status != harness.ActionDone || hits.Load() != 1) {
+			t.Fatalf("tainted %v: %+v (hits %d)", tainted, res, hits.Load())
+		}
+	}
 }

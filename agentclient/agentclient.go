@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	ehbpclient "github.com/tinfoilsh/encrypted-http-body-protocol/client"
@@ -60,6 +61,39 @@ type Conn struct {
 	Model string
 	key   []byte
 	http  *http.Client
+
+	mu      sync.Mutex
+	secrets map[string]string // task -> its run secret (StartTask): status, events and cancel carry a MAC with it
+}
+
+// TaskSecret is the run secret this connection started task id with ("" when it didn't).
+func (c *Conn) TaskSecret(id string) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.secrets[id]
+}
+
+// SetTaskSecret lets this connection follow, see and cancel a task another connection started (its run secret).
+func (c *Conn) SetTaskSecret(id, secret string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.secrets == nil {
+		c.secrets = map[string]string{}
+	}
+	c.secrets[id] = secret
+}
+
+// ref is a task call's body: the task, its MAC for op (guard.TaskMAC with the task's run secret; none when this
+// connection doesn't have it, which the VM refuses), and extra members.
+func (c *Conn) ref(op, id string, extra map[string]any) map[string]any {
+	m := map[string]any{"task": id}
+	if s := c.TaskSecret(id); s != "" {
+		m["mac"] = guard.TaskMAC(s, op, id)
+	}
+	for k, v := range extra {
+		m[k] = v
+	}
+	return m
 }
 
 // New makes a connection that encrypts to key (which must come from a verified attestation).
@@ -187,7 +221,8 @@ func (c *Conn) taskCall(ctx context.Context, path, model string, v any) (*Task, 
 	return &t, nil
 }
 
-// StartTask starts req as a task. key, when set, makes the start once-only (a retry finds the same task).
+// StartTask starts req as a task. key, when set, makes the start once-only (a retry finds the same task). Without a
+// run secret in req it makes one; the connection keeps it for the task's later calls (TaskSecret).
 func (c *Conn) StartTask(ctx context.Context, req proto.RunRequest, key string) (*Task, error) {
 	if req.Model == "" {
 		req.Model = proto.DefaultModel
@@ -196,10 +231,19 @@ func (c *Conn) StartTask(ctx context.Context, req proto.RunRequest, key string) 
 	if c.Model != "" {
 		model = c.Model
 	}
-	return c.taskCall(ctx, "/tasks", model, struct {
+	if req.RunSecret == "" {
+		b := make([]byte, 32)
+		rand.Read(b)
+		req.RunSecret = hex.EncodeToString(b)
+	}
+	t, err := c.taskCall(ctx, "/tasks", model, struct {
 		proto.RunRequest
 		Key string `json:"key,omitempty"`
 	}{req, key})
+	if err == nil && !t.Existing { // a start the key found already has the first start's secret
+		c.SetTaskSecret(t.Task, req.RunSecret)
+	}
+	return t, err
 }
 
 // Grant answers a permission prompt of a run this client started with secret (its run_secret): decision once,
@@ -223,18 +267,18 @@ func (c *Conn) Grant(ctx context.Context, secret string, p proto.Permission, dec
 
 // TaskStatus is a task's state.
 func (c *Conn) TaskStatus(ctx context.Context, id string) (*Task, error) {
-	return c.taskCall(ctx, "/tasks/status", "", map[string]any{"task": id})
+	return c.taskCall(ctx, "/tasks/status", "", c.ref("status", id, nil))
 }
 
 // CancelTask cancels a task.
 func (c *Conn) CancelTask(ctx context.Context, id string) (*Task, error) {
-	return c.taskCall(ctx, "/tasks/cancel", "", map[string]any{"task": id})
+	return c.taskCall(ctx, "/tasks/cancel", "", c.ref("cancel", id, nil))
 }
 
 // FollowTask calls on for each of the task's events after seq after, until the task ended ([DONE], nil) or ctx
 // ends. Reconnect with the last seq on saw to continue.
 func (c *Conn) FollowTask(ctx context.Context, id string, after int, on func(seq int, e proto.Event)) error {
-	res, err := c.post(ctx, "/tasks/events", "", map[string]any{"task": id, "after": after})
+	res, err := c.post(ctx, "/tasks/events", "", c.ref("events", id, map[string]any{"after": after}))
 	if err != nil {
 		return err
 	}

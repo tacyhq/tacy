@@ -456,14 +456,15 @@ func TestReaderRefusals(t *testing.T) {
 			}
 			var view struct {
 				N      int             `json:"n"`
-				URL    string          `json:"url"`
+				Site   string          `json:"site"`
+				URL    *string         `json:"url"`
 				Read   jsontext.Value  `json:"read"`
 				Reader string          `json:"reader"`
 				Note   string          `json:"note"`
 				Title  *string         `json:"title"`
 				Extra  json.RawMessage `json:"text"`
 			}
-			if err := json.Unmarshal(res.Result, &view); err != nil || view.N != 1 || view.URL != url || string(view.Read) != "null" ||
+			if err := json.Unmarshal(res.Result, &view); err != nil || view.N != 1 || view.Site != siteOf(url) || view.URL != nil || string(view.Read) != "null" ||
 				!strings.Contains(view.Reader, "nothing from this source is shown") || view.Note != readerFailNote || view.Title != nil || view.Extra != nil {
 				t.Fatalf("model's view %s (%v)", res.Result, err)
 			}

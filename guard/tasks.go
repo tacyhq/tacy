@@ -2,10 +2,12 @@ package guard
 
 import (
 	"context"
+	"crypto/hmac"
 	"encoding/json"
 	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -81,6 +83,8 @@ type hosted struct {
 	changed chan struct{}
 	timer   *time.Timer
 	flushMu sync.Mutex
+	// sources: each citation number's address, as the task's events showed them to the person (Sources).
+	sources map[int]string
 }
 
 type hostedEvent struct {
@@ -121,12 +125,45 @@ func (l *hosted) emit(e proto.Event, flushEvery time.Duration) {
 	}
 	seq := l.base + len(l.evs) + 1
 	l.evs = append(l.evs, hostedEvent{seq: seq, ev: e, data: data})
+	l.addSources(e.Citations)
 	if l.stored && l.timer == nil {
 		l.timer = time.AfterFunc(flushEvery, l.flush)
 	}
 	close(l.changed)
 	l.changed = make(chan struct{})
 	l.mu.Unlock()
+}
+
+// addSources records citations' addresses by number (l.mu held).
+func (l *hosted) addSources(cs []proto.Citation) {
+	for _, c := range cs {
+		if c.URL == "" {
+			continue
+		}
+		if l.sources == nil {
+			l.sources = map[int]string{}
+		}
+		l.sources[c.Index] = c.URL
+	}
+}
+
+// Sources is a task's sources by citation number ([n] -> address) as its events showed them to the person: what a
+// fetch of "[n]" asks about (Prompts.Sources). nil for a task this process doesn't serve.
+func (h *Host) Sources(id string) map[int]string {
+	h.init()
+	h.mu.Lock()
+	l := h.live[id]
+	h.mu.Unlock()
+	if l == nil {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make(map[int]string, len(l.sources))
+	for n, u := range l.sources {
+		out[n] = u
+	}
+	return out
 }
 
 // flush writes the events not yet in the queue, in one transaction.
@@ -533,6 +570,26 @@ func (h *Host) owned(id, user string) error {
 	return nil
 }
 
+// Authorize checks a call on a task (op: status, events, cancel): the task is user's, started through POST /tasks
+// with a run secret, and mac is TaskMAC with that secret for op and this task. Anything else is ErrNoTask (the same
+// answer as for an unknown task), so the relay, which sets the user tag but never sees the secret, can't read,
+// follow or cancel a task by itself.
+func (h *Host) Authorize(id, user, op, mac string) error {
+	if err := h.owned(id, user); err != nil {
+		return err
+	}
+	st, err := h.RT.Status(id)
+	if err != nil {
+		return ErrNoTask
+	}
+	var o TaskOptions
+	if json.Unmarshal(st.Options, &o) != nil || !validRunSecret(o.RunSecret) || len(mac) != 64 ||
+		!hmac.Equal([]byte(TaskMAC(o.RunSecret, op, id)), []byte(strings.ToLower(mac))) {
+		return ErrNoTask
+	}
+	return nil
+}
+
 // TaskState is what the starter may see of a task.
 type TaskState struct {
 	Task     string `json:"task"`
@@ -630,6 +687,16 @@ func (h *Host) Resume(ids []string) (resumed, abandoned int) {
 		base := h.lastSeq(id, 0)
 		l := &hosted{id: id, user: opts.User, via: ViaTasks, start: start, opts: opts, changed: make(chan struct{}),
 			st: h.RT.Store, stored: true, base: base, flushed: base}
+		for after := 0; after < base; { // its sources, from the events an earlier process showed
+			evs, err := h.stored(id, after, base)
+			if err != nil || len(evs) == 0 {
+				break
+			}
+			for _, e := range evs {
+				l.addSources(e.Ev.Citations)
+				after = e.Seq
+			}
+		}
 		h.mu.Lock()
 		h.live[id] = l
 		h.mu.Unlock()

@@ -52,8 +52,8 @@ func retryLease(lease guard.Lease, push func()) guard.Lease {
 // /safety on its HTTP socket), which checks them and keeps the floors on disk; gatewayd then gets agentd's newest
 // documents back (and checks them itself). gatewayd doesn't take what it pulls directly: right after a gatewayd
 // restart it has no floors, so an older document served at u could otherwise count here for a moment. The host
-// learns only that the VM is up. If u can't be reached, nothing new arrives and the stop list goes stale: side
-// effects stop (fail closed).
+// learns only that the VM is up. If u can't be reached, nothing new arrives: after 3 minutes agentd counts the list
+// silent and nothing goes out (fail closed; safety.DefaultMaxSilence).
 func pullSafety(u string, every time.Duration, agentSock string) {
 	pu, err := url.Parse(u)
 	if err != nil || pu.Scheme != "https" || pu.Host == "" {
@@ -65,6 +65,7 @@ func pullSafety(u string, every time.Duration, agentSock string) {
 			var d net.Dialer
 			return d.DialContext(ctx, "unix", agentSock)
 		}}}
+	delivered := false
 	for {
 		func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -89,8 +90,15 @@ func pullSafety(u string, every time.Duration, agentSock string) {
 			req.Header.Set("Content-Type", "application/json")
 			if r2, err := agent.Do(req); err == nil {
 				r2.Body.Close()
+				delivered = true
 			}
 		}()
+		// Until the first delivery (agentd may still be starting), try again every second: agentd refuses
+		// everything until the operator's list reaches it.
+		if !delivered {
+			time.Sleep(min(every, time.Second))
+			continue
+		}
 		time.Sleep(every)
 	}
 }

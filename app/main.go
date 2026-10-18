@@ -101,6 +101,9 @@ type server struct {
 	host     *guard.Host // tasks (tasks.go); made on first use when nil
 	hostOnce sync.Once
 	follows  chan struct{} // concurrent POST /tasks/events limit
+	// userFollows counts each user tag's open event streams (maxUserFollowers), under followMu.
+	followMu    sync.Mutex
+	userFollows map[string]int
 	// prompts are the permission prompts (guard.Prompts): POST /tasks/grant answers them. nil: none.
 	prompts *guard.Prompts
 }
@@ -379,6 +382,9 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	// agentd takes the pulled lists (gatewayd's pull posts them here every 10 s), so it alone can tell the pull
+	// stopped reaching the VM: then nothing goes out (safety.DefaultMaxSilence).
+	scfg.MaxSilence = safety.DefaultMaxSilence
 	st, err := safety.NewState(scfg)
 	if err != nil {
 		log.Fatalf("safety: %v", err)
@@ -411,6 +417,7 @@ func main() {
 			Limits: &lim, CacheSecret: randomHex(32), Now: func() time.Time { return time.Now().UTC() }, Safety: st})
 	}
 	sg := newSafeGateway(gw, st, &safety.Ledger{Dir: safetyDir})
+	sg.firstHeard = 20 * time.Second
 	// Activity records (docs/24): signed with a key derived from dstack's KMS for this app and firm (locally, a
 	// key per boot), kept on the encrypted disk.
 	ikm, err := p.ActivityKey(context.Background())
@@ -471,7 +478,8 @@ func main() {
 	host := &guard.Host{RT: rt, GW: rg, IDKey: idKey}
 	// Permission prompts: actions that send data out wait for the person's answer; the policy may cap their settings.
 	// OnWait stops the run's running-time clock while a prompt waits for the person (v0.8.1).
-	rg.prompts = &guard.Prompts{Release: rt.Release, Emit: host.Emit, Cap: permissionCap(st), OnWait: sg.waiting}
+	rg.prompts = &guard.Prompts{Release: rt.Release, Emit: host.Emit, Cap: permissionCap(st), OnWait: sg.waiting,
+		Sources: host.Sources}
 	s := &server{platform: p, id: id, agent: rg, rt: rt, rec: rec, token: p.Secret("AGENT_VM_TOKEN"), booted: time.Now().UTC(),
 		sched: newScheduler(lim), lim: lim, quotes: make(chan struct{}, 8), safety: st, gw: gw, safetySlots: make(chan struct{}, 4),
 		host: host, prompts: rg.prompts}

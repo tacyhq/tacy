@@ -87,16 +87,16 @@ jobs:
           go-version: "1.27.2" # = mise.toml
           check-latest: false
           cache: false
-      - name: gVisor release 20260928.0 (pinned)
+      - name: gVisor release 20261012.0 (pinned)
         run: |
-          curl -fsSL -o "$RUNNER_TEMP/gvisor.tar.bz2" https://storage.googleapis.com/gvisor/releases/release/20260928.0/x86_64/gvisor.tar.bz2
-          echo "f3ed9131bc252259df150e270154180188f9df56b73a2312940325e1f522a2d6  $RUNNER_TEMP/gvisor.tar.bz2" | sha256sum -c
+          curl -fsSL -o "$RUNNER_TEMP/gvisor.tar.bz2" https://storage.googleapis.com/gvisor/releases/release/20261012.0/x86_64/gvisor.tar.bz2
+          echo "180dd277f657c1478f09490e8a9a595f7378257510b43d1d3694a769aef9ed02  $RUNNER_TEMP/gvisor.tar.bz2" | sha256sum -c
           mkdir -p "$RUNNER_TEMP/gvisor"
           tar -xjf "$RUNNER_TEMP/gvisor.tar.bz2" -C "$RUNNER_TEMP/gvisor" runsc gvisor-bin/gvisor_sentry gvisor-bin/gvisor-sentry-prewarmer gvisor-bin/runsc-fd-parking
           cd "$RUNNER_TEMP/gvisor" && sha256sum -c <<'SUMS'
-          88a87d5d6d06160d4c144f51f95ec6dd6fe0fc6b02697eb877876683c5b57a91  runsc
-          e10e6e8072a0822f5e80dc203d156f0602b15fab90b85fac1d7bffd79477b267  gvisor-bin/gvisor_sentry
-          3315d7ad7c2d3751d349e4976fa02da1da6fd7e41746c35622304e5fabe4fce0  gvisor-bin/gvisor-sentry-prewarmer
+          56996c546dbafd5716e1d09e307a131d97eb3b6483c22a1178631751f3e0392f  runsc
+          1755e10a4c9d1db4973c0155497348db3737543b4c2e6a9f663a271ee71433d5  gvisor-bin/gvisor_sentry
+          46d5c028723ac5fbe40b863f95100f15a00d2aa0cd39c69d892500a988c930bd  gvisor-bin/gvisor-sentry-prewarmer
           03af90d07ea466c10ecc3e3ba839b2a59540959dd3286aea3886917cba850c11  gvisor-bin/runsc-fd-parking
           SUMS
       - name: build the test binaries and the brain

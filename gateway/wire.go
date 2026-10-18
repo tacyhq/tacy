@@ -71,6 +71,9 @@ type frame struct {
 	// action: the person's answer to its permission prompt, which gatewayd checks itself before anything
 	// is sent (guard.Grant); none for a kind the person always allows.
 	Grant *guard.Grant `json:"grant,omitzero"`
+	// model, action: the task had received outside content when the request reached agentd (harness.TaskInfo.Tainted,
+	// the runtime's taint); gatewayd also counts what it gave the task itself.
+	Tainted bool `json:"tainted,omitzero"`
 
 	// event
 	Event jsontext.Value `json:"event,omitzero"` // a proto.Event as encoding/json writes it

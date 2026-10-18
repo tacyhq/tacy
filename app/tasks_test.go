@@ -18,6 +18,7 @@ import (
 	"time"
 
 	ehbpidentity "github.com/tinfoilsh/encrypted-http-body-protocol/identity"
+	ehbpproto "github.com/tinfoilsh/encrypted-http-body-protocol/protocol"
 
 	"github.com/tacyhq/tacy/activity"
 	"github.com/tacyhq/tacy/agentclient"
@@ -329,6 +330,7 @@ func TestTasksRestartMidTask(t *testing.T) {
 	p1.kill()
 	p2 := bootTasks(t, path, m, fs, false)
 	c2 := p2.conn(t, tasksUser)
+	c2.SetTaskSecret(tk.Task, c1.TaskSecret(tk.Task)) // the tab that started it, on the new process
 	last := before[len(before)-1].seq
 	rest := followAll(t, c2, tk.Task, last)
 	contiguous(t, rest, last+1)
@@ -365,8 +367,25 @@ func TestTasksRestartMidTask(t *testing.T) {
 	if searches != 1 || m.calls.Load() != 3 {
 		t.Fatalf("searches %d (want 1), model calls %d (want 3: the cut one ran again)", searches, m.calls.Load())
 	}
-	// Another user can't see it, follow it or cancel it (the same answer as for no task).
+	// Another user can't see it, follow it or cancel it (the same answer as for no task), even with the run's
+	// secret; the right user without the secret (the relay sets the tag, never sees the secret) can't either.
 	other := p2.conn(t, "fedcba9876543210fedc")
+	other.SetTaskSecret(tk.Task, c1.TaskSecret(tk.Task))
+	relay := p2.conn(t, tasksUser)
+	for _, err := range []error{
+		func() error { _, err := relay.TaskStatus(context.Background(), tk.Task); return err }(),
+		func() error { _, err := relay.CancelTask(context.Background(), tk.Task); return err }(),
+		relay.FollowTask(context.Background(), tk.Task, 0, func(int, proto.Event) {}),
+		func() error {
+			relay.SetTaskSecret(tk.Task, strings.Repeat("ab", 32))
+			_, err := relay.TaskStatus(context.Background(), tk.Task)
+			return err
+		}(),
+	} {
+		if err == nil || !strings.Contains(err.Error(), "404") {
+			t.Fatalf("no or a wrong MAC: %v", err)
+		}
+	}
 	for _, err := range []error{
 		func() error { _, err := other.TaskStatus(context.Background(), tk.Task); return err }(),
 		func() error { _, err := other.CancelTask(context.Background(), tk.Task); return err }(),
@@ -455,6 +474,7 @@ func TestTasksCancelDuringHeldRequest(t *testing.T) {
 	p1.kill()
 	p2 := bootTasks(t, path, m, fs, true)
 	c2 := p2.conn(t, tasksUser)
+	c2.SetTaskSecret(tk.Task, c1.TaskSecret(tk.Task))
 	st := waitTask(t, c2, tk.Task, func(s *agentclient.Task) bool { return s.State == harness.StateWaiting })
 	if st.Sub != harness.WaitApproval || st.Held != 1 {
 		t.Fatalf("after the restart: %+v", st)
@@ -682,5 +702,55 @@ func TestRunShimLeavesNothing(t *testing.T) {
 	}
 	if len(refused) != 1 || refused[0].Event != activity.EventRefused || !harness.ValidTaskID(refused[0].Run) {
 		t.Fatalf("refused record %+v", refused)
+	}
+}
+
+// The task calls need a user tag (the grant doesn't: its MAC is enough), a start needs a run secret (the later calls
+// carry a MAC with it), and one user can hold at most maxUserFollowers event streams of the 64.
+func TestTasksAuthAndStreamCaps(t *testing.T) {
+	s := &server{token: "tok"}
+	reached := false
+	next := http.HandlerFunc(func(http.ResponseWriter, *http.Request) { reached = true })
+	call := func(needTag bool, tag string) int {
+		r := httptest.NewRequest("POST", "/tasks/status", strings.NewReader("x"))
+		r.Header.Set("Authorization", "Bearer tok")
+		r.Header.Set(ehbpproto.EncapsulatedKeyHeader, strings.Repeat("ab", 32))
+		if tag != "" {
+			r.Header.Set("X-Agent-User", tag)
+		}
+		w := httptest.NewRecorder()
+		s.taskGuard(false, needTag, next).ServeHTTP(w, r)
+		return w.Code
+	}
+	if code := call(true, ""); code != 400 || reached {
+		t.Fatalf("no tag: %d", code)
+	}
+	if code := call(true, tasksUser); code != 200 || !reached {
+		t.Fatalf("with a tag: %d", code)
+	}
+	reached = false
+	if code := call(false, ""); code != 200 || !reached {
+		t.Fatalf("grant without a tag: %d", code)
+	}
+	w := httptest.NewRecorder()
+	s.taskStart(w, httptest.NewRequest("POST", "/tasks", strings.NewReader(`{"messages":[{"role":"user","content":"hi"}]}`)))
+	if w.Code != 400 || !strings.Contains(w.Body.String(), "run_secret_required") {
+		t.Fatalf("start without a run secret: %d %s", w.Code, w.Body)
+	}
+	s.tasks()
+	for i := range maxUserFollowers {
+		if !s.followSlot("a") {
+			t.Fatalf("slot %d refused", i)
+		}
+	}
+	if s.followSlot("a") {
+		t.Fatal("one user took more than its share of streams")
+	}
+	if !s.followSlot("b") {
+		t.Fatal("another user was refused")
+	}
+	s.followDone("a")
+	if !s.followSlot("a") {
+		t.Fatal("a freed slot wasn't given back")
 	}
 }

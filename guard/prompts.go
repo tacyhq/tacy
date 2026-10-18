@@ -38,12 +38,49 @@ type Prompts struct {
 	// agentd stops the run's running-time clock while one is open (safety.Ledger.Pause). nil: nobody is told.
 	// Called with the prompts' lock held: it must not call back into Prompts.
 	OnWait func(task string, open bool)
+	// Sources is a task's sources by number ([n] -> address), as its events showed them to the person (Host.Sources):
+	// a fetch of "[n]" is asked about with the address it names. nil: none.
+	Sources func(task string) map[int]string
 
 	mu       sync.Mutex
 	open     map[string]*prompt           // waiting for the person, by task\x00request
 	always   map[string]map[string]*Grant // task -> kind -> the grant that allowed the kind for the run
 	grants   map[string]*Grant            // task\x00request -> the grant its action runs with
 	outcomes map[string]PermissionOutcome // task\x00request -> how its permission was given
+	steps    map[string]step              // task -> its latest model call (ModelCalled)
+}
+
+// step is a task's latest model call as the taint of its tool calls sees it: whether the task was tainted when the
+// call was made, and the ids of the tool calls it proposed.
+type step struct {
+	tainted bool
+	calls   map[string]bool
+}
+
+// ModelCalled tells the prompts a model call of the task answered (agentd, after each one): its tool calls were
+// proposed with the task as tainted as it was when the call was made (ti.Tainted then), so calls proposed together
+// don't taint each other however their requests arrive.
+func (p *Prompts) ModelCalled(ti *harness.TaskInfo, res *harness.ModelResult) {
+	if res == nil {
+		return
+	}
+	st := step{tainted: ti.Tainted, calls: map[string]bool{}}
+	for _, c := range res.Message.ToolCalls {
+		st.calls[c.ID] = true
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.init()
+	p.steps[ti.ID] = st
+}
+
+// tainted is whether action call (an id from the model's tool calls) was proposed after outside content: the
+// taint of the model call that proposed it, or, for any other request, the task's taint as it arrived (p.mu held).
+func (p *Prompts) tainted(ti *harness.TaskInfo, call string) bool {
+	if st, ok := p.steps[ti.ID]; ok && call != "" && st.calls[call] {
+		return st.tainted
+	}
+	return ti.Tainted
 }
 
 // PermissionOutcome is how an action's permission was given (one of the Perm* outcomes), for the record.
@@ -56,6 +93,9 @@ type prompt struct {
 	task, request, call, kind, value, secret string
 	sent                                     string // allowed: the value that goes out ("": value)
 	timer                                    *time.Timer
+	// composed: a fetch on a tainted task of an address the model wrote (ComposedFetch): only its own answer
+	// allows it, never an Always allow given to another prompt.
+	composed bool
 }
 
 // Errors of Answer.
@@ -75,6 +115,7 @@ func (p *Prompts) init() {
 		p.always = map[string]map[string]*Grant{}
 		p.grants = map[string]*Grant{}
 		p.outcomes = map[string]PermissionOutcome{}
+		p.steps = map[string]step{}
 	}
 }
 
@@ -83,6 +124,14 @@ func (p *Prompts) cap(space, kind string) string {
 		return ""
 	}
 	return p.Cap(space, kind)
+}
+
+// sources is the task's sources for a fetch's [n] (nil for other kinds, or without Sources).
+func (p *Prompts) sources(task, kind string) map[int]string {
+	if kind != "web.fetch" || p.Sources == nil {
+		return nil
+	}
+	return p.Sources(task)
 }
 
 func optionsOf(ti *harness.TaskInfo) TaskOptions {
@@ -108,7 +157,9 @@ func key(task, id string) string { return task + "\x00" + id }
 
 // Hold is the runtime's HoldGuard: an action of a permission kind waits for the person (WaitPermission) unless their
 // setting already decides it (Always allow, Never), an Always allow earlier in the run covers its kind, or the run
-// can't ask (no run secret: denied). Actions that send nothing out, and model calls, aren't held.
+// can't ask (no run secret: denied). On a tainted task a fetch of an address the model composed (ComposedFetch) is
+// asked about even under Always allow, and the prompt says why. A value with hidden characters is denied without
+// asking. Actions that send nothing out, and model calls, aren't held.
 func (p *Prompts) Hold(ti *harness.TaskInfo, id string, req any) string {
 	a, ok := req.(*harness.Action)
 	if !ok {
@@ -118,7 +169,8 @@ func (p *Prompts) Hold(ti *harness.TaskInfo, id string, req any) string {
 	if kind == "" {
 		return ""
 	}
-	value, ok := Outgoing(a.Name, a.Args)
+	sources := p.sources(ti.ID, kind)
+	value, ok := Outgoing(a.Name, a.Args, sources)
 	if !ok {
 		return "" // unusable arguments: the connector refuses them, nothing is sent
 	}
@@ -126,13 +178,16 @@ func (p *Prompts) Hold(ti *harness.TaskInfo, id string, req any) string {
 	k := key(ti.ID, id)
 	p.mu.Lock()
 	p.init()
+	composed := ComposedFetch(a.Name, a.Args, sources, opts.Links, p.tainted(ti, a.Call))
 	setting := PermissionSetting(opts, kind, p.cap(opts.Space, kind))
 	switch {
-	case setting == safety.PermAlways:
-		p.outcomes[k] = PermissionOutcome{Outcome: PermAlwaysSetting}
+	case HiddenChars(value): // never sent, so never asked about (whatever the setting)
+		p.outcomes[k] = PermissionOutcome{Outcome: PermHidden}
 	case setting == safety.PermNever:
 		p.outcomes[k] = PermissionOutcome{Outcome: PermNeverSetting}
-	case p.always[ti.ID][kind] != nil:
+	case setting == safety.PermAlways && !composed:
+		p.outcomes[k] = PermissionOutcome{Outcome: PermAlwaysSetting}
+	case p.always[ti.ID][kind] != nil && !composed:
 		p.grants[k] = p.always[ti.ID][kind]
 		p.outcomes[k] = PermissionOutcome{Outcome: PermAllowedAlways}
 	case !validRunSecret(opts.RunSecret):
@@ -143,7 +198,12 @@ func (p *Prompts) Hold(ti *harness.TaskInfo, id string, req any) string {
 			p.outcomes[k] = PermissionOutcome{Outcome: PermTimedOut}
 			break
 		}
-		pr := &prompt{task: ti.ID, request: id, call: cmp.Or(a.Call, id), kind: kind, value: value, secret: opts.RunSecret}
+		pr := &prompt{task: ti.ID, request: id, call: cmp.Or(a.Call, id), kind: kind, value: value, secret: opts.RunSecret,
+			composed: composed}
+		reason := ""
+		if composed {
+			reason = ComposedReason
+		}
 		p.open[k] = pr
 		if p.OnWait != nil {
 			p.OnWait(ti.ID, true)
@@ -151,7 +211,7 @@ func (p *Prompts) Hold(ti *harness.TaskInfo, id string, req any) string {
 		pr.timer = time.AfterFunc(timeout, func() { p.expire(ti.ID, id) })
 		p.mu.Unlock()
 		p.Emit(ti.ID, proto.Event{Type: "permission", ID: pr.call, Permission: &proto.Permission{Task: ti.ID, Request: id,
-			Kind: kind, Value: value, TimeoutS: int(timeout.Round(time.Second) / time.Second)}})
+			Kind: kind, Value: value, TimeoutS: int(timeout.Round(time.Second) / time.Second), Reason: reason}})
 		return harness.WaitPermission
 	}
 	p.mu.Unlock()
@@ -205,8 +265,8 @@ func (p *Prompts) Answer(g Grant) (string, error) {
 			p.always[g.Task] = map[string]*Grant{}
 		}
 		p.always[g.Task][g.Kind] = &gr
-		for k2, o := range p.open { // the run's other prompts of this kind: allowed too
-			if o.task == g.Task && o.kind == g.Kind {
+		for k2, o := range p.open { // the run's other prompts of this kind: allowed too (but not a composed address)
+			if o.task == g.Task && o.kind == g.Kind && !o.composed {
 				p.close(k2, o)
 				p.grants[k2] = &gr
 				settled = append(settled, settle{o, PermissionOutcome{Outcome: PermAllowedAlways}})
@@ -297,11 +357,11 @@ func (p *Prompts) Attach(ctx context.Context, ti *harness.TaskInfo, id string, a
 		return ctx, nil // not held here (unusable arguments, or a rerun after a restart): gatewayd decides
 	}
 	switch o.Outcome {
-	case PermDenied, PermTimedOut, PermNeverSetting, PermUnavailable:
+	case PermDenied, PermTimedOut, PermNeverSetting, PermUnavailable, PermHidden:
 		deny := PermissionDenial(kind, o.Outcome)
 		call := cmp.Or(a.Call, id)
 		if o.Outcome == PermNeverSetting || o.Outcome == PermUnavailable { // never asked: say why under the call
-			value, _ := Outgoing(a.Name, a.Args)
+			value, _ := Outgoing(a.Name, a.Args, p.sources(ti.ID, kind))
 			p.Emit(ti.ID, proto.Event{Type: "permission", ID: call, Permission: &proto.Permission{Task: ti.ID, Request: id,
 				Kind: kind, Value: value, Decision: o.Outcome}})
 		}
@@ -355,12 +415,19 @@ func (p *Prompts) Forget(task string) {
 		}
 	}
 	delete(p.always, task)
+	delete(p.steps, task)
 }
 
 // Resume asks again for the actions a task had waiting for permission when agentd restarted (they stay held):
 // each prompt is shown again with a fresh timeout. Grants given before the restart are gone with it; nothing is
-// allowed without asking again.
+// allowed without asking again. The task counts as tainted if it was from its start or a web action of its
+// journal finished (what the runtime's taint says).
 func (p *Prompts) Resume(ti *harness.TaskInfo, journal []harness.Record) {
+	if !ti.Tainted {
+		c := *ti
+		c.Tainted = ti.Start != nil && StartTaint(ti.Start) != "" || journalTainted(journal)
+		ti = &c
+	}
 	for _, r := range journal {
 		if r.Kind != harness.TypeAction || r.Held != harness.WaitPermission || r.Done {
 			continue
@@ -373,4 +440,18 @@ func (p *Prompts) Resume(ti *harness.TaskInfo, journal []harness.Record) {
 			p.release(ti.ID, r.ID)
 		}
 	}
+}
+
+// journalTainted: a web action of the journal finished, so its result (outside content) reached the brain.
+func journalTainted(journal []harness.Record) bool {
+	for _, r := range journal {
+		if r.Kind != harness.TypeAction || !r.Done {
+			continue
+		}
+		var a harness.Action
+		if json.Unmarshal(r.Req, &a) == nil && Untrusted(&a) {
+			return true
+		}
+	}
+	return false
 }

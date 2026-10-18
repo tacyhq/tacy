@@ -48,6 +48,7 @@ func (g *Guard) ModelCall(ctx context.Context, ti *harness.TaskInfo, req *harnes
 	}
 	g.answered(t, req.Messages)
 	t.mu.Lock()
+	t.outside = t.outside || t.returned || ti.Tainted
 	t.step++
 	step := t.step
 	t.mu.Unlock()
@@ -157,6 +158,10 @@ func (g *Guard) ModelCall(ctx context.Context, ti *harness.TaskInfo, req *harnes
 			resultArgs = json.RawMessage(`null`)
 		}
 		name := eventName(tc.Name)
+		shown = t.shownArgs(tc.Name, shown)
+		if json.Valid(resultArgs) && string(resultArgs) != "null" {
+			resultArgs = shown
+		}
 		t.emit(proto.Event{Type: "tool_call", ID: tc.ID, Name: name, Args: shown})
 		open = append(open, openCall{id: tc.ID, name: name, args: resultArgs})
 	}

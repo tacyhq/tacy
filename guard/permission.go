@@ -36,13 +36,14 @@ const (
 
 // Permission outcomes, per action (the person's events and the activity record; metadata only).
 const (
-	PermAllowedOnce   = "allowed_once"   // asked; the person allowed this one
-	PermAllowedAlways = "allowed_always" // asked (or covered by an Always allow earlier in the run)
-	PermAlwaysSetting = "always_setting" // not asked: the person's setting for the kind is Always allow
-	PermDenied        = "denied"         // asked; the person said no
-	PermTimedOut      = "timed_out"      // asked; no answer in time (a deny)
-	PermNeverSetting  = "never"          // not asked: the setting (or the firm's cap) is Never
-	PermUnavailable   = "unavailable"    // the setting is Ask but the run can't ask (no run secret): refused
+	PermAllowedOnce   = "allowed_once"      // asked; the person allowed this one
+	PermAllowedAlways = "allowed_always"    // asked (or covered by an Always allow earlier in the run)
+	PermAlwaysSetting = "always_setting"    // not asked: the person's setting for the kind is Always allow
+	PermDenied        = "denied"            // asked; the person said no
+	PermTimedOut      = "timed_out"         // asked; no answer in time (a deny)
+	PermNeverSetting  = "never"             // not asked: the setting (or the firm's cap) is Never
+	PermUnavailable   = "unavailable"       // the setting is Ask but the run can't ask (no run secret): refused
+	PermHidden        = "hidden_characters" // not asked: the value has hidden characters, never allowed
 )
 
 // grantLabel prefixes a grant's MAC input.
@@ -119,10 +120,22 @@ func validRunSecret(s string) bool {
 	return err == nil
 }
 
+// fetchURLArg is a fetch's url argument, as the model wrote it.
+func fetchURLArg(args []byte) (string, bool) {
+	var a struct {
+		URL string `json:"url"`
+	}
+	if json.Unmarshal(args, &a) != nil || a.URL == "" {
+		return "", false
+	}
+	return a.URL, true
+}
+
 // Outgoing is exactly what an action would send out of the VM, as the web connector makes it (tools.go Exec): a
-// search's or an image search's query, trimmed, capped and masked; a page's address as given. ok is false when the
-// arguments are unusable (the connector refuses them without sending anything).
-func Outgoing(action string, args []byte) (value string, ok bool) {
+// search's or an image search's query, trimmed, capped and masked; a page's address as given, or the address of the
+// task's source it names ("[n]", from sources). ok is false when the arguments are unusable (the connector refuses
+// them without sending anything), a [n] the task doesn't have included.
+func Outgoing(action string, args []byte, sources map[int]string) (value string, ok bool) {
 	switch appTool(action) {
 	case "web_search", "image_search":
 		var a struct {
@@ -134,16 +147,25 @@ func Outgoing(action string, args []byte) (value string, ok bool) {
 		q, _ := maskPII(capRunes(strings.TrimSpace(a.Query), 300))
 		return q, true
 	case "fetch_page":
-		var a struct {
-			URL string `json:"url"`
-		}
-		if json.Unmarshal(args, &a) != nil || a.URL == "" {
-			return "", false
-		}
-		return a.URL, true
+		u, _, ok := FetchTarget(args, sources, nil)
+		return u, ok
 	}
 	return "", false
 }
+
+// ComposedFetch: a page fetch, on a tainted task, of an address that didn't come from code (FetchTarget): not one of
+// the task's sources, not in the person's messages. The model wrote it after it read outside content, so Always
+// allow doesn't cover it: the person is asked for this one (docs/27 section 6).
+func ComposedFetch(action string, args []byte, sources map[int]string, links []string, tainted bool) bool {
+	if !tainted || PermissionKind(action) != "web.fetch" {
+		return false
+	}
+	_, fromCode, ok := FetchTarget(args, sources, links)
+	return ok && !fromCode
+}
+
+// ComposedReason is what the person is told about a prompt for a ComposedFetch (proto.Permission.Reason).
+const ComposedReason = "This link wasn't in your search results or your message."
 
 // withValue is an action's arguments with the person's value in place of the model's (an edited query or address).
 // The rest (a search's count) stays.
@@ -164,16 +186,27 @@ func withValue(action string, args []byte, value string) (jsontext.Value, error)
 	return jsontext.Value(b), err
 }
 
-// CheckGrantValue checks what a person may send for kind: 1 to 2000 characters, no control characters; a page's
-// address an absolute http(s) URL.
+// HiddenChars says whether s has characters that can hide what it says: control characters (Cc), invisible
+// format characters (Cf: zero-width spaces and joiners, direction marks and overrides, the soft hyphen, ...), and
+// the tag block U+E0000-U+E007F (invisible "tag" text). A value with any is never sent, asked about or allowed (the
+// chat refuses them too).
+func HiddenChars(s string) bool {
+	for _, r := range s {
+		if unicode.Is(unicode.Cc, r) || unicode.Is(unicode.Cf, r) || r >= 0xE0000 && r <= 0xE007F {
+			return true
+		}
+	}
+	return false
+}
+
+// CheckGrantValue checks what a person may send for kind: 1 to 2000 characters, no control or hidden characters
+// (HiddenChars); a page's address an absolute http(s) URL.
 func CheckGrantValue(kind, v string) error {
 	if strings.TrimSpace(v) == "" || utf8.RuneCountInString(v) > maxGrantValue || !utf8.ValidString(v) {
 		return errors.New("the value must be 1 to 2000 characters")
 	}
-	for _, r := range v {
-		if unicode.IsControl(r) {
-			return errors.New("the value has control characters")
-		}
+	if HiddenChars(v) {
+		return errors.New("the value has control or hidden characters")
 	}
 	if kind == "web.fetch" {
 		u, err := url.Parse(v)
@@ -205,6 +238,18 @@ func GrantMAC(secretHex string, g Grant) string {
 		}
 		m.Write([]byte(f))
 	}
+	return hex.EncodeToString(m.Sum(nil))
+}
+
+// taskLabel prefixes a task call's MAC input (POST /tasks/status, /tasks/events, /tasks/cancel).
+const taskLabel = "tacy-task/v1"
+
+// TaskMAC authorizes a call on a task (op: "status", "events" or "cancel") from the tab that started it: HMAC-SHA256
+// with the run's secret over "tacy-task/v1", op and the task id, NUL-separated, in lowercase hex.
+func TaskMAC(secretHex, op, task string) string {
+	key, _ := hex.DecodeString(secretHex)
+	m := hmac.New(sha256.New, key)
+	m.Write([]byte(taskLabel + "\x00" + op + "\x00" + task))
 	return hex.EncodeToString(m.Sum(nil))
 }
 
@@ -258,26 +303,42 @@ func (g *Guard) permit(ctx context.Context, t *task, ti *harness.TaskInfo, id st
 	if kind == "" {
 		return req.Args, nil
 	}
-	value, ok := Outgoing(req.Name, req.Args)
+	sources := t.tools.sourceMap()
+	value, ok := Outgoing(req.Name, req.Args, sources)
 	if !ok {
-		return req.Args, nil // unusable arguments: the connector refuses them; nothing is sent
+		return req.Args, nil // unusable arguments (a [n] the task doesn't have too): the connector refuses them
 	}
+	if HiddenChars(value) {
+		return nil, PermissionDenial(kind, PermHidden) // never sent, whatever the setting or a grant says
+	}
+	args := req.Args
+	if raw, _ := fetchURLArg(req.Args); kind == "web.fetch" && raw != value { // a [n]: the connector gets its address
+		a, err := withValue(req.Name, req.Args, value)
+		if err != nil {
+			return nil, PermissionDenial(kind, "")
+		}
+		args = a
+	}
+	// On a tainted task, an address the model composed needs a grant for this very request (task.taintFor).
+	composed := ComposedFetch(req.Name, req.Args, sources, t.opts.Links, t.taintFor(ti, req.Call))
 	switch PermissionSetting(t.opts, kind, g.permissionCap(t.opts.Space, kind)) {
 	case safety.PermAlways:
-		return req.Args, nil
+		if !composed {
+			return args, nil
+		}
 	case safety.PermNever:
 		return nil, PermissionDenial(kind, PermNeverSetting)
 	}
 	gr := GrantFrom(ctx)
 	switch {
 	case gr == nil || gr.Task != ti.ID || gr.Kind != kind || !gr.Verify(t.opts.RunSecret):
-		return nil, PermissionDenial(kind, "")
-	case gr.Decision == DecideOnce && gr.Request == id, gr.Decision == DecideAlways:
+		return nil, PermissionDenial(kind, permComposed(composed))
+	case gr.Decision == DecideOnce && gr.Request == id, gr.Decision == DecideAlways && (gr.Request == id || !composed):
 	default:
-		return nil, PermissionDenial(kind, "")
+		return nil, PermissionDenial(kind, permComposed(composed))
 	}
 	if gr.Request != id || gr.Value == value {
-		return req.Args, nil
+		return args, nil
 	}
 	if CheckGrantValue(kind, gr.Value) != nil {
 		return nil, PermissionDenial(kind, "")
@@ -287,6 +348,14 @@ func (g *Guard) permit(ctx context.Context, t *task, ti *harness.TaskInfo, id st
 		return nil, PermissionDenial(kind, "")
 	}
 	return args, nil
+}
+
+// permComposed is PermissionDenial's outcome for a missing grant: why, when the address was the model's own.
+func permComposed(composed bool) string {
+	if composed {
+		return "composed"
+	}
+	return ""
 }
 
 // PermissionDenial is what the model sees for an action that didn't run for want of the person's permission: why,
@@ -303,6 +372,10 @@ func PermissionDenial(kind, outcome string) *harness.ActionResult {
 		why = "the person's settings don't allow " + what
 	case PermUnavailable:
 		why = "this app can't ask the person for permission, and " + what + " needs it"
+	case "composed":
+		why = "this address wasn't in the search results or the person's message, so it needs the person's answer for this " + what
+	case PermHidden:
+		why = "the " + what + "'s value has hidden or control characters, which Tacy never sends"
 	default:
 		why = "no valid permission from the person for this " + what
 	}

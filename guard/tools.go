@@ -53,7 +53,7 @@ var toolDefs = map[string]toolDef{
 		`{"type":"object","properties":{"query":{"type":"string","description":"search terms"},"count":{"type":"integer","minimum":1,"maximum":8,"description":"results to return (default 5)"}},"required":["query"]}`),
 	"fetch_page": def("fetch_page",
 		"Fetch a public web page (http or https) and return its main text, capped at about 12,000 characters.",
-		`{"type":"object","properties":{"url":{"type":"string","description":"absolute http(s) URL"}},"required":["url"]}`),
+		`{"type":"object","properties":{"url":{"type":"string","description":"absolute http(s) URL, or a source's number in brackets from earlier results, like [3]"}},"required":["url"]}`),
 	"image_search": def("image_search",
 		"Find pictures on the web (posters, photos, artwork, maps, diagrams) and show them to the user in a gallery under your answer. Use it whenever the user asks to see images, pictures, photos or posters. Returns each shown image's title and source page; the user sees the images, you don't.",
 		`{"type":"object","properties":{"query":{"type":"string","description":"what to find pictures of, short and generic"},"count":{"type":"integer","minimum":1,"maximum":6,"description":"images to show (default 4)"}},"required":["query"]}`),
@@ -98,6 +98,9 @@ type Tools struct {
 	fetcher *http.Client
 	cites   int
 	quotes  int // quote numbers given so far ([quote N], per task)
+	// sources maps each citation number to its full address (search results, pages read): a fetch of "[n]" goes
+	// there (sources.go). Guarded by mu.
+	sources map[int]string
 	// reader: the quarantined reader is on, so no provider text reaches the model: image results go without their
 	// titles, and with only their page's host (docs/27 section 5).
 	reader bool
@@ -107,6 +110,31 @@ type Tools struct {
 	imagesUsed int // image slots taken this run (maxImagesPerRun)
 	// gate waits for the caps a network call needs ("search" or "fetch") and returns their release; nil = none.
 	gate func(ctx context.Context, kind string) (func(), error)
+}
+
+// sourceMap is a copy of the task's sources ([n] -> address).
+func (t *Tools) sourceMap() map[int]string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make(map[int]string, len(t.sources))
+	for n, u := range t.sources {
+		out[n] = u
+	}
+	return out
+}
+
+// addSources records the citations' addresses under their numbers.
+func (t *Tools) addSources(cs []proto.Citation) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.sources == nil {
+		t.sources = map[int]string{}
+	}
+	for _, c := range cs {
+		if c.URL != "" {
+			t.sources[c.Index] = c.URL
+		}
+	}
 }
 
 func errorOutcome(msg string) toolOutcome {
@@ -173,6 +201,9 @@ func (t *Tools) Exec(ctx context.Context, name string, args json.RawMessage) (pe
 		if json.Unmarshal(args, &a) != nil || a.URL == "" {
 			return pending{out: errorOutcome("arguments must be {\"url\": string}")}, args
 		}
+		if n, ok := SourceRef(a.URL); ok { // permit put the address of a source the task has in place of its [n]
+			return pending{out: errorOutcome(fmt.Sprintf("there is no source [%d] in this task's results; use a number a search or page gave", n))}, args
+		}
 		// URLs are checked for the unambiguous kinds only: long numbers and IPs are normal in URLs (article ids;
 		// private IPs are refused by the dialer anyway).
 		var kinds []string
@@ -238,6 +269,12 @@ func (t *Tools) Exec(ctx context.Context, name string, args json.RawMessage) (pe
 
 // Finish gives a call's results their citation numbers and builds what the model sees.
 func (t *Tools) Finish(p pending) toolOutcome {
+	out := t.finish(p)
+	t.addSources(out.citations)
+	return out
+}
+
+func (t *Tools) finish(p pending) toolOutcome {
 	out := p.out
 	switch {
 	case out.content != "":
@@ -276,7 +313,8 @@ func (t *Tools) Finish(p pending) toolOutcome {
 	case p.page != nil && p.read != nil:
 		t.cites++
 		// The page's own title is its text too: the model gets the reader's (read.source.title), people the page's.
-		return t.finishRead(p, out, []int{t.cites}, map[string]any{"note": readerNote, "n": t.cites, "url": p.page.final},
+		// Its address (after redirects: the page's author chose it) too: the model gets its site and number.
+		return t.finishRead(p, out, []int{t.cites}, map[string]any{"note": readerNote, "n": t.cites, "site": siteOf(p.page.final)},
 			[]proto.Citation{{Index: t.cites, Title: p.page.title, URL: p.page.final, Snippet: capRunes(p.page.text, 200)}})
 	case p.page != nil:
 		t.cites++
@@ -293,19 +331,20 @@ func (t *Tools) Finish(p pending) toolOutcome {
 		Age     string `json:"age,omitempty"`
 	}
 	if p.read != nil {
-		// The model gets each result's number, URL and age (code's) and the reader's fields over the titles and
-		// snippets (the provider's text, which a page's author writes: people see them, the model doesn't).
+		// The model gets each result's number, site and age (code's) and the reader's fields over the titles,
+		// snippets and full addresses (text a page's author writes: people see them, the model doesn't; it fetches a
+		// result by its number).
 		type ritem struct {
-			N   int    `json:"n"`
-			URL string `json:"url"`
-			Age string `json:"age,omitempty"`
+			N    int    `json:"n"`
+			Site string `json:"site"`
+			Age  string `json:"age,omitempty"`
 		}
 		rs := []ritem{}
 		var ns []int
 		var cites []proto.Citation
 		for _, r := range p.results {
 			t.cites++
-			rs = append(rs, ritem{t.cites, r.URL, r.Age})
+			rs = append(rs, ritem{t.cites, siteOf(r.URL), r.Age})
 			ns = append(ns, t.cites)
 			cites = append(cites, proto.Citation{Index: t.cites, Title: r.Title, URL: r.URL, Snippet: r.Snippet, Age: r.Age})
 		}

@@ -216,8 +216,9 @@ func TestStopListsAndStaleness(t *testing.T) {
 	f := newFixture(t)
 	s := f.state(t)
 	apply(t, s, signP(t, policy(1, ""), f.admin))
-	// No operator list yet: stale. Reads go on (stale_reads), side effects don't.
-	if _, err := s.Check("s_a", false); err != nil {
+	// No operator list yet: stale. With an operator key pinned nothing goes on, reads included, whatever the
+	// policy's stale_reads says (the release's floor).
+	if _, err := s.Check("s_a", false); CodeOf(err) != CodeStale {
 		t.Fatalf("read while stale: %v", err)
 	}
 	if _, err := s.Check("s_a", true); CodeOf(err) != CodeStale {
@@ -300,6 +301,146 @@ func TestStaleReadsOff(t *testing.T) {
 	apply(t, s, signP(t, p, f.admin))
 	if _, err := s.Check("s_a", false); CodeOf(err) != CodeStale {
 		t.Fatalf("reads must stop when stale and the policy says so: %v", err)
+	}
+}
+
+// A policy that says stale_reads true (as the live one does): with an operator key pinned, the release refuses
+// reads anyway once the list is stale (11 minutes after it was signed) or silent (not delivered again for 3
+// minutes, as when the host drops the pull), and lets them go on again when a fresh list is delivered.
+func TestStaleOrSilentStopsReads(t *testing.T) {
+	f := newFixture(t)
+	s, err := NewState(Config{Firm: "f_test", Operator: pub(f.operator), Admins: []ed25519.PublicKey{pub(f.admin)},
+		Release: release(), MaxSilence: DefaultMaxSilence, Now: func() time.Time { return *f.now.Load() }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	apply(t, s, signP(t, policy(1, ""), f.admin))
+	if e, _ := s.Policy("s_a"); !e.StaleReads() {
+		t.Fatal("the test policy allows reads while stale")
+	}
+	if st := s.StatusOf("s_a"); st.Fresh || !st.Blocked || st.HeardS != nil {
+		t.Fatalf("before any list: %+v", st)
+	}
+	hb := signS(t, opList(1, t0), f.operator)
+	apply(t, s, hb)
+	if _, err := s.Check("s_a", false); err != nil {
+		t.Fatalf("fresh: %v", err)
+	}
+	// The pull delivers the same list every 10 s: still heard.
+	for range 30 {
+		f.advance(10 * time.Second)
+		apply(t, s, hb)
+	}
+	if _, err := s.Check("s_a", false); err != nil {
+		t.Fatalf("the same list delivered again keeps it heard: %v", err)
+	}
+	// The pull is dropped: 3 minutes later nothing goes out, reads included; the status says so.
+	f.advance(DefaultMaxSilence - time.Second)
+	if _, err := s.Check("s_a", false); err != nil {
+		t.Fatalf("just under the silence limit: %v", err)
+	}
+	f.advance(2 * time.Second)
+	for _, effect := range []bool{false, true} {
+		if _, err := s.Check("s_a", effect); CodeOf(err) != CodeStale {
+			t.Fatalf("silent, effect %v: %v", effect, err)
+		}
+	}
+	st := s.StatusOf("s_a")
+	if st.Fresh || !st.Blocked || st.HeardS == nil || *st.HeardS != int64(DefaultMaxSilence/time.Second)+1 {
+		t.Fatalf("silent status: %+v", st)
+	}
+	// A list that expired while it wasn't delivered doesn't count as heard; a fresh one does.
+	f.advance(15 * time.Minute)
+	if err := apply(t, s, hb); err == nil {
+		t.Fatal("an expired list was accepted")
+	}
+	if _, err := s.Check("s_a", false); CodeOf(err) != CodeStale {
+		t.Fatalf("expired list delivered: %v", err)
+	}
+	apply(t, s, signS(t, opList(2, *f.now.Load()), f.operator))
+	if _, err := s.Check("s_a", false); err != nil {
+		t.Fatalf("a fresh list again: %v", err)
+	}
+	if st := s.StatusOf("s_a"); !st.Fresh || st.Blocked {
+		t.Fatalf("fresh status: %+v", st)
+	}
+	// Delivered every few seconds but signed long ago (someone replays an old list and drops new ones): stale
+	// once it is older than the max age, reads included.
+	old := signS(t, opList(3, *f.now.Load()), f.operator)
+	apply(t, s, old)
+	for range 66 {
+		f.advance(10 * time.Second)
+		apply(t, s, old)
+	}
+	if _, err := s.Check("s_a", false); CodeOf(err) != CodeStale {
+		t.Fatalf("an old list replayed: %v", err)
+	}
+}
+
+// A list loaded from the process's own disk after a restart isn't a delivery: the process isn't heard from until
+// the pull (or a push) reaches it.
+func TestRestartNotHeardUntilDelivered(t *testing.T) {
+	f := newFixture(t)
+	cfg := func() Config {
+		return Config{Firm: "f_test", Operator: pub(f.operator), Admins: []ed25519.PublicKey{pub(f.admin)},
+			Release: release(), Dir: f.dir, MaxSilence: DefaultMaxSilence, Now: func() time.Time { return *f.now.Load() }}
+	}
+	s, _ := NewState(cfg())
+	apply(t, s, signP(t, policy(1, ""), f.admin))
+	hb := signS(t, opList(1, t0), f.operator)
+	apply(t, s, hb)
+	s2, err := NewState(cfg())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s2.Heard() {
+		t.Fatal("heard from the disk")
+	}
+	if _, err := s2.Check("s_a", false); CodeOf(err) != CodeStale {
+		t.Fatalf("before a delivery: %v", err)
+	}
+	apply(t, s2, hb) // the held list, delivered again
+	if _, err := s2.Check("s_a", false); err != nil || !s2.Heard() {
+		t.Fatalf("after a delivery: %v", err)
+	}
+}
+
+// gatewayd and vaultd don't check silence (MaxSilence 0: they get the list from agentd, not the pull); they
+// still stop reads once the list is stale.
+func TestNoSilenceCheckStillStale(t *testing.T) {
+	f := newFixture(t)
+	s := f.state(t)
+	apply(t, s, signP(t, policy(1, ""), f.admin))
+	apply(t, s, signS(t, opList(1, t0), f.operator))
+	f.advance(9 * time.Minute)
+	if _, err := s.Check("s_a", false); err != nil {
+		t.Fatalf("not checked for silence: %v", err)
+	}
+	f.advance(2 * time.Minute)
+	if _, err := s.Check("s_a", false); CodeOf(err) != CodeStale {
+		t.Fatalf("stale: %v", err)
+	}
+}
+
+// An operator seq far ahead of its signing time would lock the floor: refused. The Worker's seq (now in ms, or one
+// more than the last) passes.
+func TestOperatorSeqAheadRefused(t *testing.T) {
+	f := newFixture(t)
+	s := f.state(t)
+	far := opList(uint64(t0.Add(time.Hour).UnixMilli()), t0)
+	if err := apply(t, s, signS(t, far, f.operator)); err == nil || !strings.Contains(err.Error(), "ahead") {
+		t.Fatalf("seq an hour ahead: %v", err)
+	}
+	huge := opList(1<<62, t0)
+	if err := apply(t, s, signS(t, huge, f.operator)); err == nil {
+		t.Fatal("a huge seq was accepted")
+	}
+	ok := opList(uint64(t0.UnixMilli())+3, t0)
+	if err := apply(t, s, signS(t, ok, f.operator)); err != nil {
+		t.Fatalf("the Worker's seq: %v", err)
+	}
+	if _, err := Heartbeat(f.operator, 0, t0, 15*time.Minute, false); err != nil {
+		t.Fatalf("Heartbeat: %v", err)
 	}
 }
 

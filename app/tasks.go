@@ -24,15 +24,18 @@ import (
 // not anyone follows it, survives an agentd restart, and its starter can follow it from any event, see its state and
 // cancel it. Every call is a POST with an EHBP-encrypted body, like POST /run: EHBP leaves a request without a body
 // (and its response) unencrypted, and the task id goes in the encrypted body, so the relay sees only which call it
-// was. Same bearer token (cost) and X-Agent-User tag (whose task) as /run; only the starter's tag sees a task.
+// was. Same bearer token (cost) and X-Agent-User tag (whose task, required) as /run; only the starter's tag sees a
+// task, and status, events and cancel also need a MAC with the run's secret (guard.TaskMAC), which only the tab that
+// started the task has (it sent it inside the encrypted start): the relay sets the tag but can't make the MAC.
 //
-//	POST /tasks          {model, messages, ..., key?} -> {task, state, existing}. key makes the start once-only: the
-//	                     same user and key always name the same task (a retry finds it; nothing runs twice).
-//	                     X-Agent-Model as for /run. Refusals: 403 {error, code, activity?}; 429 too_many_tasks.
-//	POST /tasks/status   {task} -> {task, state, sub, attempt, events, held, outcome}
-//	POST /tasks/events   {task, after} -> SSE: "id: <seq>" and "data: <proto.Event>" per event after seq after,
+//	POST /tasks          {model, messages, run_secret, ..., key?} -> {task, state, existing}. key makes the start
+//	                     once-only: the same user and key always name the same task (a retry finds it; nothing runs
+//	                     twice). X-Agent-Model as for /run. Refusals: 403 {error, code, activity?}; 429 too_many_tasks.
+//	POST /tasks/status   {task, mac} -> {task, state, sub, attempt, events, held, outcome}
+//	POST /tasks/events   {task, after, mac} -> SSE: "id: <seq>" and "data: <proto.Event>" per event after seq after,
 //	                     as they come, then "data: [DONE]" once the task ended; reconnect with the last id seen.
-//	POST /tasks/cancel   {task} -> {task, state}
+//	                     At most 8 streams at once per user, 64 in all.
+//	POST /tasks/cancel   {task, mac} -> {task, state}
 //	POST /tasks/grant    {task, request, kind, decision, value, mac} -> {outcome}: the person's answer to a
 //	                     permission prompt (guard.Prompts) of a /tasks or /run task. The MAC with the run's
 //	                     secret is the authorization (only the tab that started the run has it). 404
@@ -47,22 +50,28 @@ type taskStartRequest struct {
 	Key string `json:"key,omitempty"` // 1-128 printable characters
 }
 
-// taskRef names a task (POST /tasks/status, /events, /cancel).
+// taskRef names a task (POST /tasks/status, /events, /cancel), with the call's MAC (guard.TaskMAC).
 type taskRef struct {
 	Task  string `json:"task"`
 	After int    `json:"after,omitempty"`
+	MAC   string `json:"mac"`
 }
 
-// maxFollowers bounds the event streams open at once (each is a long request).
-const maxFollowers = 64
+// maxFollowers bounds the event streams open at once (each is a long request); maxUserFollowers those of one user
+// tag, so one person (or the relay with one tag) can't take every slot.
+const (
+	maxFollowers     = 64
+	maxUserFollowers = 8
+)
 
 // taskRoutes serves the task API on mux behind EHBP with id (the boot's key).
 func (s *server) taskRoutes(mux *http.ServeMux, id *ehbpidentity.Identity) {
-	mux.Handle("POST /tasks", s.taskGuard(true, id.Middleware()(http.HandlerFunc(s.taskStart))))
-	mux.Handle("POST /tasks/status", s.taskGuard(false, id.Middleware()(http.HandlerFunc(s.taskStatus))))
-	mux.Handle("POST /tasks/events", s.taskGuard(false, id.Middleware()(http.HandlerFunc(s.taskEvents))))
-	mux.Handle("POST /tasks/cancel", s.taskGuard(false, id.Middleware()(http.HandlerFunc(s.taskCancel))))
-	mux.Handle("POST /tasks/grant", s.taskGuard(false, id.Middleware()(http.HandlerFunc(s.taskGrant))))
+	mux.Handle("POST /tasks", s.taskGuard(true, true, id.Middleware()(http.HandlerFunc(s.taskStart))))
+	mux.Handle("POST /tasks/status", s.taskGuard(false, true, id.Middleware()(http.HandlerFunc(s.taskStatus))))
+	mux.Handle("POST /tasks/events", s.taskGuard(false, true, id.Middleware()(http.HandlerFunc(s.taskEvents))))
+	mux.Handle("POST /tasks/cancel", s.taskGuard(false, true, id.Middleware()(http.HandlerFunc(s.taskCancel))))
+	// A grant's MAC is its authorization; the tag is optional there, as the chat's relay sends it.
+	mux.Handle("POST /tasks/grant", s.taskGuard(false, false, id.Middleware()(http.HandlerFunc(s.taskGrant))))
 }
 
 // taskGrant is behind EHBP: POST /tasks/grant. Strict JSON; the grant's MAC, kind and value are checked by
@@ -103,13 +112,14 @@ func (s *server) tasks() *guard.Host {
 			s.host = &guard.Host{RT: s.rt, GW: s.agent}
 		}
 		s.follows = make(chan struct{}, maxFollowers)
+		s.userFollows = map[string]int{}
 	})
 	return s.host
 }
 
-// taskGuard is guard's checks for the task calls, before EHBP decryption: token, encrypted body, user tag; for a
-// start, the model header. No run slot: a started task waits in the runtime's queue for the brain.
-func (s *server) taskGuard(start bool, next http.Handler) http.Handler {
+// taskGuard is guard's checks for the task calls, before EHBP decryption: token, encrypted body, user tag (required
+// when needTag); for a start, the model header. No run slot: a started task waits in the runtime's queue for the brain.
+func (s *server) taskGuard(start, needTag bool, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !s.authorized(r) {
 			fail(w, 401, "unauthorized")
@@ -130,7 +140,7 @@ func (s *server) taskGuard(start bool, next http.Handler) http.Handler {
 			}
 		}
 		user := r.Header.Get("X-Agent-User")
-		if user != "" && !userTagRe.MatchString(user) {
+		if user != "" && !userTagRe.MatchString(user) || user == "" && needTag {
 			fail(w, 400, "bad_user_tag")
 			return
 		}
@@ -164,6 +174,10 @@ func (s *server) taskStart(w http.ResponseWriter, r *http.Request) {
 	}
 	if !validKey(req.Key) {
 		fail(w, 400, "key must be at most 128 printable characters")
+		return
+	}
+	if req.RunSecret == "" { // status, events and cancel need a MAC with it
+		fail(w, 400, "run_secret_required")
 		return
 	}
 	if h := r.Header.Get(ModelHeader); h != cmp.Or(req.Model, proto.DefaultModel) {
@@ -228,10 +242,19 @@ func taskFail(w http.ResponseWriter, err error) {
 	fail(w, 500, "task_unavailable")
 }
 
+// authorized checks a task call's MAC (guard.Host.Authorize); false: it answered 404.
+func (s *server) authorizedTask(w http.ResponseWriter, r *http.Request, ref taskRef, op string) bool {
+	if err := s.tasks().Authorize(ref.Task, userFrom(r.Context()), op, ref.MAC); err != nil {
+		taskFail(w, err)
+		return false
+	}
+	return true
+}
+
 // taskStatus is behind EHBP: POST /tasks/status.
 func (s *server) taskStatus(w http.ResponseWriter, r *http.Request) {
 	ref, ok := readRef(w, r)
-	if !ok {
+	if !ok || !s.authorizedTask(w, r, ref, "status") {
 		return
 	}
 	st, err := s.tasks().Status(ref.Task, userFrom(r.Context()))
@@ -245,7 +268,7 @@ func (s *server) taskStatus(w http.ResponseWriter, r *http.Request) {
 // taskCancel is behind EHBP: POST /tasks/cancel.
 func (s *server) taskCancel(w http.ResponseWriter, r *http.Request) {
 	ref, ok := readRef(w, r)
-	if !ok {
+	if !ok || !s.authorizedTask(w, r, ref, "cancel") {
 		return
 	}
 	user := userFrom(r.Context())
@@ -266,22 +289,16 @@ func (s *server) taskCancel(w http.ResponseWriter, r *http.Request) {
 // once the task ended and every event after `after` was sent.
 func (s *server) taskEvents(w http.ResponseWriter, r *http.Request) {
 	ref, ok := readRef(w, r)
-	if !ok {
+	if !ok || !s.authorizedTask(w, r, ref, "events") {
 		return
 	}
 	h := s.tasks()
 	user := userFrom(r.Context())
-	if _, err := h.Status(ref.Task, user); err != nil {
-		taskFail(w, err)
-		return
-	}
-	select {
-	case s.follows <- struct{}{}:
-		defer func() { <-s.follows }()
-	default:
+	if !s.followSlot(user) {
 		fail(w, 429, "busy")
 		return
 	}
+	defer s.followDone(user)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(200)
@@ -292,6 +309,31 @@ func (s *server) taskEvents(w http.ResponseWriter, r *http.Request) {
 	})
 	if err == nil {
 		out.done()
+	}
+}
+
+// followSlot takes an event stream's slot: one of maxFollowers, and of the user's maxUserFollowers.
+func (s *server) followSlot(user string) bool {
+	s.followMu.Lock()
+	defer s.followMu.Unlock()
+	if s.userFollows[user] >= maxUserFollowers {
+		return false
+	}
+	select {
+	case s.follows <- struct{}{}:
+	default:
+		return false
+	}
+	s.userFollows[user]++
+	return true
+}
+
+func (s *server) followDone(user string) {
+	s.followMu.Lock()
+	defer s.followMu.Unlock()
+	<-s.follows
+	if s.userFollows[user]--; s.userFollows[user] <= 0 {
+		delete(s.userFollows, user)
 	}
 }
 

@@ -16,7 +16,7 @@ import (
 // Error codes people's events and records carry (proto.Event.Code).
 const (
 	CodeStopped        = "stopped"         // a stop list stops this space, its firm, or everything
-	CodeStale          = "stop_list_stale" // no fresh operator stop list: side effects (and reads, per policy) stop
+	CodeStale          = "stop_list_stale" // no fresh operator stop list: nothing goes out (without an operator key: side effects, and reads per policy)
 	CodePolicyMissing  = "policy_missing"  // admin keys are pinned but no signed policy covers the space
 	CodePolicyDenied   = "policy_denied"   // the policy doesn't allow this model, tool, connector or host
 	CodeBudgetExceeded = "budget_exceeded" // a run or daily budget is used up
@@ -50,6 +50,12 @@ const MaxSkew = 5 * time.Minute
 // DefaultMaxStopAge is how old the newest operator stop list may get before the VM counts it stale.
 const DefaultMaxStopAge = 10 * time.Minute
 
+// DefaultMaxSilence is how long the process that pulls the operator's list (agentd, through gatewayd's pull every
+// 10 s) may go without the list being delivered again before it counts as silent: about 18 missed pulls. Someone
+// who drops the pull (the host, or anything on the network path) keeps a stop from arriving; after this long the
+// VM stops everything instead of waiting for the list to age out.
+const DefaultMaxSilence = 3 * time.Minute
+
 // Config is a process's trust roots (pinned in the attested compose) and the release's ceiling.
 type Config struct {
 	Firm       string              // the firm this VM serves (one CVM per firm)
@@ -58,7 +64,11 @@ type Config struct {
 	Threshold  int                 // distinct admin signatures needed; 0: 1
 	Release    *Policy             // the release's ceiling and default (required)
 	MaxStopAge time.Duration       // 0: DefaultMaxStopAge
-	Dir        string              // where accepted documents and version floors persist; "": memory only
+	// MaxSilence: with an operator key pinned, how long the newest operator list may go without being delivered
+	// again (pulled or pushed) before nothing may go out; 0: not checked (gatewayd and vaultd, which get the list
+	// from agentd, not from the pull).
+	MaxSilence time.Duration
+	Dir        string // where accepted documents and version floors persist; "": memory only
 	Now        func() time.Time
 }
 
@@ -92,6 +102,7 @@ type State struct {
 	stops    map[string]*stopDoc   // by issuer
 	floors   map[string]floor
 	gotStop  time.Time // when the newest operator list was accepted
+	heard    time.Time // when the newest operator list was last delivered (taken, or the held one again); not from disk
 	changed  chan struct{}
 }
 
@@ -178,12 +189,13 @@ type verified struct {
 	p    *Policy
 	l    *StopList
 	at   time.Time
+	disk bool // loaded from this process's own disk, not delivered
 }
 
 // verify checks a document on its own: shape, firm, signatures, dates. No state is read.
 func (s *State) verify(e Envelope, fromDisk bool) (*verified, error) {
 	now := s.cfg.Now()
-	v := &verified{env: e, hash: e.Hash(), at: now}
+	v := &verified{env: e, hash: e.Hash(), at: now, disk: fromDisk}
 	switch e.Kind {
 	case KindPolicy:
 		var p Policy
@@ -252,6 +264,9 @@ func (s *State) take(v *verified) (bool, error) {
 	}
 	slot := "stop:" + v.l.Issuer
 	ok, err := s.check(slot, v.l.Seq, v.hash, s.stops[v.l.Issuer] != nil)
+	if v.l.Issuer == IssuerOperator && err == nil && !v.disk {
+		s.heard = v.at // taken, or the list held delivered again: the pull (or a push) still reaches the VM
+	}
 	if !ok {
 		return false, err
 	}
@@ -324,6 +339,38 @@ func (s *State) stale() bool {
 	return !now.Before(d.l.ExpiresAt) || now.Sub(d.l.IssuedAt) > s.cfg.MaxStopAge || now.Sub(s.gotStop) > s.cfg.MaxStopAge
 }
 
+// silent: MaxSilence is checked, an operator key is pinned, and the operator's list hasn't been delivered for
+// longer than that (or not since this process started).
+func (s *State) silent() bool {
+	if s.cfg.MaxSilence <= 0 || s.cfg.Operator == nil {
+		return false
+	}
+	return s.heard.IsZero() || s.cfg.Now().Sub(s.heard) > s.cfg.MaxSilence
+}
+
+// blocked: with an operator key pinned, a stale or silent stop list stops everything (model calls, searches, page
+// and image fetches, leases), whatever the policy's stale_reads says: a stop that can't arrive must not leave reads
+// running (fail closed). The release's behaviour, not a policy field, so signed policies load unchanged. Without
+// an operator key nothing could ever arrive, and the attested compose says so: side effects stop, reads follow the
+// policy.
+func (s *State) blocked() bool {
+	return s.cfg.Operator != nil && (s.stale() || s.silent())
+}
+
+// Heard says whether the operator's list has been delivered since this process started (pulled or pushed).
+func (s *State) Heard() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return !s.heard.IsZero()
+}
+
+// Blocked says whether the stop list being stale or silent stops everything now (blocked).
+func (s *State) Blocked() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.blocked()
+}
+
 // Policy is the effective policy for space.
 func (s *State) Policy(space string) (*Effective, error) {
 	s.mu.Lock()
@@ -357,7 +404,8 @@ func (s *State) policy(space string) (*Effective, error) {
 }
 
 // Check is what every process asks before doing something in space: stopped, policy present, and, when the stop
-// list is stale, whether this may go on (side effects never; reads if the policy allows).
+// list is stale or silent, whether this may go on (with an operator key pinned: nothing; without one: side effects
+// never, reads if the policy allows).
 func (s *State) Check(space string, effect bool) (*Effective, error) {
 	if !ValidID(space) { // a request must name its space: an empty one would skip space stops and policies
 		return nil, errorf(CodePolicyMissing, "the request names no space")
@@ -371,6 +419,9 @@ func (s *State) Check(space string, effect bool) (*Effective, error) {
 	if err != nil {
 		return nil, err
 	}
+	if s.blocked() {
+		return nil, errorf(CodeStale, "the VM hasn't had a fresh operator stop list recently, so nothing goes out until it does")
+	}
 	if s.stale() && (effect || !e.StaleReads()) {
 		return nil, errorf(CodeStale, "the VM has no fresh stop list, so it can't go on (actions with side effects always stop)")
 	}
@@ -383,8 +434,14 @@ type Status struct {
 	Release     string   `json:"release_policy"`        // hash of the release's ceiling policy
 	OperatorSeq uint64   `json:"operator_seq,omitzero"` // newest operator stop list
 	FirmSeq     uint64   `json:"firm_seq,omitzero"`     // newest firm stop list
-	Fresh       bool     `json:"stop_list_fresh"`       // operator list fresh
+	Fresh       bool     `json:"stop_list_fresh"`       // operator list fresh, and (where checked) delivered recently
 	Stopped     string   `json:"stopped,omitzero"`      // issuer of the list that stops this space
+	// Blocked: the stop list is stale or silent with an operator key pinned, so nothing goes out (no model calls,
+	// searches, page or image fetches) until a fresh one arrives.
+	Blocked bool `json:"egress_blocked,omitzero"`
+	// HeardS: seconds since the operator's list was last delivered to this process (pulled or pushed); absent when
+	// it hasn't been since the process started.
+	HeardS *int64 `json:"stop_list_heard_s,omitzero"`
 }
 
 // ReleaseHash identifies the release's ceiling policy: sha256 of its JSON as the release encodes it.
@@ -398,7 +455,11 @@ func ReleaseHash(p *Policy) string {
 func (s *State) StatusOf(space string) Status {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	st := Status{Release: ReleaseHash(s.cfg.Release), Fresh: !s.stale()}
+	st := Status{Release: ReleaseHash(s.cfg.Release), Fresh: !s.stale() && !s.silent(), Blocked: s.blocked()}
+	if !s.heard.IsZero() {
+		n := max(0, int64(s.cfg.Now().Sub(s.heard)/time.Second))
+		st.HeardS = &n
+	}
 	if e, err := s.policy(space); err == nil {
 		st.Policy = e.Hashes
 	}

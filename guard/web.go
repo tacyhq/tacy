@@ -120,6 +120,7 @@ func (g *Guard) Action(ctx context.Context, ti *harness.TaskInfo, id string, req
 		g.record(Egress{Task: ti.ID, Action: id, Op: req.Name, Decision: "redacted", Rule: "leak_scan", Patterns: ids})
 		FactsFrom(ctx).leak(false, ids)
 	}
+	t.tools.citedUnder(out.citations, call) // a card about one of these sources gets its picture there (cardpics.go)
 	if !json.Valid(shown) {
 		shown = json.RawMessage(`null`)
 	}
@@ -182,7 +183,7 @@ func (g *Guard) lateImages(t *task, action, call string, shown int, tail *imageT
 		st := tail.st
 		st.bytes = bytes
 		lateMetric(m, st, used, tail.slots-used)
-		t.background.imageFailures(tail.st.reasons)
+		t.background.imageCounts(used, tail.st.reasons)
 		t.background.imageNever(tail.slots - used)
 		if m != nil {
 			t.emit(proto.Event{Type: "metrics", Metrics: m})

@@ -129,7 +129,8 @@ type task struct {
 	tools      *Tools         // citation numbers and image slots, per task
 	icons      *siteIcons     // nil: none
 	late       sync.WaitGroup // image searches whose images still land after their result (lateImages)
-	lateMu     sync.Mutex     // late.Add only while the task's context is live (close)
+	lateMu     sync.Mutex     // late.Add (and cards.wg.Add) only while the task's context is live (close)
+	cards      *cardPics      // the answer's card pictures from the task's own sources (cardpics.go)
 
 	emitMu sync.Mutex
 	out    func(proto.Event) error // the person's stream; nil: nobody watches
@@ -290,6 +291,7 @@ func (g *Guard) open(id string, opts TaskOptions, out func(proto.Event) error) *
 	t.ctx = WithFacts(t.ctx, t.background)
 	t.icons = newSiteIcons(t.ctx, g.cfg.Icons, g.gates.iconGate(), t.tools.decodes, t.emit)
 	t.tools.bg = t.ctx // an image search's downloads may finish after its result (findImages)
+	t.cards = newCardPics()
 	g.tasks[id] = t
 	return t
 }
@@ -301,6 +303,7 @@ func (g *Guard) close(t *task) {
 	t.lateMu.Lock() // no late.Add after this (lateImages checks the context under it)
 	t.lateMu.Unlock()
 	t.late.Wait() // the task's context ended: their downloads stop
+	t.cards.wg.Wait()
 	t.emitMu.Lock()
 	t.closed = true
 	t.emitMu.Unlock()
@@ -370,12 +373,19 @@ func (s *localSession) End() (int, string) {
 	t.mu.Unlock()
 	// Images still loading and icons still being fetched get a short grace, at the same time (from the old
 	// app/agent.go Run; shortened in vm-speed), then they're dropped.
-	images := make(chan struct{})
+	// Card pictures still loading get a little longer (cardEndWait): the answer's last items block may have closed
+	// just now.
+	images, cards := make(chan struct{}), make(chan struct{})
 	go func() { t.waitLate(imageEndWait); close(images) }()
+	go func() { t.cards.wait(cardEndWait); close(cards) }()
 	if m := t.icons.finish(iconEndWait, step); m != nil {
 		t.emit(proto.Event{Type: "metrics", Metrics: m})
 	}
 	<-images
+	<-cards
+	if m := t.cards.end(step, t.background); m != nil {
+		t.emit(proto.Event{Type: "metrics", Metrics: m})
+	}
 	s.g.close(t)
 	return step, finish
 }
@@ -589,7 +599,8 @@ func chatInstructions(actions []string, now time.Time, reader bool) string {
 	}
 	if slices.Contains(actions, "web.images") {
 		img := harness.ModelToolName("web.images")
-		b.WriteString(`- You can show pictures: when the user asks for images, pictures, photos, posters, artwork or what something looks like, call ` + img + `. The app shows the images in a gallery under your answer. Never say you can't display or show images, and don't embed images as Markdown or list image URLs.
+		b.WriteString(`- You can show pictures: when the user asks for photos or pictures of real things, posters, artwork or what something looks like, call ` + img + ` (not for drawings, graphs or diagrams the user wants made: draw those yourself). The app shows the images in a gallery under your answer. Never say you can't display or show images, and don't embed images as Markdown or list image URLs.
+- A search result or page marked "picture": true has its own picture: a card whose source is that result gets it, with no ` + img + ` call.
 `)
 	}
 	return b.String()

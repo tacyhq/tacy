@@ -185,6 +185,7 @@ func (g *recGateway) RunEnded(task string, e guard.RunEnd) []proto.Event {
 	g.mu.Lock()
 	end.Background = g.bg[task].Hosts
 	end.BackgroundImages = g.bg[task].Images
+	end.CardPictures = g.bg[task].CardPictures
 	end.Tainted = g.history[task]
 	delete(g.history, task)
 	g.mu.Unlock()

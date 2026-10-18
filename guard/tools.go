@@ -55,7 +55,7 @@ var toolDefs = map[string]toolDef{
 		"Fetch a public web page (http or https) and return its main text, capped at about 12,000 characters.",
 		`{"type":"object","properties":{"url":{"type":"string","description":"absolute http(s) URL, or a source's number in brackets from earlier results, like [3]"}},"required":["url"]}`),
 	"image_search": def("image_search",
-		"Find pictures on the web (posters, photos, artwork, maps, diagrams) and show them to the user in a gallery under your answer. Use it whenever the user asks to see images, pictures, photos or posters. Returns each shown image's title and source page; the user sees the images, you don't.",
+		"Find photos of real things on the web (products, places, people, posters, artwork) and show them to the user in a gallery under your answer. Not for drawings, graphs, diagrams or figures the user wants made: draw those yourself. Not needed for a card whose source is marked \"picture\": true: it gets that source's own picture. Returns each shown image's title and source page; the user sees the images, you don't.",
 		`{"type":"object","properties":{"query":{"type":"string","description":"what to find pictures of, short and generic"},"count":{"type":"integer","minimum":1,"maximum":6,"description":"images to show (default 4)"}},"required":["query"]}`),
 }
 
@@ -90,7 +90,10 @@ type pending struct {
 	read *readerResult
 }
 
-type fetched struct{ title, text, final string }
+type fetched struct {
+	title, text, final string
+	pics               []picCand // the page's own pictures, from its metadata (pagePictures)
+}
 
 // Tools runs tool calls for one /run request. Citation numbers continue across calls within the run. Exec may
 // run concurrently; Finish must be called in call order from one goroutine.
@@ -114,6 +117,10 @@ type Tools struct {
 	// bg is the task's context (ends with the task; its egress goes on the task's background record): an image
 	// search's downloads may go on under it after the call returned (findImages). nil: they don't.
 	bg context.Context
+	// pics are the card picture candidates of the task's sources, by page (picKey), page metadata first (cardpics.go);
+	// cites is each citation number's source as people see it and the call it was shown under. Guarded by mu.
+	pics  map[string][]picCand
+	cited map[int]citedSource
 }
 
 // sourceMap is a copy of the task's sources ([n] -> address).
@@ -225,9 +232,9 @@ func (t *Tools) Exec(ctx context.Context, name string, args json.RawMessage) (pe
 		}
 		var gate toolOutcome
 		release, err := t.enter(ctx, "fetch", &gate)
-		var title, text, final string
+		var page fetched
 		if err == nil {
-			title, text, final, err = t.fetch(ctx, a.URL)
+			page, err = t.fetch(ctx, a.URL)
 		}
 		release()
 		if err != nil {
@@ -235,7 +242,7 @@ func (t *Tools) Exec(ctx context.Context, name string, args json.RawMessage) (pe
 			o.ran, o.failed, o.wait = true, "error", gate.wait
 			return pending{out: o}, args
 		}
-		return pending{out: toolOutcome{ran: true, wait: gate.wait}, page: &fetched{title, text, final}}, args
+		return pending{out: toolOutcome{ran: true, wait: gate.wait}, page: &page}, args
 	case "image_search":
 		var a struct {
 			Query string `json:"query"`
@@ -331,11 +338,19 @@ func (t *Tools) finish(p pending) toolOutcome {
 		t.cites++
 		// The page's own title is its text too: the model gets the reader's (read.source.title), people the page's.
 		// Its address (after redirects: the page's author chose it) too: the model gets its site and number.
-		return t.finishRead(p, out, []int{t.cites}, map[string]any{"note": readerNote, "n": t.cites, "site": siteOf(p.page.final)},
+		head := map[string]any{"note": readerNote, "n": t.cites, "site": siteOf(p.page.final)}
+		if t.addPics(p.page.final, p.page.pics...) {
+			head["picture"] = true // its card gets the page's own picture (cardpics.go)
+		}
+		return t.finishRead(p, out, []int{t.cites}, head,
 			[]proto.Citation{{Index: t.cites, Title: p.page.title, URL: p.page.final, Snippet: capRunes(p.page.text, 200)}})
 	case p.page != nil:
 		t.cites++
-		b, _ := json.Marshal(map[string]any{"note": untrustedNote, "n": t.cites, "url": p.page.final, "title": p.page.title, "text": p.page.text})
+		res := map[string]any{"note": untrustedNote, "n": t.cites, "url": p.page.final, "title": p.page.title, "text": p.page.text}
+		if t.addPics(p.page.final, p.page.pics...) {
+			res["picture"] = true
+		}
+		b, _ := json.Marshal(res)
 		out.content = string(b)
 		out.citations = []proto.Citation{{Index: t.cites, Title: p.page.title, URL: p.page.final, Snippet: capRunes(p.page.text, 200)}}
 		return out
@@ -346,22 +361,24 @@ func (t *Tools) finish(p pending) toolOutcome {
 		URL     string `json:"url"`
 		Snippet string `json:"snippet"`
 		Age     string `json:"age,omitempty"`
+		Picture bool   `json:"picture,omitzero"` // a card for it gets its own picture (cardpics.go)
 	}
 	if p.read != nil {
 		// The model gets each result's number, site and age (code's) and the reader's fields over the titles,
 		// snippets and full addresses (text a page's author writes: people see them, the model doesn't; it fetches a
 		// result by its number).
 		type ritem struct {
-			N    int    `json:"n"`
-			Site string `json:"site"`
-			Age  string `json:"age,omitempty"`
+			N       int    `json:"n"`
+			Site    string `json:"site"`
+			Age     string `json:"age,omitempty"`
+			Picture bool   `json:"picture,omitzero"`
 		}
 		rs := []ritem{}
 		var ns []int
 		var cites []proto.Citation
 		for _, r := range p.results {
 			t.cites++
-			rs = append(rs, ritem{t.cites, siteOf(r.URL), r.Age})
+			rs = append(rs, ritem{t.cites, siteOf(r.URL), r.Age, t.addPics(r.URL, thumbCands(r.Thumbs)...)})
 			ns = append(ns, t.cites)
 			cites = append(cites, proto.Citation{Index: t.cites, Title: r.Title, URL: r.URL, Snippet: r.Snippet, Age: r.Age})
 		}
@@ -374,7 +391,7 @@ func (t *Tools) finish(p pending) toolOutcome {
 	}{Note: untrustedNote, Query: p.query, Results: []item{}}
 	for _, r := range p.results {
 		t.cites++
-		res.Results = append(res.Results, item{t.cites, r.Title, r.URL, r.Snippet, r.Age})
+		res.Results = append(res.Results, item{t.cites, r.Title, r.URL, r.Snippet, r.Age, t.addPics(r.URL, thumbCands(r.Thumbs)...)})
 		out.citations = append(out.citations, proto.Citation{Index: t.cites, Title: r.Title, URL: r.URL, Snippet: r.Snippet, Age: r.Age})
 	}
 	b, _ := json.Marshal(res)
@@ -461,10 +478,10 @@ var pageHeaders = map[string]string{
 	"Upgrade-Insecure-Requests": "1",
 }
 
-func (t *Tools) fetch(ctx context.Context, raw string) (title, text, final string, err error) {
+func (t *Tools) fetch(ctx context.Context, raw string) (fetched, error) {
 	u, err := url.Parse(raw)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil {
-		return "", "", "", errors.New("only absolute http(s) URLs without credentials")
+		return fetched{}, errors.New("only absolute http(s) URLs without credentials")
 	}
 	req, _ := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
 	for k, v := range pageHeaders {
@@ -472,33 +489,35 @@ func (t *Tools) fetch(ctx context.Context, raw string) (title, text, final strin
 	}
 	res, err := t.fetcher.Do(req)
 	if err != nil {
-		return "", "", "", fmt.Errorf("fetch failed: %s", errText(err))
+		return fetched{}, fmt.Errorf("fetch failed: %s", errText(err))
 	}
 	defer res.Body.Close()
 	if res.StatusCode != 200 {
-		return "", "", "", fmt.Errorf("fetch failed: HTTP %d", res.StatusCode)
+		return fetched{}, fmt.Errorf("fetch failed: HTTP %d", res.StatusCode)
 	}
 	ct, _, _ := mime.ParseMediaType(res.Header.Get("Content-Type"))
-	final = res.Request.URL.String()
+	var f fetched
+	f.final = res.Request.URL.String()
 	switch {
 	case ct == "text/html" || ct == "application/xhtml+xml" || ct == "":
 		// Up to maxPageRead bytes stream through a filter that keeps at most maxPageBytes of the markup that can
 		// become text (page.go: a store's menus and scripts can fill the first 2 MiB before the product starts).
 		page, err := readHTML(res.Body)
 		if err != nil {
-			return "", "", "", errors.New("fetch failed while reading")
+			return fetched{}, errors.New("fetch failed while reading")
 		}
-		title, text = htmlText(string(page))
+		f.title, f.text, f.pics = htmlPage(string(page), res.Request.URL)
 	case strings.HasPrefix(ct, "text/") || ct == "application/json":
 		body, err := io.ReadAll(io.LimitReader(res.Body, maxPageBytes))
 		if err != nil {
-			return "", "", "", errors.New("fetch failed while reading")
+			return fetched{}, errors.New("fetch failed while reading")
 		}
-		text = string(body)
+		f.text = string(body)
 	default:
-		return "", "", "", fmt.Errorf("unsupported content type %s", ct)
+		return fetched{}, fmt.Errorf("unsupported content type %s", ct)
 	}
-	return capRunes(clean(title, 300), 300), capRunes(strings.TrimSpace(text), maxPageChars), final, nil
+	f.title, f.text = capRunes(clean(f.title, 300), 300), capRunes(strings.TrimSpace(f.text), maxPageChars)
+	return f, nil
 }
 
 // errText keeps network errors short and free of internal addresses.

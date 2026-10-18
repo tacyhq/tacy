@@ -577,7 +577,7 @@ wait:
 			st.bytes += len(r.img.JPEG)
 		}
 	}
-	reqFacts.imageFailures(st.reasons) // the action's record: what failed before its result
+	reqFacts.imageCounts(len(imgs), st.reasons) // the action's record: what it showed and what failed before its result
 	if left := want - len(imgs); left > 0 && background && !finished && ctx.Err() == nil {
 		tail = &imageTail{ch: make(chan shownImage, left), slots: left, left: left}
 	}
@@ -688,13 +688,13 @@ func rankCandidates(query string, list []ImageCandidate) []ImageCandidate {
 	return out
 }
 
-// imageFailures puts failed downloads on the record, by reason (FactsData.Images).
-func (f *Facts) imageFailures(reasons map[string]int) {
+// imageCounts puts the pictures shown and the failed downloads, by reason, on the record (FactsData.Images).
+func (f *Facts) imageCounts(shown int, reasons map[string]int) {
 	n := 0
 	for _, c := range reasons {
 		n += c
 	}
-	f.addImages(&activity.Images{Failed: n, Reasons: maps.Clone(reasons)})
+	f.addImages(&activity.Images{Shown: shown, Failed: n, Reasons: maps.Clone(reasons)})
 }
 
 // imageNever puts gallery slots that stayed empty on the record (never_arrived).
@@ -705,7 +705,7 @@ func (f *Facts) imageNever(n int) {
 }
 
 func (f *Facts) addImages(m *activity.Images) {
-	if f == nil || m.Failed == 0 {
+	if f == nil || m.Failed == 0 && m.Shown == 0 {
 		return
 	}
 	f.mu.Lock()

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -21,6 +22,27 @@ type SearchResult struct {
 	URL     string
 	Snippet string
 	Age     string
+	// Thumbs are the result's own pictures as the provider names them (Brave: the thumbnail's original URL, never
+	// its proxy; Tavily: the result's images), at most maxThumbs, http(s) only, logos and SVGs left out. Never shown
+	// to the model: a card for this result may get one (cardpics.go).
+	Thumbs []string
+}
+
+// maxThumbs is how many of a result's pictures are kept as card picture candidates.
+const maxThumbs = 2
+
+// thumbsOf keeps a result's first usable pictures (cardpics.go's address rules), at most maxThumbs.
+func thumbsOf(urls ...string) []string {
+	var out []string
+	for _, u := range urls {
+		if len(out) == maxThumbs {
+			break
+		}
+		if u = strings.TrimSpace(u); len(u) <= 1000 && httpURL(u) && picURLRefused(u) == "" && !slices.Contains(out, u) {
+			out = append(out, u)
+		}
+	}
+	return out
 }
 
 // SearchProvider runs a web search. The query it gets is already PII-masked.
@@ -97,6 +119,12 @@ func (b *brave) Search(ctx context.Context, query string, count int) ([]SearchRe
 				Description   string   `json:"description"`
 				Age           string   `json:"age"`
 				ExtraSnippets []string `json:"extra_snippets"`
+				// Thumbnail: Src is Brave's proxy (imgs.search.brave.com), never fetched; Original the site's own
+				// picture; Logo marks the site's logo (left out).
+				Thumbnail struct {
+					Original string `json:"original"`
+					Logo     bool   `json:"logo"`
+				} `json:"thumbnail"`
 			} `json:"results"`
 		} `json:"web"`
 	}
@@ -113,8 +141,12 @@ func (b *brave) Search(ctx context.Context, query string, count int) ([]SearchRe
 		if len(r.ExtraSnippets) > 0 {
 			snippet += " … " + r.ExtraSnippets[0]
 		}
+		var thumbs []string
+		if !r.Thumbnail.Logo {
+			thumbs = thumbsOf(r.Thumbnail.Original)
+		}
 		rs = append(rs, SearchResult{Title: clean(r.Title, 200), URL: capRunes(r.URL, 500),
-			Snippet: clean(snippet, 600), Age: clean(r.Age, 40)})
+			Snippet: clean(snippet, 600), Age: clean(r.Age, 40), Thumbs: thumbs})
 		if len(rs) == count {
 			break
 		}
@@ -142,8 +174,10 @@ func (t *tavily) Search(ctx context.Context, query string, count int) ([]SearchR
 		return nil, err
 	}
 	defer key.Wipe()
+	// include_images: each result then lists its page's pictures (the first is usually the page's main one), card
+	// picture candidates (cardpics.go); the same one credit.
 	body, _ := json.Marshal(map[string]any{"query": query, "max_results": count, "search_depth": "basic",
-		"include_answer": false, "include_raw_content": false, "include_images": false})
+		"include_answer": false, "include_raw_content": false, "include_images": true})
 	req, _ := http.NewRequestWithContext(ctx, "POST", t.base, strings.NewReader(string(body)))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+string(key.Bytes()))
@@ -162,10 +196,11 @@ func (t *tavily) Search(ctx context.Context, query string, count int) ([]SearchR
 	}
 	var out struct {
 		Results []struct {
-			Title         string `json:"title"`
-			URL           string `json:"url"`
-			Content       string `json:"content"`
-			PublishedDate string `json:"published_date"`
+			Title         string        `json:"title"`
+			URL           string        `json:"url"`
+			Content       string        `json:"content"`
+			PublishedDate string        `json:"published_date"`
+			Images        []tavilyImage `json:"images"`
 		} `json:"results"`
 	}
 	if err := json.Unmarshal(raw, &out); err != nil {
@@ -177,8 +212,12 @@ func (t *tavily) Search(ctx context.Context, query string, count int) ([]SearchR
 		if err != nil || (u.Scheme != "https" && u.Scheme != "http") {
 			continue
 		}
+		var imgs []string
+		for _, im := range r.Images {
+			imgs = append(imgs, im.URL)
+		}
 		rs = append(rs, SearchResult{Title: clean(r.Title, 200), URL: capRunes(r.URL, 500),
-			Snippet: clean(r.Content, 600), Age: clean(r.PublishedDate, 40)})
+			Snippet: clean(r.Content, 600), Age: clean(r.PublishedDate, 40), Thumbs: thumbsOf(imgs...)})
 		if len(rs) == count {
 			break
 		}

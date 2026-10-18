@@ -38,6 +38,9 @@ type FactsData struct {
 	// Images: an image search's pictures that didn't make it, by reason (images.go): the action's for what failed
 	// before its result, the task's background facts for what failed or never landed after it.
 	Images *activity.Images `json:"images,omitzero"`
+	// CardPictures: the answer's card pictures taken from the task's own sources (cardpics.go), on the task's
+	// background facts.
+	CardPictures *activity.Images `json:"card_pictures,omitzero"`
 }
 
 // ModelAttempt is a model call given up for a fallback (fallback.go): its model, why (abandoned_slow or
@@ -70,14 +73,14 @@ func (f *Facts) Data() FactsData {
 	defer f.mu.Unlock()
 	return FactsData{Hosts: slices.Clone(f.d.Hosts), Leases: slices.Clone(f.d.Leases), Blocked: slices.Clone(f.d.Blocked),
 		Redacted: slices.Clone(f.d.Redacted), Reader: slices.Clone(f.d.Reader), Model: f.d.Model, Abandoned: slices.Clone(f.d.Abandoned),
-		Images: f.d.Images.Clone()}
+		Images: f.d.Images.Clone(), CardPictures: f.d.CardPictures.Clone()}
 }
 
 // Ptr is Data as a pointer, nil when nothing was collected (nil f too): what gateway/v0 sends.
 func (f *Facts) Ptr() *FactsData {
 	d := f.Data()
 	if len(d.Hosts) == 0 && len(d.Leases) == 0 && len(d.Blocked) == 0 && len(d.Redacted) == 0 && len(d.Reader) == 0 &&
-		d.Model == "" && len(d.Abandoned) == 0 && d.Images == nil {
+		d.Model == "" && len(d.Abandoned) == 0 && d.Images == nil && d.CardPictures == nil {
 		return nil
 	}
 	return &d
@@ -106,6 +109,7 @@ func (f *Facts) Merge(d FactsData) {
 		f.d.Model = d.Model
 	}
 	f.d.Images = f.d.Images.Add(d.Images)
+	f.d.CardPictures = f.d.CardPictures.Add(d.CardPictures)
 	f.d.Blocked = addIDs(f.d.Blocked, d.Blocked)
 	f.d.Redacted = addIDs(f.d.Redacted, d.Redacted)
 }

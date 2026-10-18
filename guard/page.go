@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net/url"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -149,10 +151,25 @@ var blockTags = map[string]bool{"p": true, "div": true, "br": true, "li": true, 
 // htmlText extracts the title and readable text of an HTML page: its structured facts, then its main content,
 // or the whole page when no content element is found.
 func htmlText(src string) (title, text string) {
+	title, text, _ = htmlPage(src, nil)
+	return title, text
+}
+
+// htmlPage is htmlText plus the page's own pictures as its metadata names them (pagePictures; none without base,
+// the page's address after redirects, which relative addresses resolve against).
+func htmlPage(src string, base *url.URL) (title, text string, pics []picCand) {
 	doc, err := html.Parse(strings.NewReader(src))
 	if err != nil {
-		return "", ""
+		return "", "", nil
 	}
+	if base != nil {
+		pics = pagePictures(doc, base)
+	}
+	title, text = htmlDoc(doc)
+	return title, text, pics
+}
+
+func htmlDoc(doc *html.Node) (title, text string) {
 	title = pageTitle(doc)
 	facts := structuredFacts(doc)
 	body := ""
@@ -546,4 +563,157 @@ func compact(ss []string) []string {
 		}
 	}
 	return out
+}
+
+// ---- the page's own pictures ---------------------------------------------------------------------------------
+
+// maxPagePics is how many pictures a page's metadata may name as card picture candidates.
+const maxPagePics = 3
+
+// pagePictures are the pictures a page names as its own in its metadata, best first: the image of the page's one
+// JSON-LD product (or its offers'), then og:image (og:image:secure_url first), then twitter:image, then
+// <link rel="image_src">. Only the markup's structured fields, never its text and never the model's: each
+// address resolved against the page's (base), http(s) only (javascript:, data: and the rest dropped), without
+// credentials, SVG and logo-looking addresses left out (picURLRefused). The fetch itself goes through the same
+// dialer as any page (cardpics.go). og:image:alt and twitter:image:alt are kept for the caption check.
+func pagePictures(doc *html.Node, base *url.URL) []picCand {
+	var ld, og, ogSecure, tw, link []string
+	var ogAlt, twAlt string
+	var items []map[string]any
+	blocks := 0
+	var walk func(n *html.Node)
+	walk = func(n *html.Node) {
+		if n.Type == html.ElementNode {
+			switch n.DataAtom {
+			case atom.Meta:
+				key := strings.ToLower(strings.TrimSpace(cmpStr(attr(n, "property"), attr(n, "name"))))
+				v := attr(n, "content")
+				switch key {
+				case "og:image", "og:image:url":
+					og = append(og, v)
+				case "og:image:secure_url":
+					ogSecure = append(ogSecure, v)
+				case "twitter:image", "twitter:image:src":
+					tw = append(tw, v)
+				case "og:image:alt":
+					ogAlt = cmpStr(ogAlt, v)
+				case "twitter:image:alt":
+					twAlt = cmpStr(twAlt, v)
+				}
+			case atom.Link:
+				if strings.EqualFold(strings.TrimSpace(attr(n, "rel")), "image_src") {
+					link = append(link, attr(n, "href"))
+				}
+			case atom.Script:
+				if blocks < maxLDBlocks && isLDJSON(attr(n, "type")) && n.FirstChild != nil && len(n.FirstChild.Data) <= maxLDBytes {
+					blocks++
+					var v any
+					if json.Unmarshal([]byte(strings.TrimSpace(n.FirstChild.Data)), &v) == nil {
+						collectLD(v, &items, 0)
+					}
+				}
+				return
+			case atom.Svg, atom.Template:
+				return
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(doc)
+	// A page about one product: its picture. A page listing several (a roundup) names none of them as its own.
+	var products []map[string]any
+	for _, it := range items {
+		if hasType(it, "Product", "ProductGroup", "IndividualProduct", "ProductModel") {
+			products = append(products, it)
+		}
+	}
+	if len(products) == 1 {
+		ld = ldImages(products[0]["image"])
+		if len(ld) == 0 {
+			ld = offerImages(products[0]["offers"])
+		}
+	}
+	var out []picCand
+	add := func(urls []string, alt string) {
+		for _, raw := range urls {
+			if len(out) == maxPagePics {
+				return
+			}
+			u := resolvePic(base, raw)
+			if u == "" || slices.ContainsFunc(out, func(c picCand) bool { return c.url == u }) {
+				continue
+			}
+			out = append(out, picCand{url: u, kind: picPage, alt: clean(alt, 200)})
+		}
+	}
+	add(ld, "")
+	add(ogSecure, ogAlt)
+	add(og, ogAlt)
+	add(tw, twAlt)
+	add(link, "")
+	return out
+}
+
+// ldImages are the addresses in a JSON-LD image value: a URL, an ImageObject (url or contentUrl), or a list of
+// either (the first few).
+func ldImages(v any) []string {
+	var out []string
+	var walk func(v any, depth int)
+	walk = func(v any, depth int) {
+		if depth > 2 || len(out) >= 8 {
+			return
+		}
+		switch x := v.(type) {
+		case string:
+			out = append(out, x)
+		case []any:
+			for _, e := range x {
+				walk(e, depth+1)
+			}
+		case map[string]any:
+			if s, ok := x["url"].(string); ok {
+				out = append(out, s)
+			} else if s, ok := x["contentUrl"].(string); ok {
+				out = append(out, s)
+			}
+		}
+	}
+	walk(v, 0)
+	return out
+}
+
+// offerImages: the image of a product's offer (an Offer, or a list of them), when the product names none.
+func offerImages(v any) []string {
+	switch x := v.(type) {
+	case []any:
+		for _, e := range x {
+			if im := offerImages(e); len(im) > 0 {
+				return im
+			}
+		}
+	case map[string]any:
+		return ldImages(x["image"])
+	}
+	return nil
+}
+
+// resolvePic is a picture's address from a page's metadata, resolved against the page's, or "" when it isn't one
+// to fetch: not http(s) (javascript:, data:, blob:, ...), credentials in it, longer than 1,000 characters, or
+// refused by picURLRefused (SVG, logos and icons by their address).
+func resolvePic(base *url.URL, raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || len(raw) > 1000 {
+		return ""
+	}
+	u, err := base.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil {
+		return ""
+	}
+	s := u.String()
+	if len(s) > 1000 || picURLRefused(s) != "" {
+		return ""
+	}
+	return s
 }

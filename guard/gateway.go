@@ -109,8 +109,12 @@ func (g *Guard) ModelCall(ctx context.Context, ti *harness.TaskInfo, req *harnes
 			delta = string(exactRedact([]byte(delta), leased))
 		}
 		t.emit(proto.Event{Type: kind, Delta: delta})
+		if kind == "text" {
+			g.cardText(t, delta) // an items block that closes: its cards' pictures from their sources (cardpics.go)
+		}
 		return nil // a person who went away cancels the task (Run); the model call itself finishes
 	}
+	t.cards.reset()
 	a := g.try(ctx, t, step, model, raw, fallback, onDelta)
 	// For the activity record: one request to the model's host (the key's lease names it), the request's bytes
 	// before EHBP encryption and the answer's as it streamed back (text, reasoning and tool calls' names and
@@ -129,6 +133,7 @@ func (g *Guard) ModelCall(ctx context.Context, ti *harness.TaskInfo, req *harnes
 		t.emit(proto.Event{Type: "model_switched", Step: step, From: model, To: fallback})
 		model, effort = fallback, effortFor(fallback, effort)
 		raw, t0, outBytes = build(model, effort), time.Now(), 0
+		t.cards.reset()
 		a = g.try(ctx, t, step, model, raw, "", onDelta)
 		FactsFrom(ctx).model(int64(len(raw)), outBytes)
 	}

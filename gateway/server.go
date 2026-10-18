@@ -211,7 +211,7 @@ func (s *Server) do(ctx context.Context, sess guard.Session, ti *harness.TaskInf
 	case tEnd:
 		res.Step, res.Finish = sess.End()
 		if b, ok := sess.(guard.BackgroundSession); ok {
-			if d := b.Background(); len(d.Hosts) > 0 || d.Images != nil {
+			if d := b.Background(); len(d.Hosts) > 0 || d.Images != nil || d.CardPictures != nil {
 				res.Facts = &d
 			}
 		}

@@ -485,6 +485,9 @@ func main() {
 		host: host, prompts: rg.prompts}
 	ctx := context.Background()
 	s.resumeTasks(ctx, ids, log.Printf)
+	if d, ok := p.(*dstack); ok { // the first /attest after a cold start then waits for one guest agent call, not two
+		go d.PrefetchInfo(ctx, 2*time.Second, 3*time.Minute)
+	}
 	go sg.enforce(ctx, 2*time.Second)
 	go pruneActivity(ctx, astore)
 	go func() { // gatewayd (and through it the vault) gets agentd's documents now and every 10 s

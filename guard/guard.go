@@ -119,8 +119,10 @@ type task struct {
 	// background collects the egress made under ctx outside any request (site icons), for the activity record.
 	background *Facts
 	cancel     context.CancelFunc
-	tools      *Tools     // citation numbers and image slots, per task
-	icons      *siteIcons // nil: none
+	tools      *Tools         // citation numbers and image slots, per task
+	icons      *siteIcons     // nil: none
+	late       sync.WaitGroup // image searches whose images still land after their result (lateImages)
+	lateMu     sync.Mutex     // late.Add only while the task's context is live (close)
 
 	emitMu sync.Mutex
 	out    func(proto.Event) error // the person's stream; nil: nobody watches
@@ -275,14 +277,18 @@ func (g *Guard) open(id string, opts TaskOptions, out func(proto.Event) error) *
 	t.background = &Facts{} // the site icons' egress, for the activity record
 	t.ctx = WithFacts(t.ctx, t.background)
 	t.icons = newSiteIcons(t.ctx, g.cfg.Icons, g.gates.iconGate(), t.tools.decodes, t.emit)
+	t.tools.bg = t.ctx // an image search's downloads may finish after its result (findImages)
 	g.tasks[id] = t
 	return t
 }
 
-// close forgets a task: its icons stop and nothing more is emitted.
+// close forgets a task: its icons and late images stop and nothing more is emitted.
 func (g *Guard) close(t *task) {
 	t.icons.stop()
 	t.cancel()
+	t.lateMu.Lock() // no late.Add after this (lateImages checks the context under it)
+	t.lateMu.Unlock()
+	t.late.Wait() // the task's context ended: their downloads stop
 	t.emitMu.Lock()
 	t.closed = true
 	t.emitMu.Unlock()
@@ -350,10 +356,14 @@ func (s *localSession) End() (int, string) {
 	t.mu.Lock()
 	step, finish := t.step, cmp.Or(t.finish, "stop")
 	t.mu.Unlock()
-	// Icons still being fetched get a short grace (from the old app/agent.go Run).
+	// Images still loading and icons still being fetched get a short grace, at the same time (from the old
+	// app/agent.go Run; shortened in vm-speed), then they're dropped.
+	images := make(chan struct{})
+	go func() { t.waitLate(imageEndWait); close(images) }()
 	if m := t.icons.finish(iconEndWait, step); m != nil {
 		t.emit(proto.Event{Type: "metrics", Metrics: m})
 	}
+	<-images
 	s.g.close(t)
 	return step, finish
 }
@@ -594,3 +604,16 @@ func label(s string, max int) bool {
 }
 
 func msSince(t time.Time) int64 { return time.Since(t).Milliseconds() }
+
+// waitLate waits up to d for the task's image searches still loading (lateImages).
+func (t *task) waitLate(d time.Duration) {
+	done := make(chan struct{})
+	go func() { t.late.Wait(); close(done) }()
+	tm := time.NewTimer(d)
+	defer tm.Stop()
+	select {
+	case <-done:
+	case <-tm.C:
+	case <-t.ctx.Done():
+	}
+}

@@ -73,6 +73,7 @@ type toolOutcome struct {
 	failed   string
 	wait     time.Duration
 	images   []shownImage  // image_search: the images to send (image events), in order
+	tail     *imageTail    // image_search: images still loading after the call returned (nil: none)
 	istats   *imageStats   // image_search: numbers for the metrics event
 	quotes   []proto.Quote // read by the quarantined reader: the exact passages, for the person only (tool_result)
 }
@@ -110,6 +111,9 @@ type Tools struct {
 	imagesUsed int // image slots taken this run (maxImagesPerRun)
 	// gate waits for the caps a network call needs ("search" or "fetch") and returns their release; nil = none.
 	gate func(ctx context.Context, kind string) (func(), error)
+	// bg is the task's context (ends with the task; its egress goes on the task's background record): an image
+	// search's downloads may go on under it after the call returned (findImages). nil: they don't.
+	bg context.Context
 }
 
 // sourceMap is a copy of the task's sources ([n] -> address).
@@ -253,15 +257,19 @@ func (t *Tools) Exec(ctx context.Context, name string, args json.RawMessage) (pe
 			return pending{out: o}, shown
 		}
 		out := toolOutcome{masked: masked, ran: true, provider: t.search.Name()}
-		imgs, st, err := t.findImages(ctx, q, want, &out)
-		t.returnImages(want - len(imgs))
+		imgs, st, tail, err := t.findImages(ctx, q, want, &out)
+		later := 0
+		if tail != nil {
+			later = tail.slots // kept until the tail ends (Guard.lateImages gives back what it didn't use)
+		}
+		t.returnImages(want - len(imgs) - later)
 		out.istats = &st
 		if err != nil {
 			o := errorOutcome(err.Error())
 			o.masked, o.ran, o.provider, o.failed, o.wait, o.istats = masked, true, out.provider, "error", out.wait, &st
 			return pending{out: o}, shown
 		}
-		out.images = imgs
+		out.images, out.tail = imgs, tail
 		return pending{out: out, query: q}, shown
 	}
 	return pending{out: errorOutcome("unknown tool " + name)}, args
@@ -287,13 +295,20 @@ func (t *Tools) finish(p pending) toolOutcome {
 			Size   string `json:"size"`
 		}
 		res := struct {
-			Note   string `json:"note"`
-			Query  string `json:"query"`
-			Shown  int    `json:"shown"`
-			Images []item `json:"images"`
+			Note  string `json:"note"`
+			Query string `json:"query"`
+			Shown int    `json:"shown"`
+			// Loading: image slots still open for images that land after this result (the gallery shows them);
+			// the journal keeps them taken after a restart (rebuild.go).
+			Loading int    `json:"loading,omitzero"`
+			Images  []item `json:"images"`
 		}{Note: imagesNote, Query: p.query, Shown: len(out.images), Images: []item{}}
 		if t.reader {
 			res.Note = imagesReaderNote
+		}
+		if out.tail != nil {
+			res.Loading = out.tail.slots
+			res.Note += fmt.Sprintf(" Up to %d more may still appear in the gallery as they finish loading; you won't get their details.", out.tail.slots)
 		}
 		if len(out.images) == 0 {
 			res.Note = "No images could be loaded for this query (none found, or they were too large, not JPEG/PNG/GIF/WebP, or unreachable). Say so briefly or try a different query."

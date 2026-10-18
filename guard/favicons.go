@@ -49,17 +49,17 @@ import (
 )
 
 const (
-	maxIconHosts    = 16              // sites per run
-	iconRunFetches  = 3               // sites fetched at once per run
-	iconFetchTime   = 3 * time.Second // one request
-	iconHostTime    = 6 * time.Second // one site, every attempt
-	iconEndWait     = 2 * time.Second // longest wait at the end of a run for icons still being fetched
-	maxIconDownload = 100 << 10       // bytes read per icon
-	maxIconPage     = 100 << 10       // bytes of the home page read for its <link rel="icon">
-	maxIconLinks    = 2               // <link> icons tried per site
-	maxIconEdge     = 1024            // width and height accepted for decoding
-	iconSize        = 32              // what is sent: iconSize x iconSize PNG
-	maxIconOut      = 8 << 10         // never send more than this per icon (a 32x32 RGBA PNG is ~4 KiB at worst)
+	maxIconHosts    = 16                     // sites per run
+	iconRunFetches  = 3                      // sites fetched at once per run
+	iconFetchTime   = 3 * time.Second        // one request
+	iconHostTime    = 6 * time.Second        // one site, every attempt
+	iconEndWait     = 500 * time.Millisecond // longest wait at the end of a run for icons still being fetched (2 s before vm-speed)
+	maxIconDownload = 100 << 10              // bytes read per icon
+	maxIconPage     = 100 << 10              // bytes of the home page read for its <link rel="icon">
+	maxIconLinks    = 2                      // <link> icons tried per site
+	maxIconEdge     = 1024                   // width and height accepted for decoding
+	iconSize        = 32                     // what is sent: iconSize x iconSize PNG
+	maxIconOut      = 8 << 10                // never send more than this per icon (a 32x32 RGBA PNG is ~4 KiB at worst)
 )
 
 var (

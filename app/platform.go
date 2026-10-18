@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -44,6 +45,14 @@ type dstack struct {
 	sock    string
 	storage string
 	http    *http.Client
+
+	// info is the guest agent's /Info, kept for the boot (vm-speed): the guest agent answers one request at a
+	// time and /Info takes about as long as a quote (~1 s each on tdx.small, measured 2026-10-18), so fetching it
+	// for every /attest doubled the attestation's time. It's only reused for a quote whose RTMR3 equals the RTMR3
+	// in it (the same event log); otherwise /attest fetches it again, as before. The quote is always fresh.
+	infoMu    sync.Mutex
+	info      json.RawMessage
+	infoRTMR3 []byte
 }
 
 func newDstack(sock, storage string) *dstack {
@@ -89,11 +98,119 @@ func (d *dstack) Evidence(ctx context.Context, reportData []byte) (json.RawMessa
 	if err != nil {
 		return nil, nil, err
 	}
-	info, err := d.call(ctx, "GET", "/Info", nil)
+	rtmr3 := quoteRTMR3(q)
+	if info := d.cachedInfo(rtmr3); info != nil {
+		return q, info, nil
+	}
+	info, err := d.fetchInfo(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
 	return q, info, nil
+}
+
+// cachedInfo is the kept /Info when its RTMR3 is rtmr3 (nil otherwise, or when rtmr3 is unknown).
+func (d *dstack) cachedInfo(rtmr3 []byte) json.RawMessage {
+	d.infoMu.Lock()
+	defer d.infoMu.Unlock()
+	if len(rtmr3) == 0 || d.info == nil || !bytes.Equal(rtmr3, d.infoRTMR3) {
+		return nil
+	}
+	return d.info
+}
+
+// fetchInfo asks the guest agent for /Info and keeps it with its RTMR3 (an /Info whose RTMR3 can't be read isn't
+// kept). It reports whether dstack's boot finished (the event log ends with "system-ready"): after that, RTMR3
+// doesn't change unless something extends it, and then the next quote won't match and /Info is fetched again.
+func (d *dstack) fetchInfo(ctx context.Context) (json.RawMessage, error) {
+	info, err := d.call(ctx, "GET", "/Info", nil)
+	if err != nil {
+		return nil, err
+	}
+	if rtmr3, _ := infoRTMR3(info); len(rtmr3) > 0 {
+		d.infoMu.Lock()
+		d.info, d.infoRTMR3 = info, rtmr3
+		d.infoMu.Unlock()
+	}
+	return info, nil
+}
+
+// PrefetchInfo fetches /Info at boot, until dstack's boot finished (the "system-ready" event: until then RTMR3
+// still changes), so the first /attest after a cold start already finds it. Each try is one guest agent request;
+// it gives up after `until`.
+func (d *dstack) PrefetchInfo(ctx context.Context, every, until time.Duration) {
+	end := time.Now().Add(until)
+	for time.Now().Before(end) && ctx.Err() == nil {
+		c, cancel := context.WithTimeout(ctx, 10*time.Second)
+		info, err := d.fetchInfo(c)
+		cancel()
+		if err == nil {
+			if _, ready := infoRTMR3(info); ready {
+				return
+			}
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(every):
+		}
+	}
+}
+
+// tdxQuoteRTMR3 is where RTMR3 sits in a TDX quote v4: the 48-byte header, then the TD report body, whose RTMR3
+// starts 472 bytes in (TEE_TCB_SVN, MRSEAM, MRSIGNERSEAM, SEAMATTRIBUTES, TDATTRIBUTES, XFAM, MRTD, MRCONFIGID,
+// MROWNER, MROWNERCONFIG, RTMR0-2 before it).
+const tdxQuoteRTMR3 = 48 + 472
+
+// quoteRTMR3 reads RTMR3 from the guest agent's /GetQuote response ({"quote": hex, ...}), nil when it can't: then
+// nothing kept is reused. Parsed only to choose the cached /Info; the browser verifies the quote itself.
+func quoteRTMR3(getQuote json.RawMessage) []byte {
+	var r struct {
+		Quote string `json:"quote"`
+	}
+	if json.Unmarshal(getQuote, &r) != nil {
+		return nil
+	}
+	raw, err := hex.DecodeString(strings.TrimPrefix(r.Quote, "0x"))
+	if err != nil || len(raw) < tdxQuoteRTMR3+48 || raw[0] != 4 || raw[1] != 0 || !bytes.Equal(raw[4:8], []byte{0x81, 0, 0, 0}) {
+		return nil // not a TDX quote v4
+	}
+	return bytes.Clone(raw[tdxQuoteRTMR3 : tdxQuoteRTMR3+48])
+}
+
+// infoRTMR3 reads /Info's RTMR3 (tcb_info.rtmr3) and whether its event log has dstack's "system-ready" event.
+// tcb_info comes as a JSON string or an object.
+func infoRTMR3(info json.RawMessage) ([]byte, bool) {
+	var i struct {
+		TcbInfo json.RawMessage `json:"tcb_info"`
+	}
+	if json.Unmarshal(info, &i) != nil {
+		return nil, false
+	}
+	var str string
+	if json.Unmarshal(i.TcbInfo, &str) == nil {
+		i.TcbInfo = []byte(str)
+	}
+	var t struct {
+		RTMR3    string `json:"rtmr3"`
+		EventLog []struct {
+			IMR   int    `json:"imr"`
+			Event string `json:"event"`
+		} `json:"event_log"`
+	}
+	if json.Unmarshal(i.TcbInfo, &t) != nil {
+		return nil, false
+	}
+	rtmr3, err := hex.DecodeString(t.RTMR3)
+	if err != nil || len(rtmr3) != 48 {
+		return nil, false
+	}
+	ready := false
+	for _, e := range t.EventLog {
+		if e.IMR == 3 && e.Event == "system-ready" {
+			ready = true
+		}
+	}
+	return rtmr3, ready
 }
 
 // ActivityKey asks the guest agent for the app's key at path "tacy/activity/v1" (dstack derives it from the KMS

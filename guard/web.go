@@ -135,7 +135,41 @@ func (g *Guard) Action(ctx context.Context, ti *harness.TaskInfo, id string, req
 	if m := toolMetric(app, step, out, ms); m != nil {
 		t.emit(proto.Event{Type: "metrics", Metrics: m})
 	}
+	if out.tail != nil {
+		g.lateImages(t, id, call, len(out.images), out.tail)
+	}
 	return actionResult(out), nil
+}
+
+// lateImages shows the images of an image search that land after its result (findImages returned early): each
+// is redacted like the others (its title; on the record as pattern ids), sent as the call's next "image" event and
+// its site's icon fetched; the slots it didn't use go back. The end of the run waits for them at most imageEndWait
+// (localSession.End); once the task ends, its downloads stop and nothing more is emitted.
+func (g *Guard) lateImages(t *task, action, call string, shown int, tail *imageTail) {
+	t.lateMu.Lock()
+	if t.ctx.Err() != nil { // the task ended: its downloads stop on their own (nobody shows them)
+		t.lateMu.Unlock()
+		return
+	}
+	t.late.Add(1)
+	t.lateMu.Unlock()
+	go func() {
+		defer t.late.Done()
+		used := 0
+		for im := range tail.ch {
+			out := toolOutcome{images: []shownImage{im}}
+			if ids := redactOutcome(&out); len(ids) > 0 {
+				g.record(Egress{Task: t.id, Action: action, Op: "web.images", Decision: "redacted", Rule: "leak_scan", Patterns: ids})
+				t.background.leak(false, ids)
+			}
+			im = out.images[0]
+			used++
+			t.emit(proto.Event{Type: "image", ID: call, Image: &proto.Image{Index: shown + used, Title: im.Title, Source: im.Source,
+				URL: im.URL, Type: "image/jpeg", Width: im.Width, Height: im.Height, Data: im.JPEG}})
+			t.icons.add(sourceURLs(out)...)
+		}
+		t.tools.returnImages(tail.slots - used)
+	}()
 }
 
 // readerDoc is what the reader reads for an action's outcome: a fetched page, or a search's results (titles and

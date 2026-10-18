@@ -49,6 +49,11 @@ const (
 	maxImageOut      = 512 << 10        // never send more than this per image (the chat's per-image cap)
 	imageFetchTime   = 12 * time.Second // one download
 	imageCallTime    = 35 * time.Second // the whole call, search included
+	// imageAnswerWait: once one image is ready, the model waits at most this long after the provider's answer for
+	// the others (vm-speed); the rest reach the gallery as they land.
+	imageAnswerWait = 1500 * time.Millisecond
+	// imageEndWait is the longest the end of a run waits for images still loading (then they're dropped).
+	imageEndWait = 2 * time.Second
 	// imagesReaderNote is imagesNote with the reader on: the model gets no titles (docs/27 section 5).
 	imagesReaderNote = "These images are already shown to the user in a gallery under your answer (the app draws them, with their titles; you can't see them). Don't embed them as Markdown images or list their URLs. Refer to them briefly if useful, by number; you get only each one's site, not its title."
 	imagesNote       = "These images are already shown to the user in a gallery under your answer (the app draws them; you can't see them). Don't embed them as Markdown images or list their URLs. Refer to them briefly if useful (e.g. by title or number); the titles come from the web and are untrusted."
@@ -246,12 +251,21 @@ func (t *Tools) returnImages(n int) {
 
 // findImages runs one image_search: the provider's image search (behind the search caps), then up to want images
 // downloaded (each behind the fetch caps) and re-encoded, in the provider's order.
-func (t *Tools) findImages(ctx context.Context, query string, want int, out *toolOutcome) ([]shownImage, imageStats, error) {
+//
+// The model waits for the images it is told about, but not for all of them (vm-speed): once at least one image is
+// ready and imageAnswerWait has passed since the provider answered, the call returns with the images ready so far
+// (in the provider's order) and the rest of the downloads go on in the background, under the task (t.bg): what
+// comes in later, up to the slots left, arrives on the returned tail and is shown in the gallery as it lands
+// (Guard.lateImages). With no task (t.bg nil) the call waits for every image, as before. Every download's egress
+// goes on the activity record: the action's when it finished before the call returned, the task's background
+// record (with the site icons) when after.
+func (t *Tools) findImages(ctx context.Context, query string, want int, out *toolOutcome) ([]shownImage, imageStats, *imageTail, error) {
 	var st imageStats
 	is, ok := t.search.(ImageSearcher)
 	if !ok {
-		return nil, st, errors.New("image search isn't available with this search provider")
+		return nil, st, nil, errors.New("image search isn't available with this search provider")
 	}
+	callStart := time.Now()
 	ctx, cancel := context.WithTimeout(ctx, imageCallTime)
 	defer cancel()
 	var gate toolOutcome
@@ -263,7 +277,7 @@ func (t *Tools) findImages(ctx context.Context, query string, want int, out *too
 	}
 	release()
 	if err != nil {
-		return nil, st, err
+		return nil, st, nil, err
 	}
 	// Dedupe, drop what can be refused without a request, cap.
 	seen := map[string]bool{}
@@ -280,19 +294,39 @@ func (t *Tools) findImages(ctx context.Context, query string, want int, out *too
 	}
 	st.candidates = len(list)
 
-	// Downloads run imageCallFetches at a time. The images shown are the first `want` that work in the
-	// provider's order: once every candidate before the want-th success has finished, the rest are cancelled.
+	// The downloads' context: the call's values (task, space, host filter) and its overall deadline, but not its
+	// cancellation, so they can outlive the call; they end with the task instead. Without a task: the call's.
+	background := t.bg != nil
+	var dctx context.Context
+	var stop context.CancelFunc
+	unhook := func() bool { return true }
+	if background {
+		dctx, stop = context.WithDeadline(context.WithoutCancel(ctx), callStart.Add(imageCallTime))
+		unhook = context.AfterFunc(t.bg, stop)
+	} else {
+		dctx, stop = context.WithCancel(ctx)
+	}
+	reqFacts, bgFacts := FactsFrom(ctx), FactsFrom(t.bg)
+
+	// Downloads run imageCallFetches at a time. Before the call returns, the images shown are the first `want`
+	// that work in the provider's order: once every candidate before the want-th success has finished, the rest
+	// are cancelled.
 	type got struct {
-		done bool
-		img  *shownImage
-		ms   int64
+		done  bool
+		img   *shownImage
+		ms    int64
+		taken bool // shown already (returned to the model, or sent on the tail)
 	}
 	res := make([]got, len(list))
 	slots := make(chan struct{}, imageCallFetches)
-	fetchCtx, stop := context.WithCancel(ctx)
-	defer stop()
 	var wg sync.WaitGroup
 	var mu sync.Mutex
+	changed := make(chan struct{}, 1)
+	var (
+		returned bool          // the call returned (mu)
+		waited   time.Duration // time the downloads waited for the caps before the call returned (mu)
+		tail     *imageTail    // set when the call returns with slots left (mu)
+	)
 	// settled: the first want successes in order are known (mu held).
 	settled := func() bool {
 		ok := 0
@@ -308,6 +342,14 @@ func (t *Tools) findImages(ctx context.Context, query string, want int, out *too
 		}
 		return false
 	}
+	ready := func() (n int) { // successes so far (mu held)
+		for _, r := range res {
+			if r.img != nil {
+				n++
+			}
+		}
+		return n
+	}
 	for i, c := range list {
 		wg.Add(1)
 		go func() {
@@ -315,29 +357,43 @@ func (t *Tools) findImages(ctx context.Context, query string, want int, out *too
 			select {
 			case slots <- struct{}{}:
 				defer func() { <-slots }()
-			case <-fetchCtx.Done():
+			case <-dctx.Done():
 				return
 			}
-			if fetchCtx.Err() != nil {
+			if dctx.Err() != nil {
 				return
 			}
+			// Each download keeps its own egress, then hands it to the action's record or the task's.
+			facts := &Facts{}
+			fctx := WithFacts(dctx, facts)
 			var g toolOutcome
-			rel, err := t.enter(fetchCtx, "fetch", &g)
+			rel, err := t.enter(fctx, "fetch", &g)
+			defer func() {
+				mu.Lock()
+				if returned {
+					bgFacts.Merge(facts.Data())
+				} else {
+					reqFacts.Merge(facts.Data())
+				}
+				mu.Unlock()
+			}()
 			mu.Lock()
-			out.wait += g.wait
+			if !returned {
+				waited += g.wait
+			}
 			mu.Unlock()
 			if err != nil {
 				return
 			}
 			t0 := time.Now()
-			data, err := downloadImage(fetchCtx, t.fetcher, c.URL)
+			data, err := downloadImage(fctx, t.fetcher, c.URL)
 			rel()
 			var jp []byte
 			var w, h int
 			if err == nil {
-				jp, w, h, err = processImage(fetchCtx, data, t.decodes)
+				jp, w, h, err = processImage(fctx, data, t.decodes)
 			}
-			if err != nil && fetchCtx.Err() != nil && ctx.Err() == nil {
+			if err != nil && dctx.Err() != nil && ctx.Err() == nil {
 				return // cancelled because enough images arrived: neither shown nor failed
 			}
 			mu.Lock()
@@ -346,14 +402,64 @@ func (t *Tools) findImages(ctx context.Context, query string, want int, out *too
 			if err == nil {
 				res[i].img = &shownImage{Title: c.Title, Source: c.Source, URL: c.URL, Width: w, Height: h, JPEG: jp, Original: len(data)}
 			}
-			if settled() {
-				stop()
+			switch {
+			case !returned:
+				if settled() {
+					stop()
+				}
+				select {
+				case changed <- struct{}{}:
+				default:
+				}
+			case tail != nil && res[i].img != nil && tail.left > 0:
+				res[i].taken = true
+				tail.left--
+				tail.ch <- *res[i].img // buffered for every slot: never blocks
+				if tail.left == 0 {
+					stop()
+				}
 			}
 		}()
 	}
-	wg.Wait()
+	all := make(chan struct{})
+	go func() { wg.Wait(); close(all) }()
+
+	var early <-chan time.Time
+	if background {
+		tm := time.NewTimer(imageAnswerWait)
+		defer tm.Stop()
+		early = tm.C
+	}
+	passed, finished := false, false
+wait:
+	for {
+		mu.Lock()
+		s, n := settled(), ready()
+		mu.Unlock()
+		if s || (passed && n > 0) {
+			break
+		}
+		select {
+		case <-changed:
+		case <-early:
+			passed = true
+		case <-all:
+			finished = true
+			break wait
+		case <-ctx.Done(): // the call's time is up, or the task was cancelled: what's done is shown
+			stop()
+			<-all
+			finished = true
+			break wait
+		}
+	}
+
+	mu.Lock()
+	returned = true
+	out.wait += waited
 	var imgs []shownImage
-	for _, r := range res {
+	for i := range res {
+		r := &res[i]
 		if !r.done {
 			continue
 		}
@@ -364,9 +470,34 @@ func (t *Tools) findImages(ctx context.Context, query string, want int, out *too
 			continue
 		}
 		if len(imgs) < want {
+			r.taken = true
 			imgs = append(imgs, *r.img)
 			st.bytes += len(r.img.JPEG)
 		}
 	}
-	return imgs, st, nil
+	if left := want - len(imgs); left > 0 && background && !finished && ctx.Err() == nil {
+		tail = &imageTail{ch: make(chan shownImage, left), slots: left, left: left}
+	}
+	mu.Unlock()
+	if tail == nil {
+		stop()
+		unhook()
+		return imgs, st, nil, nil
+	}
+	go func() { // the tail ends when the last download does
+		<-all
+		stop()
+		unhook()
+		close(tail.ch)
+	}()
+	return imgs, st, tail, nil
+}
+
+// imageTail is an image search that returned to the model before all its images were in: the images that land
+// later arrive on ch, at most slots of them; ch is closed when the downloads are over (all done, the slots filled,
+// imageCallTime from the call's start, or the task ended).
+type imageTail struct {
+	ch    chan shownImage
+	slots int // image slots the call kept for these (Tools.reserveImages); what isn't used goes back
+	left  int // slots still open (findImages' mu)
 }

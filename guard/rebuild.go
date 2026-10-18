@@ -89,13 +89,14 @@ func journaledOutput(action string, out []byte) (cite, images int, urls []string
 		}
 	case "web.images":
 		var o struct {
-			Shown  int `json:"shown"`
-			Images []struct {
+			Shown   int `json:"shown"`
+			Loading int `json:"loading"` // slots kept for images that landed after the result
+			Images  []struct {
 				Source string `json:"source"`
 			} `json:"images"`
 		}
 		if json.Unmarshal(out, &o) == nil {
-			images = max(0, o.Shown)
+			images = max(0, o.Shown) + max(0, o.Loading)
 			for _, im := range o.Images {
 				urls = append(urls, im.Source)
 			}

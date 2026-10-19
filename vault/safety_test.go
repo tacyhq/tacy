@@ -8,6 +8,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -201,4 +202,22 @@ func TestVaultRateLimits(t *testing.T) {
 		t.Fatalf("another key: %v", err)
 	}
 	s.Wipe()
+}
+
+// Every key the chat's vault grants goes to a host the release's ceiling policy lists for its connector: a host
+// missing there refuses every lease of that key (v0.8.10 shipped Exa's grant without api.exa.ai in the ceiling,
+// so every Exa search was policy_denied; found on its throwaway).
+func TestChatGrantsHostsInReleaseCeiling(t *testing.T) {
+	rel := safety.ChatRelease("f_chat", "", []string{"gpt-oss-120b"}, 300)
+	for _, g := range ChatGrants("") {
+		c, ok := rel.Connectors[g.Connector]
+		if !ok {
+			t.Fatalf("%s: connector %q not in the release ceiling", g.Secret, g.Connector)
+		}
+		for _, h := range g.SendOnlyTo {
+			if !slices.Contains(c.Hosts, h) {
+				t.Errorf("%s: host %s not in the release ceiling's %s hosts %v", g.Secret, h, g.Connector, c.Hosts)
+			}
+		}
+	}
 }

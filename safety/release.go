@@ -14,7 +14,7 @@ func ChatRelease(firm, tinfoilHost string, models []string, runSeconds int64) *P
 		Models: models,
 		Connectors: map[string]Connector{
 			"model": {Hosts: []string{tinfoilHost}},
-			"web": {Tools: []string{"web.search", "web.fetch", "web.images"}, Hosts: []string{"api.tavily.com", "api.search.brave.com"},
+			"web": {Tools: []string{"web.search", "web.fetch", "web.images"}, Hosts: []string{"api.tavily.com", "api.search.brave.com", "api.exa.ai"},
 				Fetch: []string{"*"}},
 		},
 		StaleReads: true,

@@ -54,6 +54,8 @@ type Config struct {
 type Guard struct {
 	cfg   Config
 	gates *toolGates
+	// readerSlots bounds the quarantined reader's calls in flight across the VM (reader.go readerCalls).
+	readerSlots chan struct{}
 
 	mu    sync.Mutex
 	tasks map[string]*task
@@ -82,7 +84,7 @@ func New(cfg Config) *Guard {
 	}
 	// Every fetch is counted for the activity record (facts.go): host, bytes, policy refusals.
 	cfg.Fetcher, cfg.Icons = recordingClient(cfg.Fetcher), recordingClient(cfg.Icons)
-	g := &Guard{cfg: cfg, tasks: map[string]*task{}}
+	g := &Guard{cfg: cfg, tasks: map[string]*task{}, readerSlots: make(chan struct{}, readerCalls)}
 	if cfg.Limits != nil {
 		g.gates = newToolGates(*cfg.Limits)
 	}

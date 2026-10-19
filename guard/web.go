@@ -108,9 +108,15 @@ func (g *Guard) Action(ctx context.Context, ti *harness.TaskInfo, id string, req
 		return nil, ctx.Err() // cancelled: the runtime answers "cancelled"
 	}
 	// The quarantined reader (reader.go) reads the page or the results before anything is numbered, in parallel
-	// with the step's other calls; the model then gets its fields, never the text.
+	// with the step's other calls (a search's results one result per call, all at once); the model then gets its
+	// fields, never the text. A plain chat's search starts each result's picture as soon as that result is read
+	// (cardpics.go prefetchResult), while the reader reads the others: it is shown after the result.
 	if d := g.readerDoc(ctx, ti.ID, id, req.Name, &p); d != nil {
-		p.read = g.read(ctx, t, step, d)
+		var onPart func(int, *readerResult)
+		if t.opts.Via == ViaSearch && len(p.results) == len(d.results) {
+			onPart = func(i int, r *readerResult) { g.prefetchResult(t, p.results[i], r.items) }
+		}
+		p.read = g.read(ctx, t, step, d, onPart)
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}

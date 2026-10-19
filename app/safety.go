@@ -418,7 +418,7 @@ func (g *safeGateway) Action(ctx context.Context, ti *harness.TaskInfo, id strin
 		ctx = guard.WithFacts(ctx, f)
 	}
 	res, err := g.inner.Action(ctx, ti, id, req)
-	commit(addUsage(want, readerUsed(f.Data().Reader, reader))) // a tool call counts whether or not it worked
+	commit(addUsage(want, readerUsed(f.Data().Reader, req.Name))) // a tool call counts whether or not it worked
 	g.tripFromGuard(ti.ID, err)
 	if res != nil && res.Error != "" && strings.HasPrefix(res.Error, safety.CodeRateLimited) {
 		g.trip(ti.ID, &safety.Error{Code: safety.CodeRateLimited, Msg: strings.TrimPrefix(res.Error, safety.CodeRateLimited+": ")})
@@ -426,19 +426,20 @@ func (g *safeGateway) Action(ctx context.Context, ti *harness.TaskInfo, id strin
 	return res, err
 }
 
-// readerReserve is the budget the reader's call for action may use (zero for actions it doesn't read, or when the
-// policy doesn't allow its model: gatewayd then refuses the reader and shows nothing of the source).
+// readerReserve is the budget the reader's calls for action may use: every call it may make, on the models the
+// policy allows (zero for actions it doesn't read, or when the policy allows neither of its models: gatewayd then
+// refuses the reader and shows nothing of the source).
 func readerReserve(action string, e *safety.Effective) safety.Usage {
-	model, p, c, ok := guard.ReaderReserve(action)
-	if !ok || !e.AllowsModel(model) {
+	tokens, cost, ok := guard.ReaderReserve(action, e.AllowsModel)
+	if !ok {
 		return safety.Usage{}
 	}
-	return safety.Usage{Tokens: p + c, CostMicros: safety.ModelCost(model, p, c)}
+	return safety.Usage{Tokens: tokens, CostMicros: cost}
 }
 
-// readerUsed is what the reader's calls cost: the model's own counts, or, for a call that reached the model
-// without counts (it may be billed), the whole reservation, never less.
-func readerUsed(calls []guard.ReaderUse, reserved safety.Usage) safety.Usage {
+// readerUsed is what the reader's calls for action cost: each call's own counts, or, for a call that reached the
+// model without counts (it may be billed), a call at its largest (guard.ReaderCallMax), never less.
+func readerUsed(calls []guard.ReaderUse, action string) safety.Usage {
 	var u safety.Usage
 	for _, c := range calls {
 		switch {
@@ -446,7 +447,8 @@ func readerUsed(calls []guard.ReaderUse, reserved safety.Usage) safety.Usage {
 			p, q := int64(c.Prompt), int64(c.Completion)
 			u = addUsage(u, safety.Usage{Tokens: p + q, CostMicros: safety.ModelCost(c.Model, p, q)})
 		case c.Sent:
-			u = addUsage(u, reserved)
+			p, q := guard.ReaderCallMax(action)
+			u = addUsage(u, safety.Usage{Tokens: p + q, CostMicros: safety.ModelCost(c.Model, p, q)})
 		}
 	}
 	return u
@@ -540,9 +542,9 @@ func journalUsage(recs []harness.Record) safety.Usage {
 				// The reader read its source (its answer or its refusal is in the output): counted at its
 				// reservation, since the journal doesn't keep the reader's own counts. On the high side, never low.
 				if readOutput(res.Output) {
-					if model, p, c, ok := guard.ReaderReserve(req.Name); ok {
-						u.Tokens += p + c
-						u.CostMicros += safety.ModelCost(model, p, c)
+					if tokens, cost, ok := guard.ReaderReserve(req.Name, nil); ok {
+						u.Tokens += tokens
+						u.CostMicros += cost
 					}
 				}
 			}

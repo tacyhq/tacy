@@ -28,6 +28,7 @@ package guard
 
 import (
 	"encoding/json"
+	"errors"
 	"maps"
 	"net/url"
 	"regexp"
@@ -361,10 +362,13 @@ type cardPics struct {
 	final  bool // the run ended: the metric is made, later outcomes aren't counted
 	wg     sync.WaitGroup
 	slots  chan struct{}
+	// pre: downloads a plain chat's search started while its reader read (prefetchResult), by address.
+	pre map[string]*picFetch
 }
 
 func newCardPics() *cardPics {
-	return &cardPics{tried: map[string]bool{}, taken: map[string]bool{}, sent: map[string]int{}, slots: make(chan struct{}, cardPicFetches)}
+	return &cardPics{tried: map[string]bool{}, taken: map[string]bool{}, sent: map[string]int{}, slots: make(chan struct{}, cardPicFetches),
+		pre: map[string]*picFetch{}}
 }
 
 // reset starts a model call's text.
@@ -505,10 +509,8 @@ func (g *Guard) cardPicture(t *task, card cardRef, ownOnly bool) {
 func (g *Guard) resultPictures(t *task, read *readerResult, cites []proto.Citation) {
 	for i, c := range cites {
 		var names []string
-		for _, it := range read.items {
-			if it.result == i {
-				names = append(names, it.name)
-			}
+		for _, it := range read.resultItems(i) {
+			names = append(names, it.name)
 		}
 		src, cands, ok := t.tools.cardSource(cardRef{n: c.Index})
 		if !ok || len(cands) == 0 || listTitleRe.MatchString(src.title) {
@@ -626,32 +628,33 @@ func (g *Guard) fetchCardPicture(t *task, title string, tries []cardTry) bool {
 			continue
 		}
 		downloads++
-		select {
-		case cp.slots <- struct{}{}:
-		case <-ctx.Done():
-			return false
-		}
-		var gate toolOutcome
-		rel, err := t.tools.enter(ctx, "fetch", &gate)
-		t0 := time.Now()
-		var data, jp []byte
+		var jp []byte
 		var w, h int
-		if err == nil {
-			data, err = downloadImage(ctx, t.tools.fetcher, c.url)
-			rel()
+		var err error
+		t0 := time.Now()
+		ms := int64(-1)
+		// Fetched already while the reader read (prefetchResult): its outcome, once it's there.
+		if pf := cp.prefetched(c.url); pf != nil {
+			select {
+			case <-pf.done:
+			case <-ctx.Done():
+				return false
+			}
+			if pf.err != errNotFetched {
+				cp.mu.Lock()
+				pf.used = true
+				cp.mu.Unlock()
+				jp, w, h, err, ms = pf.jp, pf.w, pf.h, pf.err, pf.ms
+			}
 		}
-		if err == nil {
-			jp, w, h, err = processImage(ctx, data, t.tools.decodes)
-		}
-		if err == nil {
-			err = cardShape(w, h)
-		}
-		<-cp.slots
-		if ctx.Err() != nil {
-			return false // the task ended while it loaded: counted as never_arrived by the metric
+		if ms < 0 {
+			if jp, w, h, err = g.downloadCardPicture(t, c.url); ctx.Err() != nil {
+				return false // the task ended while it loaded: counted as never_arrived by the metric
+			}
+			ms = time.Since(t0).Milliseconds()
 		}
 		if err != nil {
-			if !count(time.Since(t0).Milliseconds(), imageFailReason(err)) {
+			if !count(ms, imageFailReason(err)) {
 				return false
 			}
 			continue
@@ -662,7 +665,7 @@ func (g *Guard) fetchCardPicture(t *task, title string, tries []cardTry) bool {
 			return false
 		}
 		cp.st.tried++
-		cp.st.fetchMs += time.Since(t0).Milliseconds()
+		cp.st.fetchMs += ms
 		cp.st.bytes += len(jp)
 		if cp.taken[c.url] {
 			cp.mu.Unlock()
@@ -680,6 +683,120 @@ func (g *Guard) fetchCardPicture(t *task, title string, tries []cardTry) bool {
 		return true
 	}
 	return false
+}
+
+// downloadCardPicture is one card picture's download, under the task's card picture slots and the tool caps: the
+// guarded client, downloadImage's caps, processImage's re-encode, and the card's shape check.
+func (g *Guard) downloadCardPicture(t *task, u string) ([]byte, int, int, error) {
+	ctx, cp := t.ctx, t.cards
+	select {
+	case cp.slots <- struct{}{}:
+	case <-ctx.Done():
+		return nil, 0, 0, ctx.Err()
+	}
+	defer func() { <-cp.slots }()
+	var gate toolOutcome
+	rel, err := t.tools.enter(ctx, "fetch", &gate)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	data, err := downloadImage(ctx, t.tools.fetcher, u)
+	rel()
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	jp, w, h, err := processImage(ctx, data, t.tools.decodes)
+	if err == nil {
+		err = cardShape(w, h)
+	}
+	return jp, w, h, err
+}
+
+// ---- a plain chat's search: pictures fetched while the reader reads (v0.8.16) --------------------------------
+
+// picFetch is a card picture download started early (prefetchResult): once done is closed, the re-encoded picture
+// and its size, or why it failed (errNotFetched: it wasn't needed), and how long it took. used: a card took it.
+type picFetch struct {
+	done chan struct{}
+	jp   []byte
+	w, h int
+	err  error
+	ms   int64
+	used bool
+}
+
+// errNotFetched: a prefetch's candidate that wasn't downloaded (an earlier one worked, or the task ended).
+var errNotFetched = errors.New("not fetched")
+
+// prefetched is the early download of address u, or nil.
+func (c *cardPics) prefetched(u string) *picFetch {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.pre[u]
+}
+
+// prefetchResult starts, as soon as the reader has read search result r (items: its checked items), the download
+// resultPictures makes for it once the result is shown, so the picture is ready with the result instead of after it:
+// the same item (the first that one of r's own pictures names closely, cardOtherMin), the same candidates in order,
+// the same checks before any request (not a list's title; cardPicRefused at cardCaptionMin), the same download,
+// re-encode and shape check under the same slots, at most cardPicTries downloads, stopping at the first that
+// works. Nothing is shown from here: fetchCardPicture takes the outcome when the picture is shown (after the
+// result) and counts it then; a download nothing took is counted at the run's end. Its egress is the task's
+// background record, as every card picture's.
+func (g *Guard) prefetchResult(t *task, r SearchResult, items []keptItem) {
+	if len(items) == 0 || len(r.Thumbs) == 0 || listTitleRe.MatchString(r.Title) {
+		return
+	}
+	src := citedSource{url: r.URL, title: r.Title}
+	cands := thumbCands(r.Thumbs)
+	name := ""
+	for _, it := range items {
+		if slices.ContainsFunc(cands, func(cd picCand) bool { return cardPicRefused(it.name, src, cd, cardOtherMin) == "" }) {
+			name = it.name
+			break
+		}
+	}
+	if name == "" {
+		return
+	}
+	cp := t.cards
+	var todo []string
+	var fetches []*picFetch
+	cp.mu.Lock()
+	for _, c := range cands {
+		if len(todo) == cardPicTries {
+			break
+		}
+		if cardPicRefused(name, src, c, cardCaptionMin) != "" || cp.pre[c.url] != nil {
+			continue
+		}
+		pf := &picFetch{done: make(chan struct{})}
+		cp.pre[c.url] = pf
+		todo, fetches = append(todo, c.url), append(fetches, pf)
+	}
+	cp.mu.Unlock()
+	if len(todo) == 0 {
+		return
+	}
+	go func() {
+		ok := false
+		for i, u := range todo {
+			pf := fetches[i]
+			if ok || t.ctx.Err() != nil {
+				pf.err = errNotFetched
+				close(pf.done)
+				continue
+			}
+			t0 := time.Now()
+			pf.jp, pf.w, pf.h, pf.err = g.downloadCardPicture(t, u)
+			pf.ms = time.Since(t0).Milliseconds()
+			if t.ctx.Err() != nil && pf.err != nil {
+				pf.err = errNotFetched
+			}
+			ok = pf.err == nil
+			close(pf.done)
+		}
+	}()
 }
 
 // wait waits at most d for the card pictures still loading.
@@ -708,6 +825,20 @@ func (c *cardPics) end(step int, f *Facts) *proto.Metric {
 	st.reasons = maps.Clone(st.reasons)
 	for range c.open {
 		st.fail(imageNever)
+	}
+	// Early downloads no card took (prefetchResult) were made all the same.
+	for _, pf := range c.pre {
+		select {
+		case <-pf.done:
+			if !pf.used && pf.err != errNotFetched {
+				st.tried++
+				st.fetchMs += pf.ms
+				if pf.err != nil {
+					st.fail(imageFailReason(pf.err))
+				}
+			}
+		default:
+		}
 	}
 	last := c.last
 	if c.open > 0 || last.IsZero() {

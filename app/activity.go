@@ -308,11 +308,7 @@ func (g *recGateway) begin(ti *harness.TaskInfo, id, kind, name, connector strin
 		d := f.Data()
 		c.Hosts, c.Blocked, c.Redacted, c.Ms = d.Hosts, d.Blocked, d.Redacted, time.Since(t0).Milliseconds()
 		c.Images = d.Images // web.images: pictures that didn't make it, by reason
-		if n := len(d.Reader); n > 0 {
-			u := d.Reader[n-1]
-			c.Reader = &activity.Reader{Model: u.Model, Prompt: u.Prompt, Completion: u.Completion, Ms: u.Ms, Outcome: u.Outcome,
-				Why: u.Why, Quotes: u.Quotes, Dropped: u.Dropped, Instructions: u.Instructions, Verbatim: u.Verbatim}
-		}
+		c.Reader = readerRecord(d.Reader)
 		if kind == "model" && d.Model != "" {
 			c.Name = d.Model // the model it ran on (a fallback after a switch, guard/fallback.go)
 		}
@@ -551,4 +547,43 @@ func pruneActivity(ctx context.Context, st activity.Store) {
 		case <-time.After(time.Hour):
 		}
 	}
+}
+
+// readerRecord is an action's reader calls as its record's one reader entry: one call as it was; several (a search
+// read one result per call, a call that went to the fallback model; v0.8.16) summed: the models that answered
+// joined with "+", tokens and counts added, the longest call's time (they run at once), ok when one answered (a
+// result it couldn't read is in the result as unread), else the first failure's words. nil: no reader call.
+func readerRecord(calls []guard.ReaderUse) *activity.Reader {
+	if len(calls) == 0 {
+		return nil
+	}
+	if len(calls) == 1 {
+		u := calls[0]
+		return &activity.Reader{Model: u.Model, Prompt: u.Prompt, Completion: u.Completion, Ms: u.Ms, Outcome: u.Outcome,
+			Why: u.Why, Quotes: u.Quotes, Dropped: u.Dropped, Instructions: u.Instructions, Verbatim: u.Verbatim}
+	}
+	r := &activity.Reader{}
+	var models []string
+	for _, u := range calls {
+		r.Prompt += u.Prompt
+		r.Completion += u.Completion
+		r.Ms = max(r.Ms, u.Ms)
+		r.Quotes += u.Quotes
+		r.Dropped += u.Dropped
+		r.Instructions += u.Instructions
+		r.Verbatim += u.Verbatim
+		if u.Outcome == "ok" && !slices.Contains(models, u.Model) {
+			models = append(models, u.Model)
+		}
+		if r.Outcome == "" && u.Outcome != "ok" {
+			r.Outcome, r.Why = u.Outcome, u.Why
+		}
+	}
+	if len(models) > 0 {
+		slices.Sort(models)
+		r.Model, r.Outcome, r.Why = strings.Join(models, "+"), "ok", ""
+	} else {
+		r.Model = calls[0].Model
+	}
+	return r
 }

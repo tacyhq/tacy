@@ -421,6 +421,9 @@ func (t *Tools) finishRead(p pending, out toolOutcome, sources []int, head map[s
 	} else {
 		v, quotes := p.read.view(sources, &t.quotes)
 		head["read"] = v
+		if len(v.Unread) > 0 {
+			head["note"] = fmt.Sprint(head["note"]) + " " + unreadNote
+		}
 		out.quotes = quotes
 	}
 	b, _ := json.Marshal(head)

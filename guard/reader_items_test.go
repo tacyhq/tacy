@@ -36,6 +36,14 @@ func itemsAnswer(items []map[string]any, facts ...string) func(string) string {
 	}
 }
 
+// unsplit is the release's reader reading a search's results in one call (as before v0.8.16): the checks on one
+// answer naming several results.
+func unsplit() ReaderConfig {
+	rc := DefaultReader
+	rc.Split = false
+	return rc
+}
+
 func item(name, price, attr string, result int) map[string]any {
 	return map[string]any{"name": name, "price": price, "attribute": attr, "result": result}
 }
@@ -58,8 +66,8 @@ func TestReaderItemsChecked(t *testing.T) {
 		item(strings.Repeat("Nike ", 20), "", "", 1),            // too long: dropped at decode
 		item("Onitsuka Tiger Mexico 66", "~$120", "on sale", 3), // no R3: dropped
 	}, "Popular picks include the Jordan Retro 3, Nike Vomero 5, New Balance 9060 and adidas Samba [R1].")
-	g, tk, _ := directReader(t, DefaultReader, 0, answer)
-	res := g.read(context.Background(), tk, 1, itemsDoc)
+	g, tk, _ := directReader(t, unsplit(), 0, answer)
+	res := g.read(context.Background(), tk, 1, itemsDoc, nil)
 	if res.err != "" {
 		t.Fatalf("refused: %s", res.err)
 	}
@@ -116,8 +124,8 @@ func TestReaderItemDropNotWhole(t *testing.T) {
 		b, _ := json.Marshal(m)
 		return string(b)
 	}
-	g, tk, _ := directReader(t, DefaultReader, 0, answer)
-	res := g.read(context.Background(), tk, 1, itemsDoc)
+	g, tk, _ := directReader(t, unsplit(), 0, answer)
+	res := g.read(context.Background(), tk, 1, itemsDoc, nil)
 	if res.err != "" || len(res.items) != 1 || len(res.quotes) != 0 || len(res.out.Facts) != 1 {
 		t.Fatalf("%q items %+v quotes %d facts %v", res.err, res.items, len(res.quotes), res.out.Facts)
 	}
@@ -236,12 +244,31 @@ func (shopSearch) Search(context.Context, string, int) ([]SearchResult, error) {
 	}, nil
 }
 
+// shopAnswer is the reader's answer for one of shopSearch's results (a split read: one result a call, so each
+// names its own result as R1), by the result in the prompt.
+func shopAnswer(prompt string) string {
+	for _, c := range []struct {
+		in    string
+		items []map[string]any
+	}{
+		{"The Keychron Q6 Max costs", []map[string]any{item("Keychron Q6 Max", "$219", "", 1)}},
+		{"Picks: Lofree Flow ($159)", []map[string]any{item("Lofree Flow", "$159", "", 1), item("NuPhy Air75", "", "", 1)}},
+		{"The Logo K1 keyboard", []map[string]any{item("Logo K1", "", "", 1)}},
+		{"Picks: Lofree Flow 2", []map[string]any{item("Lofree Flow 2", "", "", 1)}},
+		{"The Puma Speedcat OG", []map[string]any{item("Puma Speedcat OG", "", "", 1)}},
+	} {
+		if strings.Contains(prompt, c.in) {
+			return itemsAnswer(c.items, "Keyboards [R1].")(prompt)
+		}
+	}
+	return itemsAnswer(nil)(prompt)
+}
+
 // A plain chat's search (v0.8.13) gets its results' own pictures for the chat's cards, with agent mode's checks:
 // the product page's picture (its title names the item the reader found there) under the search, with that page as
 // its source; never a roundup's banner, nor a picture shaped like a banner; counted in card_pictures; before done.
 func TestSearchTaskResultPictures(t *testing.T) {
-	answer := itemsAnswer([]map[string]any{item("Keychron Q6 Max", "$219", "", 1), item("Lofree Flow", "$159", "", 2),
-		item("NuPhy Air75", "", "", 2), item("Logo K1", "", "", 3), item("Lofree Flow 2", "", "", 4), item("Puma Speedcat OG", "", "", 5)}, "Keyboards [R1].")
+	answer := shopAnswer
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			Messages []struct{ Content string } `json:"messages"`

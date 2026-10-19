@@ -14,6 +14,7 @@ import (
 
 	"github.com/tacyhq/tacy/harness"
 	"github.com/tacyhq/tacy/proto"
+	"github.com/tacyhq/tacy/safety"
 )
 
 // v0.8.12: search answers with the specifics. Bigger snippets from every provider, a reader that names the items,
@@ -103,12 +104,32 @@ func TestReaderReserveCoversTheLargestSearch(t *testing.T) {
 	rc := DefaultReader
 	question := strings.Repeat("𝔻", maxQuestionRunes)
 	bytes := len(rc.system()) + len(d.prompt(question, spans))
-	_, p, c, ok := ReaderReserve("web.search")
-	if !ok || c != readerMaxOut || p < int64(bytes)/3+16 {
-		t.Fatalf("reserved %d prompt tokens for %d bytes", p, bytes)
+	// One call for the whole search (a call that reached the model without counts is counted at this).
+	p, c := ReaderCallMax("web.search")
+	if c != readerMaxOut || p < int64(bytes)/3+16 {
+		t.Fatalf("a call at most %d prompt tokens for %d bytes", p, bytes)
+	}
+	// Split (one call a result, each on the model and again on the fallback): every result's call at its largest.
+	one := &readerDoc{kind: "search", results: d.results[:1]}
+	part := rc.part()
+	partBytes := len(part.system()) + len(one.prompt(question, splitSpans(one.segments(true))))
+	tokens, cost, ok := ReaderReserve("web.search", nil)
+	perCall := int64(partBytes)/3 + 16 + readerMaxOut
+	if !ok || tokens < 2*maxSearchResults*perCall {
+		t.Fatalf("reserved %d tokens; %d results' calls and their fallbacks need %d", tokens, maxSearchResults, 2*maxSearchResults*perCall)
+	}
+	if want := int64(maxSearchResults) * (safety.ModelCost(ReaderModel, perCall-readerMaxOut, readerMaxOut) + safety.ModelCost(ReaderFallbackModel, perCall-readerMaxOut, readerMaxOut)); cost < want {
+		t.Fatalf("reserved $%d µ, want at least %d", cost, want)
+	}
+	// Only the models the policy allows.
+	if only, _, _ := ReaderReserve("web.search", func(m string) bool { return m == ReaderFallbackModel }); only*2 > tokens+16 {
+		t.Fatalf("one model %d of %d", only, tokens)
+	}
+	if none, _, ok := ReaderReserve("web.search", func(string) bool { return false }); none != 0 || !ok {
+		t.Fatal("no model allowed, still reserved")
 	}
 	// Pages too, with the larger span cap.
-	if _, pp, _, _ := ReaderReserve("web.fetch"); pp < int64(maxPageChars*4+len(rc.system()))/3 {
+	if pp, _ := ReaderCallMax("web.fetch"); pp < int64(maxPageChars*4+len(rc.system()))/3 {
 		t.Fatalf("page reserve %d", pp)
 	}
 }
@@ -183,14 +204,15 @@ func TestReaderSearchTimeout(t *testing.T) {
 	rc := DefaultReader
 	rc.Timeout, rc.SearchTimeout = 100*time.Millisecond, 3*time.Second
 	g, tk, _ := directReader(t, rc, 400*time.Millisecond, answer)
-	if res := g.read(context.Background(), tk, 1, search); res.err != "" {
+	if res := g.read(context.Background(), tk, 1, search, nil); res.err != "" {
 		t.Fatalf("search read within its timeout: %q", res.err)
 	}
-	if res := g.read(context.Background(), tk, 1, page); res.err != readerTimeoutMsg {
+	if res := g.read(context.Background(), tk, 1, page, nil); res.err != readerTimeoutMsg {
 		t.Fatalf("page read past the page timeout: %q", res.err)
 	}
-	if DefaultReader.SearchTimeout != 75*time.Second || DefaultReader.Timeout != 12*time.Second {
-		t.Fatalf("release timeouts %v %v", DefaultReader.Timeout, DefaultReader.SearchTimeout)
+	if r := DefaultReader; r.SearchTimeout != 75*time.Second || r.Timeout != 30*time.Second || r.ModelTimeout != 12*time.Second ||
+		r.ModelSearchTimeout != 25*time.Second {
+		t.Fatalf("release timeouts %v %v %v %v", r.Timeout, r.SearchTimeout, r.ModelTimeout, r.ModelSearchTimeout)
 	}
 
 	rc.SearchTimeout = 150 * time.Millisecond
@@ -203,7 +225,7 @@ func TestReaderSearchTimeout(t *testing.T) {
 		return nil
 	}
 	f := &Facts{}
-	res := g.read(WithFacts(context.Background(), f), tk, 1, search)
+	res := g.read(WithFacts(context.Background(), f), tk, 1, search, nil)
 	if res.err != readerSearchTimeoutMsg || res.out != nil {
 		t.Fatalf("result %+v", res)
 	}

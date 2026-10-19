@@ -318,7 +318,7 @@ func TestReaderTimeout(t *testing.T) {
 	f := &Facts{}
 	ctx := WithFacts(context.Background(), f)
 	t0 := time.Now()
-	res := g.read(ctx, tk, 1, d)
+	res := g.read(ctx, tk, 1, d, nil)
 	if took := time.Since(t0); took > time.Second {
 		t.Fatalf("the read took %v", took)
 	}
@@ -356,9 +356,9 @@ func TestReaderCache(t *testing.T) {
 	d := &readerDoc{kind: "page", title: "T", url: "https://a.example/", text: "Intro sentence that is long enough. The price is 129 dollars."}
 	f := &Facts{}
 	ctx := WithFacts(context.Background(), f)
-	r1 := g.read(ctx, tk, 1, d)
+	r1 := g.read(ctx, tk, 1, d, nil)
 	same := *d
-	r2 := g.read(ctx, tk, 2, &same)
+	r2 := g.read(ctx, tk, 2, &same, nil)
 	if calls.Load() != 1 || r1.err != "" || r2.err != "" || len(r2.quotes) != 1 || r2.quotes[0].text != "The price is 129 dollars." {
 		t.Fatalf("calls %d, %+v %+v", calls.Load(), r1, r2)
 	}
@@ -375,19 +375,19 @@ func TestReaderCache(t *testing.T) {
 	// Changed content: read again.
 	changed := *d
 	changed.text += " Now 99 dollars."
-	g.read(ctx, tk, 3, &changed)
+	g.read(ctx, tk, 3, &changed, nil)
 	if calls.Load() != 2 {
 		t.Fatalf("calls %d after a change", calls.Load())
 	}
 	// Another task (another person or not) never sees this one's answers.
 	other := g.open("tk_other", TaskOptions{Question: "what does it cost?"}, nil)
-	g.read(ctx, other, 1, d)
+	g.read(ctx, other, 1, d, nil)
 	if calls.Load() != 3 {
 		t.Fatalf("calls %d in another task", calls.Load())
 	}
 	// Another question in a task: read again.
 	tk.opts.Question = "who sells it?"
-	g.read(ctx, tk, 4, d)
+	g.read(ctx, tk, 4, d, nil)
 	if calls.Load() != 4 {
 		t.Fatalf("calls %d for another question", calls.Load())
 	}

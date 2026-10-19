@@ -125,15 +125,15 @@ func TestReaderBudgetRefusesFetch(t *testing.T) {
 
 // After an agentd restart, a web action whose output came from the reader counts the reader's reservation again.
 func TestJournalUsageCountsReader(t *testing.T) {
-	_, p, c, _ := guard.ReaderReserve("web.fetch")
+	p, c := guard.ReaderCallMax("web.fetch")
 	out := `{"n":1,"note":"x","read":{"summary":"s"},"url":"https://a.example"}`
 	if !readOutput([]byte(out)) || readOutput([]byte(`{"n":1,"text":"page"}`)) {
 		t.Fatal("readOutput")
 	}
-	if got := readerUsed([]guard.ReaderUse{{Model: guard.ReaderModel, Sent: true}}, safety.Usage{Tokens: p + c}); got.Tokens != p+c {
+	if got := readerUsed([]guard.ReaderUse{{Model: guard.ReaderModel, Sent: true}}, "web.fetch"); got.Tokens != p+c {
 		t.Fatalf("a reader call without counts: %+v", got)
 	}
-	if got := readerUsed([]guard.ReaderUse{{Model: guard.ReaderModel, Outcome: "failed", Why: "policy"}}, safety.Usage{Tokens: p + c}); got.Tokens != 0 {
+	if got := readerUsed([]guard.ReaderUse{{Model: guard.ReaderModel, Outcome: "failed", Why: "policy"}}, "web.fetch"); got.Tokens != 0 {
 		t.Fatalf("a reader call never sent: %+v", got)
 	}
 }
@@ -171,5 +171,31 @@ func TestHistoryTaint(t *testing.T) {
 	}
 	if actions != 1 {
 		t.Fatalf("%d actions on the record, want 1", actions)
+	}
+}
+
+// An action's reader calls (a search read one result per call, a call that went to the fallback; v0.8.16) are its
+// record's one reader entry: the models that answered, tokens and counts summed, the longest call's time.
+func TestReaderRecordSumsCalls(t *testing.T) {
+	if readerRecord(nil) != nil {
+		t.Fatal("no call, an entry")
+	}
+	one := readerRecord([]guard.ReaderUse{{Model: guard.ReaderModel, Prompt: 10, Completion: 5, Ms: 7, Outcome: "ok", Quotes: 1}})
+	if *one != (activity.Reader{Model: guard.ReaderModel, Prompt: 10, Completion: 5, Ms: 7, Outcome: "ok", Quotes: 1}) {
+		t.Fatalf("one call %+v", one)
+	}
+	got := readerRecord([]guard.ReaderUse{
+		{Model: guard.ReaderModel, Prompt: 100, Completion: 50, Ms: 900, Outcome: "ok", Quotes: 2, Instructions: 1, Verbatim: 1},
+		{Model: guard.ReaderModel, Ms: 25000, Outcome: "failed", Why: "timeout", Sent: true},
+		{Model: guard.ReaderFallbackModel, Prompt: 120, Completion: 80, Ms: 4000, Outcome: "ok", Quotes: 1, Dropped: 1},
+	})
+	want := activity.Reader{Model: guard.ReaderModel + "+" + guard.ReaderFallbackModel, Prompt: 220, Completion: 130, Ms: 25000, Outcome: "ok",
+		Quotes: 3, Dropped: 1, Instructions: 1, Verbatim: 1}
+	if *got != want {
+		t.Fatalf("calls %+v, want %+v", got, want)
+	}
+	failed := readerRecord([]guard.ReaderUse{{Model: guard.ReaderModel, Outcome: "failed", Why: "model"}, {Model: guard.ReaderFallbackModel, Outcome: "refused", Why: "schema"}})
+	if failed.Outcome != "failed" || failed.Why != "model" || failed.Model != guard.ReaderModel {
+		t.Fatalf("none answered %+v", failed)
 	}
 }

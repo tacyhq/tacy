@@ -19,6 +19,7 @@ import (
 	"github.com/tacyhq/tacy/brain"
 	"github.com/tacyhq/tacy/harness"
 	"github.com/tacyhq/tacy/proto"
+	"github.com/tacyhq/tacy/safety"
 )
 
 // The quarantined reader (reader.go, docs/27 section 5), offline: a fake upstream answers the reader's calls
@@ -586,11 +587,13 @@ func TestJournaledQuotes(t *testing.T) {
 
 // The reserve covers the largest page the reader can get.
 func TestReaderReserve(t *testing.T) {
-	m, p, c, ok := ReaderReserve("web.fetch")
-	if !ok || m != ReaderModel || c != readerMaxOut || p < maxPageChars {
-		t.Fatalf("%s %d %d %v", m, p, c, ok)
+	p, c := ReaderCallMax("web.fetch")
+	tokens, cost, ok := ReaderReserve("web.fetch", nil)
+	if !ok || c != readerMaxOut || p < maxPageChars || tokens != 2*(p+c) ||
+		cost != safety.ModelCost(ReaderModel, p, c)+safety.ModelCost(ReaderFallbackModel, p, c) {
+		t.Fatalf("%d %d %d %d %v", p, c, tokens, cost, ok)
 	}
-	if _, _, _, ok := ReaderReserve("web.images"); ok {
+	if _, _, ok := ReaderReserve("web.images", nil); ok {
 		t.Fatal("images reserved a reader")
 	}
 }

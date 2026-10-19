@@ -482,7 +482,7 @@ func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { retu
 // parentheses, a footnote mark or emphasis is cut like the passage itself; the reader's own words stay.
 func TestSkeletonCut(t *testing.T) {
 	src := `"Control" means (i) the power to cause the direction or management of such entity, or (ii) ownership of fifty percent (50%) or more of the outstanding shares, or (iii) beneficial ownership of such entity.[12] It is **very** important.`
-	skel := newSkeletonIndex([]string{src}, verbatimRunes)
+	skel := newSkeletonIndex([]string{src}, skeletonRunes)
 	plain := newVerbatimIndex([]string{src}, verbatimRunes)
 	for _, c := range []struct{ in, cut string }{
 		{"control is ownership of fifty percent or more of the outstanding shares, or beneficial ownership of such entity.", "…"},
@@ -498,6 +498,48 @@ func TestSkeletonCut(t *testing.T) {
 	// The reader's own words about it aren't cut.
 	if got, n := skel.cut("Control means power over management, majority ownership or beneficial ownership."); n != 0 {
 		t.Fatalf("own words cut: %q", got)
+	}
+}
+
+// A copy with its punctuation or spacing changed is a copy (v0.8.16, the w09 leak): a 40-character passage of the
+// source written with other commas, semicolons, colons, dashes, quote marks or spaces is cut, against the source
+// and against the task's earlier sources; the reader's own words with the same names and figures stay.
+func TestSkeletonCutIgnoresPunctuation(t *testing.T) {
+	src := `The committee, after a long review, approved the plan; funding starts in March 2027 (pending a final vote). Its "core" budget is $4.5 million — up from last year.`
+	skel := newSkeletonIndex([]string{src}, skeletonRunes)
+	plain := newVerbatimIndex([]string{src}, verbatimRunes)
+	for _, in := range []string{
+		"The committee after a long review approved the plan, funding starts in March 2027.", // commas dropped, ";" for ","
+		"the committee: after a long review: approved the plan -- funding starts in March",   // other punctuation
+		"Its core budget is 4.5 million; up from last year, it says.",                        // quote marks, "$", dash
+		"The  committee ,after a long  review,approved the plan",                             // spacing
+		"funding starts in March 2027 pending a final vote. Its core budget",                 // across a sentence
+	} {
+		if _, n := plain.cut(in); n != 0 {
+			t.Fatalf("plain index cut %q: the case no longer covers the gap", in)
+		}
+		got, n := skel.cut(in)
+		if n == 0 || len([]rune(got)) > len([]rune(in))-30 {
+			t.Fatalf("%q not cut: %q", in, got)
+		}
+	}
+	// The reader's own words that share names and figures aren't cut.
+	for _, own := range []string{
+		"A committee approved a plan whose funding begins in March 2027, with a $4.5 million budget.",
+		"Funding: March 2027. Budget: $4.5 million, higher than last year.",
+	} {
+		if got, n := skel.cut(own); n != 0 {
+			t.Fatalf("own words cut: %q -> %q", own, got)
+		}
+	}
+	// Against an earlier source of the task (hashed run sets), the same.
+	var ts taskSources
+	ts.add([]string{src})
+	_, earlierSkel := ts.before()
+	other := newSkeletonIndex([]string{"An unrelated page about something else entirely, with its own words."}, skeletonRunes)
+	other.more = earlierSkel
+	if _, n := other.cut("The committee; after a long review; approved the plan."); n == 0 {
+		t.Fatalf("punctuation-changed copy of an earlier source not cut")
 	}
 }
 

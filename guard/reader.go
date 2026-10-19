@@ -144,6 +144,10 @@ const (
 	// shortVerbatimRunes: the same, when the reader says the source tried to instruct an AI (instruction_count > 0):
 	// a short injection copied into its own words is cut too (docs/27 section 5).
 	shortVerbatimRunes = 20
+	// skeletonRunes: the run length in a skeleton (v0.8.16), where punctuation and symbols read as spaces: a
+	// passage's ", " is one space there, so a 40-character passage with a few commas is a bit shorter than 40. Its
+	// runs start and end with a letter or digit (a run that starts or ends at a space is a shorter copy).
+	skeletonRunes = 36
 	// Quotes by reference: the most spans one quote may cover, the longest span, the shortest (shorter pieces join
 	// the next, so a page of short lines doesn't become thousands of spans), and the most spans a document gets.
 	maxQuoteSpans = 6
@@ -1015,7 +1019,7 @@ func (g *Guard) readCall(ctx context.Context, t *task, rc *ReaderConfig, d *read
 	// parenthesized enumerators and figures, footnote marks and emphasis), so a copy that only leaves "(iii)" out
 	// is a copy; and in the task's earlier sources and, for one result of a split read, the whole search.
 	idx := newVerbatimIndex(segs, verbatimRunes)
-	skel := newSkeletonIndex(segs, verbatimRunes)
+	skel := newSkeletonIndex(segs, skeletonRunes)
 	idx.more, skel.more = d.earlier, d.earlierSkel
 	var short *verbatimIndex
 	if out.InstructionCount > 0 {
@@ -1467,19 +1471,21 @@ func fold(r rune) rune {
 	return r
 }
 
-func normalize(s string, lower bool) normText { return normalizeSkip(s, lower, nil) }
+func normalize(s string, lower bool) normText { return normalizeSkip(s, lower, nil, false) }
 
 // skeletonSkip is what a near-verbatim copy of a passage tends to leave out (v0.8.16): a short parenthesized
 // enumerator or figure ("(iii)", "(b)", "(50%)"), a footnote mark ("[12]"), markdown emphasis ("**", "__").
 var skeletonSkip = regexp.MustCompile(`\(\s*(?:[ivxlcdmIVXLCDM]{1,6}|[a-zA-Z]|\d{1,3}(?:[.,]\d+)?\s?%?)\s*\)|\[\d{1,3}\]|\*\*|__`)
 
-// skeleton is s folded and lowercased as normalize does, with skeletonSkip's matches read as spaces.
+// skeleton is s folded and lowercased as normalize does, with skeletonSkip's matches, punctuation and symbols read
+// as spaces: a copy that only changes, drops or adds punctuation or spacing ("a; b" for "a, b") is still a copy.
 func skeleton(s string) normText {
-	return normalizeSkip(s, true, skeletonSkip.FindAllStringIndex(s, -1))
+	return normalizeSkip(s, true, skeletonSkip.FindAllStringIndex(s, -1), true)
 }
 
-// normalizeSkip is normalize with the byte ranges skip (in order, not overlapping) read as spaces.
-func normalizeSkip(s string, lower bool, skip [][]int) normText {
+// normalizeSkip is normalize with the byte ranges skip (in order, not overlapping) read as spaces, and with punct
+// unicode punctuation and symbols too.
+func normalizeSkip(s string, lower bool, skip [][]int, punct bool) normText {
 	var n normText
 	space := false
 	for i, r := range s {
@@ -1490,7 +1496,8 @@ func normalizeSkip(s string, lower bool, skip [][]int) normText {
 		for len(skip) > 0 && i >= skip[0][1] {
 			skip = skip[1:]
 		}
-		if unicode.IsSpace(r) || r == ' ' || r == '​' || len(skip) > 0 && i >= skip[0][0] {
+		if unicode.IsSpace(r) || r == ' ' || r == '​' || len(skip) > 0 && i >= skip[0][0] ||
+			punct && (unicode.IsPunct(r) || unicode.IsSymbol(r)) {
 			if !space && len(n.r) > 0 {
 				n.r, n.start, n.end = append(n.r, ' '), append(n.start, i), append(n.end, i+w)
 			}
@@ -1594,7 +1601,7 @@ func (s *taskSources) add(segs []string) (runSet, runSet) {
 		}
 		return out
 	}
-	r, k := hashed(newVerbatimIndex(segs, verbatimRunes)), hashed(newSkeletonIndex(segs, verbatimRunes))
+	r, k := hashed(newVerbatimIndex(segs, verbatimRunes)), hashed(newSkeletonIndex(segs, skeletonRunes))
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(s.runs) < maxCachedReads {
@@ -1605,17 +1612,22 @@ func (s *taskSources) add(segs []string) (runSet, runSet) {
 
 func lowered(s string) normText { return normalize(s, true) }
 
-func newVerbatimIndex(segs []string, k int) verbatimIndex { return newIndex(segs, k, lowered) }
+func newVerbatimIndex(segs []string, k int) verbatimIndex { return newIndex(segs, k, lowered, false) }
 
 // newSkeletonIndex is the index of the sources' skeletons: a passage matches with skeletonSkip's matches left out
-// on either side.
-func newSkeletonIndex(segs []string, k int) verbatimIndex { return newIndex(segs, k, skeleton) }
+// and punctuation and spacing changed on either side.
+func newSkeletonIndex(segs []string, k int) verbatimIndex { return newIndex(segs, k, skeleton, true) }
 
-func newIndex(segs []string, k int, norm func(string) normText) verbatimIndex {
+// newIndex indexes the runs of k characters of the segments as norm folds them; with words, only runs that start and
+// end with a non-space.
+func newIndex(segs []string, k int, norm func(string) normText, words bool) verbatimIndex {
 	idx := verbatimIndex{k: k, runs: map[string]bool{}, norm: norm}
 	for _, s := range segs {
 		n := norm(s)
 		for i := 0; i+k <= len(n.r); i++ {
+			if words && (n.r[i] == ' ' || n.r[i+k-1] == ' ') {
+				continue
+			}
 			idx.runs[string(n.r[i:i+k])] = true
 		}
 	}

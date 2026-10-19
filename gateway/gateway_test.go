@@ -286,7 +286,7 @@ func TestReaderAcrossTheSocket(t *testing.T) {
 		answer := `{"summary":"A sentence about a fox [Q1].","facts":["A fox jumps."],"entities":[],"dates":[],"amounts":[],` +
 			`"source":{"kind":"other","title":"T","publisher":"","published":""},` +
 			`"quotes":[{"id":1,"from":2,"to":2,"location":"p","topic":"fox"}],` + // span 1 is the title, 2 the sentence
-			`"wording":"","instructions_found":false,"instruction_count":0}`
+			`"items":[],"wording":"","instructions_found":false,"instruction_count":0}`
 		b, _ := json.Marshal(answer)
 		w.Header().Set("Content-Type", "text/event-stream")
 		fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":%s},\"finish_reason\":\"stop\"}]}\n\n", b)

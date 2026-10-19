@@ -32,7 +32,7 @@ func readerAnswer(prompt string) string {
 	}
 	b, _ := json.Marshal(map[string]any{"summary": "A release note [Q1].", "facts": []string{"v0.6.1 is out."}, "entities": []string{},
 		"dates": []string{}, "amounts": []string{}, "source": map[string]any{"kind": "docs", "title": "Release", "publisher": "", "published": ""},
-		"quotes": quotes, "wording": "", "instructions_found": false, "instruction_count": 0})
+		"quotes": quotes, "items": []any{}, "wording": "", "instructions_found": false, "instruction_count": 0})
 	return string(b)
 }
 

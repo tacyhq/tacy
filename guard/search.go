@@ -29,13 +29,15 @@ type SearchResult struct {
 }
 
 // Caps on a result's provider text, in characters, the same for every provider. The snippet is what the
-// quarantined reader reads of a result (it never gets the page): 2,000 since v0.8.12, was 600 (Exa's 400-character
-// highlights named none of the 48 sneakers the pages named; at 2,000 the reader named them). The reader's budget
-// (ReaderReserve) and its spans (maxSpans) are sized from these. People get a shorter snippet with each citation
-// (citationSnippetRunes).
+// quarantined reader reads of a result (it never gets the page): 4,000 since v0.8.13 (2,000 in v0.8.12, 600
+// before: Exa's 400-character highlights named none of the 48 sneakers the pages named). At 2,000, GQ's list of 8
+// new sneakers was cut after the first; measured 2026-10-19 on the audit's four sneaker searches, 4,000 gave the
+// reader 14 checked items a search on average (2,000: 12; 3,000: 10) at the same read time (p50 13 s: the time goes
+// to the answer, not the input). The reader's budget (ReaderReserve) and its spans (maxSpans) are sized from these.
+// People get a shorter snippet with each citation (citationSnippetRunes).
 const (
 	maxTitleRunes   = 200
-	maxSnippetRunes = 2000
+	maxSnippetRunes = 4000
 	// citationSnippetRunes is a citation's snippet as people get it (the source's hover card), as before v0.8.12:
 	// the chat keeps citations with the message.
 	citationSnippetRunes = 600

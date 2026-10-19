@@ -24,6 +24,7 @@ func spanAnswer(t *testing.T, edit func(m map[string]any)) string {
 	t.Helper()
 	return answerJSON(t, func(m map[string]any) {
 		m["quotes"] = []map[string]any{{"id": 1, "from": 2, "to": 2, "location": "Section 1", "topic": "Legal Entity"}}
+		m["items"] = []map[string]any{}
 		if edit != nil {
 			edit(m)
 		}
@@ -144,9 +145,9 @@ func TestReaderSpansSchema(t *testing.T) {
 			} `json:"quotes"`
 		} `json:"properties"`
 	}
-	if err := json.Unmarshal(rc.schema(37), &s); err != nil || s.Properties.Quotes.Items.Properties["to"].Maximum != 37 ||
+	if err := json.Unmarshal(rc.schema(37, 1), &s); err != nil || s.Properties.Quotes.Items.Properties["to"].Maximum != 37 ||
 		!slices.Equal(s.Properties.Quotes.Items.Required, spanQuoteMembers) {
-		t.Fatalf("schema %s (%v)", rc.schema(37), err)
+		t.Fatalf("schema %s (%v)", rc.schema(37, 1), err)
 	}
 }
 
@@ -212,8 +213,9 @@ func TestReaderSpansInjectionCorpus(t *testing.T) {
 	}
 }
 
-// A span the document doesn't have, spans backwards, too many, or a quote across two search results: the answer is
-// refused whole, the model gets nothing from the source, the person a refused metric.
+// A span the document doesn't have, spans backwards, too many, or a quote across two search results: that quote is
+// dropped, never the whole answer (v0.8.13: one bad quote refused a whole search's five sources); the rest reaches
+// the model, the person an ok metric.
 func TestReaderSpansOutOfRange(t *testing.T) {
 	url := "https://docs.example.org/page"
 	pages := stubWeb{url: []byte(`<html><head><title>Release v0.6.1</title></head><body><p>dstack v0.6.1 was published on 13 October with fixes. It has more.</p></body></html>`)}
@@ -227,8 +229,8 @@ func TestReaderSpansOutOfRange(t *testing.T) {
 				}}
 			e := newReaderE2EWith(t, sm, pages, DefaultReader)
 			res, metric := readerOutcome(e.run(t, "what's new in dstack?"))
-			if !strings.Contains(string(res.Result), "named a passage the source doesn't have") || !strings.Contains(string(res.Result), `"read":null`) ||
-				len(res.Quotes) != 0 || metric == nil || metric.Outcome != "refused" {
+			if strings.Contains(string(res.Result), `"read":null`) || !strings.Contains(string(res.Result), `"quotes":[]`) ||
+				!strings.Contains(string(res.Result), "Version 2.0 dates from 2004") || len(res.Quotes) != 0 || metric == nil || metric.Outcome != "ok" {
 				t.Fatalf("result %s quotes %v metric %+v", res.Result, res.Quotes, metric)
 			}
 			for _, raw := range sm.actReqs {
@@ -250,7 +252,7 @@ func TestReaderSpansOutOfRange(t *testing.T) {
 		g := e.g
 		g.cfg.Search = &twoResults{}
 		res, metric := readerOutcome(e.run(t, "dstack?"))
-		if metric == nil || metric.Outcome != "refused" || len(res.Quotes) != 0 {
+		if metric == nil || metric.Outcome != "ok" || len(res.Quotes) != 0 || strings.Contains(string(res.Result), `"read":null`) {
 			t.Fatalf("result %s metric %+v", res.Result, metric)
 		}
 	})

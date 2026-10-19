@@ -69,21 +69,35 @@ func TestReaderSchemaRefusal(t *testing.T) {
 		"wrong type":         answerJSON(t, func(m map[string]any) { m["instruction_count"] = "2" }),
 		"summary too long":   answerJSON(t, func(m map[string]any) { m["summary"] = long }),
 		"too many facts":     answerJSON(t, func(m map[string]any) { m["facts"] = slices.Repeat([]string{"f"}, maxReaderFacts+1) }),
-		"empty fact":         answerJSON(t, func(m map[string]any) { m["facts"] = []string{" "} }),
 		"unknown kind":       answerJSON(t, func(m map[string]any) { m["source"].(map[string]any)["kind"] = "tool" }),
 		"source extra":       answerJSON(t, func(m map[string]any) { m["source"].(map[string]any)["url"] = "x" }),
 		"count mismatch":     answerJSON(t, func(m map[string]any) { m["instructions_found"] = true }),
 		"negative count":     answerJSON(t, func(m map[string]any) { m["instruction_count"] = -1 }),
 		"control character":  answerJSON(t, func(m map[string]any) { m["summary"] = "a\x1bb" }),
-		"duplicate quote id": answerJSON(t, func(m map[string]any) { m["quotes"].([]map[string]any)[1]["id"] = 1 }),
-		"quote id too high":  answerJSON(t, func(m map[string]any) { m["quotes"].([]map[string]any)[1]["id"] = 9 }),
 		"quote extra member": answerJSON(t, func(m map[string]any) { m["quotes"].([]map[string]any)[0]["url"] = "x" }),
-		"empty quote":        answerJSON(t, func(m map[string]any) { m["quotes"].([]map[string]any)[0]["text"] = "" }),
 		"too large":          `{"summary":"` + strings.Repeat("y", maxReaderOutBytes) + `"}`,
 	}
 	for name, b := range bad {
 		if _, err := decodeReader([]byte(b), legacy); err == nil {
 			t.Errorf("%s: accepted", name)
+		}
+	}
+	// An entry that fails on its own is dropped on its own (v0.8.13): the rest of the answer stays.
+	drop := map[string]struct {
+		answer        string
+		facts, quotes int
+	}{
+		"duplicate quote id": {answerJSON(t, func(m map[string]any) { m["quotes"].([]map[string]any)[1]["id"] = 1 }), 1, 1},
+		"quote id too high":  {answerJSON(t, func(m map[string]any) { m["quotes"].([]map[string]any)[1]["id"] = 9 }), 1, 1},
+		"empty quote":        {answerJSON(t, func(m map[string]any) { m["quotes"].([]map[string]any)[0]["text"] = "" }), 1, 1},
+		"empty fact":         {answerJSON(t, func(m map[string]any) { m["facts"] = []string{" ", "Real fact."} }), 1, 2},
+		"fact too long":      {answerJSON(t, func(m map[string]any) { m["facts"] = []string{long, "Real fact."} }), 1, 2},
+		"fact control":       {answerJSON(t, func(m map[string]any) { m["facts"] = []string{"a\x1bb", "Real fact."} }), 1, 2},
+	}
+	for name, c := range drop {
+		o, n, err := decodeReaderN([]byte(c.answer), legacy)
+		if err != nil || n != 1 || len(o.Facts) != c.facts || len(o.Quotes) != c.quotes {
+			t.Errorf("%s: %v dropped %d, facts %d quotes %d", name, err, n, len(o.Facts), len(o.Quotes))
 		}
 	}
 }

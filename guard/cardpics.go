@@ -414,20 +414,20 @@ func (c *cardPics) newCards(final bool) []cardRef {
 // pictures.
 func (g *Guard) cardText(t *task, delta string) {
 	for _, c := range t.cards.feed(delta) {
-		g.cardPicture(t, c)
+		g.cardPicture(t, c, false)
 	}
 }
 
 // cardTextDone: the model call's answer ended; a block it left open counts now.
 func (g *Guard) cardTextDone(t *task) {
 	for _, c := range t.cards.done() {
-		g.cardPicture(t, c)
+		g.cardPicture(t, c, false)
 	}
 }
 
 // cardPicture starts one card's picture in the background under the task: its own source's candidates, best
-// first, then those of other sources that name its item closely (otherSources).
-func (g *Guard) cardPicture(t *task, card cardRef) {
+// first, then (unless ownOnly) those of other sources that name its item closely (otherSources).
+func (g *Guard) cardPicture(t *task, card cardRef, ownOnly bool) {
 	var tries []cardTry
 	own := ""
 	if src, cands, ok := t.tools.cardSource(card); ok {
@@ -436,7 +436,9 @@ func (g *Guard) cardPicture(t *task, card cardRef) {
 			tries = append(tries, cardTry{src: src, c: c})
 		}
 	}
-	tries = append(tries, t.tools.otherSources(card.title, own)...)
+	if !ownOnly {
+		tries = append(tries, t.tools.otherSources(card.title, own)...)
+	}
 	key := own + "|" + strings.ToLower(card.title) // a card once (two cards may cite one roundup)
 	if len(tries) == 0 {
 		return
@@ -478,6 +480,41 @@ func (g *Guard) cardPicture(t *task, card cardRef) {
 		cp.last = time.Now()
 		cp.mu.Unlock()
 	}()
+}
+
+// ---- a plain chat's search ------------------------------------------------------------------------------------
+
+// resultPictures gives a plain chat's search (searchtask.go, v0.8.13) its results' own pictures for the chat's
+// product cards. The VM doesn't see that chat's answer (its model runs outside the VM), so the cards aren't known
+// here: each result whose own picture names one of the items the reader found in it (checked against the result:
+// reader.go checkItems) gets that picture, tried as a card with that item's name. Everything else is agent mode's
+// card picture, unchanged: the candidates are the provider's picture of the result (SearchResult.Thumbs, never
+// shown to the model), the same checks before any request (cardPicRefused: the address, a logo or icon by its path,
+// and the result's title or the picture's address naming the item, so a roundup's banner never goes on one
+// product's card), the same guarded download in the VM (never the person's browser), re-encode and shape check
+// (logos and banners), the same image slots and per-task caps, sent as an "image" event under the search with the
+// result's address as its page (the chat puts it on the card that links there), its egress on the task's
+// background record and its counts in the card_pictures metric. At most one picture a result; the end of the
+// search waits for them as for agent mode's (cardEndWait). cites are the results' citations, in order.
+func (g *Guard) resultPictures(t *task, read *readerResult, cites []proto.Citation) {
+	for i, c := range cites {
+		var names []string
+		for _, it := range read.items {
+			if it.result == i {
+				names = append(names, it.name)
+			}
+		}
+		src, cands, ok := t.tools.cardSource(cardRef{n: c.Index})
+		if !ok || len(cands) == 0 {
+			continue
+		}
+		for _, name := range names {
+			if slices.ContainsFunc(cands, func(cd picCand) bool { return cardPicRefused(name, src, cd, cardCaptionMin) == "" }) {
+				g.cardPicture(t, cardRef{title: name, n: c.Index}, true)
+				break
+			}
+		}
+	}
 }
 
 // cardPicRefused is why a candidate isn't tried for a card, before any request ("" = try it): its address

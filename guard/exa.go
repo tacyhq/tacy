@@ -38,10 +38,11 @@ const exaKey = "EXA_API_KEY"
 const exaType = "fast"
 
 // exaHighlightChars is roughly how much highlight text Exa returns per result (it may return more; the snippet is
-// capped at maxSnippetRunes anyway, as Brave's and Tavily's are). 2,000 since v0.8.12 (was 400): measured on 10
-// questions 2026-10-19, the 400-character highlights kept none of the 48 sneakers the pages named, and the share of
-// an answer's specifics the sources back went from 71% to 90% with 2,000 (and the reader's prompt naming items).
-// Full text at 3,000 doubled the reader's time without more found; type "auto" found nothing more in about 6 s.
+// capped at maxSnippetRunes anyway, as Brave's and Tavily's are). 4,000 since v0.8.13 (search.go's measurement),
+// 2,000 in v0.8.12 (was 400): measured on 10 questions 2026-10-19, the 400-character highlights kept none of the 48
+// sneakers the pages named, and the share of an answer's specifics the sources back went from 71% to 90% with 2,000
+// (and the reader's prompt naming items). Full text at 3,000 doubled the reader's time without more found; type
+// "auto" found nothing more in about 6 s.
 const exaHighlightChars = maxSnippetRunes
 
 func newExa(lease Lease, images imageProvider) *exa {

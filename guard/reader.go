@@ -11,6 +11,7 @@ import (
 	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
+	"hash/maphash"
 	"regexp"
 	"slices"
 	"strconv"
@@ -446,12 +447,11 @@ type readerDoc struct {
 	text  string // page: its text (redacted)
 	// search: each result's title and snippet (redacted), labelled R1, R2, ... in order
 	results []SearchResult
-	// others: the rest of a search's results when this is one of them, read on its own (a split read): the
-	// reader never gets them, but its fields are cut against them too (as when one call read them all), so no
-	// passage of any of the search's results reaches the acting model through another result's answer.
-	others []string
-	// earlier, earlierSkel: the run sets of the sources the task read before this one (taskSources), cut against too.
-	earlier, earlierSkel []map[string]bool
+	// earlier, earlierSkel: the run sets of the sources the task read before this one (taskSources), and, for one
+	// result of a split read, of the whole search: the reader never gets them, but its fields are cut against them
+	// too (as when one call read all the results), so no passage of another source reaches the acting model
+	// through this one's answer.
+	earlier, earlierSkel []runSet
 }
 
 // readerResult is a checked reader answer for one item: the fields as decoded (refs still local: [Q1], [R1]) and
@@ -673,9 +673,12 @@ func (g *Guard) read(ctx context.Context, t *task, step int, d *readerDoc, onPar
 	rc := g.cfg.Reader
 	// The sources read before this one are cut against too; then this one joins them.
 	d.earlier, d.earlierSkel = t.sources.before()
-	t.sources.add(d.segments(rc.Spans))
+	runs, skel := t.sources.add(d.segments(rc.Spans))
 	if d.kind == "search" && rc.Split && len(d.results) > 1 {
-		return g.readSplit(ctx, t, step, d, onPart)
+		// Each result's answer is also cut against the whole search (the sets just made), as one call's was.
+		whole := *d
+		whole.earlier, whole.earlierSkel = append(slices.Clone(d.earlier), runs), append(slices.Clone(d.earlierSkel), skel)
+		return g.readSplit(ctx, t, step, &whole, onPart)
 	}
 	res := g.readOne(ctx, t, step, rc, d, rc.timeout(d.kind))
 	if onPart != nil && d.kind == "search" && res.err == "" {
@@ -713,15 +716,10 @@ func (g *Guard) readSplit(ctx context.Context, t *task, step int, d *readerDoc, 
 	return mergeParts(parts)
 }
 
-// part is result i of a search on its own (a split read's), with the other results' text to cut against.
+// part is result i of a search on its own (a split read's), cut against what d is (its earlier sources and the
+// whole search's run sets: read sets them).
 func (d *readerDoc) part(i int) *readerDoc {
-	p := &readerDoc{kind: "search", results: d.results[i : i+1], earlier: d.earlier, earlierSkel: d.earlierSkel}
-	for j, seg := range d.segments(true) {
-		if j != i {
-			p.others = append(p.others, seg)
-		}
-	}
-	return p
+	return &readerDoc{kind: "search", results: d.results[i : i+1], earlier: d.earlier, earlierSkel: d.earlierSkel}
 }
 
 // mergeParts is a split read's answer: its parts in result order; it fails (err) only when every part did: the
@@ -1004,14 +1002,13 @@ func (g *Guard) readCall(ctx context.Context, t *task, rc *ReaderConfig, d *read
 	// prices aside too (they reach it as the source writes them, and nothing around them does).
 	// The passages are looked for in the source as it is and in its skeleton (v0.8.16: without short
 	// parenthesized enumerators and figures, footnote marks and emphasis), so a copy that only leaves "(iii)" out
-	// is a copy; and, for one result of a split read, in the search's other results too.
-	cutSegs := append(slices.Clone(segs), d.others...)
-	idx := newVerbatimIndex(cutSegs, verbatimRunes)
-	skel := newSkeletonIndex(cutSegs, verbatimRunes)
+	// is a copy; and in the task's earlier sources and, for one result of a split read, the whole search.
+	idx := newVerbatimIndex(segs, verbatimRunes)
+	skel := newSkeletonIndex(segs, verbatimRunes)
 	idx.more, skel.more = d.earlier, d.earlierSkel
 	var short *verbatimIndex
 	if out.InstructionCount > 0 {
-		ix := newVerbatimIndex(cutSegs, shortVerbatimRunes)
+		ix := newVerbatimIndex(segs, shortVerbatimRunes)
 		short = &ix
 	}
 	keep := res.itemWords()
@@ -1525,17 +1522,31 @@ type verbatimIndex struct {
 	k    int
 	runs map[string]bool
 	norm func(string) normText
-	// more: the runs of other sources (the same k and folding): the task's sources read before (taskSources).
-	more []map[string]bool
+	// more: the runs of other sources (the same k and folding), hashed: the task's sources read before
+	// (taskSources).
+	more []runSet
 }
+
+// runSet is a source's runs of k characters as 64-bit hashes (runHash): a task keeps them for every source it
+// read, so they take 8 bytes a run, not the run.
+type runSet map[uint64]struct{}
+
+// runSeed keys runHash for this process (the sets never leave it).
+var runSeed = maphash.MakeSeed()
+
+func runHash(run string) uint64 { return maphash.String(runSeed, run) }
 
 // has: run is in the source or one of the others.
 func (idx verbatimIndex) has(run string) bool {
 	if idx.runs[run] {
 		return true
 	}
+	if len(idx.more) == 0 {
+		return false
+	}
+	h := runHash(run)
 	for _, m := range idx.more {
-		if m[run] {
+		if _, ok := m[h]; ok {
 			return true
 		}
 	}
@@ -1549,24 +1560,32 @@ func (idx verbatimIndex) empty() bool { return len(idx.runs) == 0 && len(idx.mor
 // reach the acting model through another source's answer. In memory, in the task; at most maxCachedReads sources.
 type taskSources struct {
 	mu         sync.Mutex
-	runs, skel []map[string]bool
+	runs, skel []runSet
 }
 
 // before is the run sets of the sources read so far.
-func (s *taskSources) before() (runs, skel []map[string]bool) {
+func (s *taskSources) before() (runs, skel []runSet) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return slices.Clone(s.runs), slices.Clone(s.skel)
 }
 
-// add records a source the reader reads (its segments).
-func (s *taskSources) add(segs []string) {
-	r, k := newVerbatimIndex(segs, verbatimRunes), newSkeletonIndex(segs, verbatimRunes)
+// add records a source the reader reads (its segments) and returns its run sets.
+func (s *taskSources) add(segs []string) (runSet, runSet) {
+	hashed := func(idx verbatimIndex) runSet {
+		out := make(runSet, len(idx.runs))
+		for r := range idx.runs {
+			out[runHash(r)] = struct{}{}
+		}
+		return out
+	}
+	r, k := hashed(newVerbatimIndex(segs, verbatimRunes)), hashed(newSkeletonIndex(segs, verbatimRunes))
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(s.runs) < maxCachedReads {
-		s.runs, s.skel = append(s.runs, r.runs), append(s.skel, k.runs)
+		s.runs, s.skel = append(s.runs, r), append(s.skel, k)
 	}
+	return r, k
 }
 
 func lowered(s string) normText { return normalize(s, true) }

@@ -85,10 +85,11 @@ const (
 	readerTimeout = 12 * time.Second
 	// readerSearchTimeout: a search's results, 2,000 characters a result since v0.8.12, took 2.4-10 s to read in the
 	// eval of 2026-10-19, and 9-12 s on small input in a slow spell on Tinfoil, so 12 s lost whole searches. With the
-	// items list (v0.8.13) the answer is about twice as long: 4,000 characters a result took 7-29 s (p50 13 s) in the
-	// measurement of 2026-10-19, so 45 s (was 30). Well inside a run's wall time (5 minutes) and a plain chat's search
-	// (agentd's searchTimeout, 90 s).
-	readerSearchTimeout = 45 * time.Second
+	// items list (v0.8.13) the answer is about twice as long (1,000-1,800 tokens): 7-29 s (p50 13 s) at Tinfoil's
+	// usual speed, but 35-50 s in the slow spell of 2026-10-19 (gpt-oss-120b at about 27 tokens/s), where v0.8.13's
+	// 45 s lost 3 of 10 reads of the audit rerun on a throwaway. 75 s since v0.8.14: about 2,000 tokens at that speed.
+	// Well inside a run's wall time (5 minutes) and a plain chat's search (agentd's searchTimeout, 115 s).
+	readerSearchTimeout = 75 * time.Second
 	// Caps the reader's answer is checked against: a little above what the prompt asks for, so a model that runs
 	// slightly long isn't refused, but bounded.
 	maxReaderFacts = 8

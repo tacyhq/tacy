@@ -189,7 +189,7 @@ func TestReaderSearchTimeout(t *testing.T) {
 	if res := g.read(context.Background(), tk, 1, page); res.err != readerTimeoutMsg {
 		t.Fatalf("page read past the page timeout: %q", res.err)
 	}
-	if DefaultReader.SearchTimeout != 45*time.Second || DefaultReader.Timeout != 12*time.Second {
+	if DefaultReader.SearchTimeout != 75*time.Second || DefaultReader.Timeout != 12*time.Second {
 		t.Fatalf("release timeouts %v %v", DefaultReader.Timeout, DefaultReader.SearchTimeout)
 	}
 

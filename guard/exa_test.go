@@ -89,7 +89,7 @@ func TestExaRequestAndResults(t *testing.T) {
 	if body["query"] != "masked query [email]" || body["numResults"] != float64(2) || body["type"] != exaType || body["moderation"] != true {
 		t.Fatalf("body: %v", body)
 	}
-	if c, _ := json.Marshal(body["contents"]); string(c) != `{"highlights":{"maxCharacters":400}}` {
+	if c, _ := json.Marshal(body["contents"]); string(c) != `{"highlights":{"maxCharacters":2000}}` {
 		t.Fatalf("contents: %s", c)
 	}
 	h := x.headers[0]

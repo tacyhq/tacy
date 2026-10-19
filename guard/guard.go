@@ -284,7 +284,7 @@ func (g *Guard) open(id string, opts TaskOptions, out func(proto.Event) error) *
 	if g.cfg.Safety != nil { // site icons fetch under the task's context
 		t.ctx = withHostFilter(t.ctx, g.fetchFilter(opts.Space))
 	}
-	t.tools = &Tools{search: g.cfg.Search, fetcher: g.cfg.Fetcher, reader: g.cfg.Reader != nil}
+	t.tools = &Tools{search: g.cfg.Search, fetcher: g.cfg.Fetcher, reader: g.cfg.Reader != nil, plain: opts.Via == ViaSearch}
 	if g.gates != nil {
 		t.tools.gate = g.gates.forUser(opts.User)
 		t.tools.decodes = g.gates.decodes

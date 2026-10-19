@@ -34,9 +34,10 @@ import (
 // permission check, the leak scan, the quarantined reader) and on the activity record (trigger "search"). Nothing
 // is kept in the queue: the stream is the only copy, as for /run.
 
-// searchTimeout bounds one search's stream: the search, the reader (12 s) and the site icons' grace take seconds;
-// the slowest part is a cold reader. The task's own cap is guard.SearchCap.
-const searchTimeout = 60 * time.Second
+// searchTimeout bounds one search's stream: verifying the reader's model, the search (its client gives up at 20 s),
+// the reader (at most 30 s for a search's results since v0.8.12) and the site icons' grace; 75 s leaves the reader
+// its whole time after a slow search. The task's own cap is guard.SearchCap (2 minutes).
+const searchTimeout = 75 * time.Second
 
 // Searches at once: VM-wide, and per user tag (the tool caps in the guard limit the searches themselves too).
 const (

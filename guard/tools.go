@@ -108,6 +108,9 @@ type Tools struct {
 	// reader: the quarantined reader is on, so no provider text reaches the model: image results go without their
 	// titles, and with only their page's host (docs/27 section 5).
 	reader bool
+	// plain: a plain chat's search task (ViaSearch, searchtask.go), which can't fetch: its results' note says nothing
+	// about fetching.
+	plain bool
 	// decodes bounds image decodes at once across the VM (shared by every run; nil = no bound).
 	decodes    chan struct{}
 	mu         sync.Mutex
@@ -380,9 +383,13 @@ func (t *Tools) finish(p pending) toolOutcome {
 			t.cites++
 			rs = append(rs, ritem{t.cites, siteOf(r.URL), r.Age, t.pictureFlag(r.URL, r.Title, thumbCands(r.Thumbs)...)})
 			ns = append(ns, t.cites)
-			cites = append(cites, proto.Citation{Index: t.cites, Title: r.Title, URL: r.URL, Snippet: r.Snippet, Age: r.Age})
+			cites = append(cites, proto.Citation{Index: t.cites, Title: r.Title, URL: r.URL, Snippet: capRunes(r.Snippet, citationSnippetRunes), Age: r.Age})
 		}
-		return t.finishRead(p, out, ns, map[string]any{"note": readerNote, "query": p.query, "results": rs}, cites)
+		note := readerNote
+		if t.plain {
+			note = readerSearchNote
+		}
+		return t.finishRead(p, out, ns, map[string]any{"note": note, "query": p.query, "results": rs}, cites)
 	}
 	res := struct {
 		Note    string `json:"note"`
@@ -392,7 +399,7 @@ func (t *Tools) finish(p pending) toolOutcome {
 	for _, r := range p.results {
 		t.cites++
 		res.Results = append(res.Results, item{t.cites, r.Title, r.URL, r.Snippet, r.Age, t.pictureFlag(r.URL, r.Title, thumbCands(r.Thumbs)...)})
-		out.citations = append(out.citations, proto.Citation{Index: t.cites, Title: r.Title, URL: r.URL, Snippet: r.Snippet, Age: r.Age})
+		out.citations = append(out.citations, proto.Citation{Index: t.cites, Title: r.Title, URL: r.URL, Snippet: capRunes(r.Snippet, citationSnippetRunes), Age: r.Age})
 	}
 	b, _ := json.Marshal(res)
 	out.content = string(b)
@@ -406,6 +413,9 @@ func (t *Tools) finishRead(p pending, out toolOutcome, sources []int, head map[s
 	out.citations = cites
 	if p.read.err != "" || len(sources) == 0 {
 		head["note"] = readerFailNote
+		if p.read.err == readerSearchTimeoutMsg {
+			head["note"] = readerSearchTimeoutNote
+		}
 		head["read"] = nil
 		head["reader"] = cmp.Or(p.read.err, "nothing to read")
 	} else {

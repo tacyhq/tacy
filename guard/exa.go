@@ -38,8 +38,11 @@ const exaKey = "EXA_API_KEY"
 const exaType = "fast"
 
 // exaHighlightChars is roughly how much highlight text Exa returns per result (it may return more; the snippet is
-// capped at 600 characters anyway, as Brave's and Tavily's are).
-const exaHighlightChars = 400
+// capped at maxSnippetRunes anyway, as Brave's and Tavily's are). 2,000 since v0.8.12 (was 400): measured on 10
+// questions 2026-10-19, the 400-character highlights kept none of the 48 sneakers the pages named, and the share of
+// an answer's specifics the sources back went from 71% to 90% with 2,000 (and the reader's prompt naming items).
+// Full text at 3,000 doubled the reader's time without more found; type "auto" found nothing more in about 6 s.
+const exaHighlightChars = maxSnippetRunes
 
 func newExa(lease Lease, images imageProvider) *exa {
 	return &exa{lease: lease, base: "https://api.exa.ai/search", http: recordingClient(&http.Client{Timeout: 20 * time.Second}),
@@ -124,8 +127,8 @@ func parseExa(raw []byte, count int) ([]SearchResult, error) {
 		if err != nil || (u.Scheme != "https" && u.Scheme != "http") {
 			continue
 		}
-		rs = append(rs, SearchResult{Title: clean(r.Title, 200), URL: capRunes(r.URL, 500),
-			Snippet: clean(strings.Join(r.Highlights, " … "), 600), Age: clean(r.PublishedDate, 40), Thumbs: thumbsOf(r.Image)})
+		rs = append(rs, SearchResult{Title: clean(r.Title, maxTitleRunes), URL: capRunes(r.URL, 500),
+			Snippet: clean(strings.Join(r.Highlights, " … "), maxSnippetRunes), Age: clean(r.PublishedDate, 40), Thumbs: thumbsOf(r.Image)})
 		if len(rs) == count {
 			break
 		}

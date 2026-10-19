@@ -28,6 +28,19 @@ type SearchResult struct {
 	Thumbs []string
 }
 
+// Caps on a result's provider text, in characters, the same for every provider. The snippet is what the
+// quarantined reader reads of a result (it never gets the page): 2,000 since v0.8.12, was 600 (Exa's 400-character
+// highlights named none of the 48 sneakers the pages named; at 2,000 the reader named them). The reader's budget
+// (ReaderReserve) and its spans (maxSpans) are sized from these. People get a shorter snippet with each citation
+// (citationSnippetRunes).
+const (
+	maxTitleRunes   = 200
+	maxSnippetRunes = 2000
+	// citationSnippetRunes is a citation's snippet as people get it (the source's hover card), as before v0.8.12:
+	// the chat keeps citations with the message.
+	citationSnippetRunes = 600
+)
+
 // maxThumbs is how many of a result's pictures are kept as card picture candidates.
 const maxThumbs = 2
 
@@ -137,16 +150,13 @@ func (b *brave) Search(ctx context.Context, query string, count int) ([]SearchRe
 		if err != nil || (u.Scheme != "https" && u.Scheme != "http") {
 			continue
 		}
-		snippet := r.Description
-		if len(r.ExtraSnippets) > 0 {
-			snippet += " … " + r.ExtraSnippets[0]
-		}
+		snippet := strings.Join(append([]string{r.Description}, r.ExtraSnippets...), " … ")
 		var thumbs []string
 		if !r.Thumbnail.Logo {
 			thumbs = thumbsOf(r.Thumbnail.Original)
 		}
-		rs = append(rs, SearchResult{Title: clean(r.Title, 200), URL: capRunes(r.URL, 500),
-			Snippet: clean(snippet, 600), Age: clean(r.Age, 40), Thumbs: thumbs})
+		rs = append(rs, SearchResult{Title: clean(r.Title, maxTitleRunes), URL: capRunes(r.URL, 500),
+			Snippet: clean(snippet, maxSnippetRunes), Age: clean(r.Age, 40), Thumbs: thumbs})
 		if len(rs) == count {
 			break
 		}
@@ -216,8 +226,8 @@ func (t *tavily) Search(ctx context.Context, query string, count int) ([]SearchR
 		for _, im := range r.Images {
 			imgs = append(imgs, im.URL)
 		}
-		rs = append(rs, SearchResult{Title: clean(r.Title, 200), URL: capRunes(r.URL, 500),
-			Snippet: clean(r.Content, 600), Age: clean(r.PublishedDate, 40), Thumbs: thumbsOf(imgs...)})
+		rs = append(rs, SearchResult{Title: clean(r.Title, maxTitleRunes), URL: capRunes(r.URL, 500),
+			Snippet: clean(r.Content, maxSnippetRunes), Age: clean(r.PublishedDate, 40), Thumbs: thumbsOf(imgs...)})
 		if len(rs) == count {
 			break
 		}

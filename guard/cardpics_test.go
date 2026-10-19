@@ -102,7 +102,7 @@ func TestPicURLRefused(t *testing.T) {
 			t.Errorf("%s accepted", u)
 		}
 	}
-	for _, u := range []string{"https://a.example/products/q6-max-front.jpg", "http://cdn.example/silicone-case.webp?w=800",
+	for _, u := range []string{"https://a.example/products/q6-max-front.jpg", "http://cdn.example/silicone-case.webp?w=800", "https://store.example/google-pixel-10-pro.jpg",
 		"https://hips.hearstapps.example/vader-prod/1737738862-hoka-bondi-9.jpg?crop=0.6xw&resize=980:*"} {
 		if why := picURLRefused(u); why != "" {
 			t.Errorf("%s refused: %s", u, why)
@@ -134,6 +134,12 @@ func TestCardShapeAndCaption(t *testing.T) {
 	// The alt text or the picture's own address can name the item when the page title doesn't.
 	if why := cardPicRefused("Lofree Flow", roundup, picCand{url: "https://cdn.example/lofree-flow-84.jpg"}); why != "" {
 		t.Fatalf("named by its address: %s", why)
+	}
+	// Found live (Tavily's first picture of Keychron's page): "Iconic" isn't an icon.
+	if why := cardPicRefused("Keychron Q6 Max", citedSource{url: "https://www.keychron.com/products/keychron-q6-max-qmk-via-wireless-custom-mechanical-keyboard",
+		title: "Keychron Q6 Max QMK/VIA Wireless Custom Mechanical Keyboard"},
+		picCand{url: "http://www.keychron.com/cdn/shop/files/Q6-Max-Iconic-Features.jpg?crop=center&height=1200&v=1753926018&width=1200"}); why != "" {
+		t.Fatalf("Q6-Max-Iconic-Features.jpg refused: %s", why)
 	}
 	if why := cardPicRefused("Keychron Q6 Max", product, picCand{url: "https://cdn.example/keychron-logo.png"}); why != imageLogo {
 		t.Fatalf("logo: %q", why)

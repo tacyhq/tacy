@@ -15,7 +15,7 @@ package guard
 // ports 80/443, the policy's host filter), downloadImage's caps and processImage's re-encode, the same failure
 // words, the run's image slots (maxImagesPerRun). On top, for a card:
 //   - the source page's title (or its alt text, or the picture's own address) must name the card's item
-//     (captionScore >= cardCaptionMin: a roundup's banner doesn't go on one product's card): "mismatch";
+//     (namesItem: half its words, all its model numbers; a roundup's banner doesn't go on one product's card): "mismatch";
 //   - no logo, icon, sprite or banner: by the address (picURLRefused), by shape (under cardMinEdge on a side, or
 //     wider or taller than cardMaxAspect to 1): "logo".
 //
@@ -49,7 +49,7 @@ const (
 	cardPicFetches = 3               // card picture downloads at once per task
 	cardMinEdge    = 100             // px, the re-encoded picture's short side
 	cardMaxAspect  = 3               // long side over short side
-	cardCaptionMin = 0.5             // captionScore the source must reach for the card's title
+	cardCaptionMin = 0.5             // share of the card title's words its source must name (namesItem)
 	maxCardItems   = 8               // cards per items block (the chat's MAX_CARD_ITEMS)
 	cardEndWait    = 3 * time.Second // the end of a run waits at most this for card pictures still loading
 
@@ -93,7 +93,7 @@ func picKey(raw string) string {
 // in one (sitelogo.png, favicon-32.png, sprite_sheet.webp).
 var (
 	logoWords = map[string]bool{"icon": true, "icons": true, "badge": true, "badges": true, "avatar": true, "placeholder": true,
-		"spacer": true, "pixel": true, "blank": true, "banner": true, "banners": true}
+		"spacer": true, "banner": true, "banners": true} // not "pixel": a Google Pixel's photo is named so
 	logoParts = []string{"logo", "favicon", "sprite", "apple-touch"}
 )
 
@@ -417,22 +417,36 @@ func cardPicRefused(title string, src citedSource, c picCand) string {
 	return ""
 }
 
-// namesItem: the picture's page title, alt text or addresses name the card's item: captionScore at least
-// cardCaptionMin, and every model number of the title there (as the chat's matchScore: "Q5" never takes a "Q6"
-// picture).
+// namesItem: the picture's page title, alt text or addresses name the card's item: at least cardCaptionMin of the
+// title's words there (numbers, as in model names, count double; "q6max" in an address counts for "Q6 Max"), and
+// every model number of the title there (as the chat's matchScore: "Q5" never takes a "Q6" picture). Unlike
+// captionScore (image_search's ranking) no penalty for logo-like words inside other words: "Q6-Max-Iconic.jpg" is
+// a product shot; logos are refused by whole words in the address (picURLRefused) and by shape.
 func namesItem(title string, c ImageCandidate) bool {
 	q := imageWords(title)
-	if captionScore(q, c) < cardCaptionMin {
+	if len(q) == 0 {
 		return false
 	}
 	text := imageWords(c.Title + " " + c.URL + " " + c.Source)
 	joined := strings.Join(text, "")
+	if whole := strings.Join(q, ""); len(whole) >= 4 && strings.Contains(joined, whole) {
+		return true
+	}
+	var got, total float64
 	for _, w := range q {
-		if strings.ContainsAny(w, "0123456789") && !slices.Contains(text, w) && !strings.Contains(joined, w) {
+		weight := 1.0
+		if strings.ContainsAny(w, "0123456789") {
+			weight = 2
+		}
+		total += weight
+		found := slices.Contains(text, w) || len(w) >= 3 && strings.Contains(joined, w)
+		if found {
+			got += weight
+		} else if weight == 2 {
 			return false
 		}
 	}
-	return true
+	return got/total >= cardCaptionMin
 }
 
 // errCardShape: a picture shaped like a logo or a banner.

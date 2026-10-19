@@ -122,29 +122,29 @@ func TestCardShapeAndCaption(t *testing.T) {
 	product := citedSource{url: "https://www.keychron.example/products/keychron-q6-max", title: "Keychron Q6 Max QMK Wireless Keyboard"}
 	roundup := citedSource{url: "https://www.rtings.example/keyboard/reviews/best", title: "The 7 Best Mechanical Keyboards of 2026"}
 	pic := picCand{url: "https://cdn.example/files/hero.jpg", kind: picPage}
-	if why := cardPicRefused("Keychron Q6 Max", product, pic); why != "" {
+	if why := cardPicRefused("Keychron Q6 Max", product, pic, cardCaptionMin); why != "" {
 		t.Fatalf("the product's own page refused: %s", why)
 	}
-	if why := cardPicRefused("Keychron Q6 Max", roundup, pic); why != imageMismatch {
+	if why := cardPicRefused("Keychron Q6 Max", roundup, pic, cardCaptionMin); why != imageMismatch {
 		t.Fatalf("a roundup's banner on a product card: %q", why)
 	}
-	if why := cardPicRefused("Keychron Q5 Max", product, pic); why != imageMismatch {
+	if why := cardPicRefused("Keychron Q5 Max", product, pic, cardCaptionMin); why != imageMismatch {
 		t.Fatalf("another model number: %q", why) // numbers count double: Q5 isn't Q6
 	}
 	// The alt text or the picture's own address can name the item when the page title doesn't.
-	if why := cardPicRefused("Lofree Flow", roundup, picCand{url: "https://cdn.example/lofree-flow-84.jpg"}); why != "" {
+	if why := cardPicRefused("Lofree Flow", roundup, picCand{url: "https://cdn.example/lofree-flow-84.jpg"}, cardCaptionMin); why != "" {
 		t.Fatalf("named by its address: %s", why)
 	}
 	// Found live (Tavily's first picture of Keychron's page): "Iconic" isn't an icon.
 	if why := cardPicRefused("Keychron Q6 Max", citedSource{url: "https://www.keychron.com/products/keychron-q6-max-qmk-via-wireless-custom-mechanical-keyboard",
 		title: "Keychron Q6 Max QMK/VIA Wireless Custom Mechanical Keyboard"},
-		picCand{url: "http://www.keychron.com/cdn/shop/files/Q6-Max-Iconic-Features.jpg?crop=center&height=1200&v=1753926018&width=1200"}); why != "" {
+		picCand{url: "http://www.keychron.com/cdn/shop/files/Q6-Max-Iconic-Features.jpg?crop=center&height=1200&v=1753926018&width=1200"}, cardCaptionMin); why != "" {
 		t.Fatalf("Q6-Max-Iconic-Features.jpg refused: %s", why)
 	}
-	if why := cardPicRefused("Keychron Q6 Max", product, picCand{url: "https://cdn.example/keychron-logo.png"}); why != imageLogo {
+	if why := cardPicRefused("Keychron Q6 Max", product, picCand{url: "https://cdn.example/keychron-logo.png"}, cardCaptionMin); why != imageLogo {
 		t.Fatalf("logo: %q", why)
 	}
-	if why := cardPicRefused("Keychron Q6 Max", product, picCand{url: "http://127.0.0.1:8080/a.jpg?x=jane@example.com"}); why != imageBlocked {
+	if why := cardPicRefused("Keychron Q6 Max", product, picCand{url: "http://127.0.0.1:8080/a.jpg?x=jane@example.com"}, cardCaptionMin); why != imageBlocked {
 		t.Fatalf("personal data: %q", why)
 	}
 }
@@ -154,9 +154,12 @@ func TestItemsBlocksAndCards(t *testing.T) {
 		`{"items":[{"title":"Keychron Q6 Max","source":"[3]"},{"title":"Lofree Flow","source":"【4】"},{"title":"No source"},` +
 		`{"title":"By number","url":5},{"title":"By address","url":"https://shop.example/p"},{"title":"","source":"[6]"}]}` +
 		"\n```\nMore text.\n```items\n[{\"title\":\"Still open\",\"source\":\"[7]\"}]\n"
-	blocks := itemsBlocks(text)
+	blocks := itemsBlocks(text, false)
 	if len(blocks) != 1 {
 		t.Fatalf("%d blocks", len(blocks))
+	}
+	if final := itemsBlocks(text, true); len(final) != 2 || !slices.Equal(parseCards(final[1]), []cardRef{{title: "Still open", n: 7}}) {
+		t.Fatalf("the open block at the end: %q", final)
 	}
 	cards := parseCards(blocks[0])
 	want := []cardRef{{title: "Keychron Q6 Max", n: 3}, {title: "Lofree Flow", n: 4}, {title: "By number", n: 5},
@@ -177,6 +180,20 @@ func TestItemsBlocksAndCards(t *testing.T) {
 	cp.reset()
 	if got := cp.feed("```items\n[{\"title\":\"B\",\"source\":2}]\n```"); !slices.Equal(got, []cardRef{{title: "B", n: 2}}) {
 		t.Fatalf("after reset %+v", got)
+	}
+	if got := cp.done(); got != nil {
+		t.Fatalf("done again %+v", got)
+	}
+	// Seen live: the answer ends without closing its block; the call's end counts it (once).
+	cp.reset()
+	if got := cp.feed("```items\n{\"items\":[{\"title\":\"C\",\"source\":\"[3]\"}]}\n"); got != nil {
+		t.Fatalf("open block taken early %+v", got)
+	}
+	if got := cp.done(); !slices.Equal(got, []cardRef{{title: "C", n: 3}}) {
+		t.Fatalf("open block at the end %+v", got)
+	}
+	if got := cp.done(); got != nil {
+		t.Fatalf("twice %+v", got)
 	}
 }
 
@@ -254,7 +271,8 @@ func TestCardPicturesFromSearchResults(t *testing.T) {
 				} `json:"results"`
 			}
 			json.Unmarshal(e.Result, &r)
-			if len(r.Results) != 3 || !r.Results[0].Picture || !r.Results[1].Picture || r.Results[2].Picture {
+			// [2] has a picture but is a list ("The best keyboards of 2026"): not flagged; its picture is still a candidate.
+			if len(r.Results) != 3 || !r.Results[0].Picture || r.Results[1].Picture || r.Results[2].Picture {
 				t.Fatalf("picture flags %s", e.Result)
 			}
 			if strings.Contains(string(e.Result), "img.keychron") || strings.Contains(string(e.Result), "hero.png") {
@@ -273,6 +291,34 @@ func TestCardPicturesFromSearchResults(t *testing.T) {
 	// picture known.
 	if m == nil || m.Results != 2 || m.Images != 1 || m.Tried != 2 || m.Failed != 2 || m.Reasons["unreachable"] != 1 ||
 		m.Reasons["mismatch"] != 1 || m.Bytes <= 0 || m.Outcome != "ok" {
+		t.Fatalf("metric %+v", m)
+	}
+}
+
+// A card citing a roundup (whose banner doesn't name its item) gets the picture of another result of the run that
+// is the item's own page, under that result's call, with that page as its source (the chat then matches it by
+// name); a picture goes on one card only.
+func TestCardPicturesFromAnotherSource(t *testing.T) {
+	cards := "```items\n" + `[{"title":"Keychron Q6 Max","source":"[2]"},{"title":"Keychron Q6 Max keyboard","source":"[2]"}]` + "\n```"
+	a, _, _ := newTestAgent(t, toolCallSSE("c1", "web_search", `{"query":"keyboards"}`), textSSE(cards))
+	web := stubWeb{"https://img.keychron.example/q6.png": pngWH(400, 300), "https://reviews.example/hero.png": pngWH(400, 300)}
+	a.newTools = func() *Tools { return &Tools{search: &thumbSearch{}, fetcher: &http.Client{Transport: web}} }
+	evs := collect(t, a, proto.RunRequest{Permissions: AllowAll(), Messages: []proto.Message{{Role: "user", Content: "recommend keyboards"}}})
+	var imgs []*proto.Image
+	var m *proto.Metric
+	for _, e := range evs {
+		if e.Type == "image" {
+			imgs = append(imgs, e.Image)
+		}
+		if e.Type == "metrics" && e.Metrics.Kind == "card_pictures" {
+			m = e.Metrics
+		}
+	}
+	if len(imgs) != 1 || imgs[0].Source != "https://keychron.example/products/q6-max" || imgs[0].URL != "https://img.keychron.example/q6.png" {
+		t.Fatalf("images %+v", imgs)
+	}
+	// Each card: the roundup's banner refused (mismatch); the other source's first thumbnail 404s for the first card.
+	if m == nil || m.Results != 2 || m.Images != 1 || m.Reasons["mismatch"] != 2 {
 		t.Fatalf("metric %+v", m)
 	}
 }
@@ -318,6 +364,22 @@ func TestCardPicturesFromPageMetadata(t *testing.T) {
 	}
 	if src, _, ok := tl.cardSource(cardRef{url: "https://lofree.example/products/flow"}); !ok || src.call != "c9" {
 		t.Fatal("a source's address didn't resolve")
+	}
+}
+
+// Only a page that looks like one item's own is flagged (a list's picture is a banner).
+func TestPictureFlagLists(t *testing.T) {
+	tl := &Tools{}
+	c := picCand{url: "https://a.example/p.jpg", kind: picPage}
+	for title, want := range map[string]bool{"Keychron Q6 Max QMK/VIA Wireless Keyboard": true, "Sony WH-1000XM6 | Sony US": true,
+		"The 7 Best Mechanical Keyboards of 2026": false, "Top 10 robot vacuums": false, "Pegasus 41 vs Ghost 17": false,
+		"Running shoe reviews": false, "Best running shoes for beginners": false, "Keyboard buying guide": false} {
+		if got := tl.pictureFlag("https://a.example/"+title, title, c); got != want {
+			t.Errorf("%q: %v", title, got)
+		}
+	}
+	if tl.pictureFlag("https://a.example/none", "Keychron Q6 Max") {
+		t.Error("flagged without a picture")
 	}
 }
 

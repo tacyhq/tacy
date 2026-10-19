@@ -141,6 +141,7 @@ func (g *Guard) ModelCall(ctx context.Context, ti *harness.TaskInfo, req *harnes
 	if a.err != nil {
 		return failed(a.err)
 	}
+	g.cardTextDone(t)
 	res := a.res
 	m := &proto.Metric{Kind: "model", Step: step, Model: model, Ms: msSince(t0), Outcome: "ok"}
 	if !res.firstAt.IsZero() {

@@ -55,7 +55,7 @@ var toolDefs = map[string]toolDef{
 		"Fetch a public web page (http or https) and return its main text, capped at about 12,000 characters.",
 		`{"type":"object","properties":{"url":{"type":"string","description":"absolute http(s) URL, or a source's number in brackets from earlier results, like [3]"}},"required":["url"]}`),
 	"image_search": def("image_search",
-		"Find photos of real things on the web (products, places, people, posters, artwork) and show them to the user in a gallery under your answer. Not for drawings, graphs, diagrams or figures the user wants made: draw those yourself. Not needed for a card whose source is marked \"picture\": true: it gets that source's own picture. Returns each shown image's title and source page; the user sees the images, you don't.",
+		"Find photos of real things on the web (products, places, people, posters, artwork) and show them to the user in a gallery under your answer. Not for drawings, graphs, diagrams or figures the user wants made: draw those yourself. Not needed for a card whose source is the item's own page or result marked \"picture\": true (not a list or review roundup): it gets that picture. Returns each shown image's title and source page; the user sees the images, you don't.",
 		`{"type":"object","properties":{"query":{"type":"string","description":"what to find pictures of, short and generic"},"count":{"type":"integer","minimum":1,"maximum":6,"description":"images to show (default 4)"}},"required":["query"]}`),
 }
 
@@ -339,7 +339,7 @@ func (t *Tools) finish(p pending) toolOutcome {
 		// The page's own title is its text too: the model gets the reader's (read.source.title), people the page's.
 		// Its address (after redirects: the page's author chose it) too: the model gets its site and number.
 		head := map[string]any{"note": readerNote, "n": t.cites, "site": siteOf(p.page.final)}
-		if t.addPics(p.page.final, p.page.pics...) {
+		if t.pictureFlag(p.page.final, p.page.title, p.page.pics...) {
 			head["picture"] = true // its card gets the page's own picture (cardpics.go)
 		}
 		return t.finishRead(p, out, []int{t.cites}, head,
@@ -347,7 +347,7 @@ func (t *Tools) finish(p pending) toolOutcome {
 	case p.page != nil:
 		t.cites++
 		res := map[string]any{"note": untrustedNote, "n": t.cites, "url": p.page.final, "title": p.page.title, "text": p.page.text}
-		if t.addPics(p.page.final, p.page.pics...) {
+		if t.pictureFlag(p.page.final, p.page.title, p.page.pics...) {
 			res["picture"] = true
 		}
 		b, _ := json.Marshal(res)
@@ -378,7 +378,7 @@ func (t *Tools) finish(p pending) toolOutcome {
 		var cites []proto.Citation
 		for _, r := range p.results {
 			t.cites++
-			rs = append(rs, ritem{t.cites, siteOf(r.URL), r.Age, t.addPics(r.URL, thumbCands(r.Thumbs)...)})
+			rs = append(rs, ritem{t.cites, siteOf(r.URL), r.Age, t.pictureFlag(r.URL, r.Title, thumbCands(r.Thumbs)...)})
 			ns = append(ns, t.cites)
 			cites = append(cites, proto.Citation{Index: t.cites, Title: r.Title, URL: r.URL, Snippet: r.Snippet, Age: r.Age})
 		}
@@ -391,7 +391,7 @@ func (t *Tools) finish(p pending) toolOutcome {
 	}{Note: untrustedNote, Query: p.query, Results: []item{}}
 	for _, r := range p.results {
 		t.cites++
-		res.Results = append(res.Results, item{t.cites, r.Title, r.URL, r.Snippet, r.Age, t.addPics(r.URL, thumbCands(r.Thumbs)...)})
+		res.Results = append(res.Results, item{t.cites, r.Title, r.URL, r.Snippet, r.Age, t.pictureFlag(r.URL, r.Title, thumbCands(r.Thumbs)...)})
 		out.citations = append(out.citations, proto.Citation{Index: t.cites, Title: r.Title, URL: r.URL, Snippet: r.Snippet, Age: r.Age})
 	}
 	b, _ := json.Marshal(res)

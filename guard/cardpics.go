@@ -50,6 +50,8 @@ const (
 	cardMinEdge    = 100             // px, the re-encoded picture's short side
 	cardMaxAspect  = 3               // long side over short side
 	cardCaptionMin = 0.5             // share of the card title's words its source must name (namesItem)
+	cardOtherMin   = 0.75            // the same for another source of the task (the chat's MATCH_THRESHOLD)
+	cardOthers     = 3               // other sources tried for a card whose own gave none
 	maxCardItems   = 8               // cards per items block (the chat's MAX_CARD_ITEMS)
 	cardEndWait    = 3 * time.Second // the end of a run waits at most this for card pictures still loading
 
@@ -121,6 +123,17 @@ func picURLRefused(raw string) string {
 	return ""
 }
 
+// listTitleRe marks a page about many items (a roundup, a comparison, a review list, deals): its picture is a
+// banner, not one item's.
+var listTitleRe = regexp.MustCompile(`(?i)\b(best|top \d+|\d+ (best|top|great|good)|vs\.?|versus|reviews|compared|comparison|guide|deals|alternatives|picks|ranked|ranking)\b`)
+
+// pictureFlag is what the model is told about a source: "picture": true when it has a picture candidate and looks
+// like one item's own page (not a list), so a card citing it needs no image search. The candidates are kept either
+// way: a card may still get them (namesItem decides), and another card may get them as another source.
+func (t *Tools) pictureFlag(page, title string, cs ...picCand) bool {
+	return t.addPics(page, cs...) && !listTitleRe.MatchString(title)
+}
+
 // addPics adds a page's picture candidates (page metadata before thumbnails, each address once) and reports
 // whether the page has any now.
 func (t *Tools) addPics(page string, cs ...picCand) bool {
@@ -168,6 +181,38 @@ func (t *Tools) citedUnder(cs []proto.Citation, call string) {
 	}
 }
 
+// otherSources are the task's other sources whose own title names the card's item closely (namesItem at
+// cardOtherMin: a product's own page or result next to the roundup the card cites), with picture candidates, in
+// citation order, at most cardOthers; never the page skip (the card's own).
+func (t *Tools) otherSources(title, skip string) []cardTry {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	var out []cardTry
+	seen := map[string]bool{skip: true}
+	for _, n := range slices.Sorted(maps.Keys(t.cited)) {
+		src := t.cited[n]
+		k := picKey(src.url)
+		if seen[k] || src.call == "" || len(t.pics[k]) == 0 || !namesItem(title, ImageCandidate{Title: src.title, Source: src.url}, cardOtherMin) {
+			continue
+		}
+		seen[k] = true
+		for _, c := range t.pics[k] {
+			out = append(out, cardTry{src: src, c: c, other: true})
+		}
+		if len(seen) > cardOthers {
+			break
+		}
+	}
+	return out
+}
+
+// cardTry is one candidate for a card: from the card's own source, or (other) from another source naming its item.
+type cardTry struct {
+	src   citedSource
+	c     picCand
+	other bool
+}
+
 // cardSource is a card's source by its reference (a citation number, or the address of one of the task's
 // sources) and that page's picture candidates.
 func (t *Tools) cardSource(ref cardRef) (citedSource, []picCand, bool) {
@@ -206,8 +251,9 @@ var (
 )
 
 // itemsBlocks are the closed fenced blocks with the language "items" in a Markdown text, in order (the chat's
-// fencedBlocks: an unclosed one isn't a block yet; another fenced block's content is skipped).
-func itemsBlocks(text string) []string {
+// fencedBlocks; another fenced block's content is skipped). An unclosed one isn't a block yet, unless final: the text
+// is all there is, and the chat's Markdown renders a block the answer never closed as running to its end.
+func itemsBlocks(text string, final bool) []string {
 	lines := strings.Split(text, "\n")
 	var out []string
 	other := ""
@@ -238,7 +284,10 @@ func itemsBlocks(text string) []string {
 			}
 		}
 		if j == len(lines) {
-			return out // still open
+			if final {
+				out = append(out, strings.Join(lines[i+1:], "\n"))
+			}
+			return out
 		}
 		out = append(out, strings.Join(lines[i+1:j], "\n"))
 		i = j
@@ -300,7 +349,8 @@ type cardPics struct {
 	mu     sync.Mutex
 	text   strings.Builder // the current model call's answer text
 	blocks int             // its closed items blocks already handled
-	tried  map[string]bool // sources (picKey) a card picture was tried for, once each per task
+	tried  map[string]bool // cards (their source's picKey, else their title) tried, once each per task
+	taken  map[string]bool // picture addresses already sent for a card
 	sent   map[string]int  // pictures sent per call (their index)
 	cards  int             // cards whose source had a candidate
 	shown  int
@@ -314,7 +364,7 @@ type cardPics struct {
 }
 
 func newCardPics() *cardPics {
-	return &cardPics{tried: map[string]bool{}, sent: map[string]int{}, slots: make(chan struct{}, cardPicFetches)}
+	return &cardPics{tried: map[string]bool{}, taken: map[string]bool{}, sent: map[string]int{}, slots: make(chan struct{}, cardPicFetches)}
 }
 
 // reset starts a model call's text.
@@ -336,7 +386,19 @@ func (c *cardPics) feed(delta string) []cardRef {
 	if !strings.ContainsAny(delta, "`~\n") {
 		return nil
 	}
-	blocks := itemsBlocks(c.text.String())
+	return c.newCards(false)
+}
+
+// done is the end of a model call's text: an items block it left open counts too.
+func (c *cardPics) done() []cardRef {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.newCards(true)
+}
+
+// newCards are the cards of the blocks not handled yet (c.mu held).
+func (c *cardPics) newCards(final bool) []cardRef {
+	blocks := itemsBlocks(c.text.String(), final)
 	if len(blocks) <= c.blocks {
 		return nil
 	}
@@ -356,14 +418,30 @@ func (g *Guard) cardText(t *task, delta string) {
 	}
 }
 
-// cardPicture starts one card's picture: its source's candidates, best first, in the background under the task.
+// cardTextDone: the model call's answer ended; a block it left open counts now.
+func (g *Guard) cardTextDone(t *task) {
+	for _, c := range t.cards.done() {
+		g.cardPicture(t, c)
+	}
+}
+
+// cardPicture starts one card's picture in the background under the task: its own source's candidates, best
+// first, then those of other sources that name its item closely (otherSources).
 func (g *Guard) cardPicture(t *task, card cardRef) {
-	src, cands, ok := t.tools.cardSource(card)
-	if !ok || len(cands) == 0 {
+	var tries []cardTry
+	own := ""
+	if src, cands, ok := t.tools.cardSource(card); ok {
+		own = picKey(src.url)
+		for _, c := range cands {
+			tries = append(tries, cardTry{src: src, c: c})
+		}
+	}
+	tries = append(tries, t.tools.otherSources(card.title, own)...)
+	key := own + "|" + strings.ToLower(card.title) // a card once (two cards may cite one roundup)
+	if len(tries) == 0 {
 		return
 	}
 	cp := t.cards
-	key := picKey(src.url)
 	cp.mu.Lock()
 	if cp.final || cp.tried[key] {
 		cp.mu.Unlock()
@@ -391,7 +469,7 @@ func (g *Guard) cardPicture(t *task, card cardRef) {
 	t.lateMu.Unlock()
 	go func() {
 		defer cp.wg.Done()
-		shown := g.fetchCardPicture(t, card.title, src, cands)
+		shown := g.fetchCardPicture(t, card.title, tries)
 		if !shown {
 			t.tools.returnImages(1)
 		}
@@ -403,15 +481,15 @@ func (g *Guard) cardPicture(t *task, card cardRef) {
 }
 
 // cardPicRefused is why a candidate isn't tried for a card, before any request ("" = try it): its address
-// (imageURLRefused, picURLRefused) or a source that doesn't name the card's item.
-func cardPicRefused(title string, src citedSource, c picCand) string {
+// (imageURLRefused, picURLRefused) or a source that doesn't name the card's item (at min, namesItem).
+func cardPicRefused(title string, src citedSource, c picCand, min float64) string {
 	if imageURLRefused(c.url) != "" {
 		return imageBlocked
 	}
 	if why := picURLRefused(c.url); why != "" {
 		return imageLogo
 	}
-	if !namesItem(title, ImageCandidate{URL: c.url, Title: src.title + " " + c.alt, Source: src.url}) {
+	if !namesItem(title, ImageCandidate{URL: c.url, Title: src.title + " " + c.alt, Source: src.url}, min) {
 		return imageMismatch
 	}
 	return ""
@@ -422,7 +500,7 @@ func cardPicRefused(title string, src citedSource, c picCand) string {
 // every model number of the title there (as the chat's matchScore: "Q5" never takes a "Q6" picture). Unlike
 // captionScore (image_search's ranking) no penalty for logo-like words inside other words: "Q6-Max-Iconic.jpg" is
 // a product shot; logos are refused by whole words in the address (picURLRefused) and by shape.
-func namesItem(title string, c ImageCandidate) bool {
+func namesItem(title string, c ImageCandidate, min float64) bool {
 	q := imageWords(title)
 	if len(q) == 0 {
 		return false
@@ -446,7 +524,7 @@ func namesItem(title string, c ImageCandidate) bool {
 			return false
 		}
 	}
-	return got/total >= cardCaptionMin
+	return got/total >= min
 }
 
 // errCardShape: a picture shaped like a logo or a banner.
@@ -461,9 +539,10 @@ func cardShape(w, h int) error {
 	return nil
 }
 
-// fetchCardPicture tries a card's candidates in order until one works, and sends it. Reports whether one was
-// shown.
-func (g *Guard) fetchCardPicture(t *task, title string, src citedSource, cands []picCand) bool {
+// fetchCardPicture tries a card's candidates in order until one works (at most cardPicTries downloads), and sends
+// it under its source's call. Reports whether one was shown. Another source's candidate that doesn't fit isn't
+// counted as a failure: it was only a maybe.
+func (g *Guard) fetchCardPicture(t *task, title string, tries []cardTry) bool {
 	ctx := t.ctx
 	cp := t.cards
 	count := func(ms int64, reason string) bool { // false: the run ended, nothing more is counted
@@ -481,16 +560,29 @@ func (g *Guard) fetchCardPicture(t *task, title string, src citedSource, cands [
 		}
 		return true
 	}
-	for i, c := range cands {
-		if i == cardPicTries {
+	downloads := 0
+	for _, try := range tries {
+		if downloads == cardPicTries {
 			break
 		}
-		if why := cardPicRefused(title, src, c); why != "" {
-			if !count(-1, why) {
+		src, c := try.src, try.c
+		min := cardCaptionMin
+		if try.other {
+			min = cardOtherMin
+		}
+		cp.mu.Lock()
+		taken := cp.taken[c.url]
+		cp.mu.Unlock()
+		if taken {
+			continue // on another card already
+		}
+		if why := cardPicRefused(title, src, c, min); why != "" {
+			if !try.other && !count(-1, why) {
 				return false
 			}
 			continue
 		}
+		downloads++
 		select {
 		case cp.slots <- struct{}{}:
 		case <-ctx.Done():
@@ -529,6 +621,11 @@ func (g *Guard) fetchCardPicture(t *task, title string, src citedSource, cands [
 		cp.st.tried++
 		cp.st.fetchMs += time.Since(t0).Milliseconds()
 		cp.st.bytes += len(jp)
+		if cp.taken[c.url] {
+			cp.mu.Unlock()
+			continue // another card took it while this one loaded
+		}
+		cp.taken[c.url] = true
 		cp.shown++
 		cp.sent[src.call]++
 		index := cp.sent[src.call]

@@ -600,7 +600,7 @@ func chatInstructions(actions []string, now time.Time, reader bool) string {
 	if slices.Contains(actions, "web.images") {
 		img := harness.ModelToolName("web.images")
 		b.WriteString(`- You can show pictures: when the user asks for photos or pictures of real things, posters, artwork or what something looks like, call ` + img + ` (not for drawings, graphs or diagrams the user wants made: draw those yourself). The app shows the images in a gallery under your answer. Never say you can't display or show images, and don't embed images as Markdown or list image URLs.
-- A search result or page marked "picture": true has its own picture: a card whose source is that result gets it, with no ` + img + ` call.
+- A search result or page marked "picture": true has its own picture: a card whose source it is gets it with no ` + img + ` call, but only when it is the item's own page (not a list or review roundup).
 `)
 	}
 	return b.String()

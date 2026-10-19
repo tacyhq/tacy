@@ -312,6 +312,7 @@ func ChatGrants(tinfoilHost string) []Grant {
 		{Secret: "TINFOIL_API_KEY", Connector: "model", SendOnlyTo: []string{tinfoilHost}},
 		{Secret: "TAVILY_API_KEY", Connector: "web", SendOnlyTo: []string{"api.tavily.com"}},
 		{Secret: "BRAVE_SEARCH_API_KEY", Connector: "web", SendOnlyTo: []string{"api.search.brave.com"}},
+		{Secret: "EXA_API_KEY", Connector: "web", SendOnlyTo: []string{"api.exa.ai"}},
 	}
 }
 

@@ -60,6 +60,9 @@ func (g *Guard) Action(ctx context.Context, ti *harness.TaskInfo, id string, req
 	}
 	ctx = withTask(ctx, ti.ID)
 	t := g.task(ti)
+	if err := t.searchOnly(req); err != nil { // a plain chat's search task: its one search only (searchtask.go)
+		return nil, err
+	}
 	ctx = withSpace(ctx, t.opts.Space)
 	if err := g.checkSafety(t.opts.Space, req); err != nil {
 		if d, ok := deniedResult(err); ok {
@@ -90,8 +93,11 @@ func (g *Guard) Action(ctx context.Context, ti *harness.TaskInfo, id string, req
 		g.record(Egress{Task: ti.ID, Action: id, Op: req.Name, Decision: "denied", Rule: "leak_scan", Patterns: ids})
 		FactsFrom(ctx).leak(true, ids)
 		provider := ""
-		if app != "fetch_page" {
+		switch app {
+		case "web_search":
 			provider = t.tools.search.Name()
+		case "image_search":
+			provider = imageProviderName(t.tools.search)
 		}
 		p, shown = pending{out: leakRefused(ids, provider)}, json.RawMessage(args)
 	} else {

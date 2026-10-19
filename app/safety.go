@@ -143,6 +143,33 @@ func (g *safeGateway) StartFor(r *proto.RunRequest) (harness.Start, guard.TaskOp
 	return start, opts, nil
 }
 
+// StartSearch applies the policy to a plain chat's search (POST /search, guard.SearchStart): stopped, no policy, web
+// search not allowed and a used-up day are refused (*safety.Error), as a run's start; the deadline moves earlier
+// when the day's running time has less left. Its budget is reserved with its one action (Action), as any search's.
+func (g *safeGateway) StartSearch(r *proto.SearchRequest) (harness.Start, guard.TaskOptions, []byte, error) {
+	const space = "s_chat"
+	g.waitFirstHeard()
+	e, err := g.st.Check(space, false)
+	if err != nil {
+		return harness.Start{}, guard.TaskOptions{}, nil, err
+	}
+	if !e.AllowsTool("web.search") {
+		return harness.Start{}, guard.TaskOptions{}, nil, &safety.Error{Code: safety.CodePolicyDenied, Msg: "web search isn't allowed by the policy"}
+	}
+	end, err := g.ledger.Admit(space, e.Budget())
+	if err != nil {
+		return harness.Start{}, guard.TaskOptions{}, nil, err
+	}
+	start, opts, args, err := guard.SearchStart(r, time.Now())
+	if err != nil {
+		return start, opts, nil, err
+	}
+	if d, err := time.Parse(time.RFC3339, start.Limits.Deadline); err == nil && !end.IsZero() && end.Before(d) {
+		start.Limits.Deadline = end.UTC().Format(time.RFC3339)
+	}
+	return start, opts, args, nil
+}
+
 // waitFirstHeard: a VM that just booted hasn't had the operator's list delivered yet, so everything would be
 // refused (stop_list_stale) for the few seconds until the first pull lands. A start waits for it, up to firstHeard.
 // Once a list was delivered, nothing waits: a stale or silent list refuses at once.

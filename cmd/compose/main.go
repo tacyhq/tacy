@@ -94,7 +94,7 @@ const modulePath = "github.com/tacyhq/tacy"
 // container each goes to: the keys to vaultd only, the run token to agentd (it checks it, never sends it), the
 // search provider choice (not a secret) to gatewayd. runnerd, the brain and setup get none.
 var (
-	vaultEnv   = []string{"TINFOIL_API_KEY", "BRAVE_SEARCH_API_KEY", "TAVILY_API_KEY"}
+	vaultEnv   = []string{"TINFOIL_API_KEY", "BRAVE_SEARCH_API_KEY", "TAVILY_API_KEY", "EXA_API_KEY"}
 	agentEnv   = []string{"AGENT_VM_TOKEN"}
 	gatewayEnv = []string{"SEARCH_PROVIDER"}
 )

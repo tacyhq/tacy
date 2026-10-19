@@ -90,6 +90,36 @@ type RunRequest struct {
 	AutoFallback bool `json:"auto_fallback,omitempty"`
 }
 
+// SearchRequest is POST /search's body: the plain chat's one web search the person allowed in their tab (docs/29;
+// agentd app/search.go, guard/searchtask.go). EHBP-encrypted; strict JSON, nothing else accepted.
+type SearchRequest struct {
+	// Query is exactly what the person allowed in their tab (the model's query, masked there, or their edit). The
+	// VM masks it again (guard.maskPII) before it goes out, as every search.
+	Query string `json:"query"`
+	// Count is how many results to ask for: 1 to 8, default 5.
+	Count int `json:"count,omitzero"`
+	// Question is the person's last message (capped), what the reader reads the results for, as in agent mode. It
+	// never goes to the search provider. "": the query.
+	Question string `json:"question,omitzero"`
+	// Decision is how the person allowed it, for the activity record: "once" (Allow once), "always" (Always allow,
+	// on this prompt) or "setting" (not asked: their setting for web search is Always allow).
+	Decision string `json:"decision"`
+	// Edited: the person changed the model's query in the prompt (for the record).
+	Edited bool `json:"edited,omitzero"`
+	// CacheSecret scopes Tinfoil's prompt cache for the reader's call (RunRequest.CacheSecret).
+	CacheSecret string `json:"cache_secret,omitzero"`
+	// RecordTo and RecordProof: the activity record's recipient and the proof, as for a run (RunRequest).
+	RecordTo    string `json:"record_to,omitzero"`
+	RecordProof []byte `json:"record_proof,omitzero"`
+}
+
+// Search decisions (SearchRequest.Decision).
+const (
+	SearchOnce    = "once"
+	SearchAlways  = "always"
+	SearchSetting = "setting"
+)
+
 // Event is one server-sent event in the (EHBP-encrypted) /run response: `data: <json>\n\n`, ending with
 // `data: [DONE]`. Types and how they map onto assistant-ui message parts:
 //

@@ -64,7 +64,7 @@ var PreLaunchScripts = map[string]string{
 }
 
 // Envs are the only environment variable names the CVM may receive from the deployer (encrypted env).
-var Envs = []string{"TINFOIL_API_KEY", "BRAVE_SEARCH_API_KEY", "TAVILY_API_KEY", "SEARCH_PROVIDER", "AGENT_VM_TOKEN"}
+var Envs = []string{"TINFOIL_API_KEY", "BRAVE_SEARCH_API_KEY", "TAVILY_API_KEY", "EXA_API_KEY", "SEARCH_PROVIDER", "AGENT_VM_TOKEN"}
 
 // Policy is what the verifier requires.
 type Policy struct {

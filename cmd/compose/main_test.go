@@ -135,7 +135,7 @@ func TestComposeLayout(t *testing.T) {
 		if (len(s.CapAdd) > 0) != (name == "setup") {
 			t.Errorf("%s: cap_add %v", name, s.CapAdd)
 		}
-		for _, env := range []string{"TINFOIL_API_KEY", "TAVILY_API_KEY", "BRAVE_SEARCH_API_KEY"} {
+		for _, env := range []string{"TINFOIL_API_KEY", "TAVILY_API_KEY", "BRAVE_SEARCH_API_KEY", "EXA_API_KEY"} {
 			if (s.Environment[env] == "${"+env+"}") != (name == "vaultd") {
 				t.Errorf("%s: %s", name, env)
 			}

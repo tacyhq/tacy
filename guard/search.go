@@ -385,14 +385,27 @@ func (b *brave) Images(ctx context.Context, query string, count int) ([]ImageCan
 	return cs, nil
 }
 
-// NewSearch picks the provider: provider (SEARCH_PROVIDER: brave | tavily) if set, else Brave when its key is set
-// (has: the vault's names, never values), else Tavily. Keys are leased per request.
+// NewSearch picks the provider: provider (SEARCH_PROVIDER: exa | brave | tavily) if set, else Exa when its key is
+// set (has: the vault's names, never values; the production default since v0.8.10, docs/29), else Brave when its key
+// is set, else Tavily. Keys are leased per request. Exa has no image search: with Exa, image_search goes to Brave
+// when its key is set, else Tavily (as before Exa).
 func NewSearch(provider string, has func(name string) bool, lease Lease) SearchProvider {
+	images := func() imageProvider {
+		if has(braveKey) {
+			return newBrave(lease)
+		}
+		return newTavily(lease)
+	}
 	switch provider {
+	case "exa":
+		return newExa(lease, images())
 	case "brave":
 		return newBrave(lease)
 	case "tavily":
 		return newTavily(lease)
+	}
+	if has(exaKey) {
+		return newExa(lease, images())
 	}
 	if has(braveKey) {
 		return newBrave(lease)

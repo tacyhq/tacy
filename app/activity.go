@@ -77,6 +77,21 @@ func (g *recGateway) StartFor(r *proto.RunRequest) (harness.Start, guard.TaskOpt
 	return start, opts, err
 }
 
+// StartSearch: the record's recipient checked as for a run, then the safety checks (safeGateway.StartSearch).
+func (g *recGateway) StartSearch(r *proto.SearchRequest) (harness.Start, guard.TaskOptions, []byte, error) {
+	if r.RecordTo != "" {
+		if _, err := activity.ParseRecipient(r.RecordTo); err != nil {
+			return harness.Start{}, guard.TaskOptions{}, nil, errors.New("record_to must be an x25519 public key")
+		}
+		if g.vmKey == nil || activity.CheckRecordProof(g.vmKey, r.RecordTo, r.RecordProof) != nil {
+			return harness.Start{}, guard.TaskOptions{}, nil, errors.New("record_to needs a valid record_proof")
+		}
+	}
+	start, opts, args, err := g.safeGateway.StartSearch(r)
+	opts.RecordTo = r.RecordTo
+	return start, opts, args, err
+}
+
 // Open wraps the session so its End passes on the site icons' egress.
 func (g *recGateway) Open(id string, opts guard.TaskOptions, emit func(proto.Event) error) guard.Session {
 	return &recSession{Session: g.safeGateway.Open(id, opts, emit), g: g, id: id}
@@ -136,9 +151,13 @@ func recordStart(task string, start *harness.Start, opts guard.TaskOptions, cont
 	for _, t := range start.Tools {
 		tools = append(tools, t.Name)
 	}
+	kind := "chat"
+	if opts.Via == guard.ViaSearch { // the plain chat's search (POST /search): one approved search, no model
+		kind = "search"
+	}
 	return activity.Start{Run: task, Space: start.Space, To: opts.RecordTo,
 		Agent:   activity.Agent{ID: start.Agent.ID, Version: start.Agent.Version, Digest: start.Agent.Digest},
-		Trigger: activity.Trigger{Kind: "chat", Via: via}, Controls: controls, Models: start.Models, Tools: tools,
+		Trigger: activity.Trigger{Kind: kind, Via: via}, Controls: controls, Models: start.Models, Tools: tools,
 		Limits: activity.Limits{MaxSteps: start.Limits.MaxSteps, MaxModelCalls: start.Limits.MaxModelCalls, Deadline: start.Limits.Deadline},
 		Input:  in}
 }
@@ -240,6 +259,28 @@ func (g *recGateway) Refused(r *proto.RunRequest, err error) (proto.Event, bool)
 		Agent: activity.Agent{ID: "a_chat", Version: "1", Digest: "unsigned"}, Trigger: activity.Trigger{Kind: "chat", Via: "relay"},
 		Controls: &activity.Controls{Policy: st.Policy, ReleasePolicy: st.Release, OperatorSeq: st.OperatorSeq, FirmSeq: st.FirmSeq, Fresh: st.Fresh},
 		Models:   []string{model}, Input: in}, activity.Status{Code: code, Detail: msg})
+	if rerr != nil {
+		if !errors.Is(rerr, activity.ErrNoRecipient) {
+			log.Printf("activity: refused record not written: %v", rerr)
+		}
+		return proto.Event{}, false
+	}
+	return activityEvent(rec), true
+}
+
+// RefusedSearch records a plain chat's search (POST /search) refused before it started (a stop, no policy, web search
+// not allowed, the day used up) and returns the event that carries its record, or false. Sizes and codes only.
+func (g *recGateway) RefusedSearch(r *proto.SearchRequest, err error) (proto.Event, bool) {
+	if r.RecordTo == "" {
+		return proto.Event{}, false
+	}
+	const space = "s_chat"
+	st := g.st.StatusOf(space)
+	code, msg := coded(err)
+	rec, rerr := g.rec.Refused(activity.Start{Run: harness.NewTaskID(), Space: space, To: r.RecordTo,
+		Agent: activity.Agent{ID: "a_search", Version: "1", Digest: "unsigned"}, Trigger: activity.Trigger{Kind: "search", Via: "relay"},
+		Controls: &activity.Controls{Policy: st.Policy, ReleasePolicy: st.Release, OperatorSeq: st.OperatorSeq, FirmSeq: st.FirmSeq, Fresh: st.Fresh},
+		Tools:    []string{"web.search"}}, activity.Status{Code: code, Detail: msg})
 	if rerr != nil {
 		if !errors.Is(rerr, activity.ErrNoRecipient) {
 			log.Printf("activity: refused record not written: %v", rerr)

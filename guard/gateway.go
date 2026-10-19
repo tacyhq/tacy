@@ -25,6 +25,9 @@ import (
 func (g *Guard) ModelCall(ctx context.Context, ti *harness.TaskInfo, req *harness.ModelCall) (*harness.ModelResult, error) {
 	ctx = withTask(ctx, ti.ID) // the vault records the key's lease under the task and this request
 	t := g.task(ti)
+	if err := t.searchOnly(req); err != nil { // a plain chat's search task calls no model (searchtask.go)
+		return nil, err
+	}
 	ctx = withSpace(ctx, t.opts.Space)
 	if err := g.checkSafety(t.opts.Space, req); err != nil {
 		return nil, err

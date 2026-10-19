@@ -153,6 +153,8 @@ type task struct {
 	// was written after outside content: the task is tainted whatever agentd says (permit). Calls proposed together
 	// in one step don't taint each other.
 	returned, outside bool
+	// searched: a search task (ViaSearch) made its one search; anything more is refused (searchtask.go).
+	searched bool
 
 	reads readCache // the reader's answers for this task (readcache.go)
 }

@@ -372,6 +372,17 @@ func (p *Prompts) Attach(ctx context.Context, ti *harness.TaskInfo, id string, a
 	return WithGrant(ctx, g), nil
 }
 
+// Approved records a permission the person gave in their tab before the task started (the plain chat's search,
+// POST /search: the prompt is shown in the tab, and only an allowed query is sent): the request runs with grant g
+// (Attach), and the activity record says how the person allowed it (Outcome).
+func (p *Prompts) Approved(task, id string, g *Grant, o PermissionOutcome) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.init()
+	k := key(task, id)
+	p.grants[k], p.outcomes[k] = g, o
+}
+
 // Outcome is how a task's request got its permission (false: it needed none, or wasn't held here).
 func (p *Prompts) Outcome(task, id string) (PermissionOutcome, bool) {
 	p.mu.Lock()

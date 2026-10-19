@@ -263,7 +263,7 @@ func (t *Tools) Exec(ctx context.Context, name string, args json.RawMessage) (pe
 			o.masked = masked
 			return pending{out: o}, shown
 		}
-		out := toolOutcome{masked: masked, ran: true, provider: t.search.Name()}
+		out := toolOutcome{masked: masked, ran: true, provider: imageProviderName(t.search)}
 		imgs, st, tail, err := t.findImages(ctx, q, want, &out)
 		later := 0
 		if tail != nil {

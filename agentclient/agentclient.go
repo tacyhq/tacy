@@ -170,6 +170,47 @@ func (c *Conn) Run(ctx context.Context, req proto.RunRequest, on func(proto.Even
 	return errors.New("stream ended without [DONE]")
 }
 
+// Search sends one web search (POST /search, the plain chat's: agentd app/search.go) and calls on for each event
+// until [DONE].
+func (c *Conn) Search(ctx context.Context, req proto.SearchRequest, on func(proto.Event)) error {
+	body, _ := json.Marshal(req)
+	r, _ := http.NewRequestWithContext(ctx, "POST", c.Base+"/search", bytes.NewReader(body))
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("Authorization", "Bearer "+c.Token)
+	if c.User != "" {
+		r.Header.Set("X-Agent-User", c.User)
+	}
+	res, err := c.http.Do(r)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		b, _ := io.ReadAll(io.LimitReader(res.Body, 2000))
+		return fmt.Errorf("search: HTTP %d: %s", res.StatusCode, strings.TrimSpace(string(b)))
+	}
+	sc := bufio.NewScanner(res.Body)
+	sc.Buffer(make([]byte, 0, 64<<10), 8<<20)
+	for sc.Scan() {
+		data, ok := strings.CutPrefix(sc.Text(), "data: ")
+		if !ok {
+			continue
+		}
+		if data == "[DONE]" {
+			return nil
+		}
+		var e proto.Event
+		if err := json.Unmarshal([]byte(data), &e); err != nil {
+			return fmt.Errorf("bad event: %w", err)
+		}
+		on(e)
+	}
+	if err := sc.Err(); err != nil {
+		return err
+	}
+	return errors.New("stream ended without [DONE]")
+}
+
 // ---- the task API (docs/27; agentd's app/tasks.go) ----------------------------------------------------------
 
 // Task is a task's state as POST /tasks and /tasks/status answer it.

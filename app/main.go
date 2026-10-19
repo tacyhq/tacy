@@ -109,6 +109,11 @@ type server struct {
 	userFollows map[string]int
 	// prompts are the permission prompts (guard.Prompts): POST /tasks/grant answers them. nil: none.
 	prompts *guard.Prompts
+
+	// POST /search (search.go): slots VM-wide, and each user tag's searches at once (under searchMu).
+	searchSlots  chan struct{}
+	searchMu     sync.Mutex
+	userSearches map[string]int
 }
 
 type ticketKey struct{}
@@ -527,6 +532,8 @@ func main() {
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) { fmt.Fprintln(w, "ok") })
 	mux.Handle("POST /run", s.guard(id.Middleware()(http.HandlerFunc(s.run))))
 	s.taskRoutes(mux, id)
+	// The plain chat's web search (search.go, docs/29).
+	s.searchRoutes(mux, id)
 	mux.HandleFunc("GET /activity", s.activityOut) // sealed activity records, for the relay (docs/24)
 	// Signed policies and stop lists; the signature is the authorization. Only served when the compose pins a key
 	// (stage 2): without one nothing could verify, so there's nothing to take.

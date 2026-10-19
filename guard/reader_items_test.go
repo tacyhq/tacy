@@ -227,6 +227,12 @@ func (shopSearch) Search(context.Context, string, int) ([]SearchResult, error) {
 		{Title: "The best keyboards of 2026", URL: "https://reviews.example/best", Snippet: "Picks: Lofree Flow ($159) and NuPhy Air75.",
 			Thumbs: []string{"https://reviews.example/hero.png"}},
 		{Title: "Logo test", URL: "https://logo.example/k", Snippet: "The Logo K1 keyboard.", Thumbs: []string{"https://logo.example/k1-wide.png"}},
+		// A roundup's banner whose file name has a "2": a list by its title, never tried.
+		{Title: "The 6 Best Quiet Keyboards", URL: "https://quiet.example/best", Snippet: "Picks: Lofree Flow 2 and the WH80.",
+			Thumbs: []string{"https://quiet.example/best-quiet-keyboards-2-medium.jpg"}},
+		// A trend piece naming one item among others: the item's name only half there, never tried.
+		{Title: "Trending keyboards: Puma Speedcat, retro boards", URL: "https://trend.example/k", Snippet: "The Puma Speedcat OG is back.",
+			Thumbs: []string{"https://trend.example/hero.jpg"}},
 	}, nil
 }
 
@@ -235,7 +241,7 @@ func (shopSearch) Search(context.Context, string, int) ([]SearchResult, error) {
 // its source; never a roundup's banner, nor a picture shaped like a banner; counted in card_pictures; before done.
 func TestSearchTaskResultPictures(t *testing.T) {
 	answer := itemsAnswer([]map[string]any{item("Keychron Q6 Max", "$219", "", 1), item("Lofree Flow", "$159", "", 2),
-		item("NuPhy Air75", "", "", 2), item("Logo K1", "", "", 3)}, "Keyboards [R1].")
+		item("NuPhy Air75", "", "", 2), item("Logo K1", "", "", 3), item("Lofree Flow 2", "", "", 4), item("Puma Speedcat OG", "", "", 5)}, "Keyboards [R1].")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			Messages []struct{ Content string } `json:"messages"`
@@ -247,7 +253,8 @@ func TestSearchTaskResultPictures(t *testing.T) {
 	}))
 	defer srv.Close()
 	web := stubWeb{"https://img.keychron.example/q6.png": pngWH(400, 300), "https://reviews.example/hero.png": pngWH(400, 300),
-		"https://logo.example/k1-wide.png": pngWH(900, 120)}
+		"https://logo.example/k1-wide.png": pngWH(900, 120), "https://quiet.example/best-quiet-keyboards-2-medium.jpg": pngWH(400, 300),
+		"https://trend.example/hero.jpg": pngWH(400, 300)}
 	rc := DefaultReader
 	g := New(Config{Up: &plainUpstream{url: srv.URL, http: srv.Client()}, Reader: &rc, Search: shopSearch{},
 		Fetcher: &http.Client{Transport: web}, Now: time.Now})
@@ -284,7 +291,7 @@ func TestSearchTaskResultPictures(t *testing.T) {
 			}
 		case e.Type == "tool_result":
 			result = i
-			if !strings.Contains(string(e.Result), `"items":["Keychron Q6 Max · $219 [1]","Lofree Flow · $159 [2]","NuPhy Air75 [2]","Logo K1 [3]"]`) {
+			if !strings.Contains(string(e.Result), `"items":["Keychron Q6 Max · $219 [1]","Lofree Flow · $159 [2]","NuPhy Air75 [2]","Logo K1 [3]","Lofree Flow 2 [4]","Puma Speedcat OG [5]"]`) {
 				t.Fatalf("items %s", e.Result)
 			}
 			if strings.Contains(string(e.Result), "img.keychron") {
@@ -298,7 +305,8 @@ func TestSearchTaskResultPictures(t *testing.T) {
 		len(imgs[0].Data) == 0 || imgs[0].Type != "image/jpeg" {
 		t.Fatalf("images %+v", imgs)
 	}
-	// [1]: the first 404s, the second shows; [2] the roundup: never tried; [3] a banner's shape: refused as a logo.
+	// [1]: the first 404s, the second shows; [2] and [4] roundups and [5] a trend piece: never tried; [3] a banner's
+	// shape: refused as a logo.
 	if m == nil || m.Results != 2 || m.Images != 1 || m.Reasons["unreachable"] != 1 || m.Reasons["logo"] != 1 {
 		t.Fatalf("metric %+v", m)
 	}

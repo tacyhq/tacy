@@ -496,6 +496,12 @@ func (g *Guard) cardPicture(t *task, card cardRef, ownOnly bool) {
 // result's address as its page (the chat puts it on the card that links there), its egress on the task's
 // background record and its counts in the card_pictures metric. At most one picture a result; the end of the
 // search waits for them as for agent mode's (cardEndWait). cites are the results' citations, in order.
+//
+// Stricter than a card's own check, since the card isn't known and the chat puts the picture on whichever card
+// links to the result (v0.8.15, from the audit on v0.8.14's throwaway: a "6 Best Quiet Keyboards" banner passed for
+// the item "Lofree Flow 2" on the "2" in its file name): only a result that is one item's own page (not a list or a
+// roundup by its title, as the model's "picture": true says, pictureFlag) and whose title or addresses name the item
+// as closely as another source must for a card (cardOtherMin, 0.75).
 func (g *Guard) resultPictures(t *task, read *readerResult, cites []proto.Citation) {
 	for i, c := range cites {
 		var names []string
@@ -505,11 +511,11 @@ func (g *Guard) resultPictures(t *task, read *readerResult, cites []proto.Citati
 			}
 		}
 		src, cands, ok := t.tools.cardSource(cardRef{n: c.Index})
-		if !ok || len(cands) == 0 {
+		if !ok || len(cands) == 0 || listTitleRe.MatchString(src.title) {
 			continue
 		}
 		for _, name := range names {
-			if slices.ContainsFunc(cands, func(cd picCand) bool { return cardPicRefused(name, src, cd, cardCaptionMin) == "" }) {
+			if slices.ContainsFunc(cands, func(cd picCand) bool { return cardPicRefused(name, src, cd, cardOtherMin) == "" }) {
 				g.cardPicture(t, cardRef{title: name, n: c.Index}, true)
 				break
 			}

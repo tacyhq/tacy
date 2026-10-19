@@ -477,3 +477,79 @@ func TestSearchPicturesFetchedWhileReading(t *testing.T) {
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// A near-verbatim copy is a copy (v0.8.16): a passage that only leaves out a short enumerator, a figure in
+// parentheses, a footnote mark or emphasis is cut like the passage itself; the reader's own words stay.
+func TestSkeletonCut(t *testing.T) {
+	src := `"Control" means (i) the power to cause the direction or management of such entity, or (ii) ownership of fifty percent (50%) or more of the outstanding shares, or (iii) beneficial ownership of such entity.[12] It is **very** important.`
+	skel := newSkeletonIndex([]string{src}, verbatimRunes)
+	plain := newVerbatimIndex([]string{src}, verbatimRunes)
+	for _, c := range []struct{ in, cut string }{
+		{"control is ownership of fifty percent or more of the outstanding shares, or beneficial ownership of such entity.", "…"},
+		{"Control is shown by owning the outstanding shares, or (iii) beneficial ownership [2].", "…"},
+		{"It holds beneficial ownership of such entity.", "It holds beneficial ownership of such entity."},
+	} {
+		got, _ := plain.cut(c.in)
+		got, _ = skel.cut(got)
+		if !strings.Contains(got, c.cut) {
+			t.Fatalf("%q -> %q, want %q in it", c.in, got, c.cut)
+		}
+	}
+	// The reader's own words about it aren't cut.
+	if got, n := skel.cut("Control means power over management, majority ownership or beneficial ownership."); n != 0 {
+		t.Fatalf("own words cut: %q", got)
+	}
+}
+
+// One result's answer of a split read is cut against the search's other results too: wording that is verbatim in
+// another result doesn't reach the acting model through this one's answer (as when one call read them all).
+func TestReaderSplitCutsAcrossResults(t *testing.T) {
+	doc := &readerDoc{kind: "search", results: []SearchResult{
+		{Title: "Apache License 2.0", Snippet: "Legal Entity means the union of the acting entity and all other entities that control it, or (iii) beneficial ownership."},
+		{Title: "License summary", Snippet: "A summary: control is fifty percent or more of outstanding shares, or beneficial ownership of the entity."},
+	}}
+	g, tk, _, _ := modelReader(t, DefaultReader, func(c readerCall) (string, int, time.Duration) {
+		return answerJSON(t, func(m map[string]any) {
+			m["quotes"], m["items"] = []map[string]any{}, []map[string]any{}
+			m["source"] = map[string]any{"kind": "search_results", "title": "", "publisher": "", "published": ""}
+			// Both readers write the same paraphrase: verbatim in the second result only.
+			m["summary"] = "Control is fifty percent or more of outstanding shares, or beneficial ownership [R1]."
+			m["facts"] = []string{"A Legal Entity includes the entities that control it [R1]."}
+		}), 0, 0
+	})
+	res := g.read(context.Background(), tk, 1, doc, nil)
+	next := 0
+	v, _ := res.view([]int{1, 2}, &next)
+	if strings.Contains(strings.ToLower(v.Summary), "outstanding shares, or beneficial ownership") {
+		t.Fatalf("a passage of the second result reached the model through the first's answer: %q", v.Summary)
+	}
+	if !slices.Contains(v.Facts, "A Legal Entity includes the entities that control it [1].") {
+		t.Fatalf("facts %q", v.Facts)
+	}
+}
+
+// A source's reader can't pass on a passage of a source the task read before it (v0.8.16): its fields are cut
+// against them too. Read in the other order, the first answer stands (it was shown before the second source came).
+func TestReaderCutsAgainstEarlierSources(t *testing.T) {
+	name := "Creative Commons Attribution 4.0 International"
+	first := &readerDoc{kind: "search", results: []SearchResult{{Title: name + " | SPDX", Snippet: "The SPDX entry for CC-BY-4.0."}}}
+	page := &readerDoc{kind: "page", title: "Deed - Attribution 4.0 International", url: "https://cc.example/by/4.0/", text: "You are free to share and adapt. No additional restrictions."}
+	answer := func(c readerCall) (string, int, time.Duration) {
+		return answerJSON(t, func(m map[string]any) {
+			m["quotes"], m["items"] = []map[string]any{}, []map[string]any{}
+			m["summary"] = "The " + name + " deed lists what you may do."
+		}), 0, 0
+	}
+	g, tk, _, _ := modelReader(t, DefaultReader, answer)
+	g.read(context.Background(), tk, 1, first, nil)
+	res := g.read(context.Background(), tk, 2, page, nil)
+	next := 0
+	if v, _ := res.view([]int{2}, &next); strings.Contains(v.Summary, name) {
+		t.Fatalf("an earlier source's passage passed: %q", v.Summary)
+	}
+	g, tk, _, _ = modelReader(t, DefaultReader, answer)
+	res = g.read(context.Background(), tk, 1, page, nil)
+	if v, _ := res.view([]int{1}, &next); !strings.Contains(v.Summary, name) {
+		t.Fatalf("the reader's own words were cut: %q", v.Summary)
+	}
+}

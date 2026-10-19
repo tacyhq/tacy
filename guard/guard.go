@@ -158,7 +158,8 @@ type task struct {
 	// searched: a search task (ViaSearch) made its one search; anything more is refused (searchtask.go).
 	searched bool
 
-	reads readCache // the reader's answers for this task (readcache.go)
+	reads   readCache   // the reader's answers for this task (readcache.go)
+	sources taskSources // the sources the reader read in this task, for the verbatim cut (reader.go)
 }
 
 // taintFor says whether an action was proposed after outside content reached the brain. One of the latest model

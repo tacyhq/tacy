@@ -446,6 +446,12 @@ type readerDoc struct {
 	text  string // page: its text (redacted)
 	// search: each result's title and snippet (redacted), labelled R1, R2, ... in order
 	results []SearchResult
+	// others: the rest of a search's results when this is one of them, read on its own (a split read): the
+	// reader never gets them, but its fields are cut against them too (as when one call read them all), so no
+	// passage of any of the search's results reaches the acting model through another result's answer.
+	others []string
+	// earlier, earlierSkel: the run sets of the sources the task read before this one (taskSources), cut against too.
+	earlier, earlierSkel []map[string]bool
 }
 
 // readerResult is a checked reader answer for one item: the fields as decoded (refs still local: [Q1], [R1]) and
@@ -665,6 +671,9 @@ func (d *readerDoc) prompt(question string, spans []span) string {
 // result read, as it is (from that call's goroutine), before the others are done.
 func (g *Guard) read(ctx context.Context, t *task, step int, d *readerDoc, onPart func(result int, r *readerResult)) *readerResult {
 	rc := g.cfg.Reader
+	// The sources read before this one are cut against too; then this one joins them.
+	d.earlier, d.earlierSkel = t.sources.before()
+	t.sources.add(d.segments(rc.Spans))
 	if d.kind == "search" && rc.Split && len(d.results) > 1 {
 		return g.readSplit(ctx, t, step, d, onPart)
 	}
@@ -694,7 +703,7 @@ func (g *Guard) readSplit(ctx context.Context, t *task, step int, d *readerDoc, 
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			parts[i] = g.readOne(rctx, t, step, rc, &readerDoc{kind: "search", results: d.results[i : i+1]}, 0)
+			parts[i] = g.readOne(rctx, t, step, rc, d.part(i), 0)
 			if onPart != nil && parts[i].err == "" {
 				onPart(i, parts[i])
 			}
@@ -702,6 +711,17 @@ func (g *Guard) readSplit(ctx context.Context, t *task, step int, d *readerDoc, 
 	}
 	wg.Wait()
 	return mergeParts(parts)
+}
+
+// part is result i of a search on its own (a split read's), with the other results' text to cut against.
+func (d *readerDoc) part(i int) *readerDoc {
+	p := &readerDoc{kind: "search", results: d.results[i : i+1], earlier: d.earlier, earlierSkel: d.earlierSkel}
+	for j, seg := range d.segments(true) {
+		if j != i {
+			p.others = append(p.others, seg)
+		}
+	}
+	return p
 }
 
 // mergeParts is a split read's answer: its parts in result order; it fails (err) only when every part did: the
@@ -982,10 +1002,16 @@ func (g *Guard) readCall(ctx context.Context, t *task, rc *ReaderConfig, d *read
 	// Raw text can't ride in the reader's own words: passages of the source it copied are cut out (quotes' text
 	// aside: that is checked against the source next, and never reaches the acting model), checked items' names and
 	// prices aside too (they reach it as the source writes them, and nothing around them does).
-	idx := newVerbatimIndex(segs, verbatimRunes)
+	// The passages are looked for in the source as it is and in its skeleton (v0.8.16: without short
+	// parenthesized enumerators and figures, footnote marks and emphasis), so a copy that only leaves "(iii)" out
+	// is a copy; and, for one result of a split read, in the search's other results too.
+	cutSegs := append(slices.Clone(segs), d.others...)
+	idx := newVerbatimIndex(cutSegs, verbatimRunes)
+	skel := newSkeletonIndex(cutSegs, verbatimRunes)
+	idx.more, skel.more = d.earlier, d.earlierSkel
 	var short *verbatimIndex
 	if out.InstructionCount > 0 {
-		ix := newVerbatimIndex(segs, shortVerbatimRunes)
+		ix := newVerbatimIndex(cutSegs, shortVerbatimRunes)
 		short = &ix
 	}
 	keep := res.itemWords()
@@ -993,6 +1019,8 @@ func (g *Guard) readCall(ctx context.Context, t *task, rc *ReaderConfig, d *read
 		var n int
 		*f = spanMarkRe.ReplaceAllString(*f, "") // the prompt's markers aren't text
 		*f, n = idx.cutExcept(*f, keep)
+		use.Verbatim += n
+		*f, n = skel.cutExcept(*f, keep)
 		use.Verbatim += n
 		if short != nil {
 			*f, n = short.cut(*f)
@@ -1427,7 +1455,19 @@ func fold(r rune) rune {
 	return r
 }
 
-func normalize(s string, lower bool) normText {
+func normalize(s string, lower bool) normText { return normalizeSkip(s, lower, nil) }
+
+// skeletonSkip is what a near-verbatim copy of a passage tends to leave out (v0.8.16): a short parenthesized
+// enumerator or figure ("(iii)", "(b)", "(50%)"), a footnote mark ("[12]"), markdown emphasis ("**", "__").
+var skeletonSkip = regexp.MustCompile(`\(\s*(?:[ivxlcdmIVXLCDM]{1,6}|[a-zA-Z]|\d{1,3}(?:[.,]\d+)?\s?%?)\s*\)|\[\d{1,3}\]|\*\*|__`)
+
+// skeleton is s folded and lowercased as normalize does, with skeletonSkip's matches read as spaces.
+func skeleton(s string) normText {
+	return normalizeSkip(s, true, skeletonSkip.FindAllStringIndex(s, -1))
+}
+
+// normalizeSkip is normalize with the byte ranges skip (in order, not overlapping) read as spaces.
+func normalizeSkip(s string, lower bool, skip [][]int) normText {
 	var n normText
 	space := false
 	for i, r := range s {
@@ -1435,7 +1475,10 @@ func normalize(s string, lower bool) normText {
 		if w < 0 {
 			w = 1
 		}
-		if unicode.IsSpace(r) || r == ' ' || r == '​' {
+		for len(skip) > 0 && i >= skip[0][1] {
+			skip = skip[1:]
+		}
+		if unicode.IsSpace(r) || r == ' ' || r == '​' || len(skip) > 0 && i >= skip[0][0] {
 			if !space && len(n.r) > 0 {
 				n.r, n.start, n.end = append(n.r, ' '), append(n.start, i), append(n.end, i+w)
 			}
@@ -1477,16 +1520,67 @@ func findQuote(segs []string, quote string) (string, int, bool) {
 	return "", 0, false
 }
 
-// verbatimIndex holds every run of k characters of the source (folded, lowercased).
+// verbatimIndex holds every run of k characters of the source (folded, lowercased; or its skeleton).
 type verbatimIndex struct {
 	k    int
 	runs map[string]bool
+	norm func(string) normText
+	// more: the runs of other sources (the same k and folding): the task's sources read before (taskSources).
+	more []map[string]bool
 }
 
-func newVerbatimIndex(segs []string, k int) verbatimIndex {
-	idx := verbatimIndex{k: k, runs: map[string]bool{}}
+// has: run is in the source or one of the others.
+func (idx verbatimIndex) has(run string) bool {
+	if idx.runs[run] {
+		return true
+	}
+	for _, m := range idx.more {
+		if m[run] {
+			return true
+		}
+	}
+	return false
+}
+
+func (idx verbatimIndex) empty() bool { return len(idx.runs) == 0 && len(idx.more) == 0 }
+
+// taskSources are the verbatim runs of every source the task's reader has read (v0.8.16), as it is and as its
+// skeleton: a reader's fields are cut against the sources read before it too, so a passage of one source can't
+// reach the acting model through another source's answer. In memory, in the task; at most maxCachedReads sources.
+type taskSources struct {
+	mu         sync.Mutex
+	runs, skel []map[string]bool
+}
+
+// before is the run sets of the sources read so far.
+func (s *taskSources) before() (runs, skel []map[string]bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.runs), slices.Clone(s.skel)
+}
+
+// add records a source the reader reads (its segments).
+func (s *taskSources) add(segs []string) {
+	r, k := newVerbatimIndex(segs, verbatimRunes), newSkeletonIndex(segs, verbatimRunes)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.runs) < maxCachedReads {
+		s.runs, s.skel = append(s.runs, r.runs), append(s.skel, k.runs)
+	}
+}
+
+func lowered(s string) normText { return normalize(s, true) }
+
+func newVerbatimIndex(segs []string, k int) verbatimIndex { return newIndex(segs, k, lowered) }
+
+// newSkeletonIndex is the index of the sources' skeletons: a passage matches with skeletonSkip's matches left out
+// on either side.
+func newSkeletonIndex(segs []string, k int) verbatimIndex { return newIndex(segs, k, skeleton) }
+
+func newIndex(segs []string, k int, norm func(string) normText) verbatimIndex {
+	idx := verbatimIndex{k: k, runs: map[string]bool{}, norm: norm}
 	for _, s := range segs {
-		n := normalize(s, true)
+		n := norm(s)
 		for i := 0; i+k <= len(n.r); i++ {
 			idx.runs[string(n.r[i:i+k])] = true
 		}
@@ -1498,14 +1592,14 @@ func newVerbatimIndex(segs []string, k int) verbatimIndex {
 // how many it cut.
 func (idx verbatimIndex) cut(s string) (string, int) {
 	k := idx.k
-	n := normalize(s, true)
-	if len(n.r) < k || len(idx.runs) == 0 {
+	n := idx.norm(s)
+	if len(n.r) < k || idx.empty() {
 		return s, 0
 	}
 	covered := make([]bool, len(n.r))
 	hit := false
 	for i := 0; i+k <= len(n.r); i++ {
-		if idx.runs[string(n.r[i:i+k])] {
+		if idx.has(string(n.r[i : i+k])) {
 			for j := i; j < i+k; j++ {
 				covered[j] = true
 			}
@@ -1543,14 +1637,14 @@ func (idx verbatimIndex) cutExcept(s string, keep []string) (string, int) {
 		return idx.cut(s)
 	}
 	k := idx.k
-	n := normalize(s, true)
-	if len(n.r) < k || len(idx.runs) == 0 {
+	n := idx.norm(s)
+	if len(n.r) < k || idx.empty() {
 		return s, 0
 	}
 	word := func(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) }
 	exempt := make([]bool, len(n.r))
 	for _, w := range keep {
-		q := normalize(w, true).r
+		q := idx.norm(w).r
 		if len(q) == 0 {
 			continue
 		}
@@ -1570,7 +1664,7 @@ func (idx verbatimIndex) cutExcept(s string, keep []string) (string, int) {
 	covered := make([]bool, len(n.r))
 	hit := false
 	for i := 0; i+k <= len(n.r); i++ {
-		if slices.Contains(exempt[i:i+k], true) || !idx.runs[string(n.r[i:i+k])] {
+		if slices.Contains(exempt[i:i+k], true) || !idx.has(string(n.r[i:i+k])) {
 			continue
 		}
 		for j := i; j < i+k; j++ {

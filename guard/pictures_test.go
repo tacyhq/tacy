@@ -265,8 +265,9 @@ func TestHeldBackLookupsAfterAllow(t *testing.T) {
 	if len(ticket) != 32 {
 		t.Fatalf("no ticket at the run's end: %+v", evs)
 	}
+	space := "s_other"
 	run := func(user, ticket string) (*harness.ActionResult, []*proto.Image) {
-		start, opts, args, err := PicturesStart(&proto.PicturesRequest{Ticket: ticket}, time.Now())
+		start, opts, args, err := PicturesStart(&proto.PicturesRequest{Ticket: ticket, Space: space}, time.Now())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -291,6 +292,12 @@ func TestHeldBackLookupsAfterAllow(t *testing.T) {
 		ps.Close()
 		return res, imgs
 	}
+	// Another space can't use it, even with the same user tag (v0.10.0: a pictures request proves its space), and
+	// doesn't use it up.
+	if res, imgs := run("u1", ticket); res.Status != harness.ActionFailed || len(imgs) != 0 {
+		t.Fatalf("another space: %+v %d", res, len(imgs))
+	}
+	space = "s_chat"
 	// Another user tag can't use it (and doesn't use it up).
 	if res, imgs := run("u2", ticket); res.Status != harness.ActionFailed || len(imgs) != 0 {
 		t.Fatalf("another user: %+v %d", res, len(imgs))
@@ -386,7 +393,7 @@ func TestLateLookupsFilledAfterTheAnswer(t *testing.T) {
 	}
 	close(s.release) // the provider answers now
 	run := func(user, prev string) (*harness.ActionResult, []string) {
-		start, opts, args, err := PicturesStart(&proto.PicturesRequest{Ticket: ticket}, time.Now())
+		start, opts, args, err := PicturesStart(&proto.PicturesRequest{Ticket: ticket, Space: "s_chat"}, time.Now())
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -61,7 +61,7 @@ func imageRun(t *testing.T, ms []int, count int) ([]proto.Event, map[string]time
 	is := &delayedImages{base: srv.URL, ms: ms}
 	a.gates = newToolGates(DefaultLimits)
 	a.newTools = func() *Tools { return &Tools{search: is, fetcher: newFetcher(nil)} }
-	r := proto.RunRequest{Permissions: AllowAll(), Messages: []proto.Message{{Role: "user", Content: "show me posters"}}}
+	r := proto.RunRequest{Space: testSpace, Permissions: AllowAll(), Messages: []proto.Message{{Role: "user", Content: "show me posters"}}}
 	if err := validate(&r); err != nil {
 		t.Fatal(err)
 	}

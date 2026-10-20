@@ -31,17 +31,6 @@ func recipientKey(t *testing.T) (*ecdh.PrivateKey, string) {
 	return k, activity.RecipientString(k.PublicKey())
 }
 
-// recorded is a request whose records go to priv's key, with the proof the browser makes against the VM's key.
-func (e *safeEnv) recorded(priv *ecdh.PrivateKey, req proto.RunRequest) proto.RunRequest {
-	to := activity.RecipientString(priv.PublicKey())
-	p, err := activity.RecordProof(priv, e.vmKey.PublicKey(), to, e.vmKey.PublicKey().Bytes())
-	if err != nil {
-		e.t.Fatal(err)
-	}
-	req.RecordTo, req.RecordProof = to, p
-	return req
-}
-
 // opened is a run's activity event, checked and opened.
 func openedActivity(t *testing.T, evs []proto.Event, priv *ecdh.PrivateKey, key string) []*activity.Run {
 	t.Helper()
@@ -109,7 +98,7 @@ func testActivityChain(t *testing.T, behindRunner bool) {
 	// 1. A plain answer.
 	evs := runParity(t, e.s, e.recorded(priv, proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("what is the meaning of life, my SSN is 078-05-1120")}))
 	m := metaOf(evs)
-	if m == nil || m.Activity == nil || m.Activity.Key != key || m.Activity.Seq != 0 || m.Activity.Head != "" || m.Activity.Chain != activity.ChainID("s_chat", to) {
+	if m == nil || m.Activity == nil || m.Activity.Key != key || m.Activity.Seq != 0 || m.Activity.Head != "" || m.Activity.Chain != activity.ChainID(testSpace, to) {
 		t.Fatalf("meta.activity: %+v", m)
 	}
 	runs := openedActivity(t, evs, priv, key)
@@ -167,11 +156,11 @@ func testActivityChain(t *testing.T, behindRunner bool) {
 	all = append(all, runs...)
 	e.mustPost(e.stop(safety.IssuerFirm, 2, nil, e.admin))
 
-	// 4. A run without a recipient isn't recorded (and gets no activity event).
-	e.model.replies = append(e.model.replies, pText("unrecorded"))
+	// 4. Every run is recorded (keys v2 slice 6): one with another seal key goes to that key's chain, never this one.
+	e.model.replies = append(e.model.replies, pText("elsewhere"))
 	evs = runParity(t, e.s, proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("hi")})
-	if strings.Contains(types(evs), "activity") || metaOf(evs).Activity != nil {
-		t.Fatalf("unrecorded run: %s", types(evs))
+	if m := metaOf(evs); !strings.Contains(types(evs), "activity") || m.Activity == nil || m.Activity.Chain != activity.ChainID(testSpace, testAsker.SealString()) {
+		t.Fatalf("a run in another chain: %s", types(evs))
 	}
 
 	// 5. A budget ends it: the end says which control.
@@ -185,7 +174,7 @@ func testActivityChain(t *testing.T, behindRunner bool) {
 	all = append(all, runs...)
 
 	// 6. A run cut by a restart: the next process writes its end as interrupted.
-	if _, err := e.rec.Begin(activity.Start{Run: "t_cut", Space: "s_chat", To: to}); err != nil {
+	if _, err := e.rec.Begin(activity.Start{Run: "t_cut", Space: testSpace, To: to}); err != nil {
 		t.Fatal(err)
 	}
 	next := &activity.Recorder{Signer: e.rec.Signer, Store: e.rec.Store}
@@ -195,11 +184,11 @@ func testActivityChain(t *testing.T, behindRunner bool) {
 
 	// The whole chain, as the relay fetches it: valid from seq 1, every start ended once.
 	w := httptest.NewRecorder()
-	e.s.activityOut(w, httptest.NewRequest("GET", "/activity?chain="+activity.ChainID("s_chat", to)+"&after=0", nil))
+	e.s.activityOut(w, httptest.NewRequest("GET", "/activity?chain="+activity.ChainID(testSpace, to)+"&after=0", nil))
 	if w.Code != 401 {
 		t.Fatalf("GET /activity without the token: %d", w.Code)
 	}
-	r := httptest.NewRequest("GET", "/activity?chain="+activity.ChainID("s_chat", to)+"&after=0", nil)
+	r := httptest.NewRequest("GET", "/activity?chain="+activity.ChainID(testSpace, to)+"&after=0", nil)
 	r.Header.Set("Authorization", "Bearer tok")
 	w = httptest.NewRecorder()
 	e.s.activityOut(w, r)
@@ -273,7 +262,7 @@ func TestActivityKillSwitchOnTheRecord(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	time.Sleep(200 * time.Millisecond)
-	e.mustPost(e.stop(safety.IssuerFirm, 1, func(l *safety.StopList) { l.Stop = []safety.Target{{Firm: "f_chat", Space: "s_chat"}} }, e.admin))
+	e.mustPost(e.stop(safety.IssuerFirm, 1, func(l *safety.StopList) { l.Stop = []safety.Target{{Firm: "f_chat", Space: testSpace}} }, e.admin))
 	var evs []proto.Event
 	select {
 	case evs = <-done:
@@ -296,37 +285,5 @@ func TestActivityKillSwitchOnTheRecord(t *testing.T) {
 	}
 	if fetch == nil || fetch.Outcome != "cancelled" {
 		t.Fatalf("the fetch the stop cut: %+v", runs[1].Calls)
-	}
-}
-
-func TestActivityBadRecipientRefused(t *testing.T) {
-	e := newSafeEnv(t, pText("x"))
-	e.mustPost(e.policy(1, nil), e.heartbeat())
-	body, _ := json.Marshal(proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("hi"), RecordTo: "x25519:AAAA"})
-	r := httptest.NewRequest("POST", "/run", strings.NewReader(string(body)))
-	r.Header.Set(ModelHeader, proto.DefaultModel)
-	w := httptest.NewRecorder()
-	e.s.run(w, r)
-	if w.Code != 400 || !strings.Contains(w.Body.String(), "record_to") {
-		t.Fatalf("%d %s", w.Code, w.Body)
-	}
-	// Someone else's key without its private half (our relay, or another person who saw it): refused, and
-	// nothing reveals that chain's length.
-	victim, to := recipientKey(t)
-	_ = victim
-	forger, _ := recipientKey(t)
-	forged, _ := activity.RecordProof(forger, e.vmKey.PublicKey(), to, e.vmKey.PublicKey().Bytes())
-	for _, proof := range [][]byte{nil, forged} {
-		body, _ := json.Marshal(proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("hi"), RecordTo: to, RecordProof: proof})
-		r := httptest.NewRequest("POST", "/run", strings.NewReader(string(body)))
-		r.Header.Set(ModelHeader, proto.DefaultModel)
-		w := httptest.NewRecorder()
-		e.s.run(w, r)
-		if w.Code != 400 || !strings.Contains(w.Body.String(), "record_proof") {
-			t.Fatalf("forged proof: %d %s", w.Code, w.Body)
-		}
-	}
-	if _, head, _ := e.rec.Head("s_chat", to); head.Seq != 0 {
-		t.Fatal("a record was written for an unproven key")
 	}
 }

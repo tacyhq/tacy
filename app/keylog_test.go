@@ -125,7 +125,7 @@ func TestKeylogEndToEnd(t *testing.T) {
 		meta.Keys.Genesis != meta.Keys.Head || meta.Keys.Firm != "f_chat" || meta.Keys.Fork {
 		t.Fatalf("meta keys: %+v", meta)
 	}
-	if st := e.s.safety.StatusOf("s_chat"); st.Keys == nil || st.Keys.Seq != 1 || len(st.Policy) != 1 || st.Policy[0] != pol.Hash() {
+	if st := e.s.safety.StatusOf(testSpace); st.Keys == nil || st.Keys.Seq != 1 || len(st.Policy) != 1 || st.Policy[0] != pol.Hash() {
 		t.Fatalf("status: %+v", st)
 	}
 }
@@ -141,7 +141,7 @@ func TestNoKeylogMetaUnchanged(t *testing.T) {
 			t.Fatalf("meta: %+v", ev.Meta)
 		}
 	}
-	if e.s.safety.KeyLogged() || e.s.safety.StatusOf("s_chat").Keys != nil {
+	if e.s.safety.KeyLogged() || e.s.safety.StatusOf(testSpace).Keys != nil {
 		t.Fatal("a legacy VM reports a key log")
 	}
 }

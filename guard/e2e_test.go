@@ -231,7 +231,7 @@ func TestRunLikeApp(t *testing.T) {
 	e := newE2E(t, nil,
 		toolCallSSE("c1", "web_search", `{"query":"dstack release for jane@example.com","count":3}`),
 		textSSE("dstack v0.6.1 is the latest [1]."))
-	evs, err := e.run(proto.RunRequest{Permissions: AllowAll(), Messages: user("latest dstack?")})
+	evs, err := e.run(proto.RunRequest{Space: testSpace, Permissions: AllowAll(), Messages: user("latest dstack?")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -317,7 +317,7 @@ func TestRunBadToolCalls(t *testing.T) {
 		toolCallSSE("c2", "rm_rf", `{}`),
 		toolCallSSE("c3", "web_search", `{not json`),
 		textSSE("ok"))
-	evs, err := e.run(proto.RunRequest{Permissions: AllowAll(), Tools: []string{"web_search", "fetch_page"}, Messages: user("q")})
+	evs, err := e.run(proto.RunRequest{Space: testSpace, Permissions: AllowAll(), Tools: []string{"web_search", "fetch_page"}, Messages: user("q")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -362,7 +362,7 @@ func TestRunBadToolCalls(t *testing.T) {
 // app/app_test.go TestAgentLastStepHasNoTools.
 func TestRunLastStepHasNoTools(t *testing.T) {
 	e := newE2E(t, nil, toolCallSSE("c1", "web_search", `{"query":"a"}`), toolCallSSE("c2", "web_search", `{"query":"b"}`))
-	evs, err := e.run(proto.RunRequest{Permissions: AllowAll(), MaxSteps: 2, CacheSecret: "user-secret", Messages: user("q")})
+	evs, err := e.run(proto.RunRequest{Space: testSpace, Permissions: AllowAll(), MaxSteps: 2, CacheSecret: "user-secret", Messages: user("q")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -385,7 +385,7 @@ func TestRunModelError(t *testing.T) {
 	e := newE2E(t, func(c *Config) {
 		c.Up = &plainUpstream{url: "http://127.0.0.1:1/none", http: &http.Client{Timeout: time.Second}}
 	})
-	evs, err := e.run(proto.RunRequest{Permissions: AllowAll(), Messages: user("q")})
+	evs, err := e.run(proto.RunRequest{Space: testSpace, Permissions: AllowAll(), Messages: user("q")})
 	if err == nil {
 		t.Fatal("no error")
 	}
@@ -411,7 +411,7 @@ func TestRunParallelTools(t *testing.T) {
 			[3]string{"c2", "web_fetch", `{"url":"https://example.org/poster"}`},
 			[3]string{"c3", "web_images", `{"query":"poster","count":1}`}),
 		textSSE("Posters [1] [2]."))
-	evs, err := e.run(proto.RunRequest{Permissions: AllowAll(), Messages: user("posters?")})
+	evs, err := e.run(proto.RunRequest{Space: testSpace, Permissions: AllowAll(), Messages: user("posters?")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -478,7 +478,7 @@ func TestRunBrainCrash(t *testing.T) {
 		e.launch()
 		close(e.fs.release)
 	}()
-	evs, err := e.run(proto.RunRequest{Permissions: AllowAll(), Messages: user("latest dstack?")})
+	evs, err := e.run(proto.RunRequest{Space: testSpace, Permissions: AllowAll(), Messages: user("latest dstack?")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -493,7 +493,7 @@ func TestRunBrainCrash(t *testing.T) {
 // The start the guard makes passes the protocol's own checks and offers what the request asked for.
 func TestStartFor(t *testing.T) {
 	g := New(Config{Now: time.Now})
-	s, o, err := g.StartFor(&proto.RunRequest{Permissions: AllowAll(), Model: "deepseek-v4-1-flash", ReasoningEffort: "none", Tools: []string{"fetch_page"},
+	s, o, err := g.StartFor(&proto.RunRequest{Space: testSpace, Permissions: AllowAll(), Model: "deepseek-v4-1-flash", ReasoningEffort: "none", Tools: []string{"fetch_page"},
 		MaxSteps: 3, CacheSecret: "cs", Messages: user("x")})
 	if err != nil {
 		t.Fatal(err)
@@ -508,6 +508,7 @@ func TestStartFor(t *testing.T) {
 	}
 	for _, r := range []proto.RunRequest{{Messages: user("x"), Tools: []string{"shell"}}, {Messages: user("x"), MaxSteps: 11},
 		{Model: "gpt-4o", Messages: user("x")}} {
+		r.Space = testSpace
 		if _, _, err := g.StartFor(&r); err == nil {
 			t.Errorf("accepted %+v", r)
 		}

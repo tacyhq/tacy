@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -24,7 +25,7 @@ func (c *countSearch) Search(_ context.Context, q string, _ int) ([]SearchResult
 func TestSearchTaskDoesOneSearchOnly(t *testing.T) {
 	cs := &countSearch{}
 	g := New(Config{Up: &plainUpstream{}, Search: cs, Fetcher: NewFetcher(true), Now: time.Now})
-	start, opts, args, err := SearchStart(&proto.SearchRequest{Query: "best kettle 2026", Decision: proto.SearchOnce}, time.Now())
+	start, opts, args, err := SearchStart(&proto.SearchRequest{Query: "best kettle 2026", Decision: proto.SearchOnce, Space: "s_chat"}, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,7 +45,7 @@ func TestSearchTaskDoesOneSearchOnly(t *testing.T) {
 		t.Fatalf("no grant: %+v %v %q", res, err, cs.queries)
 	}
 	// A fresh task: a grant made with another secret is refused too.
-	start, opts, args, _ = SearchStart(&proto.SearchRequest{Query: "best kettle 2026", Decision: proto.SearchOnce}, time.Now())
+	start, opts, args, _ = SearchStart(&proto.SearchRequest{Query: "best kettle 2026", Decision: proto.SearchOnce, Space: "s_chat"}, time.Now())
 	b, _ = json.Marshal(opts)
 	ti = &harness.TaskInfo{ID: "t_search2", Start: &start, Options: b}
 	sess2 := g.Open(ti.ID, opts, func(proto.Event) error { return nil })
@@ -57,7 +58,7 @@ func TestSearchTaskDoesOneSearchOnly(t *testing.T) {
 		t.Fatalf("forged grant: %+v %v", res, err)
 	}
 	// (The forged one used up the task's one search: gatewayd counts a search when it's asked for.)
-	start, opts, args, _ = SearchStart(&proto.SearchRequest{Query: "best kettle 2026", Decision: proto.SearchOnce}, time.Now())
+	start, opts, args, _ = SearchStart(&proto.SearchRequest{Query: "best kettle 2026", Decision: proto.SearchOnce, Space: "s_chat"}, time.Now())
 	b, _ = json.Marshal(opts)
 	ti = &harness.TaskInfo{ID: "t_search3", Start: &start, Options: b}
 	sess3 := g.Open(ti.ID, opts, func(proto.Event) error { return nil })
@@ -104,11 +105,23 @@ func TestSearchStartChecks(t *testing.T) {
 		"tag":      {Query: "q", Question: "x\U000E0041", Decision: "once"},
 		"cache":    {Query: "q", Decision: "once", CacheSecret: string(make([]byte, 257))},
 	} {
+		r.Space = "s_chat"
 		if _, _, _, err := SearchStart(&r, time.Now()); err == nil {
 			t.Errorf("%s accepted", name)
 		}
 	}
-	_, opts, args, err := SearchStart(&proto.SearchRequest{Query: "  q  ", Decision: "setting"}, time.Now())
+	// v0.10.0: no default space; agentd's verified one wins over the one named.
+	if _, _, _, err := SearchStart(&proto.SearchRequest{Query: "q", Decision: "once"}, time.Now()); err == nil {
+		t.Error("a search with no space accepted")
+	}
+	if s, _, _, err := SearchStart(&proto.SearchRequest{Query: "q", Decision: "once", Space: "s_other",
+		Verified: &proto.Verified{Space: "s_verified"}}, time.Now()); err != nil || s.Space != "s_verified" {
+		t.Errorf("space %q %v", s.Space, err)
+	}
+	if _, _, _, err := PicturesStart(&proto.PicturesRequest{Ticket: strings.Repeat("ab", 16)}, time.Now()); err == nil {
+		t.Error("a pictures request with no space accepted")
+	}
+	_, opts, args, err := SearchStart(&proto.SearchRequest{Query: "  q  ", Decision: "setting", Space: "s_chat"}, time.Now())
 	if err != nil || string(args) != `{"count":5,"query":"q"}` || opts.Question != "q" {
 		t.Fatalf("%s %+v %v", args, opts, err)
 	}

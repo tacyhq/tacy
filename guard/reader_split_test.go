@@ -428,7 +428,7 @@ func TestSearchPicturesFetchedWhileReading(t *testing.T) {
 	defer srv.Close()
 	g := New(Config{Up: &plainUpstream{url: srv.URL, http: srv.Client()}, Reader: &rc, Search: shopSearch{},
 		Fetcher: &http.Client{Transport: rec}, Now: time.Now})
-	start, opts, args, _ := SearchStart(&proto.SearchRequest{Query: "best keyboards", Decision: proto.SearchOnce}, time.Now())
+	start, opts, args, _ := SearchStart(&proto.SearchRequest{Query: "best keyboards", Decision: proto.SearchOnce, Space: "s_chat"}, time.Now())
 	b, _ := json.Marshal(opts)
 	ti := &harness.TaskInfo{ID: "t_prefetch", Start: &start, Options: b}
 	var evs []proto.Event

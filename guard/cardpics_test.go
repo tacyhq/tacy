@@ -251,7 +251,7 @@ func TestCardPicturesFromSearchResults(t *testing.T) {
 	a, _, _ := newTestAgent(t, toolCallSSE("c1", "web_search", `{"query":"keyboards"}`), textSSE(cards))
 	web := stubWeb{"https://img.keychron.example/q6.png": pngWH(400, 300), "https://reviews.example/hero.png": pngWH(400, 300)}
 	a.newTools = func() *Tools { return &Tools{search: &thumbSearch{}, fetcher: &http.Client{Transport: web}} }
-	evs := collect(t, a, proto.RunRequest{Permissions: AllowAll(), Messages: []proto.Message{{Role: "user", Content: "recommend keyboards"}}})
+	evs := collect(t, a, proto.RunRequest{Space: testSpace, Permissions: AllowAll(), Messages: []proto.Message{{Role: "user", Content: "recommend keyboards"}}})
 	var imgs []*proto.Image
 	var ids []string
 	var m *proto.Metric
@@ -303,7 +303,7 @@ func TestCardPicturesFromAnotherSource(t *testing.T) {
 	a, _, _ := newTestAgent(t, toolCallSSE("c1", "web_search", `{"query":"keyboards"}`), textSSE(cards))
 	web := stubWeb{"https://img.keychron.example/q6.png": pngWH(400, 300), "https://reviews.example/hero.png": pngWH(400, 300)}
 	a.newTools = func() *Tools { return &Tools{search: &thumbSearch{}, fetcher: &http.Client{Transport: web}} }
-	evs := collect(t, a, proto.RunRequest{Permissions: AllowAll(), Messages: []proto.Message{{Role: "user", Content: "recommend keyboards"}}})
+	evs := collect(t, a, proto.RunRequest{Space: testSpace, Permissions: AllowAll(), Messages: []proto.Message{{Role: "user", Content: "recommend keyboards"}}})
 	var imgs []*proto.Image
 	var m *proto.Metric
 	for _, e := range evs {
@@ -332,7 +332,7 @@ func TestCardPicturesFromPageMetadata(t *testing.T) {
 	cards := "```items\n" + `[{"title":"Lofree Flow 84","source":"[1]"}]` + "\n```\nThat's it."
 	a, _, _ := newTestAgent(t, toolCallSSE("p1", "web_fetch", `{"url":"https://lofree.example/products/flow"}`), textSSE(cards))
 	a.newTools = func() *Tools { return &Tools{search: &fakeSearch{}, fetcher: &http.Client{Transport: web}} }
-	evs := collect(t, a, proto.RunRequest{Permissions: AllowAll(), Tools: []string{"web_search", "fetch_page"},
+	evs := collect(t, a, proto.RunRequest{Space: testSpace, Permissions: AllowAll(), Tools: []string{"web_search", "fetch_page"},
 		Messages: []proto.Message{{Role: "user", Content: "is the lofree flow good?"}}})
 	var img *proto.Image
 	for _, e := range evs {

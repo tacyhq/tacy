@@ -233,7 +233,7 @@ func TestLateMetric(t *testing.T) {
 // search result. Its instructions say one number per bracket and only numbers sources gave.
 func TestImageResultNumbersArePictures(t *testing.T) {
 	a, fm, _, _ := newImageAgent(t, toolCallSSE("c1", "web_images", `{"query":"Arrival poster","count":2}`), textSSE("Here."))
-	evs := collect(t, a, proto.RunRequest{Permissions: AllowAll(), Messages: []proto.Message{{Role: "user", Content: "posters"}}})
+	evs := collect(t, a, proto.RunRequest{Space: testSpace, Permissions: AllowAll(), Messages: []proto.Message{{Role: "user", Content: "posters"}}})
 	for _, e := range evs {
 		if e.Type == "tool_result" && (!strings.Contains(string(e.Result), `"picture":1`) || strings.Contains(string(e.Result), `"n":`) ||
 			!strings.Contains(string(e.Result), "never cite a picture")) {

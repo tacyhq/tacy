@@ -144,7 +144,7 @@ func main() {
 			ch := st.Changed()
 			select {
 			case <-ch:
-				s := st.StatusOf("s_chat") // hashes and numbers only
+				s := st.StatusOf("") // the firm's; hashes and numbers only
 				log.Printf("safety: controls now policy %v, operator seq %d, firm seq %d, fresh %v, stopped %q", s.Policy,
 					s.OperatorSeq, s.FirmSeq, s.Fresh, s.Stopped)
 			case <-time.After(10 * time.Second):

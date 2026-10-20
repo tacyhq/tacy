@@ -176,6 +176,7 @@ func connTo(t *testing.T, s *server, user string) *agentclient.Conn {
 		t.Fatal(err)
 	}
 	c.User = user
+	c.Asker = testAsker // the tests' space (testSpace), which they stop and read
 	return c
 }
 
@@ -544,7 +545,7 @@ func TestTasksKillSwitch(t *testing.T) {
 	}
 	time.Sleep(200 * time.Millisecond) // the fetch is running
 	t0 := time.Now()
-	e.mustPost(e.stop(safety.IssuerFirm, 1, func(l *safety.StopList) { l.Stop = []safety.Target{{Firm: "f_chat", Space: "s_chat"}} }, e.admin))
+	e.mustPost(e.stop(safety.IssuerFirm, 1, func(l *safety.StopList) { l.Stop = []safety.Target{{Firm: "f_chat", Space: testSpace}} }, e.admin))
 	var r result
 	select {
 	case r = <-done:
@@ -646,7 +647,7 @@ func TestTasksBudgetAfterRestart(t *testing.T) {
 	l := &safety.Ledger{}
 	sg := &safeGateway{ledger: l}
 	started := time.Now().Add(-time.Minute)
-	sg.ResumeTask("tk_x", &harness.Start{Space: "s_chat"}, guard.TaskOptions{Space: "s_chat"}, started, recs)
+	sg.ResumeTask("tk_x", &harness.Start{Space: testSpace}, guard.TaskOptions{Space: testSpace}, started, recs)
 	if got, ok := l.Used("tk_x"); !ok || got != want {
 		t.Fatalf("ledger after resume: %+v %v", got, ok)
 	}
@@ -684,7 +685,7 @@ func TestRunShimLeavesNothing(t *testing.T) {
 		t.Fatalf("status of a /run task: %v", err)
 	}
 	// A refused run's record has a tk_ id too.
-	e.mustPost(e.stop(safety.IssuerFirm, 1, func(l *safety.StopList) { l.Stop = []safety.Target{{Firm: "f_chat", Space: "s_chat"}} }, e.admin))
+	e.mustPost(e.stop(safety.IssuerFirm, 1, func(l *safety.StopList) { l.Stop = []safety.Target{{Firm: "f_chat", Space: testSpace}} }, e.admin))
 	evs = runParity(t, e.s, e.recorded(priv, proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("hi")}))
 	var refused []*activity.Run
 	for _, ev := range evs {

@@ -303,7 +303,7 @@ func TestSearchTaskResultPictures(t *testing.T) {
 	rc := DefaultReader
 	g := New(Config{Up: &plainUpstream{url: srv.URL, http: srv.Client()}, Reader: &rc, Search: shopSearch{},
 		Fetcher: &http.Client{Transport: web}, Now: time.Now})
-	start, opts, args, err := SearchStart(&proto.SearchRequest{Query: "best keyboards", Decision: proto.SearchOnce}, time.Now())
+	start, opts, args, err := SearchStart(&proto.SearchRequest{Query: "best keyboards", Decision: proto.SearchOnce, Space: "s_chat"}, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}

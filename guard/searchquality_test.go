@@ -270,7 +270,7 @@ func TestSearchNotePerPath(t *testing.T) {
 // The guard sets plain for a search task only.
 func TestSearchTaskToolsArePlain(t *testing.T) {
 	g := New(Config{Up: &plainUpstream{}, Search: &countSearch{}, Fetcher: NewFetcher(true), Now: time.Now})
-	_, opts, _, err := SearchStart(&proto.SearchRequest{Query: "best sneakers 2026", Decision: proto.SearchOnce}, time.Now())
+	_, opts, _, err := SearchStart(&proto.SearchRequest{Query: "best sneakers 2026", Decision: proto.SearchOnce, Space: "s_chat"}, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}

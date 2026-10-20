@@ -72,6 +72,9 @@ type safeOpts struct {
 	// entries in e.keylog, e.admin the first owner's identity key, e.kit the recovery kit), carry pinned hashes.
 	keylog bool
 	carry  []string
+	// firmVM: a firm's VM (keys v2 slice 6): no personal spaces, so a space runs only under its own signed policy
+	// naming its seal key, for an identity current in the key log. Off: the shared chat VM, as f_chat's compose.
+	firmVM bool
 	// wrapUp wraps the model upstream (fake slow or overloaded models); slowAfter is the guard's first-token wait.
 	wrapUp    func(guard.Upstream) guard.Upstream
 	slowAfter time.Duration
@@ -104,7 +107,7 @@ func newSafeEnvWith(t *testing.T, o safeOpts, replies ...string) *safeEnv {
 	t.Cleanup(srv.Close)
 	cfg := safety.Config{Firm: "f_chat", Operator: e.operator.Public().(ed25519.PublicKey),
 		Admins: []ed25519.PublicKey{e.admin.Public().(ed25519.PublicKey)}, Release: guard.ReleasePolicy("f_chat", ""),
-		Dir: t.TempDir()}
+		Dir: t.TempDir(), PersonalSpaces: !o.firmVM}
 	if o.keyless {
 		cfg.Operator, cfg.Admins = nil, nil
 	}
@@ -282,7 +285,7 @@ func TestSafetyForgedAndReplayedPolicies(t *testing.T) {
 	if r := e.post(e.policy(1, nil)); r[0] == "ok" || !strings.Contains(r[0], "rollback") {
 		t.Fatalf("v1 after v2: %v", r)
 	}
-	if st := e.s.safety.StatusOf("s_chat"); len(st.Policy) != 1 || st.Policy[0] != v2.Hash() {
+	if st := e.s.safety.StatusOf(testSpace); len(st.Policy) != 1 || st.Policy[0] != v2.Hash() {
 		t.Fatalf("the policy in force changed: %+v", st)
 	}
 }
@@ -320,7 +323,7 @@ func testSafetyKillSwitch(t *testing.T, behindRunner bool) {
 	}
 	time.Sleep(200 * time.Millisecond) // the fetch is running
 	t0 := time.Now()
-	e.mustPost(e.stop(safety.IssuerFirm, 1, func(l *safety.StopList) { l.Stop = []safety.Target{{Firm: "f_chat", Space: "s_chat"}} }, e.admin))
+	e.mustPost(e.stop(safety.IssuerFirm, 1, func(l *safety.StopList) { l.Stop = []safety.Target{{Firm: "f_chat", Space: testSpace}} }, e.admin))
 	var evs []proto.Event
 	select {
 	case evs = <-done:
@@ -488,7 +491,7 @@ func TestSafetyOutputCapAndMissingUsage(t *testing.T) {
 	e2.mustPost(e2.policy(1, nil), e2.heartbeat())
 	runParity(t, e2.s, proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("hi")})
 	sg := e2.s.agent.(*recGateway).safeGateway
-	if _, err := sg.ledger.Admit("s_chat", safety.Budgets{Day: safety.Limits{Tokens: safety.CompletionReserve}}); safety.CodeOf(err) != safety.CodeBudgetExceeded {
+	if _, err := sg.ledger.Admit(testSpace, "", safety.Budgets{Day: safety.Limits{Tokens: safety.CompletionReserve}}); safety.CodeOf(err) != safety.CodeBudgetExceeded {
 		t.Fatal("a call without reported usage was counted as less than its reservation")
 	}
 }

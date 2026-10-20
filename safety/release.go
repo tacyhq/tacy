@@ -33,6 +33,10 @@ func ChatRelease(firm, tinfoilHost string, models []string, runSeconds int64) *P
 		Budget: Budgets{
 			Run: Limits{Tokens: 8_000_000, ToolCalls: 64, WallSeconds: runSeconds, CostMicros: 20_000_000},
 			Day: Limits{Tokens: 200_000_000, ToolCalls: 5_000, WallSeconds: 24 * 3600, CostMicros: 200_000_000},
+			// Keys v2 slice 6: one member (on the shared chat VM, one person's daily tag) can use a quarter of the
+			// day, and the whole VM no more than one space could before (today's cost cap, now for everyone).
+			Member: Limits{Tokens: 50_000_000, ToolCalls: 1_250, WallSeconds: 6 * 3600, CostMicros: 50_000_000},
+			VM:     Limits{Tokens: 200_000_000, ToolCalls: 5_000, WallSeconds: 24 * 3600, CostMicros: 200_000_000},
 		},
 		Rates: Rates{Key: Rate{PerMinute: 600, Burst: 120}, Connector: Rate{PerMinute: 600, Burst: 120},
 			Space: Rate{PerMinute: 900, Burst: 180}},

@@ -237,7 +237,12 @@ func (s *server) run(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, "model_mismatch: the X-Agent-Model header doesn't match the run's model")
 		return
 	}
-	if _, _, err := s.agent.StartFor(&req); err != nil { // the request checks (Run makes the task from it again)
+	// Where and who (keys v2 slice 6): checked once, here; StartFor then uses what was verified.
+	err = s.verifyWho(&req, userFrom(r.Context()))
+	if err == nil {
+		_, _, err = s.agent.StartFor(&req) // the request checks (Run makes the task from it again)
+	}
+	if err != nil {
 		if safety.CodeOf(err) != "" { // stopped, no policy, a model it doesn't allow, the day used up: say why
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.Header().Set("Cache-Control", "no-store")
@@ -290,6 +295,15 @@ func (s *server) run(w http.ResponseWriter, r *http.Request) {
 	}
 	s.tasks().Run(r.Context(), userFrom(r.Context()), &req, emit)
 	out.done()
+}
+
+// verifyWho checks a request's where and who (recGateway.Verify) and notes it in req.Verified. A server whose gateway
+// isn't the recorder (a guard alone: local development and tests, where nothing is recorded) takes the space as named.
+func (s *server) verifyWho(req *proto.RunRequest, user string) error {
+	if rg, ok := s.agent.(*recGateway); ok {
+		return rg.Verify(req, user)
+	}
+	return nil
 }
 
 // waitBrain reports whether a brain is connected, waiting up to d for one.
@@ -544,7 +558,7 @@ func main() {
 	if st.KeyLogged() {
 		mux.HandleFunc("POST /keylog", s.keylogIn)
 	}
-	mux.HandleFunc("GET /safety", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, st.StatusOf("s_chat")) })
+	mux.HandleFunc("GET /safety", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, st.StatusOf("")) }) // the firm's controls
 	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)

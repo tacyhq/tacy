@@ -65,12 +65,24 @@ type RunRequest struct {
 	// CacheSecret scopes Tinfoil's prompt cache (user_cache_secret); the chat sends its per-user secret.
 	// When empty, a per-boot random secret is used.
 	CacheSecret string `json:"cache_secret,omitempty"`
-	// RecordTo is the X25519 key the run's activity record is sealed to ("x25519:<base64>", docs/24): the
-	// person's own activity key until spaces have keys. Without one the run isn't recorded.
-	RecordTo string `json:"record_to,omitempty"`
-	// RecordProof shows the sender holds RecordTo's private key (activity.RecordProof, base64): without it the VM
-	// refuses a run that names record_to.
-	RecordProof []byte `json:"record_proof,omitempty"`
+	// Where and who (keys v2 slice 6, docs/26 section 6; package runauth). Every run names its space and that
+	// space's seal public key, with a proof made against this boot's attested key that the sender holds the seal
+	// private key (which only the space's holders can open); the run's activity records are sealed to the seal key,
+	// so the request can neither choose nor drop their recipient. On a firm's VM the seal key must be the one the
+	// space's signed policy names; on the shared chat VM (personal spaces) it comes from the request, proven.
+	Space      string `json:"space,omitempty"`       // "s_…"
+	SpaceSeal  string `json:"space_seal,omitempty"`  // "x25519:<base64>"
+	SpaceProof []byte `json:"space_proof,omitempty"` // runauth.SpaceProof (base64)
+	// Identity signs the request (runauth.Digest) with this boot's VM key, Nonce (16 random bytes, 32 lowercase hex)
+	// and SignedAt (unix seconds): a request runs at most once per boot. On a firm's VM the identity must be current
+	// in the firm key log with IdentityKey; on the shared chat VM it is self-certified.
+	Identity    string `json:"identity,omitempty"`     // "i_…"
+	IdentityKey string `json:"identity_key,omitempty"` // "ed25519:<base64>"
+	Nonce       string `json:"nonce,omitempty"`
+	SignedAt    int64  `json:"signed_at,omitempty"`
+	IdentitySig []byte `json:"identity_sig,omitempty"` // runauth.Sign (base64)
+	// Verified is the agent VM's own note that it checked the above (never read from or written to the wire).
+	Verified *Verified `json:"-"`
 	// RunSecret is this run's answer key for permission prompts (docs/27 section 6): 32 random bytes as 64
 	// lowercase hex, made by the person's tab and sent only inside this encrypted body. A grant (POST /tasks/grant)
 	// carries an HMAC with it, so only that tab can answer the run's prompts; the relay can't read or forge one.
@@ -108,9 +120,19 @@ type SearchRequest struct {
 	Edited bool `json:"edited,omitzero"`
 	// CacheSecret scopes Tinfoil's prompt cache for the reader's call (RunRequest.CacheSecret).
 	CacheSecret string `json:"cache_secret,omitzero"`
-	// RecordTo and RecordProof: the activity record's recipient and the proof, as for a run (RunRequest).
-	RecordTo    string `json:"record_to,omitzero"`
-	RecordProof []byte `json:"record_proof,omitzero"`
+	// Where and who, as for a run (RunRequest; keys v2 slice 6, v0.10.0): the space, its seal key and proof, and the
+	// identity's signature (runauth.SearchDigest, its own label, so a run's signature can't pass as a search's or
+	// the reverse). The search's record is sealed to the seal key; record_to and record_proof are gone.
+	Space       string `json:"space,omitzero"`
+	SpaceSeal   string `json:"space_seal,omitzero"`
+	SpaceProof  []byte `json:"space_proof,omitzero"`
+	Identity    string `json:"identity,omitzero"`
+	IdentityKey string `json:"identity_key,omitzero"`
+	Nonce       string `json:"nonce,omitzero"`
+	SignedAt    int64  `json:"signed_at,omitzero"`
+	IdentitySig []byte `json:"identity_sig,omitzero"`
+	// Verified is the agent VM's own note that it checked the above (never read from or written to the wire).
+	Verified *Verified `json:"-"`
 }
 
 // PicturesRequest is the body of POST /pictures (v0.8.21): the person turned product photos on after an answer whose
@@ -119,9 +141,18 @@ type SearchRequest struct {
 // user tag, for 30 minutes and one use. Nothing else goes out: the tab sends no names.
 type PicturesRequest struct {
 	Ticket string `json:"ticket"`
-	// RecordTo and RecordProof: the activity record's recipient and the proof, as for a search.
-	RecordTo    string `json:"record_to,omitzero"`
-	RecordProof []byte `json:"record_proof,omitzero"`
+	// Where and who, as for a search (runauth.PicturesDigest, its own label; v0.10.0). The ticket is good only in
+	// the space its run was in, and the record is sealed to that space's seal key.
+	Space       string `json:"space,omitzero"`
+	SpaceSeal   string `json:"space_seal,omitzero"`
+	SpaceProof  []byte `json:"space_proof,omitzero"`
+	Identity    string `json:"identity,omitzero"`
+	IdentityKey string `json:"identity_key,omitzero"`
+	Nonce       string `json:"nonce,omitzero"`
+	SignedAt    int64  `json:"signed_at,omitzero"`
+	IdentitySig []byte `json:"identity_sig,omitzero"`
+	// Verified: as SearchRequest's.
+	Verified *Verified `json:"-"`
 }
 
 // Search decisions (SearchRequest.Decision).
@@ -130,6 +161,17 @@ const (
 	SearchAlways  = "always"
 	SearchSetting = "setting"
 )
+
+// Verified is what the agent VM verified about a request's where and who (runauth.Check), and whose budget it
+// counts against.
+type Verified struct {
+	Space    string // the proven space
+	Seal     string // its seal public key: the run's activity records are sealed to it
+	Identity string // the identity that signed the request
+	// Member is whose member budget the run uses: the identity on a firm's VM; on the shared chat VM the relay's
+	// daily per-user tag (X-Agent-User), since accounts are free to make and only the relay knows who is who.
+	Member string
+}
 
 // Event is one server-sent event in the (EHBP-encrypted) /run response: `data: <json>\n\n`, ending with
 // `data: [DONE]`. Types and how they map onto assistant-ui message parts:
@@ -190,7 +232,7 @@ type Event struct {
 	Error    string   `json:"error,omitempty"`
 	Code     string   `json:"code,omitempty"` // error: why a safety control ended the run (stopped, stop_list_stale, policy_missing, policy_denied, budget_exceeded, rate_limited), or model_overloaded
 	// Activity: the run's sealed activity records (its start and end, or the one record of a refused run), sent
-	// right before done or error. Each is signed by Meta.Activity.Key and sealed to RunRequest.RecordTo.
+	// right before done or error. Each is signed by Meta.Activity.Key and sealed to RunRequest.SpaceSeal.
 	Activity     []json.RawMessage `json:"activity,omitempty"`
 	FinishReason string            `json:"finish_reason,omitempty"`
 	// Permission: a permission prompt or its outcome.

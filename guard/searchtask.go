@@ -82,7 +82,17 @@ func SearchStart(r *proto.SearchRequest, now time.Time) (harness.Start, TaskOpti
 	secret := make([]byte, 32)
 	rand.Read(secret)
 	args, _ := json.Marshal(map[string]any{"query": q, "count": r.Count})
-	s.Space, s.Attempt, s.Agent = "s_chat", 1, searchAgent
+	// Its space (keys v2 slice 6, v0.10.0): the one agentd verified (runauth), or as the request names it for a guard
+	// that runs alone (tests: nothing is recorded there). No default: every request names one.
+	switch {
+	case r.Verified != nil:
+		s.Space = r.Verified.Space
+	case r.Space != "":
+		s.Space = r.Space
+	default:
+		return s, TaskOptions{}, nil, errors.New("the request names no space")
+	}
+	s.Attempt, s.Agent = 1, searchAgent
 	s.Tools = ToolDefs("web.search")
 	s.Limits = harness.TaskLimits{Deadline: now.Add(SearchCap).UTC().Format(time.RFC3339)}
 	question := strings.TrimSpace(r.Question)

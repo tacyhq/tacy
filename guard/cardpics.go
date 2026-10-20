@@ -641,13 +641,13 @@ func namesItem(title string, c ImageCandidate, min float64) bool {
 		return true
 	}
 	var got, total float64
-	for _, w := range q {
+	for i, w := range q {
 		weight := 1.0
 		if strings.ContainsAny(w, "0123456789") {
 			weight = 2
 		}
 		total += weight
-		found := slices.Contains(text, w) || len(w) >= 3 && strings.Contains(joined, w)
+		found := slices.Contains(text, w) || len(w) >= 3 && strings.Contains(joined, w) || spacedModel(q, i, text)
 		if found {
 			got += weight
 		} else if weight == 2 {

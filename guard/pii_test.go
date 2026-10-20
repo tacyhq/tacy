@@ -54,3 +54,37 @@ func TestMaskPIIPricesAndYears(t *testing.T) {
 		}
 	}
 }
+
+// An IBAN is masked only when it is one (registry country, its length, mod-97): long model numbers in an image
+// query stay (v0.10.1: "Samsung DW90F89P0USR" went out as "Samsung [iban]").
+func TestMaskPIIIBANChecked(t *testing.T) {
+	masked := []struct{ in, want string }{
+		{"IBAN DE89 3704 0044 0532 0130 00", "IBAN [iban]"},
+		{"pay DE89370400440532013000 today", "pay [iban] today"},
+		{"GB82 WEST 1234 5698 7654 32", "[iban]"},
+		{"GB82WEST12345698765432 RENT", "[iban] RENT"},
+		{"FR14 2004 1010 0505 0001 3M02 606", "[iban]"},
+		{"NL91ABNA0417164300", "[iban]"},
+		{"NO9386011117947", "[iban]"},
+		{"BE68539007547034 invoice", "[iban] invoice"},
+	}
+	for _, c := range masked {
+		if got, kinds := maskPII(c.in); got != c.want || !slices.Equal(kinds, []string{"iban"}) {
+			t.Errorf("maskPII(%q) = %q %v, want %q [iban]", c.in, got, kinds, c.want)
+		}
+	}
+	keep := []string{
+		"Samsung DW90F89P0USR dishwasher",
+		"DW90F89P0USR",
+		"Samsung QN65S90DAEXZA",
+		"LG OLED65C4PUA 65 inch",
+		"GB00WEST12345698765432", // a GB shape, wrong check digits
+		"DE89WEST12345698765432", // DE's length, wrong check
+		"NL91ABNA041716430",      // one short
+	}
+	for _, q := range keep {
+		if got, kinds := maskPII(q); got != q || kinds != nil {
+			t.Errorf("maskPII(%q) = %q %v, want unchanged", q, got, kinds)
+		}
+	}
+}

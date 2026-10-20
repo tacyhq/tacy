@@ -38,6 +38,7 @@ import (
 
 	xdraw "golang.org/x/image/draw"
 	"golang.org/x/image/webp"
+	"golang.org/x/text/unicode/norm"
 
 	"github.com/tacyhq/tacy/activity"
 )
@@ -618,10 +619,31 @@ var imageStop = map[string]bool{"a": true, "an": true, "the": true, "and": true,
 // notAPhoto are words in an image's address or caption that mark a site's chrome, not the thing asked for.
 var notAPhoto = []string{"logo", "icon", "favicon", "sprite", "avatar", "placeholder", "banner", "badge", "pixel", "spacer"}
 
-// imageWords are the lowercase words and numbers of s, without filler words.
+// foldAccents takes the accents off letters (NFKD, combining marks dropped): "Kärcher" is "Karcher", as most shops
+// and addresses write it (v0.10.1: a "Kärcher K4" card refused its "Karcher K4" pictures).
+func foldAccents(s string) string {
+	ascii := true
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			ascii = false
+			break
+		}
+	}
+	if ascii {
+		return s
+	}
+	return strings.Map(func(r rune) rune {
+		if unicode.Is(unicode.Mn, r) {
+			return -1
+		}
+		return r
+	}, norm.NFKD.String(s))
+}
+
+// imageWords are the lowercase words and numbers of s, accents folded, without filler words.
 func imageWords(s string) []string {
 	var out []string
-	for _, w := range strings.FieldsFunc(strings.ToLower(s), func(r rune) bool {
+	for _, w := range strings.FieldsFunc(strings.ToLower(foldAccents(s)), func(r rune) bool {
 		return !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r > 0x7f && unicode.IsLetter(r))
 	}) {
 		if !imageStop[w] {
@@ -629,6 +651,38 @@ func imageWords(s string) []string {
 		}
 	}
 	return out
+}
+
+// shortLetters: one or two letters, the series letter of a model number ("K" of "K 4", "Q" of "Q 6").
+func shortLetters(w string) bool {
+	return len(w) <= 2 && w != "" && strings.Trim(w, "abcdefghijklmnopqrstuvwxyz") == ""
+}
+
+func allDigits(w string) bool { return w != "" && strings.Trim(w, "0123456789") == "" }
+
+// spacedModel: q[i] is in text once a model number's spacing is ignored: "K 4" and "K4" are one model. A joined
+// "k4" is found where text writes "K 4", and the "k" or the "4" of "K 4" where text writes "K4". Only one or two
+// letters and the number right after them: "K 5" never matches "K4", and "4" alone never matches "K4".
+func spacedModel(q []string, i int, text []string) bool {
+	has := func(w string) bool {
+		if slices.Contains(text, w) {
+			return true
+		}
+		for j := 0; j+1 < len(text); j++ {
+			if shortLetters(text[j]) && allDigits(text[j+1]) && text[j]+text[j+1] == w {
+				return true
+			}
+		}
+		return false
+	}
+	w := q[i]
+	if letters := strings.TrimRight(w, "0123456789"); shortLetters(letters) && allDigits(w[len(letters):]) && has(w) {
+		return true
+	}
+	if i > 0 && shortLetters(q[i-1]) && allDigits(w) && has(q[i-1]+w) {
+		return true
+	}
+	return i+1 < len(q) && shortLetters(w) && allDigits(q[i+1]) && has(w+q[i+1])
 }
 
 // captionScore is how well a candidate's caption, file address and page address name the query: the share of the

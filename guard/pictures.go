@@ -621,8 +621,8 @@ func pictureNames(name string, c ImageCandidate) string {
 	}
 	captionNumbers := slices.ContainsFunc(imageWords(c.Title), func(w string) bool { return strings.ContainsAny(w, "0123456789") })
 	var got, total float64
-	for _, w := range q {
-		found := slices.Contains(text, w) || len(w) >= 3 && strings.Contains(joined, w) || unitNumber(w, text)
+	for i, w := range q {
+		found := slices.Contains(text, w) || len(w) >= 3 && strings.Contains(joined, w) || unitNumber(w, text) || spacedModel(q, i, text)
 		if strings.ContainsAny(w, "0123456789") {
 			if !found && captionNumbers {
 				return imageNumber

@@ -249,3 +249,64 @@ func TestParseTavilyImagesFast(t *testing.T) {
 		t.Fatalf("got %+v", cs)
 	}
 }
+
+// Accents are folded on both sides, and a model number's spacing doesn't matter ("K 4" is "K4"); other model
+// numbers stay refused (found during v0.10.1: a "Kärcher K4" card refused its "Karcher K4" pictures).
+func TestNamesFoldAccentsAndModelSpacing(t *testing.T) {
+	if got := imageWords("Kärcher K4 Ｐremium Café"); !slices.Equal(got, []string{"karcher", "k4", "premium", "cafe"}) {
+		t.Fatalf("imageWords: %q", got)
+	}
+	src := citedSource{url: "https://shop.example/p/123", title: "Karcher K4 Power Control Pressure Washer"}
+	pic := picCand{url: "https://cdn.example/files/123.jpg", kind: picPage}
+	for _, c := range []struct {
+		title string
+		src   citedSource
+		ok    bool
+	}{
+		{"Kärcher K4", src, true},
+		{"Kärcher K 4 Power Control", src, true},
+		{"Karcher K4 Power Control", citedSource{url: src.url, title: "Kärcher K 4 Power Control"}, true},
+		{"Kärcher K5", src, false},
+		{"Kärcher K 5 Power Control", src, false},
+		{"Kärcher K4", citedSource{url: src.url, title: "Karcher K5 Power Control 4 nozzles"}, false},
+		{"Nilfisk Core 140", src, false},
+	} {
+		if why := cardPicRefused(c.title, c.src, pic, cardCaptionMin); (why == "") != c.ok {
+			t.Errorf("%q on %q: %q", c.title, c.src.title, why)
+		}
+	}
+	lookup := []struct {
+		name, caption string
+		want          string
+	}{
+		{"Kärcher K4 Power Control", "Karcher K4 Power Control electric pressure washer", ""},
+		{"Karcher K 4 Power Control", "KÄRCHER K4 Power Control", ""},
+		{"Kärcher K4 Power Control", "Karcher K 4 Power Control", ""},
+		{"Kärcher K4 Power Control", "Karcher K5 Power Control", imageNumber},
+		{"Kärcher K 4 Power Control", "Karcher K 5 Power Control", imageNumber},
+		{"Kärcher K4 Power Control", "Nilfisk pressure washer", imageMismatch},
+	}
+	for _, c := range lookup {
+		if why := pictureNames(c.name, ImageCandidate{URL: "https://cdn.example/x.jpg", Title: c.caption}); why != c.want {
+			t.Errorf("%q for %q: %q, want %q", c.caption, c.name, why, c.want)
+		}
+	}
+	// Spacing only joins one or two letters and the number right after them.
+	for _, c := range []struct {
+		q    []string
+		i    int
+		text []string
+		ok   bool
+	}{
+		{[]string{"k4"}, 0, []string{"k", "4"}, true},
+		{[]string{"k", "4"}, 1, []string{"k4"}, true},
+		{[]string{"k", "4"}, 0, []string{"k4"}, true},
+		{[]string{"k", "5"}, 1, []string{"k4"}, false},
+		{[]string{"4"}, 0, []string{"k4"}, false},
+		{[]string{"rtx", "5090"}, 1, []string{"rtx5090"}, false},
+	} {
+		if got := spacedModel(c.q, c.i, c.text); got != c.ok {
+			t.Errorf("spacedModel(%q, %d, %q) = %v", c.q, c.i, c.text, got)
+		}
+	}
+}

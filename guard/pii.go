@@ -86,6 +86,15 @@ func maskPII(s string) (string, []string) {
 			if p.kind == "card" && digits(m) < 13 {
 				continue
 			}
+			// An IBAN is masked only when it is one: a registry country, that country's length and the mod-97
+			// check (v0.10.1: the Samsung dishwasher "DW90F89P0USR" went out as "[iban]"). It ends at that length.
+			if p.kind == "iban" {
+				n := ibanLen(m)
+				if n == 0 {
+					continue
+				}
+				l[1] = l[0] + n
+			}
 			b.WriteString(s[last:l[0]])
 			b.WriteString("[" + p.kind + "]")
 			last = l[1]
@@ -107,4 +116,62 @@ func digits(s string) int {
 		}
 	}
 	return n
+}
+
+// ibanLengths are the IBAN registry's countries and the length of their IBANs (SWIFT IBAN registry).
+var ibanLengths = map[string]int{
+	"AD": 24, "AE": 23, "AL": 28, "AT": 20, "AZ": 28, "BA": 20, "BE": 16, "BG": 22, "BH": 22, "BI": 27, "BR": 29,
+	"BY": 28, "CH": 21, "CR": 22, "CY": 28, "CZ": 24, "DE": 22, "DJ": 27, "DK": 18, "DO": 28, "EE": 20, "EG": 29,
+	"ES": 24, "FI": 18, "FK": 18, "FO": 18, "FR": 27, "GB": 22, "GE": 22, "GI": 23, "GL": 18, "GR": 27, "GT": 28,
+	"HN": 28, "HR": 21, "HU": 28, "IE": 22, "IL": 23, "IQ": 23, "IS": 26, "IT": 27, "JO": 30, "KW": 30, "KZ": 20,
+	"LB": 28, "LC": 32, "LI": 21, "LT": 20, "LU": 20, "LV": 21, "LY": 25, "MC": 27, "MD": 24, "ME": 22, "MK": 19,
+	"MN": 20, "MR": 27, "MT": 31, "MU": 30, "NI": 28, "NL": 18, "NO": 15, "OM": 23, "PK": 24, "PL": 28, "PS": 29,
+	"PT": 25, "QA": 29, "RO": 24, "RS": 22, "RU": 33, "SA": 24, "SC": 31, "SD": 18, "SE": 24, "SI": 19, "SK": 24,
+	"SM": 27, "SO": 23, "ST": 25, "SV": 28, "TL": 23, "TN": 24, "TR": 26, "UA": 29, "VA": 22, "VG": 24, "XK": 20,
+	"YE": 30,
+}
+
+// ibanLen is the length in bytes of the IBAN that the iban pattern's match m starts with, or 0 when it isn't one:
+// its country is in the registry, it has that country's length (spaces aside; the match may run on into the next
+// group, so the IBAN ends there, at a space or the match's end) and passes the ISO 13616 mod-97 check.
+func ibanLen(m string) int {
+	if len(m) < 4 {
+		return 0
+	}
+	want, ok := ibanLengths[m[:2]]
+	if !ok {
+		return 0
+	}
+	compact := make([]byte, 0, want)
+	end := -1
+	for i := 0; i < len(m); i++ {
+		if m[i] == ' ' {
+			continue
+		}
+		compact = append(compact, m[i])
+		if len(compact) == want {
+			end = i + 1
+			break
+		}
+	}
+	if end < 0 || end < len(m) && m[end] != ' ' || !ibanChecksum(compact) {
+		return 0
+	}
+	return end
+}
+
+// ibanChecksum: the country and check digits moved to the end, letters as 10-35, the number mod 97 is 1.
+func ibanChecksum(iban []byte) bool {
+	r := 0
+	for _, c := range append(append([]byte{}, iban[4:]...), iban[:4]...) {
+		switch {
+		case c >= '0' && c <= '9':
+			r = (r*10 + int(c-'0')) % 97
+		case c >= 'A' && c <= 'Z':
+			r = (r*100 + int(c-'A') + 10) % 97
+		default:
+			return false
+		}
+	}
+	return r == 1
 }

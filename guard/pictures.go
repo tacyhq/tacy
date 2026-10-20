@@ -43,12 +43,15 @@ import (
 )
 
 const (
-	maxCardLookups   = 6               // image searches for card pictures per run
-	lookupCandidates = 8               // candidates asked for per lookup
-	cardLookupWait   = 6 * time.Second // the end of a run waits at most this for lookups still loading
+	maxCardLookups   = 6 // image searches for card pictures per run
+	lookupCandidates = 8 // candidates asked for per lookup
 	lookupTime       = 12 * time.Second
 	maxTaskItems     = 200 // reader item names a run keeps for lookups
 )
+
+// cardLookupWait: the end of a run waits at most this for lookups still loading (those still open then go into the
+// run's ticket, cardPics.end). A var for the tests.
+var cardLookupWait = 6 * time.Second
 
 // taskItem is a reader item a run can look up: its name as the reader gave it, and the call that brought its
 // source (its picture is shown under that call).
@@ -366,6 +369,11 @@ func (c *cardPics) endWait() time.Duration {
 // (pictureLookups) exactly as the run would have (lookupCardPicture: the VM's own copy of each name, the same
 // checks), and shows each picture under the call that brought its item, for that answer's cards. The tab sends no
 // names: the exfil guard is unchanged. A ticket is good once, for 30 minutes, under the run's user tag and space.
+//
+// v0.8.22: a run with pictures allowed whose lookups were still loading when it ended (the end waits at most
+// cardLookupWait) puts those cards' items in the ticket too (cardPics.end), and the tab, photos being on already,
+// sends it at once: the answer's remaining cards fill right after it. The previous UTC day's user tag of the same
+// person is accepted for a ticket (takePictures), so one from before midnight UTC still works after it.
 
 // ViaPictures is a task started by POST /pictures (TaskOptions.Via).
 const ViaPictures = "pictures"
@@ -448,12 +456,21 @@ func (g *Guard) holdPictures(t *task) string {
 var errNoTicket = errors.New("these pictures can't be looked up now (the answer is too old, or they were looked up already)")
 
 // takePictures is a ticket's held-back lookups, once, for the same user tag and space.
-func (g *Guard) takePictures(ticket, user, space string) ([]taskItem, error) {
+//
+// prev (v0.8.22) is the same person's tag for the previous UTC day: the relay's tag is an HMAC of the UTC day and the
+// account (the chat Worker's userTag), so a ticket from a run just before midnight UTC was refused just
+// after it. Accepting prev is safe: the relay computes both tags from the one signed-in account, with its secret,
+// so prev is never another person's tag (the VM never sees account ids and can't make or guess one); the ticket is
+// still 128 random bits, good once, for this space, and still only for laterTTL from the run's end (expires), so
+// yesterday's tag opens nothing older than 30 minutes; and what it unlocks is unchanged (lookups of the VM's own
+// copies of the run's checked item names, pictures shown to the same account's tab).
+func (g *Guard) takePictures(ticket, user, prev, space string) ([]taskItem, error) {
 	l := &g.later
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	e := l.m[ticket]
-	if e == nil || e.user != user || e.space != space || g.cfg.Now().After(e.expires) {
+	ok := e != nil && (e.user == user || prev != "" && e.user == prev)
+	if !ok || e.space != space || g.cfg.Now().After(e.expires) {
 		return nil, errNoTicket
 	}
 	delete(l.m, ticket)
@@ -503,7 +520,7 @@ func (g *Guard) pictureLookups(t *task) (*harness.ActionResult, error) {
 	if PermissionSetting(t.opts, "web.images", g.permissionCap(t.opts.Space, "web.images")) != safety.PermAlways {
 		return PermissionDenial("web.images", PermNeverSetting), nil
 	}
-	items, err := g.takePictures(t.opts.Pictures, t.opts.User, t.opts.Space)
+	items, err := g.takePictures(t.opts.Pictures, t.opts.User, t.opts.PrevUser, t.opts.Space)
 	if err != nil {
 		return &harness.ActionResult{Status: harness.ActionFailed, Error: err.Error()}, nil
 	}

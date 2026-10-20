@@ -323,3 +323,148 @@ func TestHeldBackLookupsAfterAllow(t *testing.T) {
 		t.Fatalf("photos off: queries %q, ticket %v", q, slices.ContainsFunc(got, func(e proto.Event) bool { return e.Type == "pictures" }))
 	}
 }
+
+// slowLookups holds the image searches for some names until released (or the lookup's context ends): lookups still
+// loading when a run ends.
+type slowLookups struct {
+	*lookupSearch
+	slow    map[string]bool
+	release chan struct{}
+}
+
+func (s *slowLookups) Images(ctx context.Context, q string, n int) ([]ImageCandidate, error) {
+	if s.slow[q] {
+		select {
+		case <-s.release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return s.lookupSearch.Images(ctx, q, n)
+}
+
+// v0.8.22: with pictures allowed, the lookups still loading when the run ends (running shoes: 2 of 4 shown) go into
+// the run's ticket, and the pictures task right after the answer fills those cards: only those items, with the VM's
+// own names, once, for the same user.
+func TestLateLookupsFilledAfterTheAnswer(t *testing.T) {
+	defer func(d time.Duration) { cardLookupWait = d }(cardLookupWait)
+	cardLookupWait = 300 * time.Millisecond
+	base, web := espressoWeb()
+	s := &slowLookups{lookupSearch: base, slow: map[string]bool{"Breville Barista Express BES870XL": true, "Gaggia Classic Pro": true}, release: make(chan struct{})}
+	g := New(Config{Search: s, Fetcher: &http.Client{Transport: web}, Icons: &http.Client{Transport: stubWeb{}}, Now: time.Now})
+	var mu sync.Mutex
+	var evs []proto.Event
+	sess := g.Open("t1", TaskOptions{User: "u1", Space: "s_chat", Permissions: map[string]string{"web.images": "always"}}, func(e proto.Event) error {
+		mu.Lock()
+		evs = append(evs, e)
+		mu.Unlock()
+		return nil
+	})
+	tk := g.task(&harness.TaskInfo{ID: "t1"})
+	read := &readerResult{}
+	for _, n := range []string{"Profitec GO", "Breville Barista Express BES870XL", "Gaggia Classic Pro"} {
+		read.items = append(read.items, keptItem{name: n})
+	}
+	tk.noteItems("c1", read)
+	g.cardText(tk, espressoCards)
+	g.cardTextDone(tk)
+	sess.End()
+	sess.Close()
+	mu.Lock()
+	ticket, shown := "", []string{}
+	for _, e := range evs {
+		switch e.Type {
+		case "pictures":
+			ticket = e.Pictures
+		case "image":
+			shown = append(shown, e.Image.For)
+		}
+	}
+	mu.Unlock()
+	if !slices.Equal(shown, []string{"Profitec GO"}) || len(ticket) != 32 {
+		t.Fatalf("in the run: shown %q, ticket %q", shown, ticket)
+	}
+	close(s.release) // the provider answers now
+	run := func(user, prev string) (*harness.ActionResult, []string) {
+		start, opts, args, err := PicturesStart(&proto.PicturesRequest{Ticket: ticket}, time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		opts.User, opts.PrevUser, opts.Space = user, prev, start.Space
+		var got []string
+		id := "p-" + user
+		ps := g.Open(id, opts, func(e proto.Event) error {
+			if e.Type == "image" {
+				if e.ID != "c1" {
+					t.Errorf("picture under %q", e.ID)
+				}
+				got = append(got, e.Image.For)
+			}
+			return nil
+		})
+		res, err := g.Action(context.Background(), &harness.TaskInfo{ID: id, Start: &start}, PicturesActionID, &harness.Action{Name: "web.images", Call: PicturesActionID, Args: args})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ps.End()
+		ps.Close()
+		slices.Sort(got)
+		return res, got
+	}
+	if res, got := run("u2", "u3"); res.Status != harness.ActionFailed || len(got) != 0 {
+		t.Fatalf("another user: %+v %q", res, got)
+	}
+	before := len(s.queries())
+	res, got := run("u1", "")
+	if res.Status != harness.ActionDone || !slices.Equal(got, []string{"Breville Barista Express BES870XL", "Gaggia Classic Pro"}) {
+		t.Fatalf("after the answer: %+v, %q", res, got)
+	}
+	asked := s.queries()[before:]
+	slices.Sort(asked)
+	if !slices.Equal(asked, []string{"Breville Barista Express BES870XL", "Gaggia Classic Pro"}) || s.badCtx {
+		t.Fatalf("after the answer, queries %q (ctx ok: %v)", asked, !s.badCtx)
+	}
+	if res, got := run("u1", ""); res.Status != harness.ActionFailed || len(got) != 0 {
+		t.Fatalf("a second use: %+v %q", res, got)
+	}
+}
+
+// v0.8.22: a ticket from a run before midnight UTC is good with the same person's previous-day tag (the relay's
+// X-Agent-User-Prev) within its 30 minutes; never with another person's tags, and never once it's stale.
+func TestTicketAcrossMidnight(t *testing.T) {
+	now := time.Date(2026, 10, 20, 23, 50, 0, 0, time.UTC)
+	g := New(Config{Search: &lookupSearch{}, Now: func() time.Time { return now }})
+	hold := func() string {
+		tk := g.open("t-"+now.Format("150405.000000000"), TaskOptions{User: "day1-u1", Space: "s_chat", Permissions: map[string]string{"web.images": "ask"}}, func(proto.Event) error { return nil })
+		tk.cards.deferItem(taskItem{name: "Profitec GO", call: "c1"})
+		return g.holdPictures(tk)
+	}
+	tk := hold()
+	now = now.Add(20 * time.Minute) // 00:10 the next day: the relay's tag is day2's now
+	if _, err := g.takePictures(tk, "day2-u2", "day1-u2", "s_chat"); err == nil {
+		t.Fatal("another person's tags took the ticket")
+	}
+	if _, err := g.takePictures(tk, "day2-u1", "", "s_chat"); err == nil {
+		t.Fatal("the new day's tag alone took a ticket from the day before")
+	}
+	if _, err := g.takePictures(tk, "day2-u1", "day1-u1", "s_other"); err == nil {
+		t.Fatal("another space took the ticket")
+	}
+	items, err := g.takePictures(tk, "day2-u1", "day1-u1", "s_chat")
+	if err != nil || len(items) != 1 || items[0].name != "Profitec GO" {
+		t.Fatalf("across midnight: %v %+v", err, items)
+	}
+	if _, err := g.takePictures(tk, "day2-u1", "day1-u1", "s_chat"); err == nil {
+		t.Fatal("a ticket used twice")
+	}
+	// Stale: 31 minutes after the run, with the right tags, it's refused.
+	now = time.Date(2026, 10, 20, 23, 50, 0, 0, time.UTC)
+	stale := hold()
+	now = now.Add(31 * time.Minute)
+	if _, err := g.takePictures(stale, "day2-u1", "day1-u1", "s_chat"); err == nil {
+		t.Fatal("a stale ticket was taken")
+	}
+	if _, err := g.takePictures(stale, "day1-u1", "", "s_chat"); err == nil {
+		t.Fatal("a stale ticket was taken with the run's own tag")
+	}
+}

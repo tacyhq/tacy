@@ -122,6 +122,9 @@ type TaskOptions struct {
 	Fallbacks    []string `json:"fallbacks,omitzero"`
 	// Pictures: a pictures task's ticket (ViaPictures, pictures.go).
 	Pictures string `json:"pictures,omitzero"`
+	// PrevUser: a pictures task's user tag for the same person on the previous UTC day (the relay's
+	// X-Agent-User-Prev), so a ticket from a run before midnight UTC is still theirs (pictures.go takePictures).
+	PrevUser string `json:"prev_user,omitzero"`
 }
 
 // task is the guard's state for one task: what the old app/agent.go kept per run.

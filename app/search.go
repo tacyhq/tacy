@@ -68,7 +68,8 @@ const picturesTimeout = 40 * time.Second
 
 // POST /pictures (v0.8.21): an answer's cards' held-back photos, once the person allows pictures (guard/pictures.go).
 //
-//	POST /pictures  {ticket, record_to?, record_proof?}
+//	POST /pictures  {ticket, record_to?, record_proof?}; optional "X-Agent-User-Prev: <hex>" (the same person's
+//	              tag for the previous UTC day, v0.8.22)
 //	              -> EHBP-encrypted SSE of proto.Event: meta, image (under the run's calls, "for" its item), metrics,
 //	              activity, then done or error. Same token, slots and user tag as /search; nothing is kept.
 func (s *server) pictures(w http.ResponseWriter, r *http.Request) {
@@ -104,6 +105,11 @@ func (s *server) pictures(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	opts.User, opts.Space = userFrom(r.Context()), start.Space
+	// The same person's tag for the previous UTC day (the relay sends it with a pictures request only): a ticket
+	// from a run before midnight UTC (guard/pictures.go takePictures says why this is safe).
+	if prev := r.Header.Get("X-Agent-User-Prev"); opts.User != "" && userTagRe.MatchString(prev) {
+		opts.PrevUser = prev
+	}
 	id := harness.NewTaskID()
 	ctx, cancel := context.WithTimeout(r.Context(), picturesTimeout)
 	defer cancel()

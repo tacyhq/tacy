@@ -372,11 +372,16 @@ type cardPics struct {
 	// deferred: cards that named a reader item but weren't looked up because the run's pictures setting was Ask
 	// (pictures.go holdPictures), at most maxCardLookups
 	deferred []taskItem
+	// pending: the reader items of cards whose lookup (pictures allowed) hadn't ended, by card (nextPending). At the
+	// run's end the ones still open go into the run's ticket with deferred (v0.8.22, end), so the tab looks them up
+	// right after the answer instead of losing them.
+	pending     map[int]taskItem
+	nextPending int
 }
 
 func newCardPics() *cardPics {
 	return &cardPics{tried: map[string]bool{}, taken: map[string]bool{}, sent: map[string]int{}, slots: make(chan struct{}, cardPicFetches),
-		pre: map[string]*picFetch{}, items: map[string]taskItem{}}
+		pre: map[string]*picFetch{}, items: map[string]taskItem{}, pending: map[int]taskItem{}}
 }
 
 // reset starts a model call's text.
@@ -504,11 +509,24 @@ func (g *Guard) cardPicture(t *task, card cardRef, ownOnly bool) {
 	if cp.first.IsZero() {
 		cp.first = time.Now()
 	}
+	pid := -1
+	if lookup != nil {
+		pid = cp.nextPending
+		cp.nextPending++
+		cp.pending[pid] = *lookup
+	}
 	cp.mu.Unlock()
 	cp.wg.Add(1)
 	t.lateMu.Unlock()
 	go func() {
 		defer cp.wg.Done()
+		defer func() {
+			if pid >= 0 {
+				cp.mu.Lock()
+				delete(cp.pending, pid)
+				cp.mu.Unlock()
+			}
+		}()
 		shown := len(tries) > 0 && g.fetchCardPicture(t, card.title, tries)
 		if !shown && lookup != nil && t.ctx.Err() == nil {
 			shown = g.lookupCardPicture(t, *lookup)
@@ -867,6 +885,17 @@ func (c *cardPics) end(step int, f *Facts) *proto.Metric {
 		return nil
 	}
 	c.final = true
+	// Lookups still open now can't show anything any more (final): their items go into the run's ticket
+	// (holdPictures), so the tab looks them up right after the answer (v0.8.22: running shoes showed 2 of 4, the
+	// other two lookups were still loading when the run ended). Only the VM's own copies of checked reader items, as
+	// deferItem's; in the cards' order.
+	for _, k := range slices.Sorted(maps.Keys(c.pending)) {
+		it := c.pending[k]
+		if len(c.deferred) < maxCardLookups && !slices.ContainsFunc(c.deferred, func(x taskItem) bool { return x.name == it.name }) {
+			c.deferred = append(c.deferred, it)
+		}
+	}
+	clear(c.pending)
 	if c.cards == 0 {
 		return nil
 	}

@@ -112,8 +112,11 @@ func (g *Guard) ModelCall(ctx context.Context, ti *harness.TaskInfo, req *harnes
 			delta = string(exactRedact([]byte(delta), leased))
 		}
 		t.emit(proto.Event{Type: kind, Delta: delta})
-		if kind == "text" {
+		switch kind {
+		case "text":
 			g.cardText(t, delta) // an items block that closes: its cards' pictures from their sources (cardpics.go)
+		case "reasoning":
+			g.watchMentions(t, delta) // the items it names: their lookups start now (pictures.go)
 		}
 		return nil // a person who went away cancels the task (Run); the model call itself finishes
 	}

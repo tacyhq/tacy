@@ -268,6 +268,95 @@ func (t *tavily) Images(ctx context.Context, query string, count int) ([]ImageCa
 	return parseTavilyImages(raw, count)
 }
 
+// ImagesFast is Tavily's search with include_images but without include_image_descriptions (v0.10.1): about 2 s
+// where the descriptions take 7-16 s on a query Tavily hasn't seen (measured 2026-10-20). Its pictures are plain
+// addresses, so each gets its result's page title as its caption and that page as its source: the first
+// fastPerResult pictures of each result (a page's own pictures come first, its og:image usually leading), after the
+// top-level pictures (Tavily's pick for the query; captioned likewise when a result lists them, else only their
+// address can name the item). The card checks are the same (pictureRefused): a caption or address that doesn't name
+// the item, a list's title, people, logos are refused before any download. One search credit.
+func (t *tavily) ImagesFast(ctx context.Context, query string, count int) ([]ImageCandidate, error) {
+	key, err := searchKey(ctx, t.lease, tavilyKey, t.base)
+	if err != nil {
+		return nil, err
+	}
+	defer key.Wipe()
+	body, _ := json.Marshal(map[string]any{"query": query, "max_results": 5, "search_depth": "basic",
+		"include_answer": false, "include_raw_content": false, "include_images": true})
+	req, _ := http.NewRequestWithContext(ctx, "POST", t.base, strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+string(key.Bytes()))
+	res, err := t.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("search provider unreachable")
+	}
+	defer res.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(res.Body, 2<<20))
+	if err != nil {
+		return nil, err
+	}
+	raw = exactRedact(raw, []*vault.Secret{key}) // an echoed key never reaches the brain
+	if res.StatusCode != 200 {
+		return nil, fmt.Errorf("search provider returned %d", res.StatusCode)
+	}
+	return parseTavilyImagesFast(raw, count)
+}
+
+// fastPerResult: pictures taken from each result of a fast image search (ImagesFast).
+const fastPerResult = 2
+
+func parseTavilyImagesFast(raw []byte, count int) ([]ImageCandidate, error) {
+	var out struct {
+		Images  []tavilyImage `json:"images"`
+		Results []struct {
+			Title  string        `json:"title"`
+			URL    string        `json:"url"`
+			Images []tavilyImage `json:"images"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("search provider: bad response")
+	}
+	type page struct{ url, title string }
+	pageOf := map[string]page{} // image URL -> its result
+	for _, r := range out.Results {
+		if !httpURL(r.URL) {
+			continue
+		}
+		for _, im := range r.Images {
+			if _, ok := pageOf[im.URL]; !ok {
+				pageOf[im.URL] = page{r.URL, r.Title}
+			}
+		}
+	}
+	var cs []ImageCandidate
+	seen := map[string]bool{}
+	add := func(u, title, source string) {
+		if !httpURL(u) || seen[u] || len(cs) >= count || strings.Contains(strings.ToLower(u), "logo") {
+			return
+		}
+		seen[u] = true
+		cs = append(cs, ImageCandidate{URL: capRunes(u, 1000), Title: clean(title, 200), Source: capRunes(source, 500)})
+	}
+	for _, im := range out.Images {
+		p := pageOf[im.URL]
+		add(im.URL, p.title, p.url)
+	}
+	for _, r := range out.Results {
+		if !httpURL(r.URL) {
+			continue
+		}
+		n := len(cs)
+		for _, im := range r.Images {
+			if len(cs)-n == fastPerResult {
+				break
+			}
+			add(im.URL, r.Title, r.URL)
+		}
+	}
+	return cs, nil
+}
+
 type tavilyImage struct {
 	URL         string `json:"url"`
 	Title       string `json:"title"`

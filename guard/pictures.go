@@ -3,22 +3,25 @@ package guard
 // Card picture lookups (v0.8.18). An answer's item card gets its picture from its own source first (cardpics.go);
 // a card citing a roundup or a review list has none there, and until v0.8.17 it got one only when the model called
 // image_search for it, which it often didn't ("best 2 espresso machines", 2026-10-20: two cards, two
-// searches, no image_search, no photos). Now the VM looks it up itself, once the card's items block closes: one
-// image search per card still without a picture, at most maxCardLookups an answer, in the background like any card
-// picture (the answer never waits; the end of the run waits at most cardLookupWait).
+// searches, no image_search, no photos). Now the VM looks it up itself: one lookup per card still without a picture,
+// at most maxCardLookups cards an answer, in the background like any card picture (the answer never waits; the end
+// of the run waits at most cardLookupWait). Since v0.10.1 a lookup starts as soon as the answer or its reasoning
+// names the item (watchMentions, below), and tries the provider's fast image search first.
 //
 // The exfiltration guard: nothing of the conversation may ride out in an image query, and a card's title is the
 // model's text. So a card is looked up only when its title names one of the run's checked reader items (the
 // quarantined reader's items, reader.go checkItems: each found in its source's own text, none reading like an
 // instruction), and what goes out is the VM's own copy of that item's name (noteItems), PII-masked again, never the
-// card's title. A title that names no item is never searched.
+// card's title. A title that names no item is never searched. The same for a lookup the answer's words start
+// (v0.10.1): the words only choose which checked item; its name, the VM's copy, is what goes out.
 //
 // Permission: pictures are one feature with one setting, web.images ("Show product photos", asked once in the
 // chat and remembered). A lookup runs only when the run's setting for web.images is Always allow and the policy's
 // cap allows it; on Ask or Never there is no lookup and no prompt (the card keeps its placeholder). Its egress (the
 // image search and the downloads) goes on the task's background record, as the card pictures' does.
 //
-// Which picture: the image search's candidates, refused before any request when their caption or addresses don't
+// Which picture: the image search's candidates (the fast search's captioned by their page's title), refused before
+// any request when their caption or addresses don't
 // name the item, name another model number, or show a logo, a roundup's banner, a collage or people
 // (pictureRefused); then ranked by caption (rankCandidates), downloaded, re-encoded and shape-checked (cardShape) as
 // every card picture, at most cardPicTries of them.
@@ -36,6 +39,7 @@ import (
 	"sync"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/tacyhq/tacy/harness"
 	"github.com/tacyhq/tacy/proto"
@@ -155,113 +159,386 @@ func (g *Guard) lookupAllowed(t *task) bool {
 	return PermissionSetting(t.opts, "web.images", g.permissionCap(t.opts.Space, "web.images")) == safety.PermAlways
 }
 
-// lookupCardPicture looks a card's picture up with the image search, for the run's reader item its title names
-// (the VM's copy of the name goes out, never the title), and shows the first candidate that passes the checks
-// under the call that brought the item's source. Reports whether one was shown. Counted in card_pictures.
-func (g *Guard) lookupCardPicture(t *task, it taskItem) bool {
+// ---- the lookup (v0.10.1) ---------------------------------------------------------------------------------------
+//
+// Until v0.10.0 a card's lookup started when its items block closed, about a second before the answer ended, with
+// Tavily's image search with image descriptions (7-16 s on a query it hasn't seen): a live answer's pressure washers
+// (2026-10-20) showed their photos about 30 s after the answer, through the ticket's fill, which searched again from
+// the start. Now:
+//   - a lookup starts as soon as the answer (or its reasoning) names one of the run's checked reader items
+//     (watchMentions; at most maxEarlyLookups a run), so the search runs while the answer is still being written; a
+//     card that names the item takes its outcome (one lookup per item, startLookup). What goes out is unchanged: the
+//     VM's own copy of a checked item's name, never the answer's words, and only with pictures on (lookupAllowed);
+//   - the search is the provider's fast one first (ImagesFast: no generated descriptions, about 2 s), its pictures
+//     captioned by their page's title; the slow one with descriptions only when the fast one gave none that passed
+//     the checks and downloaded;
+//   - the best candidates download at once (lookupHedge), the best-ranked that works is shown.
+// The photo checks are the same for both searches (pictureRefused before any download, cardShape after).
+
+const (
+	maxEarlyLookups = 4  // lookups started by a mention, before a card names the item, per run
+	maxRunLookups   = 8  // items looked up per run, early ones included (each: the fast search, the slow one if needed)
+	fastCandidates  = 12 // candidates asked for from the fast search
+	lookupHedge     = 2  // candidates downloaded at once per lookup
+)
+
+// lookupFastTime: the fast image search's limit (it answers in about 2 s). A var for the tests.
+var lookupFastTime = 8 * time.Second
+
+// errNoFastImages: the image provider has no fast search (Brave): the lookup goes straight to Images.
+var errNoFastImages = errors.New("no fast image search")
+
+// fastImageSearcher is an image provider with a fast search (ImagesFast).
+type fastImageSearcher interface {
+	ImagesFast(ctx context.Context, query string, count int) ([]ImageCandidate, error)
+}
+
+// lookPic is a lookup's downloaded picture, re-encoded and shape-checked.
+type lookPic struct {
+	c    ImageCandidate
+	jp   []byte
+	w, h int
+}
+
+// lookup is one item's lookup: done closes when it ended; pics are its pictures that worked, best first.
+type lookup struct {
+	done chan struct{}
+	pics []lookPic
+}
+
+// startLookup returns the run's lookup for item it, starting it if it hasn't started (nil: none may start: the run
+// ended, or early and the run's early lookups are used up). It runs under the task's context.
+func (g *Guard) startLookup(t *task, it taskItem, early bool) *lookup {
 	cp := t.cards
+	k := itemKey(it.name)
+	cp.mu.Lock()
+	if l := cp.looks[k]; l != nil {
+		cp.mu.Unlock()
+		return l
+	}
+	if cp.final || len(cp.looks) >= maxRunLookups || early && cp.early >= maxEarlyLookups {
+		cp.mu.Unlock()
+		return nil
+	}
+	if early {
+		cp.early++
+	}
+	l := &lookup{done: make(chan struct{})}
+	cp.looks[k] = l
+	cp.mu.Unlock()
+	go func() {
+		defer close(l.done)
+		l.pics = g.runLookup(t, it)
+	}()
+	return l
+}
+
+// runLookup is a lookup's searches and downloads: the fast search, then (no picture from it) the slow one; the
+// pictures that worked, best first (at most lookupHedge).
+func (g *Guard) runLookup(t *task, it taskItem) []lookPic {
 	is, ok := t.tools.search.(ImageSearcher)
 	if !ok {
-		return false
+		return nil
 	}
 	// The task and its space, as an action's context has them: the vault leases the image provider's key only for a
-	// space whose policy allows it (v0.8.18's first live run had neither: every lookup's lease was refused).
+	// space whose policy allows it.
 	base := withSpace(withTask(t.ctx, t.id), t.opts.Space)
-	sctx, scancel := context.WithTimeout(base, lookupSearchTime)
-	defer scancel()
 	q, _ := maskPII(capRunes(strings.TrimSpace(it.name), maxQueryRunes))
 	if q == "" || HiddenChars(q) || outboundLeak([]byte(q)) != nil {
-		return false
+		return nil
 	}
-	var gate toolOutcome
-	rel, err := t.tools.enter(sctx, "search", &gate)
-	var cands []ImageCandidate
-	if err == nil {
-		cands, err = is.Images(sctx, q, lookupCandidates)
-	}
-	rel()
-	cp.mu.Lock()
-	cp.lookedUp++
-	cp.mu.Unlock()
-	if err != nil {
-		why := imageFailReason(err)
-		if errors.Is(sctx.Err(), context.DeadlineExceeded) {
-			why = imageTimeout // the providers say "unreachable" for a request their context ended
+	tried := map[string]bool{}
+	search := func(fast bool) ([]ImageCandidate, bool) {
+		limit := lookupSearchTime
+		if fast {
+			limit = lookupFastTime
 		}
-		cp.mu.Lock()
-		cp.st.fail(why)
-		cp.mu.Unlock()
-		return false
+		sctx, cancel := context.WithTimeout(base, limit)
+		defer cancel()
+		var gate toolOutcome
+		rel, err := t.tools.enter(sctx, "search", &gate)
+		var cands []ImageCandidate
+		if err == nil {
+			if fast {
+				f, ok := is.(fastImageSearcher)
+				if !ok {
+					rel()
+					return nil, false
+				}
+				cands, err = f.ImagesFast(sctx, q, fastCandidates)
+			} else {
+				cands, err = is.Images(sctx, q, lookupCandidates)
+			}
+		}
+		rel()
+		if errors.Is(err, errNoFastImages) {
+			return nil, false
+		}
+		t.cards.count(func(st *imageStats) { t.cards.lookedUp++ })
+		if err != nil {
+			why := imageFailReason(err)
+			if errors.Is(sctx.Err(), context.DeadlineExceeded) {
+				why = imageTimeout // the providers say "unreachable" for a request their context ended
+			}
+			t.cards.count(func(st *imageStats) { st.fail(why) })
+			return nil, true
+		}
+		return cands, true
+	}
+	pick := func(cands []ImageCandidate) []lookPic {
+		var list []ImageCandidate
+		seen := map[string]bool{}
+		for _, c := range cands {
+			// A picture the fast search's caption didn't pass may pass with the slow one's (its own page's title, or
+			// a description): only downloads aren't repeated.
+			if tried[c.URL] || seen[c.URL] || imageURLRefused(c.URL) != "" {
+				continue
+			}
+			seen[c.URL] = true
+			if why := pictureRefused(it.name, c); why != "" {
+				t.cards.count(func(st *imageStats) { st.fail(why) })
+				continue
+			}
+			list = append(list, c)
+		}
+		// Best caption first; a plain product shot before a review's action photo or a special edition (lab,
+		// 2026-10-20: RunRepeat's "Cut in half" and a gold "85th Anniversary" Gaggia came first).
+		list = rankCandidates(it.name, list)
+		slices.SortStableFunc(list, func(a, b ImageCandidate) int { return cmp.Compare(lessIdeal(it.name, a), lessIdeal(it.name, b)) })
+		list = list[:min(len(list), cardPicTries)]
+		for _, c := range list {
+			tried[c.URL] = true
+		}
+		return g.downloadHedged(t, base, list)
+	}
+	if cands, ran := search(true); ran {
+		if pics := pick(cands); len(pics) > 0 {
+			return pics
+		}
+	}
+	if t.ctx.Err() != nil {
+		return nil
+	}
+	cands, _ := search(false)
+	return pick(cands)
+}
+
+// downloadHedged downloads list's candidates, lookupHedge at once, and returns the ones that worked in list's order;
+// it stops once the best-ranked of those still possible has worked. Under lookupFetchTime.
+func (g *Guard) downloadHedged(t *task, base context.Context, list []ImageCandidate) []lookPic {
+	if len(list) == 0 {
+		return nil
 	}
 	ctx, cancel := context.WithTimeout(base, lookupFetchTime)
 	defer cancel()
-	var list []ImageCandidate
-	seen := map[string]bool{}
-	for _, c := range cands {
-		if seen[c.URL] || imageURLRefused(c.URL) != "" {
-			continue
-		}
-		seen[c.URL] = true
-		if why := pictureRefused(it.name, c); why != "" {
-			cp.mu.Lock()
-			cp.st.fail(why)
-			cp.mu.Unlock()
-			continue
-		}
-		list = append(list, c)
+	type res struct {
+		p   lookPic
+		err error
+		ms  int64
 	}
-	// Best caption first; a plain product shot before a review's action photo or a special edition (lab, 2026-10-20:
-	// RunRepeat's "Cut in half" and a gold "85th Anniversary" Gaggia came first).
-	list = rankCandidates(it.name, list)
-	slices.SortStableFunc(list, func(a, b ImageCandidate) int { return cmp.Compare(lessIdeal(it.name, a), lessIdeal(it.name, b)) })
-	for i, c := range list {
-		if i == cardPicTries || ctx.Err() != nil {
-			break
+	out := make([]*res, len(list))
+	done := make([]chan struct{}, len(list))
+	for i := range list {
+		done[i] = make(chan struct{})
+	}
+	start := func(i int) {
+		go func() {
+			defer close(done[i])
+			t0 := time.Now()
+			jp, w, h, err := g.downloadCardPictureCtx(t, ctx, list[i].URL)
+			out[i] = &res{p: lookPic{c: list[i], jp: jp, w: w, h: h}, err: err, ms: time.Since(t0).Milliseconds()}
+		}()
+	}
+	next := 0
+	for ; next < min(lookupHedge, len(list)); next++ {
+		start(next)
+	}
+	var pics []lookPic
+	for i := range list {
+		select {
+		case <-done[i]:
+		case <-ctx.Done():
+			return pics
 		}
-		cp.mu.Lock()
-		taken := cp.taken[c.URL] || cp.final
-		cp.mu.Unlock()
-		if taken {
-			continue
+		r := out[i]
+		t.cards.count(func(st *imageStats) {
+			st.tried++
+			st.fetchMs += r.ms
+			if r.err != nil {
+				st.fail(imageFailReason(r.err))
+			} else {
+				st.bytes += len(r.p.jp)
+			}
+		})
+		if r.err == nil {
+			pics = append(pics, r.p)
 		}
-		t0 := time.Now()
-		jp, w, h, err := g.downloadCardPicture(t, c.URL)
-		ms := time.Since(t0).Milliseconds()
+		if len(pics) > 0 {
+			// The best that worked so far: the ones already loading still may give a second picture (another card
+			// of the same item), but nothing new starts.
+			for j := i + 1; j < next; j++ {
+				select {
+				case <-done[j]:
+					if out[j].err == nil {
+						pics = append(pics, out[j].p)
+					}
+				default:
+				}
+			}
+			return pics
+		}
+		if next < len(list) {
+			start(next)
+			next++
+		}
+	}
+	return pics
+}
+
+// showLookup shows a card's picture from its item's lookup (startLookup: the one already running if the answer named
+// the item before, else a new one), under the call that brought the item's source. Reports whether one was shown.
+// Counted in card_pictures.
+func (g *Guard) showLookup(t *task, it taskItem) bool {
+	l := g.startLookup(t, it, false)
+	if l == nil {
+		return false
+	}
+	select {
+	case <-l.done:
+	case <-t.ctx.Done():
+		return false
+	}
+	cp := t.cards
+	for _, p := range l.pics {
 		cp.mu.Lock()
 		if cp.final {
 			cp.mu.Unlock()
 			return false
 		}
-		cp.st.tried++
-		cp.st.fetchMs += ms
-		if err != nil {
-			cp.st.fail(imageFailReason(err))
+		if cp.taken[p.c.URL] {
 			cp.mu.Unlock()
 			continue
 		}
-		if cp.taken[c.URL] {
-			cp.mu.Unlock()
-			continue
-		}
-		cp.st.bytes += len(jp)
-		cp.taken[c.URL] = true
+		cp.taken[p.c.URL] = true
 		cp.shown++
 		cp.sent[it.call]++
 		index := cp.sent[it.call]
 		cp.mu.Unlock()
 		// The caption is the web's (redacted as an image search's is); For names the item, so the chat puts it on
 		// that item's card.
-		out := toolOutcome{images: []shownImage{{Title: c.Title}}}
+		out := toolOutcome{images: []shownImage{{Title: p.c.Title}}}
 		if ids := redactOutcome(&out); len(ids) > 0 {
 			g.record(Egress{Task: t.id, Action: it.call, Op: "web.images", Decision: "redacted", Rule: "leak_scan", Patterns: ids})
 		}
-		title := out.images[0].Title
-		t.emit(proto.Event{Type: "image", ID: it.call, Image: &proto.Image{Index: index, Title: title, Source: c.Source,
-			URL: c.URL, Type: "image/jpeg", Width: w, Height: h, Data: jp, For: it.name}})
+		t.emit(proto.Event{Type: "image", ID: it.call, Image: &proto.Image{Index: index, Title: out.images[0].Title, Source: p.c.Source,
+			URL: p.c.URL, Type: "image/jpeg", Width: p.w, Height: p.h, Data: p.jp, For: it.name}})
 		return true
 	}
 	return false
 }
+
+// count changes the card pictures' counts, unless the run ended (they were made then).
+func (c *cardPics) count(f func(st *imageStats)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.final {
+		f(&c.st)
+	}
+}
+
+// watchMentions watches a model call's answer text and reasoning as they stream: each of the run's checked reader
+// items it names (the item's words, whole, in order; at least two words or one with a digit, as matchItem) starts
+// that item's lookup, when pictures are allowed (lookupAllowed), at most maxEarlyLookups a run. The words only choose
+// which item: what goes out is the VM's copy of its name.
+func (g *Guard) watchMentions(t *task, delta string) {
+	if t.opts.Via == ViaSearch || t.opts.Via == ViaPictures || delta == "" {
+		return
+	}
+	cp := t.cards
+	cp.mu.Lock()
+	if cp.final || len(cp.items) == 0 || cp.early >= maxEarlyLookups {
+		cp.mu.Unlock()
+		return
+	}
+	cp.tail += delta
+	if n := len(cp.tail); n > mentionTail {
+		cut := n - mentionTail
+		for cut < n && !utf8.RuneStart(cp.tail[cut]) {
+			cut++
+		}
+		cp.tail = cp.tail[cut:]
+	}
+	// Up to the last word's end: a word still streaming ("WF-1000XM" of "WF-1000XM6") isn't matched yet.
+	end := strings.LastIndexFunc(cp.tail, func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) })
+	if end < 0 {
+		cp.mu.Unlock()
+		return
+	}
+	text := " " + itemKey(cp.tail[:end]) + " "
+	type at struct {
+		it  taskItem
+		pos int
+	}
+	var found []at
+	for k, it := range cp.items {
+		if cp.mentioned[k] || cp.looks[k] != nil || !mentionable(k) {
+			continue
+		}
+		i := strings.Index(text, " "+k+" ")
+		if i < 0 {
+			continue
+		}
+		// A longer item that starts with this one ("Fellow Stagg EKG Pro" for "Fellow Stagg EKG"): named, it's that
+		// one; maybe still streaming, wait for the next words.
+		rest, longer, wait := text[i+len(k)+2:], false, false
+		for k2 := range cp.items {
+			tail, ok := strings.CutPrefix(k2, k+" ")
+			if !ok {
+				continue
+			}
+			if strings.HasPrefix(rest, tail+" ") {
+				longer = true
+			} else if strings.HasPrefix(tail, strings.TrimSpace(rest)) {
+				wait = true
+			}
+		}
+		if wait && !longer {
+			continue
+		}
+		cp.mentioned[k] = true
+		if !longer {
+			found = append(found, at{it, i})
+		}
+	}
+	// An item inside another one named at the same time ("Encore ESP" in "Baratza Encore ESP"): that one.
+	found = slices.DeleteFunc(found, func(a at) bool {
+		k := " " + itemKey(a.it.name) + " "
+		return slices.ContainsFunc(found, func(b at) bool {
+			k2 := " " + itemKey(b.it.name) + " "
+			return k2 != k && strings.Contains(k2, k)
+		})
+	})
+	cp.mu.Unlock()
+	slices.SortFunc(found, func(a, b at) int { return cmp.Compare(a.pos, b.pos) }) // in the answer's order
+	if len(found) == 0 || !g.lookupAllowed(t) {
+		return
+	}
+	for _, f := range found {
+		g.startLookup(t, f.it, true)
+	}
+}
+
+// mentionable: an item name a mention may start a lookup for: two words or more, or one of at least 4 letters and
+// digits with a digit in it ("DF54", not "2P" or "Pro").
+func mentionable(k string) bool {
+	if strings.Contains(k, " ") {
+		return true
+	}
+	return len(k) >= 4 && strings.ContainsAny(k, "0123456789") && strings.IndexFunc(k, unicode.IsLetter) >= 0
+}
+
+// mentionTail: the answer's last bytes watchMentions looks at (an item's name is at most 160).
+const mentionTail = 600
 
 // ---- which picture --------------------------------------------------------------------------------------------
 
@@ -345,7 +622,7 @@ func pictureNames(name string, c ImageCandidate) string {
 	captionNumbers := slices.ContainsFunc(imageWords(c.Title), func(w string) bool { return strings.ContainsAny(w, "0123456789") })
 	var got, total float64
 	for _, w := range q {
-		found := slices.Contains(text, w) || len(w) >= 3 && strings.Contains(joined, w)
+		found := slices.Contains(text, w) || len(w) >= 3 && strings.Contains(joined, w) || unitNumber(w, text)
 		if strings.ContainsAny(w, "0123456789") {
 			if !found && captionNumbers {
 				return imageNumber
@@ -361,6 +638,26 @@ func pictureNames(name string, c ImageCandidate) string {
 		return imageMismatch
 	}
 	return ""
+}
+
+// unitWords follow a small number as its unit in a caption ("20V" for "20-Volt", "6QT" for "6-Quart").
+var unitWords = map[string]bool{"v": true, "volt": true, "qt": true, "quart": true, "in": true, "inch": true, "mm": true, "cm": true,
+	"l": true, "ml": true, "oz": true, "gal": true, "w": true, "ah": true, "mah": true, "hp": true, "cfm": true, "psi": true,
+	"gb": true, "tb": true, "hz": true, "ft": true, "lb": true, "lbs": true, "kg": true, "mph": true, "db": true}
+
+// unitNumber: a small number of the item's name (w, up to 3 digits) is in the caption with its unit joined to it
+// (v0.10.1: "20V" for the "20" of "20-Volt", "6QT" for the "6" of "6-Quart"; Tavily's page titles write them so). Only
+// a unit: "9a" is another model than "9", "15pro" than "15".
+func unitNumber(w string, text []string) bool {
+	if len(w) > 3 || strings.Trim(w, "0123456789") != "" {
+		return false
+	}
+	for _, x := range text {
+		if rest, ok := strings.CutPrefix(x, w); ok && unitWords[rest] {
+			return true
+		}
+	}
+	return false
 }
 
 // endWait is how long the end of a run waits for card pictures still loading: longer when a lookup is among them
@@ -565,7 +862,7 @@ func (g *Guard) pictureLookups(t *task) (*harness.ActionResult, error) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if g.lookupCardPicture(t, it) {
+			if g.showLookup(t, it) {
 				mu.Lock()
 				shown++
 				mu.Unlock()

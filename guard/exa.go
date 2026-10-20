@@ -145,6 +145,15 @@ func (e *exa) Images(ctx context.Context, query string, count int) ([]ImageCandi
 	return e.images.Images(ctx, query, count)
 }
 
+// ImagesFast is the image provider's fast search (card lookups, v0.10.1), when it has one.
+func (e *exa) ImagesFast(ctx context.Context, query string, count int) ([]ImageCandidate, error) {
+	f, ok := e.images.(fastImageSearcher)
+	if !ok {
+		return nil, errNoFastImages
+	}
+	return f.ImagesFast(ctx, query, count)
+}
+
 // ImageProvider names the provider image_search goes to (the metrics' provider).
 func (e *exa) ImageProvider() string {
 	if e.images == nil {

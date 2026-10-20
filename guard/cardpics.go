@@ -27,6 +27,7 @@ package guard
 // shown, tried, failed by reason; never an address.
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"maps"
@@ -47,7 +48,7 @@ const (
 	picThumb = "thumb" // the search provider's picture of the result
 
 	cardPicTries   = 3               // candidates tried per card
-	cardPicFetches = 3               // card picture downloads at once per task
+	cardPicFetches = 6               // card picture downloads at once per task
 	cardMinEdge    = 100             // px, the re-encoded picture's short side
 	cardMaxAspect  = 3               // long side over short side
 	cardCaptionMin = 0.5             // share of the card title's words its source must name (namesItem)
@@ -377,11 +378,18 @@ type cardPics struct {
 	// right after the answer instead of losing them.
 	pending     map[int]taskItem
 	nextPending int
+	// looks: the run's lookups by itemKey (startLookup), early: those a mention started (watchMentions), mentioned:
+	// items already named, tail: the end of the answer text and reasoning watched for names.
+	looks     map[string]*lookup
+	early     int
+	mentioned map[string]bool
+	tail      string
 }
 
 func newCardPics() *cardPics {
 	return &cardPics{tried: map[string]bool{}, taken: map[string]bool{}, sent: map[string]int{}, slots: make(chan struct{}, cardPicFetches),
-		pre: map[string]*picFetch{}, items: map[string]taskItem{}, pending: map[int]taskItem{}}
+		pre: map[string]*picFetch{}, items: map[string]taskItem{}, pending: map[int]taskItem{},
+		looks: map[string]*lookup{}, mentioned: map[string]bool{}}
 }
 
 // reset starts a model call's text.
@@ -430,6 +438,7 @@ func (c *cardPics) newCards(final bool) []cardRef {
 // cardText watches a model call's answer text: the cards of each items block that closes get their sources'
 // pictures.
 func (g *Guard) cardText(t *task, delta string) {
+	g.watchMentions(t, delta) // a reader item the answer names: its lookup starts now (pictures.go)
 	for _, c := range t.cards.feed(delta) {
 		g.cardPicture(t, c, false)
 	}
@@ -529,7 +538,7 @@ func (g *Guard) cardPicture(t *task, card cardRef, ownOnly bool) {
 		}()
 		shown := len(tries) > 0 && g.fetchCardPicture(t, card.title, tries)
 		if !shown && lookup != nil && t.ctx.Err() == nil {
-			shown = g.lookupCardPicture(t, *lookup)
+			shown = g.showLookup(t, *lookup)
 		}
 		if !shown && later != nil {
 			cp.deferItem(*later)
@@ -755,7 +764,12 @@ func (g *Guard) fetchCardPicture(t *task, title string, tries []cardTry) bool {
 // downloadCardPicture is one card picture's download, under the task's card picture slots and the tool caps: the
 // guarded client, downloadImage's caps, processImage's re-encode, and the card's shape check.
 func (g *Guard) downloadCardPicture(t *task, u string) ([]byte, int, int, error) {
-	ctx, cp := t.ctx, t.cards
+	return g.downloadCardPictureCtx(t, t.ctx, u)
+}
+
+// downloadCardPictureCtx is downloadCardPicture under ctx (a lookup's, within the task's).
+func (g *Guard) downloadCardPictureCtx(t *task, ctx context.Context, u string) ([]byte, int, int, error) {
+	cp := t.cards
 	select {
 	case cp.slots <- struct{}{}:
 	case <-ctx.Done():

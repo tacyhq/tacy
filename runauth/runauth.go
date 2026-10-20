@@ -19,7 +19,9 @@
 //	         names joined by ","), cache_secret, run_secret, permissions (sorted "kind=setting" joined by ","),
 //	         fallback_models (in order, joined by ","), auto_fallback ("true" or "false"), the number of messages
 //	         (decimal), then each message's role and content, then, only when the request names an agent, "agent="
-//	         and its id (docs/30; absent for the chat, so a chat request's digest is the one v0.10.0 checks)
+//	         and its id (docs/30; absent for the chat, so a chat request's digest is the one v0.10.0 checks), then
+//	         each image of each message, in order, as "image=<message index (decimal)>:<data URL>" (v0.12.0; none
+//	         without images, so such a request's digest is unchanged)
 //	sig    = Ed25519(identity key, "tacy/v2/run-request" ‖ 0 ‖ digest)
 //
 // A plain chat's search (POST /search) and an answer's pictures (POST /pictures) carry the same where and who (v0.10.0),
@@ -207,6 +209,14 @@ func Digest(r *proto.RunRequest, vmPub []byte) [32]byte {
 	// number of items after the count only ever ends with the agent).
 	if r.Agent != "" {
 		rest = append(rest, "agent="+r.Agent)
+	}
+	// The person's images (releases since v0.12.0) come after it, one item each, "image=<message index>:<data URL>",
+	// only when there are any: a request without images hashes exactly as before. An older release ignores the
+	// field, so its digest has no image items and the signature fails: it refuses a run with images, never drops them.
+	for i, m := range r.Messages {
+		for _, u := range m.Images {
+			rest = append(rest, "image="+strconv.Itoa(i)+":"+u)
+		}
 	}
 	return digest(RequestLabel, vmPub, runFields(r), rest...)
 }

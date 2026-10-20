@@ -46,11 +46,27 @@ type Attestation struct {
 	Booted string `json:"booted"`
 }
 
-// Message is one chat message. Only plain text content: earlier tool calls come back as assistant text.
+// Message is one chat message: plain text (earlier tool calls come back as assistant text), and on a person's
+// message the pictures they attached.
 type Message struct {
 	Role    string `json:"role"` // system | user | assistant
 	Content string `json:"content"`
+	// Images are the person's own pictures with this message (releases since v0.12.0; only on a user message of a
+	// chat run): JPEG data URLs ("data:image/jpeg;base64,..."), resized and re-encoded in their browser, which drops
+	// EXIF and GPS. At most MaxRunImages per run, each at most MaxImageBytes decoded. They go to the run's model
+	// when it can see images, and nowhere else: never into a search, a page fetch, an image search or any other
+	// request (guard/images_in.go).
+	Images []string `json:"images,omitempty"`
 }
+
+// The caps on a run's images (Message.Images). The request's encrypted body is capped too (8 MiB, agentd).
+const (
+	MaxRunImages  = 4         // per run, over all its messages
+	MaxImageBytes = 512 << 10 // one image's JPEG bytes (the chat's own cap per image)
+)
+
+// ImageURLPrefix starts every image a run takes: only JPEG, as the chat sends it.
+const ImageURLPrefix = "data:image/jpeg;base64,"
 
 // DefaultModel is the model a run gets when its request names none.
 const DefaultModel = "gpt-oss-120b"

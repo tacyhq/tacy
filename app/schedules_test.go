@@ -491,3 +491,20 @@ func TestScheduleCountStopRemove(t *testing.T) {
 		t.Fatalf("next version: %d %v", code, out)
 	}
 }
+
+// Every model the chat may sign a schedule with (its model list and the plan's default) installs;
+// one this release doesn't have is refused at install, not at each slot.
+func TestScheduleInstallModels(t *testing.T) {
+	e := newSchedEnv(t)
+	for _, m := range []string{"deepseek-v4-1-flash", "gpt-oss-120b", "gemma4-31b", "glm-5-3", "kimi-k3"} {
+		d := e.daily(e.me, func(d *trigger.Definition) { d.Models = []string{m} })
+		if code, out := e.install(e.me, e.sign(d, e.me.Key)); code != 200 {
+			t.Errorf("%s: %d %v", m, code, out)
+		}
+		e.s.triggers.Stop(d.Agent, true) // room for the next (8 per space)
+	}
+	d := e.daily(e.me, func(d *trigger.Definition) { d.Models = []string{"gpt-9"} })
+	if code, out := e.install(e.me, e.sign(d, e.me.Key)); code != 403 || errOf(out) != "bad_definition" {
+		t.Fatalf("unknown model: %d %v", code, out)
+	}
+}

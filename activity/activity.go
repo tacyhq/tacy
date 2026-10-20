@@ -148,6 +148,9 @@ type Limits struct {
 type Input struct {
 	Messages int `json:"messages"`
 	Bytes    int `json:"bytes"`
+	// Images the person gave the run (v0.12.0): how many and their JPEGs' bytes in all; never what they show.
+	Images     int `json:"images,omitzero"`
+	ImageBytes int `json:"image_bytes,omitzero"`
 }
 
 // Status is how a run ended.

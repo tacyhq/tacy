@@ -102,7 +102,11 @@ func (g *Guard) Action(ctx context.Context, ti *harness.TaskInfo, id string, req
 	var shown json.RawMessage
 	// The brain's arguments are scanned before anything is sent: a credential pattern, in any encoding, blocks the
 	// action (denied), like a URL with personal data.
-	if ids := outboundLeak(args); ids != nil {
+	if len(t.opts.Images) > 0 && imageInArgs(args, t.opts.Images) {
+		// The person's images go to the model only (images_in.go): an action carrying one sends nothing.
+		g.record(Egress{Task: ti.ID, Action: id, Op: req.Name, Decision: "denied", Rule: "image"})
+		p, shown = pending{out: imageRefused()}, json.RawMessage(args)
+	} else if ids := outboundLeak(args); ids != nil {
 		g.record(Egress{Task: ti.ID, Action: id, Op: req.Name, Decision: "denied", Rule: "leak_scan", Patterns: ids})
 		FactsFrom(ctx).leak(true, ids)
 		provider := ""

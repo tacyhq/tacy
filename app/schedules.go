@@ -177,7 +177,17 @@ func (s *server) scheduleInstall(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	in, err := s.triggers.InstallChecked(req.Definition, func(d *trigger.Definition) error {
-		return trigger.Personal(d, who.Space, who.Seal, who.Identity)
+		if err := trigger.Personal(d, who.Space, who.Seal, who.Identity); err != nil {
+			return err
+		}
+		// Every model must be one this release has and the space's policy allows (else each slot would fail).
+		e, err := s.safety.Policy(d.Space)
+		for _, m := range d.Models {
+			if !guard.KnownModel(m) || err != nil || !e.AllowsModel(m) {
+				return errors.New("model " + m + " isn't one this release runs for the space")
+			}
+		}
+		return nil
 	})
 	switch {
 	case errors.Is(err, trigger.ErrStale):

@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"crypto/ecdh"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -217,9 +218,12 @@ func (g *recGateway) RunStarted(task string, start *harness.Start, opts guard.Ta
 
 // recordStart is a task's start record: who it runs as, under which controls, with what it may use; sizes only.
 func recordStart(task string, start *harness.Start, opts guard.TaskOptions, controls *activity.Controls, via string) activity.Start {
-	in := activity.Input{Messages: len(start.Input)}
+	in := activity.Input{Messages: len(start.Input), Images: len(opts.Images)}
 	for _, m := range start.Input {
 		in.Bytes += len(m.Content)
+	}
+	for _, im := range opts.Images { // that the person gave images, and their size: never what they show
+		in.ImageBytes += im.Bytes
 	}
 	var tools []string
 	for _, t := range start.Tools {
@@ -335,6 +339,10 @@ func (g *recGateway) Refused(r *proto.RunRequest, err error) (proto.Event, bool)
 	in := activity.Input{Messages: len(r.Messages)}
 	for _, m := range r.Messages {
 		in.Bytes += len(m.Content)
+		for _, u := range m.Images {
+			in.Images++
+			in.ImageBytes += base64.StdEncoding.DecodedLen(len(strings.TrimPrefix(u, proto.ImageURLPrefix)))
+		}
 	}
 	ag := guard.AgentRef(r.Agent) // the built-in agent asked for (refused at the door when unknown: never here)
 	rec, rerr := g.rec.Refused(activity.Start{Run: harness.NewTaskID(), Space: space, To: v.Seal, Member: v.Identity,

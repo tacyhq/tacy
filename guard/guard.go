@@ -166,6 +166,10 @@ type TaskOptions struct {
 	// Agent is the built-in agent the task runs when it isn't the chat (agents.go: "a_research"); "": the chat. Its
 	// caps (searches, page reads) are counted here; agentd applies its running time and budget.
 	Agent string `json:"agent,omitzero"`
+	// Images are the person's own images with their messages (proto.Message.Images, v0.12.0; images_in.go): only
+	// here, never in the task's start, so the brain never gets them; the gateway puts them on the person's message
+	// in each model request for a model that sees images. Kept with the task (the encrypted disk) while it is kept.
+	Images []PersonImage `json:"images,omitzero"`
 }
 
 // task is the guard's state for one task: what the old app/agent.go kept per run.
@@ -578,6 +582,10 @@ func startFor(r *proto.RunRequest, now time.Time, reader bool) (harness.Start, T
 	if len(r.Messages) == 0 || len(r.Messages) > maxMessages {
 		return s, TaskOptions{}, fmt.Errorf("messages must have 1 to %d entries", maxMessages)
 	}
+	images, err := runImages(r.Messages)
+	if err != nil {
+		return s, TaskOptions{}, err
+	}
 	total := 0
 	for _, m := range r.Messages {
 		if m.Role != "system" && m.Role != "user" && m.Role != "assistant" {
@@ -593,6 +601,9 @@ func startFor(r *proto.RunRequest, now time.Time, reader bool) (harness.Start, T
 		return s, TaskOptions{}, fmt.Errorf("the last message must be from the user")
 	}
 	if !IsChat(def.ID) {
+		if len(images) > 0 {
+			return s, TaskOptions{}, fmt.Errorf("images go only to the chat agent")
+		}
 		if err := checkRunOptions(r); err != nil {
 			return s, TaskOptions{}, err
 		}
@@ -623,7 +634,6 @@ func startFor(r *proto.RunRequest, now time.Time, reader bool) (harness.Start, T
 	if err := checkRunOptions(r); err != nil {
 		return s, TaskOptions{}, err
 	}
-	var err error
 	if s.Space, err = runSpace(r); err != nil {
 		return s, TaskOptions{}, err
 	}
@@ -642,6 +652,9 @@ func startFor(r *proto.RunRequest, now time.Time, reader bool) (harness.Start, T
 	if r.AutoFallback {
 		fallbacks = fallbackModels(r.Model, r.FallbackModels)
 	}
+	if len(images) > 0 && SeesImages(r.Model) { // a step moved to another model keeps seeing the person's images
+		fallbacks = slices.DeleteFunc(fallbacks, func(m string) bool { return !SeesImages(m) })
+	}
 	r.FallbackModels = fallbacks
 	s.Models = append([]string{r.Model}, fallbacks...)
 	s.Tools = ToolDefs(actions...)
@@ -652,7 +665,7 @@ func startFor(r *proto.RunRequest, now time.Time, reader bool) (harness.Start, T
 	return s, TaskOptions{ReasoningEffort: r.ReasoningEffort, CacheSecret: r.CacheSecret,
 		Question:  capRunes(strings.TrimSpace(r.Messages[len(r.Messages)-1].Content), maxQuestionRunes),
 		RunSecret: r.RunSecret, Permissions: maps.Clone(r.Permissions), Links: personLinks(r.Messages),
-		AutoFallback: r.AutoFallback, Fallbacks: fallbacks}, nil
+		AutoFallback: r.AutoFallback, Fallbacks: fallbacks, Images: images}, nil
 }
 
 // checkRunOptions checks what every agent's request may carry: the cache scope, the run secret, the permissions.

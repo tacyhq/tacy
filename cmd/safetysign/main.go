@@ -7,6 +7,9 @@
 //	go run ./cmd/safetysign sign -key K -kind stop stop.json
 //	go run ./cmd/safetysign heartbeat -key K [-ttl 15m] [-all]   # the operator's list: seq = now in ms
 //	go run ./cmd/safetysign stop -key K -firm f_chat [-seq N] [-space s_chat | -all]   # the firm's own stop list
+//
+// The firm key log's entries (keys v2 slice 5): identity, x25519, keylog-genesis, keylog-sign, keylog-check
+// (keylog.go).
 package main
 
 import (
@@ -53,17 +56,25 @@ func out(e safety.Envelope) {
 
 func main() {
 	if len(os.Args) < 2 {
-		die("usage: keygen | sign | heartbeat | stop (see the source)")
+		die("usage: keygen | sign | heartbeat | stop | identity | x25519 | keylog-genesis | keylog-sign | keylog-check (see the source)")
 	}
 	fs := flag.NewFlagSet(os.Args[1], flag.ExitOnError)
 	keyPath := fs.String("key", "", "private key file")
-	kind := fs.String("kind", safety.KindPolicy, "sign: policy | stop")
+	kind := fs.String("kind", safety.KindPolicy, "sign: policy | stop; keylog-sign: the entry kind of a payload")
 	ttl := fs.Duration("ttl", 15*time.Minute, "heartbeat: lifetime (at most 1 h)")
 	all := fs.Bool("all", false, "heartbeat: stop everything; stop: the whole firm")
 	firm := fs.String("firm", "f_chat", "stop: the firm")
 	space := fs.String("space", "", "stop: a space to stop")
 	seq := fs.Uint64("seq", 0, "stop: sequence number (0: now in ms)")
+	identity := fs.String("identity", "", "keylog-genesis: the first owner's public identity (identity's output)")
+	kit := fs.String("kit", "", "keylog-genesis: the recovery kit's key (ed25519:…; f_chat: the offline admin key)")
+	root := fs.String("root", "", "keylog-genesis: the firm root's public key (x25519:…)")
+	user := fs.String("user", "", "identity: the account id the identity belongs to")
+	email := fs.String("email", "", "identity: that account's email (the entry commits to it)")
 	fs.Parse(os.Args[2:])
+	if keylogCmd(os.Args[1], fs.Args(), *keyPath, *kind, *firm, *identity, *kit, *root, *user, *email) {
+		return
+	}
 	now := time.Now().UTC()
 	if *seq == 0 {
 		*seq = uint64(now.UnixMilli())

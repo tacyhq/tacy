@@ -325,3 +325,58 @@ func (e *Effective) Tools(actions []string) []string {
 	}
 	return out
 }
+
+// Widens says whether p allows anything old doesn't (docs/23 decision 6: on a firm with two or more key admins, a
+// policy that widens the one in force needs two admin signatures). Conservative: anything that might allow more
+// counts (a fetch pattern old doesn't list word for word, unless old allows any host; an approval dropped; reads
+// while stale turned on; a budget or rate raised or removed).
+func Widens(old, p *Policy) bool {
+	for _, m := range p.Models {
+		if !slices.Contains(old.Models, m) {
+			return true
+		}
+	}
+	for name, c := range p.Connectors {
+		o, ok := old.Connectors[name]
+		if !ok {
+			return true
+		}
+		for _, t := range c.Tools {
+			if !slices.Contains(o.Tools, t) {
+				return true
+			}
+		}
+		for _, h := range c.Hosts {
+			if !slices.Contains(o.Hosts, h) {
+				return true
+			}
+		}
+		for _, f := range c.Fetch {
+			if !slices.Contains(o.Fetch, f) && !slices.Contains(o.Fetch, "*") {
+				return true
+			}
+		}
+	}
+	for _, a := range old.Approve {
+		if !slices.Contains(p.Approve, a) {
+			return true
+		}
+	}
+	if p.StaleReads && !old.StaleReads {
+		return true
+	}
+	looser := func(o, n int64) bool { return o > 0 && (n <= 0 || n > o) }
+	for _, l := range [][2]Limits{{old.Budget.Run, p.Budget.Run}, {old.Budget.Day, p.Budget.Day}} {
+		o, n := l[0], l[1]
+		if looser(o.Tokens, n.Tokens) || looser(o.ToolCalls, n.ToolCalls) || looser(o.WallSeconds, n.WallSeconds) || looser(o.CostMicros, n.CostMicros) {
+			return true
+		}
+	}
+	for _, r := range [][2]Rate{{old.Rates.Key, p.Rates.Key}, {old.Rates.Connector, p.Rates.Connector}, {old.Rates.Space, p.Rates.Space}} {
+		o, n := r[0], r[1]
+		if looser(int64(o.PerMinute), int64(n.PerMinute)) || o.PerMinute > 0 && n.PerMinute > 0 && n.Burst > o.Burst {
+			return true
+		}
+	}
+	return false
+}

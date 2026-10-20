@@ -31,7 +31,7 @@ func (s *Server) apply(docs []safety.Envelope) {
 	if s.Safety == nil || len(docs) == 0 {
 		return
 	}
-	if _, changed := s.Safety.Apply(docs); changed && s.OnDocs != nil {
+	if _, changed := s.Safety.ApplyOrdered(docs); changed && s.OnDocs != nil {
 		s.OnDocs()
 	}
 }

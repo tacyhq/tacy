@@ -537,8 +537,12 @@ func main() {
 	mux.HandleFunc("GET /activity", s.activityOut) // sealed activity records, for the relay (docs/24)
 	// Signed policies and stop lists; the signature is the authorization. Only served when the compose pins a key
 	// (stage 2): without one nothing could verify, so there's nothing to take.
-	if scfg.Operator != nil || len(scfg.Admins) > 0 {
+	if st.Keyed() {
 		mux.HandleFunc("POST /safety", s.safetyIn)
+	}
+	// Firm key log entries (keys v2 slice 5); only when the compose pins the log's genesis.
+	if st.KeyLogged() {
+		mux.HandleFunc("POST /keylog", s.keylogIn)
 	}
 	mux.HandleFunc("GET /safety", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, st.StatusOf("s_chat")) })
 	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {

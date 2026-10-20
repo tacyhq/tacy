@@ -5,19 +5,22 @@ import (
 	"encoding/json/v2"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/tacyhq/tacy/keylog"
 )
 
 // Error codes people's events and records carry (proto.Event.Code).
 const (
 	CodeStopped        = "stopped"         // a stop list stops this space, its firm, or everything
 	CodeStale          = "stop_list_stale" // no fresh operator stop list: nothing goes out (without an operator key: side effects, and reads per policy)
-	CodePolicyMissing  = "policy_missing"  // admin keys are pinned but no signed policy covers the space
+	CodePolicyMissing  = "policy_missing"  // admin keys (or a key log) are pinned but no signed policy covers the space
 	CodePolicyDenied   = "policy_denied"   // the policy doesn't allow this model, tool, connector or host
 	CodeBudgetExceeded = "budget_exceeded" // a run or daily budget is used up
 	CodeRateLimited    = "rate_limited"    // the vault's lease rate for a key, connector or space
@@ -57,18 +60,28 @@ const DefaultMaxStopAge = 10 * time.Minute
 const DefaultMaxSilence = 3 * time.Minute
 
 // Config is a process's trust roots (pinned in the attested compose) and the release's ceiling.
+//
+// Admin signers come from one of two places. Before keys v2 slice 5 (and on a VM whose compose pins no key log):
+// Admins, Ed25519 keys pinned in the compose. With slice 5: Genesis, the hash of the firm key log's first entry
+// (docs/26 section 4); the VM verifies the log from it (entries arrive over POST /keylog) and policies and the
+// firm's stop lists are signed by the log's current key admins (its threshold). Never both.
 type Config struct {
-	Firm       string              // the firm this VM serves (one CVM per firm)
-	Operator   ed25519.PublicKey   // signs the operator stop list; nil: no heartbeat can be checked (always stale)
-	Admins     []ed25519.PublicKey // sign policies and the firm's stop list; none: the release policy applies alone
-	Threshold  int                 // distinct admin signatures needed; 0: 1
-	Release    *Policy             // the release's ceiling and default (required)
-	MaxStopAge time.Duration       // 0: DefaultMaxStopAge
+	Firm      string              // the firm this VM serves (one CVM per firm)
+	Operator  ed25519.PublicKey   // signs the operator stop list; nil: no heartbeat can be checked (always stale)
+	Admins    []ed25519.PublicKey // compose-pinned admin keys; none (and no Genesis): the release policy applies alone
+	Threshold int                 // distinct compose admin signatures needed; 0: 1
+	Genesis   string              // the firm key log's genesis hash (hex); "": admin keys from Admins
+	// Carry: hashes of documents signed before the move to the key log (by a compose admin key that is now the
+	// log's recovery kit, docs/26 decision 6). Each listed document is taken as admin-signed when the log's kit signed
+	// it; nothing else the kit signs is. Only with Genesis. The release pins them, so the list is attested.
+	Carry      []string
+	Release    *Policy       // the release's ceiling and default (required)
+	MaxStopAge time.Duration // 0: DefaultMaxStopAge
 	// MaxSilence: with an operator key pinned, how long the newest operator list may go without being delivered
 	// again (pulled or pushed) before nothing may go out; 0: not checked (gatewayd and vaultd, which get the list
 	// from agentd, not from the pull).
 	MaxSilence time.Duration
-	Dir        string // where accepted documents and version floors persist; "": memory only
+	Dir        string // where accepted documents, the key log and the floors persist; "": memory only
 	Now        func() time.Time
 }
 
@@ -76,12 +89,14 @@ type policyDoc struct {
 	env  Envelope
 	p    Policy
 	hash string
+	at   int64 // the key log entry it was taken at (0: no key log)
 }
 
 type stopDoc struct {
 	env  Envelope
 	l    StopList
 	hash string
+	at   int64
 }
 
 // floor is the highest version (policies) or seq (stop lists) seen for a slot, with that document's hash: lower
@@ -104,12 +119,31 @@ type State struct {
 	gotStop  time.Time // when the newest operator list was accepted
 	heard    time.Time // when the newest operator list was last delivered (taken, or the held one again); not from disk
 	changed  chan struct{}
+	log      *keylog.Log  // the firm key log (nil: admin keys from the compose)
+	fork     *keylog.Fork // proof the key log forked: no admin-signed change is taken any more
 }
 
 // NewState makes a State and loads what cfg.Dir holds (each document checked again).
 func NewState(cfg Config) (*State, error) {
 	if cfg.Release == nil || !ValidID(cfg.Firm) {
 		return nil, errors.New("safety: a release policy and a valid firm id are required")
+	}
+	var kl *keylog.Log
+	switch {
+	case cfg.Genesis != "" && len(cfg.Admins) > 0:
+		return nil, errors.New("safety: pin either admin keys or a key log genesis, not both")
+	case cfg.Genesis != "":
+		var err error
+		if kl, err = keylog.New(cfg.Firm, cfg.Genesis); err != nil {
+			return nil, fmt.Errorf("safety: %w", err)
+		}
+	case len(cfg.Carry) > 0:
+		return nil, errors.New("safety: carried documents need a key log genesis")
+	}
+	for _, h := range cfg.Carry {
+		if len(h) != 64 || strings.Trim(h, "0123456789abcdef") != "" {
+			return nil, errors.New("safety: a carried document is named by its hash (64 hex)")
+		}
 	}
 	if cfg.Threshold <= 0 {
 		cfg.Threshold = 1
@@ -121,7 +155,7 @@ func NewState(cfg Config) (*State, error) {
 		cfg.Now = time.Now
 	}
 	s := &State{cfg: cfg, policies: map[string]*policyDoc{}, stops: map[string]*stopDoc{}, floors: map[string]floor{},
-		changed: make(chan struct{})}
+		changed: make(chan struct{}), log: kl}
 	if cfg.Dir != "" {
 		if err := s.load(); err != nil {
 			return nil, err
@@ -140,35 +174,71 @@ func (s *State) Changed() <-chan struct{} {
 	return s.changed
 }
 
-// Apply checks and takes envelopes. It returns one error per envelope (nil: taken or already held) and whether
-// anything changed.
-func (s *State) Apply(envs []Envelope) ([]error, bool) {
-	// Decoding and signature checks need no lock (the input is unauthenticated and may be slow to check); only
-	// the floors and the swap do.
+// Apply checks and takes envelopes from anyone (POST /safety, POST /keylog): signed documents and key log
+// entries. It returns one error per envelope (nil: taken or already held) and whether anything changed. Every
+// admin-signed document is checked against the key log as it stands now (its current key admins), whatever
+// order the envelopes come in.
+func (s *State) Apply(envs []Envelope) ([]error, bool) { return s.apply(envs, false, false) }
+
+// ApplyOrdered is Apply for what another process of this VM passes on (agentd's documents to gatewayd, gatewayd's
+// to the vault): its Docs, the key log entries in order with each document right after the entry it was taken
+// at. A document is checked against the key log as it stood there, so one signed by a key admin who was revoked
+// later stays in force (docs/26 decision 12) here too, as it does in agentd. That position is agentd's word, the
+// same trust gatewayd and vaultd already give agentd for floors (they have none of their own after a restart):
+// it can only name a point of the log they verify themselves, so a document still needs the signatures of keys
+// that were key admins there.
+func (s *State) ApplyOrdered(envs []Envelope) ([]error, bool) { return s.apply(envs, true, false) }
+
+func (s *State) apply(envs []Envelope, ordered, fromDisk bool) ([]error, bool) {
 	errs := make([]error, len(envs))
-	ready := make([]*verified, len(envs))
-	for i := range envs {
-		ready[i], errs[i] = s.verify(envs[i], false)
-	}
 	s.saveMu.Lock()
 	defer s.saveMu.Unlock()
-	s.mu.Lock()
 	changed := false
-	for i, v := range ready {
-		if v != nil {
-			var c bool
-			c, errs[i] = s.take(v)
-			changed = changed || c
+	at := int64(-1) // ordered: the key log entry the next document was taken at (-1: the head)
+	for i, e := range envs {
+		if keylog.IsKind(e.Kind) {
+			seq, c, err := s.addEntry(e)
+			errs[i], changed = err, changed || c
+			if ordered && err == nil {
+				at = seq
+			}
+			continue
 		}
+		// Decoding and signature checks need no lock (the input is unauthenticated and may be slow to check);
+		// only the view, the floors and the swap do.
+		s.mu.Lock()
+		held := s.holds(e)
+		// The operator's list is checked and taken again (take): a delivery of the one held keeps it heard, an
+		// expired one is refused. It needs only the pinned operator key, never the key log.
+		if held {
+			if d := s.stops[IssuerOperator]; d != nil && d.hash == e.Hash() && d.env.Kind == e.Kind {
+				held = false
+			}
+		}
+		auth := s.authority(at)
+		s.mu.Unlock()
+		if held {
+			continue // the same document again: nothing to check or change (also when its signers left since)
+		}
+		v, err := s.verify(e, auth, fromDisk)
+		if err != nil {
+			errs[i] = err
+			continue
+		}
+		s.mu.Lock()
+		c, err := s.take(v)
+		s.mu.Unlock()
+		errs[i], changed = err, changed || c
 	}
 	var snap []byte
+	s.mu.Lock()
 	if changed {
 		close(s.changed)
 		s.changed = make(chan struct{})
 		snap, _ = s.snapshot()
 	}
 	s.mu.Unlock()
-	if changed {
+	if changed && !fromDisk {
 		// Written in the order taken (saveMu), outside the state lock. The new documents apply in memory either
 		// way; only the restart floor is at risk, so a failure is loud, never open.
 		if err := s.write(snap); err != nil {
@@ -182,20 +252,146 @@ func (s *State) Apply(envs []Envelope) ([]error, bool) {
 	return errs, changed
 }
 
+// addEntry takes one key log entry: checked on its own outside the lock, then against the log. A proven fork
+// is kept (and persisted) and from then on nothing admin-signed is taken: no entry past the head, no policy, no
+// firm stop list (docs/26 section 4 and decision 5).
+func (s *State) addEntry(e Envelope) (int64, bool, error) {
+	if s.log == nil {
+		return 0, false, errors.New("key log: this VM pins no key log genesis")
+	}
+	c, err := keylog.Check(entryOf(e), s.cfg.Firm)
+	if err != nil {
+		return 0, false, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.fork != nil && c.P.Seq > s.log.Seq() {
+		return 0, false, fmt.Errorf("key log: it forked at entry %d, so this VM takes no more entries", s.fork.Seq)
+	}
+	r, err := s.log.Add(c)
+	var fe *keylog.ForkError
+	if errors.As(err, &fe) {
+		if s.fork == nil {
+			s.fork = &fe.Fork
+			log.Printf("safety: keylog_fork: %v; no admin-signed change is taken from now on", fe)
+			return 0, true, err
+		}
+		return 0, false, err
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return c.P.Seq, r == keylog.Appended, nil
+}
+
+func entryOf(e Envelope) keylog.Entry {
+	k := keylog.Entry{Kind: e.Kind, Payload: e.Payload}
+	for _, s := range e.Sigs {
+		k.Sigs = append(k.Sigs, keylog.Sig{Key: s.Key, Sig: s.Sig})
+	}
+	return k
+}
+
+func envelopeOf(k keylog.Entry) Envelope {
+	e := Envelope{Kind: k.Kind, Payload: k.Payload}
+	for _, s := range k.Sigs {
+		e.Sigs = append(e.Sigs, Sig{Key: s.Key, Sig: s.Sig})
+	}
+	return e
+}
+
+// holds: e is the document held in its slot (s.mu held).
+func (s *State) holds(e Envelope) bool {
+	h := e.Hash()
+	for _, d := range s.policies {
+		if d.hash == h && d.env.Kind == e.Kind {
+			return true
+		}
+	}
+	for _, d := range s.stops {
+		if d.hash == h && d.env.Kind == e.Kind {
+			return true
+		}
+	}
+	return false
+}
+
+// authority is who may sign admin documents: the compose's keys, or the key log's key admins after entry at (-1:
+// the head). s.mu held.
+type authority struct {
+	keyed     bool // admin keys or a key log are pinned: documents need them
+	logged    bool // the signers come from the key log
+	admins    []ed25519.PublicKey
+	threshold int
+	count     int               // how many key admins there are (two or more: widening needs two signatures)
+	kit       ed25519.PublicKey // the key log's recovery kit (signs only carried documents here)
+	at        int64
+	forked    bool
+}
+
+func (s *State) authority(at int64) authority {
+	if s.log == nil {
+		return authority{keyed: len(s.cfg.Admins) > 0, admins: s.cfg.Admins, threshold: s.cfg.Threshold, count: len(s.cfg.Admins)}
+	}
+	a := authority{keyed: true, logged: true, forked: s.fork != nil}
+	if at < 0 {
+		at = s.log.Seq()
+	}
+	v, ok := s.log.ViewAt(at)
+	if !ok {
+		return a // no key log yet (or that entry isn't held): nothing admin-signed verifies
+	}
+	for _, k := range v.Admins {
+		if pk, err := keylog.ParseEd(k); err == nil {
+			a.admins = append(a.admins, pk)
+		}
+	}
+	a.threshold, a.count, a.at = int(v.Threshold), len(v.Admins), at
+	a.kit, _ = keylog.ParseEd(v.Kit)
+	return a
+}
+
 // verified is a document whose payload and signatures checked out, ready for the floors.
 type verified struct {
 	env  Envelope
 	hash string
 	p    *Policy
 	l    *StopList
-	at   time.Time
+	t    time.Time
+	at   int64 // the key log entry its signers were checked at
+	sigs int   // distinct admin signatures (policies and firm lists)
+	auth authority
 	disk bool // loaded from this process's own disk, not delivered
 }
 
-// verify checks a document on its own: shape, firm, signatures, dates. No state is read.
-func (s *State) verify(e Envelope, fromDisk bool) (*verified, error) {
+// adminSigned checks e's admin signatures against auth: the threshold, or (key log only) a carried document the
+// recovery kit signed. It returns the number of admin signatures.
+func (s *State) adminSigned(e Envelope, hash string, auth authority, what string) (int, error) {
+	switch {
+	case !auth.keyed:
+		return 0, fmt.Errorf("%s: no admin keys are pinned in this release", what)
+	case auth.logged && auth.at == 0:
+		return 0, fmt.Errorf("%s: this VM hasn't received its firm key log yet", what)
+	case auth.forked:
+		return 0, fmt.Errorf("%s: the firm key log forked, so this VM takes no admin-signed document", what)
+	}
+	n := e.signers(auth.admins)
+	if n >= auth.threshold {
+		return n, nil
+	}
+	if auth.logged && auth.kit != nil && slices.Contains(s.cfg.Carry, hash) && e.signers([]ed25519.PublicKey{auth.kit}) == 1 {
+		return n, nil // signed by the old compose admin key, now the kit, and pinned by the release
+	}
+	if auth.logged {
+		return n, fmt.Errorf("%s: not signed by enough current key admins (the firm key log)", what)
+	}
+	return n, fmt.Errorf("%s: not signed by enough pinned admin keys", what)
+}
+
+// verify checks a document on its own: shape, firm, signatures (against auth), dates. No state is read.
+func (s *State) verify(e Envelope, auth authority, fromDisk bool) (*verified, error) {
 	now := s.cfg.Now()
-	v := &verified{env: e, hash: e.Hash(), at: now, disk: fromDisk}
+	v := &verified{env: e, hash: e.Hash(), t: now, at: auth.at, auth: auth, disk: fromDisk}
 	switch e.Kind {
 	case KindPolicy:
 		var p Policy
@@ -205,17 +401,17 @@ func (s *State) verify(e Envelope, fromDisk bool) (*verified, error) {
 		if err := p.Validate(); err != nil {
 			return nil, err
 		}
-		switch {
-		case p.Firm != s.cfg.Firm:
+		if p.Firm != s.cfg.Firm {
 			return nil, errors.New("policy: for another firm")
-		case len(s.cfg.Admins) == 0:
-			return nil, errors.New("policy: no admin keys are pinned in this release")
-		case e.signers(s.cfg.Admins) < s.cfg.Threshold:
-			return nil, errors.New("policy: not signed by enough pinned admin keys")
-		case p.IssuedAt.After(now.Add(MaxSkew)):
+		}
+		n, err := s.adminSigned(e, v.hash, auth, "policy")
+		if err != nil {
+			return nil, err
+		}
+		if p.IssuedAt.After(now.Add(MaxSkew)) {
 			return nil, errors.New("policy: issued in the future")
 		}
-		v.p = &p
+		v.p, v.sigs = &p, n
 		return v, nil
 	case KindStop:
 		var l StopList
@@ -227,6 +423,7 @@ func (s *State) verify(e Envelope, fromDisk bool) (*verified, error) {
 		}
 		switch l.Issuer {
 		case IssuerOperator:
+			v.at = 0
 			if s.cfg.Operator == nil || e.signers([]ed25519.PublicKey{s.cfg.Operator}) < 1 {
 				return nil, errors.New("stop list: not signed by the pinned operator key")
 			}
@@ -234,12 +431,14 @@ func (s *State) verify(e Envelope, fromDisk bool) (*verified, error) {
 				return nil, errors.New("stop list: expired")
 			}
 		case IssuerFirm:
-			switch {
-			case l.Firm != s.cfg.Firm:
+			if l.Firm != s.cfg.Firm {
 				return nil, errors.New("stop list: for another firm")
-			case len(s.cfg.Admins) == 0 || e.signers(s.cfg.Admins) < s.cfg.Threshold:
-				return nil, errors.New("stop list: not signed by enough pinned admin keys")
 			}
+			n, err := s.adminSigned(e, v.hash, auth, "stop list")
+			if err != nil {
+				return nil, err
+			}
+			v.sigs = n
 		}
 		if l.IssuedAt.After(now.Add(MaxSkew)) {
 			return nil, errors.New("stop list: issued in the future")
@@ -252,28 +451,35 @@ func (s *State) verify(e Envelope, fromDisk bool) (*verified, error) {
 
 // take applies a verified document against the floors (s.mu held).
 func (s *State) take(v *verified) (bool, error) {
+	if s.fork != nil && (v.p != nil || v.l.Issuer == IssuerFirm) {
+		return false, errors.New("safety: the firm key log forked, so this VM takes no admin-signed document")
+	}
 	if v.p != nil {
 		slot := "policy:" + v.p.Space
 		ok, err := s.check(slot, v.p.Version, v.hash, s.policies[v.p.Space] != nil)
 		if !ok {
 			return false, err
 		}
-		s.policies[v.p.Space] = &policyDoc{env: v.env, p: *v.p, hash: v.hash}
+		// Two key admins' signatures to widen the policy in force, once the firm has two (docs/23 decision 6).
+		if old := s.policies[v.p.Space]; old != nil && v.auth.logged && v.auth.count >= 2 && v.sigs < 2 && Widens(&old.p, v.p) {
+			return false, errors.New("policy: it allows more than the policy in force, so it needs two key admins' signatures")
+		}
+		s.policies[v.p.Space] = &policyDoc{env: v.env, p: *v.p, hash: v.hash, at: v.at}
 		s.floors[slot] = floor{v.p.Version, v.hash}
 		return true, nil
 	}
 	slot := "stop:" + v.l.Issuer
 	ok, err := s.check(slot, v.l.Seq, v.hash, s.stops[v.l.Issuer] != nil)
 	if v.l.Issuer == IssuerOperator && err == nil && !v.disk {
-		s.heard = v.at // taken, or the list held delivered again: the pull (or a push) still reaches the VM
+		s.heard = v.t // taken, or the list held delivered again: the pull (or a push) still reaches the VM
 	}
 	if !ok {
 		return false, err
 	}
-	s.stops[v.l.Issuer] = &stopDoc{env: v.env, l: *v.l, hash: v.hash}
+	s.stops[v.l.Issuer] = &stopDoc{env: v.env, l: *v.l, hash: v.hash, at: v.at}
 	s.floors[slot] = floor{v.l.Seq, v.hash}
 	if v.l.Issuer == IssuerOperator {
-		s.gotStop = v.at
+		s.gotStop = v.t
 	}
 	return true, nil
 }
@@ -339,6 +545,15 @@ func (s *State) stale() bool {
 	return !now.Before(d.l.ExpiresAt) || now.Sub(d.l.IssuedAt) > s.cfg.MaxStopAge || now.Sub(s.gotStop) > s.cfg.MaxStopAge
 }
 
+// keyed: admin-signed documents are required (admin keys or a key log genesis pinned).
+func (s *State) keyed() bool { return len(s.cfg.Admins) > 0 || s.log != nil }
+
+// Keyed says whether this VM takes signed documents at all (compose keys or a key log pinned).
+func (s *State) Keyed() bool { return s.cfg.Operator != nil || s.keyed() }
+
+// KeyLogged says whether admin signers come from a firm key log (POST /keylog is served).
+func (s *State) KeyLogged() bool { return s.log != nil }
+
 // silent: MaxSilence is checked, an operator key is pinned, and the operator's list hasn't been delivered for
 // longer than that (or not since this process started).
 func (s *State) silent() bool {
@@ -390,14 +605,14 @@ func (s *State) policy(space string) (*Effective, error) {
 			// Signed once, not verifiable now (keys rotated in a new release): fail closed until a newer one
 			// arrives. Not when no admin keys are pinned: then nothing could ever arrive, and the release policy
 			// applies alone, as the attested compose says (a release without keys after one with them).
-			if _, had := s.floors["policy:"+k]; had && len(s.cfg.Admins) > 0 {
+			if _, had := s.floors["policy:"+k]; had && s.keyed() {
 				return nil, errorf(CodePolicyMissing, "the signed policy for this space can't be verified")
 			}
 			continue
 		}
 		e.Layers, e.Hashes = append(e.Layers, &d.p), append(e.Hashes, d.hash)
 	}
-	if len(s.cfg.Admins) > 0 && len(e.Hashes) == 0 {
+	if s.keyed() && len(e.Hashes) == 0 {
 		return nil, errorf(CodePolicyMissing, "no signed policy for this space yet")
 	}
 	return e, nil
@@ -442,6 +657,32 @@ type Status struct {
 	// HeardS: seconds since the operator's list was last delivered to this process (pulled or pushed); absent when
 	// it hasn't been since the process started.
 	HeardS *int64 `json:"stop_list_heard_s,omitzero"`
+	Keys   *Keys  `json:"keys,omitzero"` // the firm key log as this VM holds it (key log VMs only)
+}
+
+// Keys is the VM's firm key log head, announced to browsers in every run's meta (EHBP-authenticated to the attested
+// key) and in GET /safety, so a browser can compare it with the log it verified itself and catch a server showing
+// people different logs (docs/26 section 4). Genesis is the compose's pin; Seq 0 and Head "" until it arrives.
+type Keys struct {
+	Firm    string `json:"firm"`
+	Genesis string `json:"genesis"`
+	Seq     int64  `json:"seq"`
+	Head    string `json:"head"`
+	Fork    bool   `json:"fork,omitzero"` // the VM saw two valid entries at one position and takes no signed change
+}
+
+// KeysStatus is the key log head (nil without a key log).
+func (s *State) KeysStatus() *Keys {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.keysStatus()
+}
+
+func (s *State) keysStatus() *Keys {
+	if s.log == nil {
+		return nil
+	}
+	return &Keys{Firm: s.cfg.Firm, Genesis: s.log.Genesis(), Seq: s.log.Seq(), Head: s.log.Head(), Fork: s.fork != nil}
 }
 
 // ReleaseHash identifies the release's ceiling policy: sha256 of its JSON as the release encodes it.
@@ -472,10 +713,13 @@ func (s *State) StatusOf(space string) Status {
 	if stop, by := s.stopped(space); stop {
 		st.Stopped = by
 	}
+	st.Keys = s.keysStatus()
 	return st
 }
 
-// Docs are the documents held, to pass on to the next process (stop lists first, then policies by space).
+// Docs are what this process holds, to pass on to the next process (ApplyOrdered) and to keep on disk: the key
+// log entries in order, each followed by the documents taken at it; documents taken without a key log first
+// (stop lists, then policies by space).
 func (s *State) Docs() []Envelope {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -483,10 +727,10 @@ func (s *State) Docs() []Envelope {
 }
 
 func (s *State) docs() []Envelope {
-	var out []Envelope
+	byAt := map[int64][]Envelope{}
 	for _, iss := range []string{IssuerOperator, IssuerFirm} {
 		if d := s.stops[iss]; d != nil {
-			out = append(out, d.env)
+			byAt[d.at] = append(byAt[d.at], d.env)
 		}
 	}
 	spaces := make([]string, 0, len(s.policies))
@@ -495,7 +739,15 @@ func (s *State) docs() []Envelope {
 	}
 	slices.Sort(spaces)
 	for _, k := range spaces {
-		out = append(out, s.policies[k].env)
+		d := s.policies[k]
+		byAt[d.at] = append(byAt[d.at], d.env)
+	}
+	out := byAt[0]
+	if s.log != nil {
+		for i, e := range s.log.Entries() {
+			out = append(out, envelopeOf(e))
+			out = append(out, byAt[int64(i+1)]...)
+		}
 	}
 	return out
 }
@@ -503,14 +755,15 @@ func (s *State) docs() []Envelope {
 // ---- persistence (the encrypted disk: the floors outlive a restart) ----------------------------------------
 
 type saved struct {
-	Docs   []Envelope       `json:"docs"`
+	Docs   []Envelope       `json:"docs"` // Docs order: key log entries with the documents taken at each
 	Floors map[string]floor `json:"floors"`
+	Fork   *keylog.Fork     `json:"keylog_fork,omitzero"`
 }
 
 func (s *State) path() string { return filepath.Join(s.cfg.Dir, "safety.json") }
 
 func (s *State) snapshot() ([]byte, error) {
-	return json.Marshal(saved{Docs: s.docs(), Floors: s.floors})
+	return json.Marshal(saved{Docs: s.docs(), Floors: s.floors, Fork: s.fork})
 }
 
 func (s *State) write(b []byte) error {
@@ -556,12 +809,20 @@ func (s *State) load() error {
 	for k, f := range sv.Floors {
 		s.floors[k] = f
 	}
-	for _, e := range sv.Docs {
-		// A document that no longer verifies (keys rotated in a new release) is dropped; its floor stays, so
-		// the slot fails closed until a newer signed one arrives.
-		if v, err := s.verify(e, true); err == nil {
-			s.take(v)
+	// Replayed in order: each document is checked again against the key log as it stood when it was taken (its
+	// signers may have been revoked since: it stays in force, docs/26 decision 12). A document or entry that no longer
+	// verifies (keys changed in a new release, another genesis pinned) is dropped; its floor stays, so the slot
+	// fails closed until a newer signed one arrives.
+	errs, _ := s.apply(sv.Docs, true, true)
+	for i, err := range errs {
+		if err != nil {
+			log.Printf("safety: dropped a held %s at load: %v", sv.Docs[i].Kind, err)
 		}
+	}
+	// The fork proof stays while the log still holds the entry it was against (a new release pinning another
+	// genesis starts over). Set after the replay: what was held before the fork stays held.
+	if f := sv.Fork; f != nil && s.log != nil && f.Seq > 1 && s.log.HashAt(f.Seq) == f.Ours {
+		s.fork = f
 	}
 	return nil
 }

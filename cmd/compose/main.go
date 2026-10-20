@@ -73,6 +73,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/tarball"
 	"github.com/google/go-containerregistry/pkg/v1/types"
 
+	"github.com/tacyhq/tacy/safety"
 	"github.com/tacyhq/tacy/sandbox"
 	"github.com/tacyhq/tacy/verifier"
 )
@@ -150,14 +151,51 @@ const (
 	safetyURL   = "https://chat.tacy.io/api/safety/docs"
 )
 
+// Keys v2 slice 5 (docs/26 section 4, decisions 5 and 6): once f_chat's firm key log exists, keylogGenesis is
+// its genesis entry's hash (safetysign keylog-check prints it) and the admin key leaves the compose: the VM takes
+// admin signers from the log's current key admins and verifies the log itself (entries from keylogURL, pulled by
+// gatewayd with the documents, or POST /keylog). Our offline admin key becomes the log's recovery kit, so
+// the policy it signed (chat-v1, safety.ChatPolicyV1) is carried: taken as signed by the key admins while it is
+// the one in force, nothing else the kit signs is. Empty: the release pins adminKeys as before.
+//
+// f_chat's genesis was signed offline on 2026-10-18 (its owner's identity i_nrqykwaqqhlrcbdruyhwgqty2i as the
+// first key admin, the offline admin key as the kit); the entry is testdata/fchat-genesis.json. Pinned from v0.9.0.
+const (
+	keylogGenesis = "a35f4cb79bd5066638a0fd0aa8dc855b951febba003e6a6fd3e335adc8d47cfd"
+	keylogCarry   = safety.ChatPolicyV1
+	keylogURL     = "https://chat.tacy.io/api/safety/keylog"
+)
+
 // safetyArgs are the trust-root flags every guard process gets.
-func safetyArgs() []string {
+func safetyArgs() []string { return trustArgs(adminKeys, keylogGenesis, keylogCarry) }
+
+// trustArgs: the firm, the operator key, and either the admin keys or the key log genesis (with the carried
+// documents), never both.
+func trustArgs(admins, genesis, carry string) []string {
 	a := []string{"-firm", safetyFirm}
 	if operatorKey != "" {
 		a = append(a, "-operator-key", operatorKey)
 	}
-	if adminKeys != "" {
-		a = append(a, "-admin-keys", adminKeys)
+	switch {
+	case genesis != "":
+		a = append(a, "-keylog-genesis", genesis)
+		if carry != "" {
+			a = append(a, "-keylog-carry", carry)
+		}
+	case admins != "":
+		a = append(a, "-admin-keys", admins)
+	}
+	return a
+}
+
+// pullArgs are gatewayd's sources: the documents, and the key log when one is pinned.
+func pullArgs(genesis string) []string {
+	var a []string
+	if safetyURL != "" {
+		a = append(a, "-safety-url", safetyURL)
+	}
+	if genesis != "" && keylogURL != "" {
+		a = append(a, "-keylog-url", keylogURL)
 	}
 	return a
 }
@@ -699,9 +737,7 @@ func generate(r *Release) (string, error) {
 	b.WriteString("      HOME: /tmp\n")
 	gw := append([]string{"-socket", "/run/tacy/agent/gateway.sock", "-agent-uid", agentdUID, "-vault-socket", "/run/tacy/vault/vault.sock",
 		"-listen", ":8080", "-forward", "/run/tacy/agent/http.sock"}, safetyArgs()...)
-	if safetyURL != "" {
-		gw = append(gw, "-safety-url", safetyURL)
-	}
+	gw = append(gw, pullArgs(keylogGenesis)...)
 	args(gw...)
 	service("vaultd", "vaultd", vaultdUID+":"+gatewaydUID, false) // primary group: gatewayd's, so its socket is the gateway's to open
 	b.WriteString(`    volumes:

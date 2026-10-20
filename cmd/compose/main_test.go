@@ -20,6 +20,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/types"
 	"go.yaml.in/yaml/v3"
 
+	"github.com/tacyhq/tacy/safety"
 	"github.com/tacyhq/tacy/sandbox"
 	"github.com/tacyhq/tacy/verifier"
 )
@@ -465,4 +466,46 @@ func TestGVisorLayer(t *testing.T) {
 	if _, err := gvisorLayer(cut); err == nil {
 		t.Fatal("cut tarball accepted")
 	}
+}
+
+// Keys v2 slice 5: the compose pins either the admin keys or the key log genesis (with the carried chat policy and
+// the key log source for gatewayd), never both; and every guard process gets the same trust roots.
+func TestTrustArgs(t *testing.T) {
+	legacy := strings.Join(trustArgs(adminKeys, "", keylogCarry), " ")
+	if !strings.Contains(legacy, "-admin-keys "+adminKeys) || strings.Contains(legacy, "-keylog") {
+		t.Errorf("without a genesis: %s", legacy)
+	}
+	g := strings.Repeat("ab", 32)
+	logged := strings.Join(trustArgs(adminKeys, g, keylogCarry), " ")
+	if strings.Contains(logged, "-admin-keys") || !strings.Contains(logged, "-keylog-genesis "+g) || !strings.Contains(logged, "-keylog-carry "+keylogCarry) ||
+		!strings.Contains(logged, "-operator-key "+operatorKey) {
+		t.Errorf("with a genesis: %s", logged)
+	}
+	if keylogCarry != safety.ChatPolicyV1 || !strings.HasPrefix(keylogCarry, "e6f08a76") {
+		t.Error("the carried document is the live chat policy")
+	}
+	if p := strings.Join(pullArgs(g), " "); !strings.Contains(p, "-keylog-url "+keylogURL) || !strings.Contains(p, "-safety-url "+safetyURL) {
+		t.Errorf("gatewayd pulls: %s", p)
+	}
+	if p := strings.Join(pullArgs(""), " "); strings.Contains(p, "-keylog-url") {
+		t.Errorf("no key log without a genesis: %s", p)
+	}
+	// The generated compose matches the constants: each of agentd, gatewayd and vaultd gets safetyArgs().
+	out := string(readCompose(t))
+	want := flowArgs(safetyArgs())
+	if n := strings.Count(out, want); n != 3 {
+		t.Errorf("safety args in %d services, want 3 (%s)", n, want)
+	}
+	if (keylogGenesis == "") == strings.Contains(out, "-keylog-genesis") {
+		t.Error("compose.yaml and keylogGenesis disagree")
+	}
+}
+
+// flowArgs is how args appear inside a service's command flow sequence.
+func flowArgs(a []string) string {
+	q := make([]string, len(a))
+	for i, s := range a {
+		q[i] = fmt.Sprintf("%q", s)
+	}
+	return strings.Join(q, ", ")
 }

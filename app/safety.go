@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"encoding/json"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/tacyhq/tacy/guard"
 	"github.com/tacyhq/tacy/harness"
+	"github.com/tacyhq/tacy/keylog"
 	"github.com/tacyhq/tacy/proto"
 	"github.com/tacyhq/tacy/safety"
 )
@@ -231,6 +233,9 @@ func (s *safeSession) Meta(ctx context.Context) (*proto.Meta, error) {
 		st := s.g.st.StatusOf(s.space)
 		m.Controls = &proto.Controls{Policy: st.Policy, ReleasePolicy: st.Release, OperatorSeq: st.OperatorSeq,
 			FirmSeq: st.FirmSeq, Fresh: st.Fresh}
+		if k := st.Keys; k != nil {
+			m.Keys = &proto.Keys{Firm: k.Firm, Genesis: k.Genesis, Seq: k.Seq, Head: k.Head, Fork: k.Fork}
+		}
 	}
 	return m, err
 }
@@ -675,6 +680,81 @@ func (s *server) safetyIn(w http.ResponseWriter, r *http.Request) {
 		s.pushSafety()
 	}
 	writeJSON(w, 200, out)
+}
+
+// keylogIn takes firm key log entries from anyone (keys v2 slice 5): the relay's pull (gatewayd's -keylog-url), an
+// admin's browser. Entries are authorized by their signatures and checked against the log this VM verified from
+// the genesis its compose pins; the next entries are appended, ones it holds are no-ops, a different valid entry at
+// a held position is a fork (kept as proof; from then on no admin-signed change is taken). Served only when the
+// compose pins a key log genesis. Same caps and slots as POST /safety.
+func (s *server) keylogIn(w http.ResponseWriter, r *http.Request) {
+	http.NewResponseController(w).SetReadDeadline(time.Now().Add(5 * time.Second))
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxKeylogBody))
+	if err != nil {
+		fail(w, 400, "unreadable or oversize body")
+		return
+	}
+	select {
+	case s.safetySlots <- struct{}{}:
+		defer func() { <-s.safetySlots }()
+	default:
+		fail(w, 429, "busy")
+		return
+	}
+	entries, err := decodeEntries(body)
+	if err != nil {
+		fail(w, 400, err.Error())
+		return
+	}
+	errs, changed := s.safety.Apply(entries)
+	out := struct {
+		Results []string     `json:"results"` // "ok" or why it was refused, per entry
+		Keys    *safety.Keys `json:"keys"`
+	}{Keys: s.safety.KeysStatus()}
+	for _, e := range errs {
+		if e == nil {
+			out.Results = append(out.Results, "ok")
+		} else {
+			out.Results = append(out.Results, e.Error())
+		}
+	}
+	if changed {
+		s.pushSafety()
+	}
+	writeJSON(w, 200, out)
+}
+
+// maxKeylogEntries per POST /keylog (a longer log comes in several, from the VM's head on).
+const (
+	maxKeylogEntries = 64
+	maxKeylogBody    = maxKeylogEntries * 2 * safety.MaxEnvelope
+)
+
+// decodeEntries reads one entry or a JSON array of up to maxKeylogEntries, strictly; every one must be a key log
+// kind (policies and stop lists go to POST /safety).
+func decodeEntries(b []byte) ([]safety.Envelope, error) {
+	b = bytes.TrimSpace(b)
+	var out []safety.Envelope
+	var err error
+	if len(b) > 0 && b[0] == '[' {
+		err = jsonv2.Unmarshal(b, &out, jsonv2.RejectUnknownMembers(true))
+	} else {
+		var e safety.Envelope
+		err = jsonv2.Unmarshal(b, &e, jsonv2.RejectUnknownMembers(true))
+		out = []safety.Envelope{e}
+	}
+	switch {
+	case err != nil:
+		return nil, fmt.Errorf("key log: bad entry: %w", err)
+	case len(out) == 0 || len(out) > maxKeylogEntries:
+		return nil, fmt.Errorf("key log: 1 to %d entries at once", maxKeylogEntries)
+	}
+	for _, e := range out {
+		if !keylog.IsKind(e.Kind) {
+			return nil, errors.New("key log: not a key log entry (signed documents go to POST /safety)")
+		}
+	}
+	return out, nil
 }
 
 // pushSafety passes agentd's documents to gatewayd now (in the background; the next session's open carries them

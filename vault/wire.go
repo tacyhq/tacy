@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/tacyhq/tacy/keylog"
 	"github.com/tacyhq/tacy/safety"
 )
 
@@ -19,8 +20,8 @@ import (
 // per frame, any number per connection. Decoding is strict: unknown members, a bad length or trailing data close
 // the connection.
 
-// maxFrame: a lease is small; a safety push carries up to 8 signed documents.
-const maxFrame = 16<<10 + 8*2*safety.MaxEnvelope
+// maxFrame: a lease is small; a safety push carries up to 8 signed documents and the firm key log.
+const maxFrame = 16<<10 + 8*2*safety.MaxEnvelope + keylog.MaxEntries*keylog.MaxEntryWire
 
 type reply struct {
 	Value []byte   `json:"value,omitzero"` // base64 in JSON
@@ -130,7 +131,7 @@ func (v *Vault) serveConn(c net.Conn, peerUID int) {
 			if st := v.Safety(); st == nil {
 				rep = reply{Error: "vault: no safety controls"}
 			} else {
-				errs, changed := st.Apply(r.Docs)
+				errs, changed := st.ApplyOrdered(r.Docs)
 				if err := errors.Join(errs...); err != nil {
 					rep = reply{Error: "vault: " + err.Error()}
 				}

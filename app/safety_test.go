@@ -45,6 +45,8 @@ type safeEnv struct {
 	seq             uint64
 	rec             *activity.Recorder
 	vmKey           *ecdh.PrivateKey
+	kit             ed25519.PrivateKey
+	keylog          []safety.Envelope
 }
 
 func newSafeEnv(t *testing.T, replies ...string) *safeEnv {
@@ -66,6 +68,10 @@ type safeOpts struct {
 	// reader turns the quarantined reader on (as gatewayd runs it); the model server answers its calls with
 	// reader(prompt) and counts them in readerReqs.
 	reader func(prompt string) string
+	// keylog: admin signers from a firm key log (keys v2 slice 5) instead of a compose key: genesis pinned (its
+	// entries in e.keylog, e.admin the first owner's identity key, e.kit the recovery kit), carry pinned hashes.
+	keylog bool
+	carry  []string
 	// wrapUp wraps the model upstream (fake slow or overloaded models); slowAfter is the guard's first-token wait.
 	wrapUp    func(guard.Upstream) guard.Upstream
 	slowAfter time.Duration
@@ -101,6 +107,11 @@ func newSafeEnvWith(t *testing.T, o safeOpts, replies ...string) *safeEnv {
 		Dir: t.TempDir()}
 	if o.keyless {
 		cfg.Operator, cfg.Admins = nil, nil
+	}
+	if o.keylog {
+		_, e.kit, _ = ed25519.GenerateKey(rand.Reader)
+		e.keylog = fchatGenesis(t, e.admin, e.kit)
+		cfg.Admins, cfg.Genesis, cfg.Carry = nil, keylogHash(e.keylog[0]), o.carry
 	}
 	st, err := safety.NewState(cfg)
 	if err != nil {

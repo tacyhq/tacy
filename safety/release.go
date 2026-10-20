@@ -2,6 +2,18 @@ package safety
 
 import "time"
 
+// ChatPolicyV1 is the hash of the chat VM's first signed policy (policies/chat-v1.json, signed 2026-10-18 by our
+// offline admin key, live since v0.6.0). With keys v2 slice 5 that key becomes f_chat's recovery kit and
+// signs no new documents; a release that moves f_chat to its key log carries this one (Config.Carry, docs/26 decision 6)
+// until a key admin re-signs it.
+const ChatPolicyV1 = "e6f08a761337f9a367594c3ed43a07723ac50cbf790f5b740e25442d9a8c7496"
+
+// ChatPolicyV2 is the hash of the chat VM's second signed policy (policies/chat-v2.json: api.exa.ai and the run's
+// wall_seconds 900), signed 2026-10-18 by the same offline admin key and in force since v0.8.11. A VM that took it
+// keeps its version floor (2), so a release that moves f_chat to its key log carries it too: carrying v1 alone
+// would leave that VM with no policy it can take (v2 not carried, v1 below the floor).
+const ChatPolicyV2 = "b1cf194b7246c31a565f7c11de8416f16c377a461976dd9eb8a4e290cef1fe1a"
+
 // ChatRelease is the release's ceiling and default policy for the chat agent's connectors: the given models, the
 // web connector with its three tools and any public host, the providers' hosts for the keys, reads go on while
 // the stop list is stale. A signed policy can only narrow it. Budgets and rates are generous ceilings today's runs

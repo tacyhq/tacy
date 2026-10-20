@@ -45,7 +45,8 @@ func main() {
 	forward := flag.String("forward", "", "agentd's HTTP unix socket")
 	memLimit := flag.Int("mem-limit-mib", 900, "Go soft memory limit (GOMEMLIMIT), MiB; 0 = none")
 	safetyURL := flag.String("safety-url", "", "https URL to pull the signed stop lists and policies from (empty: agentd's pushes only)")
-	safetyEvery := flag.Duration("safety-every", 10*time.Second, "how often to pull -safety-url")
+	safetyEvery := flag.Duration("safety-every", 10*time.Second, "how often to pull -safety-url (and -keylog-url)")
+	keylogURL := flag.String("keylog-url", "", "https URL to pull the firm key log from (a JSON array of entries; empty: POST /keylog only)")
 	// Test only: cmd/e2e's overlay is the only thing that sets it (a release compose never does, and the attested
 	// compose hash covers the command line, so the verifier would see another compose).
 	modelFault := flag.String("e2e-model-fault", "", "e2e test only: <model>=slow|overloaded,... makes calls to those models slow (no byte before the slow threshold) or answer 503 overloaded")
@@ -150,11 +151,14 @@ func main() {
 			}
 		}
 	}()
-	if *safetyURL != "" {
+	if *safetyURL != "" || *keylogURL != "" {
 		if *forward == "" {
-			log.Fatal("gatewayd: -safety-url needs -forward (pulled documents go to agentd)")
+			log.Fatal("gatewayd: -safety-url and -keylog-url need -forward (what is pulled goes to agentd)")
 		}
-		go pullSafety(*safetyURL, *safetyEvery, *forward)
+		if *keylogURL != "" && sf.Genesis == "" {
+			log.Fatal("gatewayd: -keylog-url without -keylog-genesis")
+		}
+		go pullSafety(*safetyURL, *keylogURL, *safetyEvery, *forward)
 	}
 	log.Fatal((&gateway.Server{G: g, Safety: st}).Serve(l, *agentUID))
 }

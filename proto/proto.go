@@ -286,6 +286,18 @@ type Meta struct {
 	Controls *Controls `json:"controls,omitempty"`
 	// Activity says where the run's activity record goes (docs/24); nil when it isn't recorded.
 	Activity *Activity `json:"activity,omitempty"`
+	// Keys is the firm key log's head as this VM holds it (keys v2 slice 5); nil on a VM without a key log pin.
+	Keys *Keys `json:"keys,omitempty"`
+}
+
+// Keys announces the VM's firm key log head (docs/26 section 4) over EHBP: the browser compares it with the log it
+// verified itself, so a server showing different people different logs is caught. Genesis is the compose's pin.
+type Keys struct {
+	Firm    string `json:"firm"`
+	Genesis string `json:"genesis"`
+	Seq     int64  `json:"seq"`
+	Head    string `json:"head"`           // "" while seq is 0 (the genesis entry hasn't arrived)
+	Fork    bool   `json:"fork,omitempty"` // the VM saw two valid entries at one position
 }
 
 // Activity names the key that signs this VM's activity records and the chain the run's records go to. It arrives

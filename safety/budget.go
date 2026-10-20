@@ -39,7 +39,7 @@ func over(l Limits, used Usage, more Usage, wall time.Duration) string {
 }
 
 type ledgerRun struct {
-	space          string
+	space, member  string
 	start          time.Time
 	used, reserved Usage
 	// Running time leaves out the time the run only waits for its person (docs/27 section 6): while at least one
@@ -76,16 +76,19 @@ type ledgerDay struct {
 	reserved Usage
 }
 
-// Ledger keeps the budgets: per run in memory, per space per UTC day on the encrypted disk (counts only). A
-// request reserves what it may use before it runs, under one lock, so parallel requests can't each see room that
-// only one of them has; the reservation is replaced by what was actually used when it ends.
+// Ledger keeps the budgets (keys v2 slice 6, docs/26 section 7): per run in memory, and per UTC day on the encrypted
+// disk (counts only) for each space, each member (all spaces together) and the whole VM. A request reserves what
+// it may use from all four before it runs, under one lock, so parallel requests can't each see room that only one of
+// them has; the reservation is replaced by what was actually used when it ends. A member is whoever the run's
+// budget is counted for (proto.Verified.Member): a firm's identity, or on the shared chat VM the relay's daily
+// per-user tag. Making a new space gets nothing: the member's and the VM's days are the same whatever the space.
 type Ledger struct {
 	Dir string // where the day counters persist; "": memory only
 	Now func() time.Time
 
 	mu   sync.Mutex
 	runs map[string]*ledgerRun
-	days map[string]*ledgerDay // space + "|" + YYYY-MM-DD
+	days map[string]*ledgerDay // "<space>|YYYY-MM-DD", "m:<member>|YYYY-MM-DD", "vm|YYYY-MM-DD"
 	once sync.Once
 }
 
@@ -103,8 +106,14 @@ func (l *Ledger) init() {
 	})
 }
 
-func (l *Ledger) day(space string) *ledgerDay {
-	k := space + "|" + l.Now().UTC().Format(time.DateOnly)
+// A day's scope: one space ("<space>"), one member ("m:<member>") or the VM ("vm"). Space ids start with a letter
+// and hold an underscore, so the three never meet.
+const vmScope = "vm"
+
+func memberScope(member string) string { return "m:" + member }
+
+func (l *Ledger) day(scope string) *ledgerDay {
+	k := scope + "|" + l.Now().UTC().Format(time.DateOnly)
 	d := l.days[k]
 	if d == nil {
 		d = &ledgerDay{}
@@ -113,39 +122,60 @@ func (l *Ledger) day(space string) *ledgerDay {
 	return d
 }
 
-// dayWall is the space's running time today: finished runs plus the ones running now (time waiting for a person
+// inScope: a run counts in a day's scope.
+func (r *ledgerRun) inScope(scope string) bool {
+	return scope == vmScope || scope == r.space || scope == memberScope(r.member)
+}
+
+// dayWall is a scope's running time today: finished runs plus the ones running now (time waiting for a person
 // left out, as for a run).
-func (l *Ledger) dayWall(space string, d *ledgerDay) time.Duration {
+func (l *Ledger) dayWall(scope string, d *ledgerDay) time.Duration {
 	w := time.Duration(d.Used.WallMs) * time.Millisecond
 	now := l.Now()
 	for _, r := range l.runs {
-		if r.space == space {
+		if r.inScope(scope) {
 			w += r.elapsed(now)
 		}
 	}
 	return w
 }
 
+// dayLimit is one day budget a run counts against.
+type dayLimit struct {
+	scope, name string // name: whose day, in the refusal ("the space's daily budget …")
+	lim         Limits
+	d           *ledgerDay
+}
+
+// daysOf are the day budgets a run in space for member counts against: the space's, the member's and the VM's.
+func (l *Ledger) daysOf(space, member string, b Budgets) []dayLimit {
+	return []dayLimit{
+		{space, "daily", b.Day, l.day(space)},
+		{memberScope(member), "member's daily", b.Member, l.day(memberScope(member))},
+		{vmScope, "agent VM's daily", b.VM, l.day(vmScope)},
+	}
+}
+
 func budgetError(scope, what string) error {
 	return errorf(CodeBudgetExceeded, "the %s budget for %s is used up", scope, what)
 }
 
-// Start registers a run in space (Admit, then Begin).
-func (l *Ledger) Start(task, space string, b Budgets) (time.Time, error) {
-	if _, err := l.Admit(space, b); err != nil {
+// Start registers a run in space for member (Admit, then Begin).
+func (l *Ledger) Start(task, space, member string, b Budgets) (time.Time, error) {
+	if _, err := l.Admit(space, member, b); err != nil {
 		return time.Time{}, err
 	}
-	l.Begin(task, space)
-	return l.Admit(space, b, task)
+	l.Begin(task, space, member)
+	return l.Admit(space, member, b, task)
 }
 
-// Begin registers a run in space from now (again: a no-op).
-func (l *Ledger) Begin(task, space string) {
+// Begin registers a run in space for member from now (again: a no-op).
+func (l *Ledger) Begin(task, space, member string) {
 	l.init()
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.runs[task] == nil {
-		l.runs[task] = &ledgerRun{space: space, start: l.Now()}
+		l.runs[task] = &ledgerRun{space: space, member: member, start: l.Now()}
 	}
 }
 
@@ -153,7 +183,7 @@ func (l *Ledger) Begin(task, space string) {
 // used what used says, so its run budget and running time go on from there instead of starting over. Time it
 // waited for its person before the restart isn't known here, so it counts as running time: a restart can only
 // shorten a run, never lengthen it. A run already registered is left as it is.
-func (l *Ledger) Resume(task, space string, start time.Time, used Usage) {
+func (l *Ledger) Resume(task, space, member string, start time.Time, used Usage) {
 	l.init()
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -161,35 +191,40 @@ func (l *Ledger) Resume(task, space string, start time.Time, used Usage) {
 		if start.IsZero() || start.After(l.Now()) {
 			start = l.Now()
 		}
-		l.runs[task] = &ledgerRun{space: space, start: start, used: used}
+		l.runs[task] = &ledgerRun{space: space, member: member, start: start, used: used}
 	}
 }
 
-// Admit refuses a new run when the space's day budget is already used up, and returns the latest a run may go on
-// (zero: no limit), from the day's running time. task, when given, is a run already begun. The run's own running
-// time isn't a fixed end: time waiting for the person doesn't count (Pause), so Elapsed is checked as it goes
-// (Reserve, and the caller's timer). The day's end is computed as if nothing paused: never later than it should be.
-func (l *Ledger) Admit(space string, b Budgets, task ...string) (time.Time, error) {
+// Admit refuses a new run when the space's, the member's or the VM's day budget is already used up, and returns the
+// latest a run may go on (zero: no limit), from the days' running time. task, when given, is a run already begun.
+// The run's own running time isn't a fixed end: time waiting for the person doesn't count (Pause), so Elapsed is
+// checked as it goes (Reserve, and the caller's timer). The day's end is computed as if nothing paused: never later
+// than it should be.
+func (l *Ledger) Admit(space, member string, b Budgets, task ...string) (time.Time, error) {
 	l.init()
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	d := l.day(space)
-	held := d.Used
-	held.add(d.reserved, 1)
-	// A run needs at least a token of model budget; used-up tool calls only refuse its tool calls.
-	if what := over(b.Day, held, Usage{Tokens: 1, CostMicros: 1}, l.dayWall(space, d)); what != "" {
-		return time.Time{}, budgetError("daily", what)
-	}
 	var end time.Time
-	if b.Day.WallSeconds > 0 {
-		end = l.Now().Add(time.Duration(b.Day.WallSeconds)*time.Second - l.dayWall(space, d))
+	for _, dl := range l.daysOf(space, member, b) {
+		held := dl.d.Used
+		held.add(dl.d.reserved, 1)
+		wall := l.dayWall(dl.scope, dl.d)
+		// A run needs at least a token of model budget; used-up tool calls only refuse its tool calls.
+		if what := over(dl.lim, held, Usage{Tokens: 1, CostMicros: 1}, wall); what != "" {
+			return time.Time{}, budgetError(dl.name, what)
+		}
+		if dl.lim.WallSeconds > 0 {
+			if e := l.Now().Add(time.Duration(dl.lim.WallSeconds)*time.Second - wall); end.IsZero() || e.Before(end) {
+				end = e
+			}
+		}
 	}
 	return end, nil
 }
 
 var errUnknownRun = errorf(CodeBudgetExceeded, "the run has no budget (not started here)")
 
-// Reserve takes want from the run's and the day's budgets b (the current policy's), or refuses with the limit it
+// Reserve takes want from the run's and its days' budgets b (the current policy's), or refuses with the limit it
 // would pass. commit replaces the reservation with what was used (call it exactly once).
 func (l *Ledger) Reserve(task string, want Usage, b Budgets) (commit func(used Usage), err error) {
 	l.init()
@@ -199,19 +234,23 @@ func (l *Ledger) Reserve(task string, want Usage, b Budgets) (commit func(used U
 	if r == nil {
 		return nil, errUnknownRun
 	}
-	d := l.day(r.space)
 	held := r.used
 	held.add(r.reserved, 1)
 	if what := over(b.Run, held, want, r.elapsed(l.Now())); what != "" {
 		return nil, budgetError("run's", what)
 	}
-	held = d.Used
-	held.add(d.reserved, 1)
-	if what := over(b.Day, held, want, l.dayWall(r.space, d)); what != "" {
-		return nil, budgetError("daily", what)
+	days := l.daysOf(r.space, r.member, b)
+	for _, dl := range days {
+		held = dl.d.Used
+		held.add(dl.d.reserved, 1)
+		if what := over(dl.lim, held, want, l.dayWall(dl.scope, dl.d)); what != "" {
+			return nil, budgetError(dl.name, what)
+		}
 	}
 	r.reserved.add(want, 1)
-	d.reserved.add(want, 1)
+	for _, dl := range days {
+		dl.d.reserved.add(want, 1)
+	}
 	r.inflight++ // working: the clock runs while the request does, even with a prompt open
 	r.clock(l.Now())
 	var once sync.Once
@@ -220,9 +259,11 @@ func (l *Ledger) Reserve(task string, want Usage, b Budgets) (commit func(used U
 			l.mu.Lock()
 			defer l.mu.Unlock()
 			r.reserved.add(want, -1)
-			d.reserved.add(want, -1)
 			r.used.add(used, 1)
-			d.Used.add(used, 1)
+			for _, dl := range days {
+				dl.d.reserved.add(want, -1)
+				dl.d.Used.add(used, 1)
+			}
 			r.inflight--
 			r.clock(l.Now())
 			l.save()
@@ -230,7 +271,7 @@ func (l *Ledger) Reserve(task string, want Usage, b Budgets) (commit func(used U
 	}, nil
 }
 
-// TokensLeft is how many model tokens the run may still reserve: the least of the run's and the day's token
+// TokensLeft is how many model tokens the run may still reserve: the least of the run's and its days' token
 // budgets left after what is used and reserved (-1: no token limit; 0 for a run it doesn't know).
 func (l *Ledger) TokensLeft(task string, b Budgets) int64 {
 	l.init()
@@ -240,12 +281,13 @@ func (l *Ledger) TokensLeft(task string, b Budgets) int64 {
 	if r == nil {
 		return 0
 	}
-	d := l.day(r.space)
+	type tc struct{ lim, used, res int64 }
+	cs := []tc{{b.Run.Tokens, r.used.Tokens, r.reserved.Tokens}}
+	for _, dl := range l.daysOf(r.space, r.member, b) {
+		cs = append(cs, tc{dl.lim.Tokens, dl.d.Used.Tokens, dl.d.reserved.Tokens})
+	}
 	left := int64(-1)
-	for _, c := range []struct {
-		lim       int64
-		used, res int64
-	}{{b.Run.Tokens, r.used.Tokens, r.reserved.Tokens}, {b.Day.Tokens, d.Used.Tokens, d.reserved.Tokens}} {
+	for _, c := range cs {
 		if c.lim > 0 {
 			if v := max(0, c.lim-c.used-c.res); left < 0 || v < left {
 				left = v
@@ -299,7 +341,7 @@ func (l *Ledger) ask(task string, d int) {
 	r.clock(l.Now())
 }
 
-// End adds the run's time to its space's day and forgets it.
+// End adds the run's time to its days (space, member, VM) and forgets it.
 func (l *Ledger) End(task string) {
 	l.init()
 	l.mu.Lock()
@@ -309,7 +351,10 @@ func (l *Ledger) End(task string) {
 		return
 	}
 	delete(l.runs, task)
-	l.day(r.space).Used.WallMs += r.elapsed(l.Now()).Milliseconds()
+	ms := r.elapsed(l.Now()).Milliseconds()
+	for _, scope := range []string{r.space, memberScope(r.member), vmScope} {
+		l.day(scope).Used.WallMs += ms
+	}
 	l.save()
 }
 

@@ -9,6 +9,10 @@ import (
 	"errors"
 )
 
+// Since keys v2 slice 6 (v0.10.0) the VM no longer takes record_to: a run's records go to its space's seal key, proven
+// with runauth.SpaceProof (the same construction under its own label). RecordProof stays for its vector, which the
+// chat checks while it still talks to older releases.
+//
 // RecordProof is how a run request shows that whoever asks for records sealed to `to` holds its private key
 // (else anyone who saw someone's public key, our relay included, could make the VM write into their chain and
 // learn its length from meta.activity). Both sides compute it from one X25519 agreement between the recipient key

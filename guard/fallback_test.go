@@ -134,7 +134,7 @@ func TestSlowThreshold(t *testing.T) {
 // Fallbacks are kept in the chat's order, without the run's model, unknown models or duplicates, at most 5; none
 // without Auto. The start lists the run's model and its fallbacks.
 func TestStartForFallbacks(t *testing.T) {
-	r := proto.RunRequest{Model: "deepseek-v4-1-flash", Messages: user("q"), AutoFallback: true,
+	r := proto.RunRequest{Space: testSpace, Model: "deepseek-v4-1-flash", Messages: user("q"), AutoFallback: true,
 		FallbackModels: []string{"kimi-k3", "nope", "deepseek-v4-1-flash", "kimi-k3", "gpt-oss-120b", "glm-5-3", "gemma4-31b", "llama3-3-70b"}}
 	s, opts, err := StartFor(&r, time.Now())
 	if err != nil {
@@ -144,7 +144,7 @@ func TestStartForFallbacks(t *testing.T) {
 	if !slices.Equal(opts.Fallbacks, want) || !opts.AutoFallback || !slices.Equal(s.Models, append([]string{"deepseek-v4-1-flash"}, want...)) {
 		t.Fatalf("models %v, fallbacks %v", s.Models, opts.Fallbacks)
 	}
-	r = proto.RunRequest{Model: "kimi-k3", Messages: user("q"), FallbackModels: []string{"gpt-oss-120b"}}
+	r = proto.RunRequest{Space: testSpace, Model: "kimi-k3", Messages: user("q"), FallbackModels: []string{"gpt-oss-120b"}}
 	s, opts, err = StartFor(&r, time.Now())
 	if err != nil || len(opts.Fallbacks) != 0 || opts.AutoFallback || !slices.Equal(s.Models, []string{"kimi-k3"}) {
 		t.Fatalf("hand-picked: models %v, fallbacks %v, %v", s.Models, opts.Fallbacks, err)
@@ -156,7 +156,7 @@ func TestStartForFallbacks(t *testing.T) {
 func TestSlowSwitchesOnAuto(t *testing.T) {
 	up := &modelUp{behave: map[string]string{"deepseek-v4-1-flash": "slow"}}
 	e := newFallbackE2E(t, up)
-	evs, err := e.run(proto.RunRequest{Permissions: AllowAll(), Model: "deepseek-v4-1-flash", ReasoningEffort: "xhigh", Tools: []string{},
+	evs, err := e.run(proto.RunRequest{Space: testSpace, Permissions: AllowAll(), Model: "deepseek-v4-1-flash", ReasoningEffort: "xhigh", Tools: []string{},
 		AutoFallback: true, FallbackModels: []string{"gpt-oss-120b"}, Messages: user("q")})
 	if err != nil {
 		t.Fatal(err)
@@ -192,7 +192,7 @@ func TestSlowSwitchesOnAuto(t *testing.T) {
 func TestSlowHandPickedKeepsWaiting(t *testing.T) {
 	up := &modelUp{behave: map[string]string{"kimi-k3": "slow:400ms"}}
 	e := newFallbackE2E(t, up)
-	evs, err := e.run(proto.RunRequest{Permissions: AllowAll(), Model: "kimi-k3", Tools: []string{},
+	evs, err := e.run(proto.RunRequest{Space: testSpace, Permissions: AllowAll(), Model: "kimi-k3", Tools: []string{},
 		FallbackModels: []string{"gpt-oss-120b"}, Messages: user("q")})
 	if err != nil {
 		t.Fatal(err)
@@ -217,7 +217,7 @@ func TestOverloadedSwitchesOnAuto(t *testing.T) {
 		t.Run(b, func(t *testing.T) {
 			up := &modelUp{behave: map[string]string{"glm-5-3": b}}
 			e := newFallbackE2E(t, up)
-			evs, err := e.run(proto.RunRequest{Permissions: AllowAll(), Model: "glm-5-3", ReasoningEffort: "low", Tools: []string{},
+			evs, err := e.run(proto.RunRequest{Space: testSpace, Permissions: AllowAll(), Model: "glm-5-3", ReasoningEffort: "low", Tools: []string{},
 				AutoFallback: true, FallbackModels: []string{"gpt-oss-120b"}, Messages: user("q")})
 			if err != nil {
 				t.Fatal(err)
@@ -246,7 +246,7 @@ func TestOverloadedHandPickedEnds(t *testing.T) {
 		t.Run(b, func(t *testing.T) {
 			up := &modelUp{behave: map[string]string{"glm-5-3": b}}
 			e := newFallbackE2E(t, up)
-			evs, _ := e.run(proto.RunRequest{Permissions: AllowAll(), Model: "glm-5-3", Tools: []string{}, Messages: user("q")})
+			evs, _ := e.run(proto.RunRequest{Space: testSpace, Permissions: AllowAll(), Model: "glm-5-3", Tools: []string{}, Messages: user("q")})
 			if got := types(evs); got != "meta,step,model_slow,metrics,error" {
 				t.Fatalf("events %s", got)
 			}
@@ -272,7 +272,7 @@ func TestSwitchedStaysAndSwitchesOnce(t *testing.T) {
 	up := &modelUp{behave: map[string]string{"deepseek-v4-1-flash": "slow"},
 		replies: map[string][]string{"gpt-oss-120b": {toolCallSSE("c1", "web_search", `{"query":"x"}`), textSSE("done [1]")}}}
 	e := newFallbackE2E(t, up)
-	evs, err := e.run(proto.RunRequest{Permissions: AllowAll(), Model: "deepseek-v4-1-flash", Tools: []string{"web_search"},
+	evs, err := e.run(proto.RunRequest{Space: testSpace, Permissions: AllowAll(), Model: "deepseek-v4-1-flash", Tools: []string{"web_search"},
 		AutoFallback: true, FallbackModels: []string{"gpt-oss-120b", "kimi-k3"}, Messages: user("q")})
 	if err != nil {
 		t.Fatal(err)
@@ -290,7 +290,7 @@ func TestSwitchedStaysAndSwitchesOnce(t *testing.T) {
 	// The fallback is slow too: no second switch (kimi-k3 is never called); it is waited for.
 	up = &modelUp{behave: map[string]string{"deepseek-v4-1-flash": "slow", "gpt-oss-120b": "slow:400ms"}}
 	e = newFallbackE2E(t, up)
-	evs, err = e.run(proto.RunRequest{Permissions: AllowAll(), Model: "deepseek-v4-1-flash", Tools: []string{},
+	evs, err = e.run(proto.RunRequest{Space: testSpace, Permissions: AllowAll(), Model: "deepseek-v4-1-flash", Tools: []string{},
 		AutoFallback: true, FallbackModels: []string{"gpt-oss-120b", "kimi-k3"}, Messages: user("q")})
 	if err != nil {
 		t.Fatal(err)
@@ -308,7 +308,7 @@ func TestSwitchedStaysAndSwitchesOnce(t *testing.T) {
 	// The fallback is overloaded: the run ends with model_overloaded naming it.
 	up = &modelUp{behave: map[string]string{"deepseek-v4-1-flash": "slow", "gpt-oss-120b": "503"}}
 	e = newFallbackE2E(t, up)
-	evs, _ = e.run(proto.RunRequest{Permissions: AllowAll(), Model: "deepseek-v4-1-flash", Tools: []string{},
+	evs, _ = e.run(proto.RunRequest{Space: testSpace, Permissions: AllowAll(), Model: "deepseek-v4-1-flash", Tools: []string{},
 		AutoFallback: true, FallbackModels: []string{"gpt-oss-120b", "kimi-k3"}, Messages: user("q")})
 	if er := evs[len(evs)-1]; er.Type != "error" || !strings.Contains(er.Error, OverloadedText("gpt-oss-120b")) {
 		t.Fatalf("events %s, last %+v", types(evs), er)
@@ -320,7 +320,7 @@ func TestSwitchedStaysAndSwitchesOnce(t *testing.T) {
 func TestNoSwitchWhenFast(t *testing.T) {
 	up := &modelUp{}
 	e := newFallbackE2E(t, up)
-	evs, err := e.run(proto.RunRequest{Permissions: AllowAll(), Model: "kimi-k3", Tools: []string{}, AutoFallback: true,
+	evs, err := e.run(proto.RunRequest{Space: testSpace, Permissions: AllowAll(), Model: "kimi-k3", Tools: []string{}, AutoFallback: true,
 		FallbackModels: []string{"gpt-oss-120b"}, Messages: user("q")})
 	if err != nil || types(evs) != "meta,step,text,usage,metrics,done" {
 		t.Fatalf("events %s %v", types(evs), err)

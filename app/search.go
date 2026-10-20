@@ -24,7 +24,8 @@ import (
 // does the tab verify this VM and send that query here, EHBP-encrypted like a run. Nothing else can be asked for:
 // one query (strict JSON, proto.SearchRequest), no messages, no model, no pages, no images.
 //
-//	POST /search  {query, count?, question?, decision, edited?, cache_secret?, record_to?, record_proof?}
+//	POST /search  {query, count?, question?, decision, edited?, cache_secret?, space, space_seal, space_proof,
+//	              identity, identity_key, nonce, signed_at, identity_sig} (the where and who: runauth, v0.10.0)
 //	              -> EHBP-encrypted SSE of proto.Event: meta, tool_call, tool_result (the reader's fields with [n]
 //	              sources, citations, quotes), favicon, metrics, activity, then done or error. As /run's.
 //
@@ -63,12 +64,15 @@ type picturesStarter interface {
 	StartPictures(r *proto.PicturesRequest) (harness.Start, guard.TaskOptions, []byte, error)
 }
 
-// picturesTimeout bounds one pictures stream: the lookups' own bound (20 s) and the end's grace.
-const picturesTimeout = 40 * time.Second
+// picturesTimeout bounds one pictures stream: the lookups' own bound (guard laterWait, 40 s since v0.10.0: a 25 s image
+// search, then 12 s for downloads) and the end's grace. The stream carries keepalives meanwhile, so the chat's stall
+// check (6 s) and the relay don't cut it.
+const picturesTimeout = 45 * time.Second
 
 // POST /pictures (v0.8.21): an answer's cards' held-back photos, once the person allows pictures (guard/pictures.go).
 //
-//	POST /pictures  {ticket, record_to?, record_proof?}; optional "X-Agent-User-Prev: <hex>" (the same person's
+//	POST /pictures  {ticket, space, space_seal, space_proof, identity, identity_key, nonce, signed_at, identity_sig}
+//	              (runauth, v0.10.0); optional "X-Agent-User-Prev: <hex>" (the same person's
 //	              tag for the previous UTC day, v0.8.22)
 //	              -> EHBP-encrypted SSE of proto.Event: meta, image (under the run's calls, "for" its item), metrics,
 //	              activity, then done or error. Same token, slots and user tag as /search; nothing is kept.
@@ -86,6 +90,12 @@ func (s *server) pictures(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		fail(w, 404, "pictures_unavailable")
 		return
+	}
+	if rg, ok := s.agent.(*recGateway); ok { // as for a search
+		if err := rg.VerifyPictures(&req, userFrom(r.Context())); err != nil {
+			fail(w, 400, err.Error())
+			return
+		}
 	}
 	start, opts, args, err := starter.StartPictures(&req)
 	if err != nil && safety.CodeOf(err) == "" {
@@ -212,6 +222,13 @@ func (s *server) search(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		fail(w, 404, "search_unavailable")
 		return
+	}
+	// Where and who (keys v2 slice 6, v0.10.0): checked once, here, as for a run; a refusal writes nothing.
+	if rg, ok := s.agent.(*recGateway); ok {
+		if err := rg.VerifySearch(&req, userFrom(r.Context())); err != nil {
+			fail(w, 400, err.Error())
+			return
+		}
 	}
 	start, opts, args, err := starter.StartSearch(&req)
 	if err != nil && safety.CodeOf(err) == "" {

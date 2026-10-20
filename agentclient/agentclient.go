@@ -22,6 +22,7 @@ import (
 
 	"github.com/tacyhq/tacy/guard"
 	"github.com/tacyhq/tacy/proto"
+	"github.com/tacyhq/tacy/runauth"
 	"github.com/tacyhq/tacy/verifier"
 )
 
@@ -59,6 +60,9 @@ type Conn struct {
 	User string
 	// Model, when set, is sent as X-Agent-Model instead of the request's model (tests: the VM must refuse it).
 	Model string
+	// Asker fills each request's space and identity (keys v2 slice 6; runauth) unless the request names a space
+	// already (tests that send their own). New makes a fresh one: a personal space and identity of this connection.
+	Asker *runauth.Asker
 	key   []byte
 	http  *http.Client
 
@@ -96,6 +100,17 @@ func (c *Conn) ref(op, id string, extra map[string]any) map[string]any {
 	return m
 }
 
+// Key is the VM key requests are encrypted to (the attested EHBP key).
+func (c *Conn) Key() []byte { return c.key }
+
+// authorize fills req's where and who (Asker) unless it names a space already.
+func (c *Conn) authorize(req *proto.RunRequest) error {
+	if req.Space != "" || c.Asker == nil {
+		return nil
+	}
+	return c.Asker.Authorize(req, c.key)
+}
+
 // New makes a connection that encrypts to key (which must come from a verified attestation).
 func New(base, token string, key []byte) (*Conn, error) {
 	id, err := ehbpidentity.FromPublicKeyBytes(key)
@@ -106,7 +121,11 @@ func New(base, token string, key []byte) (*Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Conn{Base: strings.TrimSuffix(base, "/"), Token: token, key: key, http: &http.Client{Transport: tr}}, nil
+	a, err := runauth.NewAsker()
+	if err != nil {
+		return nil, err
+	}
+	return &Conn{Base: strings.TrimSuffix(base, "/"), Token: token, Asker: a, key: key, http: &http.Client{Transport: tr}}, nil
 }
 
 // Connect attests, verifies and returns a connection to the attested key.
@@ -127,6 +146,9 @@ func Connect(ctx context.Context, base, token string, p verifier.Policy) (*Conn,
 func (c *Conn) Run(ctx context.Context, req proto.RunRequest, on func(proto.Event)) error {
 	if req.Model == "" {
 		req.Model = proto.DefaultModel
+	}
+	if err := c.authorize(&req); err != nil {
+		return err
 	}
 	body, _ := json.Marshal(req)
 	r, _ := http.NewRequestWithContext(ctx, "POST", c.Base+"/run", bytes.NewReader(body))
@@ -173,12 +195,22 @@ func (c *Conn) Run(ctx context.Context, req proto.RunRequest, on func(proto.Even
 // Search sends one web search (POST /search, the plain chat's: agentd app/search.go) and calls on for each event
 // until [DONE].
 func (c *Conn) Search(ctx context.Context, req proto.SearchRequest, on func(proto.Event)) error {
+	if req.Space == "" && c.Asker != nil { // where and who, as for a run (v0.10.0)
+		if err := c.Asker.AuthorizeSearch(&req, c.key); err != nil {
+			return err
+		}
+	}
 	return c.stream(ctx, "/search", req, on)
 }
 
 // Pictures asks for an answer's held-back card photos (POST /pictures, v0.8.20) and calls on for each event until
 // [DONE].
 func (c *Conn) Pictures(ctx context.Context, req proto.PicturesRequest, on func(proto.Event)) error {
+	if req.Space == "" && c.Asker != nil { // where and who, as for a run (v0.10.0)
+		if err := c.Asker.AuthorizePictures(&req, c.key); err != nil {
+			return err
+		}
+	}
 	return c.stream(ctx, "/pictures", req, on)
 }
 
@@ -298,6 +330,10 @@ func (c *Conn) StartTask(ctx context.Context, req proto.RunRequest, key string) 
 		b := make([]byte, 32)
 		rand.Read(b)
 		req.RunSecret = hex.EncodeToString(b)
+	}
+	// Signed after the run secret is set: the signature covers it (runauth).
+	if err := c.authorize(&req); err != nil {
+		return nil, err
 	}
 	t, err := c.taskCall(ctx, "/tasks", model, struct {
 		proto.RunRequest

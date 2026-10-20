@@ -162,7 +162,7 @@ func TestPromptsResumeAsksAgain(t *testing.T) {
 // prompt waits the full 10 minutes; a prompt still never waits past the deadline less a minute; agentd is told when
 // each prompt opens and closes (answered, timed out, dropped) to stop the run's clock meanwhile.
 func TestPromptWaitsTenMinutesUnderTheCap(t *testing.T) {
-	start, _, err := StartFor(&proto.RunRequest{Messages: []proto.Message{{Role: "user", Content: "hi"}}}, time.Now())
+	start, _, err := StartFor(&proto.RunRequest{Space: testSpace, Messages: []proto.Message{{Role: "user", Content: "hi"}}}, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}

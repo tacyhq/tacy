@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ecdh"
+	"crypto/rand"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -21,6 +22,7 @@ import (
 	"github.com/tacyhq/tacy/agentclient"
 	"github.com/tacyhq/tacy/guard"
 	"github.com/tacyhq/tacy/proto"
+	"github.com/tacyhq/tacy/runauth"
 	"github.com/tacyhq/tacy/safety"
 )
 
@@ -69,11 +71,22 @@ func searchBody(req proto.SearchRequest) []byte {
 	return b
 }
 
-// recordedSearch is a search whose records go to priv's key, with the proof.
+// recordedSearch is a search in testSpace whose records go to priv (the space's seal key in these tests), signed by
+// testAsker's identity against the VM's key (v0.10.0), as e.recorded is for a run.
 func (e *safeEnv) recordedSearch(priv *ecdh.PrivateKey, req proto.SearchRequest) proto.SearchRequest {
-	r := e.recorded(priv, proto.RunRequest{})
-	req.RecordTo, req.RecordProof = r.RecordTo, r.RecordProof
+	a := &runauth.Asker{Space: testSpace, Seal: priv, Identity: testAsker.Identity, Key: testAsker.Key}
+	if err := a.AuthorizeSearch(&req, e.vmKey.PublicKey().Bytes()); err != nil {
+		e.t.Fatal(err)
+	}
 	return req
+}
+
+// signedSearch is req signed by testAsker for the env's VM.
+func (e *safeEnv) signedSearch(req proto.SearchRequest) []byte {
+	if err := testAsker.AuthorizeSearch(&req, e.vmKey.PublicKey().Bytes()); err != nil {
+		e.t.Fatal(err)
+	}
+	return searchBody(req)
 }
 
 // withPrompts gives the env's agentd its permission prompts, as main does (the record then names the person's answer).
@@ -157,14 +170,77 @@ func TestSearchRefusesAnythingElse(t *testing.T) {
 		"not json":     `query=q`,
 		"duplicate":    `{"query":"q","query":"other","decision":"once"}`,
 		"bad record":   `{"query":"q","decision":"once","record_to":"x25519:AAAA"}`,
+		"unsigned":     `{"query":"q","decision":"once"}`,
 	} {
 		code, evs := searchOf(t, e.s, []byte(body))
 		if code != 400 || len(evs) != 0 {
 			t.Errorf("%s: %d %s", name, code, types(evs))
 		}
 	}
+	// Signed (v0.10.0), a bad value is still refused, after the where and who.
+	for name, r := range map[string]proto.SearchRequest{
+		"empty":        {Query: "  ", Decision: "once"},
+		"bad decision": {Query: "q", Decision: "deny"},
+		"count":        {Query: "q", Decision: "once", Count: 9},
+		"long":         {Query: strings.Repeat("a", 301), Decision: "once"},
+		"tag question": {Query: "q", Decision: "once", Question: "hi 󠁁"},
+	} {
+		code, evs := searchOf(t, e.s, e.signedSearch(r))
+		if code != 400 || len(evs) != 0 {
+			t.Errorf("signed %s: %d %s", name, code, types(evs))
+		}
+	}
 	if len(e.fs.queries) != 0 || e.modelReqs.Load() != 0 {
 		t.Fatalf("something ran: %q, %d model calls", e.fs.queries, e.modelReqs.Load())
+	}
+}
+
+// v0.10.0: a search carries a run's where and who, under its own label: one signed for another VM, changed after
+// signing, replayed, or carrying a run's signature is refused at the door (400, nothing recorded, nothing out).
+func TestSearchRunAuth(t *testing.T) {
+	e := newSafeEnvWith(t, safeOpts{reader: readerAnswer})
+	e.mustPost(e.policy(1, nil), e.heartbeat())
+	priv, _ := recipientKey(t)
+	ok := e.recordedSearch(priv, proto.SearchRequest{Query: "acme quarterly results", Decision: proto.SearchOnce})
+	refused := func(why string, body []byte) {
+		t.Helper()
+		code, evs := searchOf(t, e.s, body)
+		if code != 400 || len(evs) != 0 {
+			t.Errorf("%s: %d %s", why, code, types(evs))
+		}
+	}
+	r := ok
+	r.Query = "acme quarterly results and more"
+	refused("changed after signing", searchBody(r))
+	other, _ := ecdh.X25519().GenerateKey(rand.Reader)
+	r = proto.SearchRequest{Query: "acme quarterly results", Decision: proto.SearchOnce}
+	if err := testAsker.AuthorizeSearch(&r, other.PublicKey().Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	refused("signed for another VM", searchBody(r))
+	run := e.recorded(priv, proto.RunRequest{Messages: []proto.Message{{Role: "user", Content: "acme quarterly results"}}})
+	r = ok
+	r.Nonce, r.SignedAt, r.IdentitySig = run.Nonce, run.SignedAt, run.IdentitySig
+	refused("a run's signature", searchBody(r))
+	if len(e.fs.queries) != 0 {
+		t.Fatalf("searched: %q", e.fs.queries)
+	}
+	code, evs := searchOf(t, e.s, searchBody(ok))
+	if code != 200 || evs[len(evs)-1].Type != "done" || len(e.fs.queries) != 1 {
+		t.Fatalf("the signed search: %d %s", code, types(evs))
+	}
+	// Its records are the space's: sealed to its seal key, naming the identity.
+	runs := openedActivity(t, evs, priv, e.rec.Signer.Public())
+	if len(runs) != 2 || runs[0].Space != testSpace || runs[0].Member != testAsker.Identity {
+		t.Fatalf("records: %+v", runs)
+	}
+	refused("replayed", searchBody(ok))
+	if len(e.fs.queries) != 1 {
+		t.Fatalf("the replay searched: %q", e.fs.queries)
+	}
+	// Nothing was recorded for a refused request: the space's chain holds the search's start and end.
+	if _, head, _ := e.rec.Head(testSpace, runauth.SealString(priv.PublicKey())); head.Seq != 2 {
+		t.Fatalf("chain head %d, want 2", head.Seq)
 	}
 }
 
@@ -192,7 +268,7 @@ func TestSearchPolicyAndBudgets(t *testing.T) {
 			w.Tools = []string{"web.fetch"}
 			p.Connectors["web"] = w
 		}), e.heartbeat())
-		_, evs := searchOf(t, e.s, searchBody(ok))
+		_, evs := searchOf(t, e.s, e.signedSearch(ok))
 		if er, isErr := lastError(evs); !isErr || er.Code != safety.CodePolicyDenied || len(e.fs.queries) != 0 {
 			t.Fatalf("%+v", evs)
 		}
@@ -200,7 +276,7 @@ func TestSearchPolicyAndBudgets(t *testing.T) {
 	t.Run("CappedToNever", func(t *testing.T) {
 		e := newSafeEnv(t)
 		e.mustPost(e.policy(1, func(p *safety.Policy) { p.AskCap = map[string]string{"web.search": safety.PermNever} }), e.heartbeat())
-		_, evs := searchOf(t, e.s, searchBody(ok))
+		_, evs := searchOf(t, e.s, e.signedSearch(ok))
 		if er, isErr := lastError(evs); !isErr || er.Code != "search_denied" || !strings.Contains(er.Error, "don't allow web search") ||
 			len(e.fs.queries) != 0 {
 			t.Fatalf("%+v", evs)
@@ -209,7 +285,7 @@ func TestSearchPolicyAndBudgets(t *testing.T) {
 	t.Run("RunBudget", func(t *testing.T) {
 		e := newSafeEnvWith(t, safeOpts{reader: readerAnswer})
 		e.mustPost(e.policy(1, func(p *safety.Policy) { p.Budget.Run.CostMicros = safety.SearchCost / 2 }), e.heartbeat())
-		_, evs := searchOf(t, e.s, searchBody(ok))
+		_, evs := searchOf(t, e.s, e.signedSearch(ok))
 		if er, isErr := lastError(evs); !isErr || er.Code != safety.CodeBudgetExceeded || len(e.fs.queries) != 0 || e.readerReqs.Load() != 0 {
 			t.Fatalf("%+v", evs)
 		}
@@ -218,7 +294,7 @@ func TestSearchPolicyAndBudgets(t *testing.T) {
 		e := newSafeEnv(t)
 		e.mustPost(e.policy(1, nil), e.heartbeat())
 		e.mustPost(e.stop(safety.IssuerOperator, 99, func(l *safety.StopList) { l.All = true }, e.operator))
-		_, evs := searchOf(t, e.s, searchBody(ok))
+		_, evs := searchOf(t, e.s, e.signedSearch(ok))
 		if er, isErr := lastError(evs); !isErr || er.Code != safety.CodeStopped || len(e.fs.queries) != 0 {
 			t.Fatalf("%+v", evs)
 		}
@@ -329,5 +405,58 @@ func TestSearchTokenEHBPAndSlots(t *testing.T) {
 	}
 	if c := do(); c != 200 {
 		t.Fatalf("after: %d", c)
+	}
+}
+
+// POST /pictures (v0.10.0): unsigned or replayed is refused at the door with nothing recorded; a signed one runs in
+// its proven space (a ticket from another space isn't found there: guard/pictures_test.go) and its records are that
+// space's.
+func TestPicturesRunAuth(t *testing.T) {
+	e := newSafeEnv(t)
+	e.mustPost(e.policy(1, nil), e.heartbeat())
+	priv, _ := recipientKey(t)
+	of := func(body []byte) (int, []proto.Event) {
+		t.Helper()
+		if e.s.searchSlots == nil {
+			e.s.searchRoutes(http.NewServeMux(), mustIdentity(t))
+		}
+		r := httptest.NewRequest("POST", "/pictures", bytes.NewReader(body))
+		w := httptest.NewRecorder()
+		e.s.pictures(w, r.WithContext(withUser(context.Background(), "u1")))
+		var evs []proto.Event
+		for _, line := range strings.Split(w.Body.String(), "\n") {
+			if d, ok := strings.CutPrefix(line, "data: "); ok && d != "[DONE]" {
+				var ev proto.Event
+				if err := json.Unmarshal([]byte(d), &ev); err != nil {
+					t.Fatal(err)
+				}
+				evs = append(evs, ev)
+			}
+		}
+		return w.Code, evs
+	}
+	ticket := strings.Repeat("ab", 16)
+	if code, evs := of([]byte(`{"ticket":"` + ticket + `"}`)); code != 400 || len(evs) != 0 {
+		t.Fatalf("unsigned: %d %s", code, types(evs))
+	}
+	if code, evs := of([]byte(`{"ticket":"` + ticket + `","record_to":"x25519:AAAA"}`)); code != 400 || len(evs) != 0 {
+		t.Fatalf("v0.9.0's record_to: %d %s", code, types(evs))
+	}
+	req := proto.PicturesRequest{Ticket: ticket}
+	a := &runauth.Asker{Space: testSpace, Seal: priv, Identity: testAsker.Identity, Key: testAsker.Key}
+	if err := a.AuthorizePictures(&req, e.vmKey.PublicKey().Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(req)
+	code, evs := of(body)
+	if er, isErr := lastError(evs); code != 200 || !isErr || er.Type != "error" {
+		t.Fatalf("signed, unknown ticket: %d %s", code, types(evs))
+	}
+	runs := openedActivity(t, evs, priv, e.rec.Signer.Public())
+	if len(runs) != 2 || runs[0].Space != testSpace || runs[0].Member != testAsker.Identity || runs[0].Trigger.Kind != "search" {
+		t.Fatalf("records: %+v", runs)
+	}
+	if code, evs := of(body); code != 400 || len(evs) != 0 {
+		t.Fatalf("replayed: %d %s", code, types(evs))
 	}
 }

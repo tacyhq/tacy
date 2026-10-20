@@ -211,8 +211,18 @@ func (s *server) taskStart(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, "model_mismatch: the X-Agent-Model header doesn't match the task's model")
 		return
 	}
-	id, existed, err := s.tasks().Start(r.Context(), guard.StartRequest{User: userFrom(r.Context()), Req: &req.RunRequest,
-		Key: req.Key, Via: guard.ViaTasks})
+	// Where and who (keys v2 slice 6): checked once, here; the task is made from what was verified.
+	err = s.verifyWho(&req.RunRequest, userFrom(r.Context()))
+	if err != nil && safety.CodeOf(err) == "" {
+		fail(w, 400, err.Error())
+		return
+	}
+	var id string
+	var existed bool
+	if err == nil {
+		id, existed, err = s.tasks().Start(r.Context(), guard.StartRequest{User: userFrom(r.Context()), Req: &req.RunRequest,
+			Key: req.Key, Via: guard.ViaTasks})
+	}
 	switch {
 	case errors.Is(err, guard.ErrTooMany):
 		fail(w, 429, "too_many_tasks")
@@ -222,7 +232,7 @@ func (s *server) taskStart(w http.ResponseWriter, r *http.Request) {
 		out := struct {
 			Error    string            `json:"error"`
 			Code     string            `json:"code"`
-			Activity []json.RawMessage `json:"activity,omitempty"` // the refused record, sealed to record_to
+			Activity []json.RawMessage `json:"activity,omitempty"` // the refused record, sealed to the space's seal key
 		}{Error: msg, Code: code}
 		if rg, ok := s.agent.(*recGateway); ok { // the refusal goes on the record too
 			if ev, ok := rg.Refused(&req.RunRequest, err); ok {

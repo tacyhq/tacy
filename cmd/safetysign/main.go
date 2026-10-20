@@ -6,7 +6,7 @@
 //	go run ./cmd/safetysign sign -key K policy.json    # a policy (JSON, checked first) -> signed envelope on stdout
 //	go run ./cmd/safetysign sign -key K -kind stop stop.json
 //	go run ./cmd/safetysign heartbeat -key K [-ttl 15m] [-all]   # the operator's list: seq = now in ms
-//	go run ./cmd/safetysign stop -key K -firm f_chat [-seq N] [-space s_chat | -all]   # the firm's own stop list
+//	go run ./cmd/safetysign stop -key K -firm f_chat [-seq N] [-space s_… | -all]   # the firm's own stop list
 //
 // The firm key log's entries (keys v2 slice 5): identity, x25519, keylog-genesis, keylog-sign, keylog-check
 // (keylog.go).

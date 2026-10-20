@@ -74,9 +74,14 @@ type Config struct {
 	// Carry: hashes of documents signed before the move to the key log (by a compose admin key that is now the
 	// log's recovery kit, docs/26 decision 6). Each listed document is taken as admin-signed when the log's kit signed
 	// it; nothing else the kit signs is. Only with Genesis. The release pins them, so the list is attested.
-	Carry      []string
-	Release    *Policy       // the release's ceiling and default (required)
-	MaxStopAge time.Duration // 0: DefaultMaxStopAge
+	Carry []string
+	// PersonalSpaces (the shared chat VM, keys v2 slice 6): a space without a signed policy of its own runs under the
+	// firm's policy, with the seal key its request proves and its budget counted for the relay's per-user tag
+	// (people's personal spaces, which nobody signs a policy for). Off (a firm's VM): a space runs only under a
+	// signed policy of its own that names its seal key, and only for an identity current in the firm key log.
+	PersonalSpaces bool
+	Release        *Policy       // the release's ceiling and default (required)
+	MaxStopAge     time.Duration // 0: DefaultMaxStopAge
 	// MaxSilence: with an operator key pinned, how long the newest operator list may go without being delivered
 	// again (pulled or pushed) before nothing may go out; 0: not checked (gatewayd and vaultd, which get the list
 	// from agentd, not from the pull).
@@ -669,6 +674,25 @@ type Keys struct {
 	Seq     int64  `json:"seq"`
 	Head    string `json:"head"`
 	Fork    bool   `json:"fork,omitzero"` // the VM saw two valid entries at one position and takes no signed change
+}
+
+// PersonalSpaces says whether spaces without a policy of their own may run (Config.PersonalSpaces).
+func (s *State) PersonalSpaces() bool { return s.cfg.PersonalSpaces }
+
+// CurrentIdentity says whether id is current in the firm key log at its head with Ed25519 key ed ("ed25519:…"). False
+// without a key log, or after a fork (the log can't be trusted for anything new).
+func (s *State) CurrentIdentity(id, ed string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.log == nil || s.fork != nil {
+		return false
+	}
+	st := s.log.State()
+	if st == nil {
+		return false
+	}
+	i, ok := st.Identity(id)
+	return ok && i.Revoked == 0 && i.Ed25519 == ed
 }
 
 // KeysStatus is the key log head (nil without a key log).

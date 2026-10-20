@@ -77,6 +77,9 @@ type Run struct {
 	Seq   uint64 `json:"seq"`
 	Run   string `json:"run"` // the task id
 	Space string `json:"space"`
+	// Member (start and refused) is the identity that asked for the run ("i_…", keys v2 slice 6): in a space's
+	// chain, which of its holders started each run.
+	Member string `json:"member,omitzero"`
 
 	// start and refused
 	Agent    *Agent    `json:"agent,omitzero"`

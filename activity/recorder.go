@@ -34,7 +34,8 @@ type run struct {
 type Start struct {
 	Run      string
 	Space    string
-	To       string // recipient: "x25519:<base64>"
+	To       string // recipient: "x25519:<base64>" (the space's seal key)
+	Member   string // the identity that asked for the run ("i_…"; keys v2 slice 6)
 	Agent    Agent
 	Trigger  Trigger
 	Controls *Controls
@@ -128,7 +129,7 @@ func (r *Recorder) Begin(s Start) (Sealed, error) {
 		s.Started = r.now()
 	}
 	chain := ChainID(s.Space, s.To)
-	body := &Run{Event: EventStart, Run: s.Run, Space: s.Space, Agent: &s.Agent, Trigger: &s.Trigger, Controls: s.Controls,
+	body := &Run{Event: EventStart, Run: s.Run, Space: s.Space, Member: s.Member, Agent: &s.Agent, Trigger: &s.Trigger, Controls: s.Controls,
 		Models: s.Models, Tools: s.Tools, Limits: &s.Limits, Input: &s.Input, Started: s.Started}
 	open := &OpenRun{Run: s.Run, Space: s.Space, To: s.To, Started: s.Started}
 	rec, seq, err := r.append(chain, s.To, body, open, "")
@@ -232,7 +233,7 @@ func (r *Recorder) Refused(s Start, st Status) (Sealed, error) {
 	}
 	now := r.now()
 	st.State = "refused"
-	body := &Run{Event: EventRefused, Run: s.Run, Space: s.Space, Agent: &s.Agent, Trigger: &s.Trigger, Controls: s.Controls,
+	body := &Run{Event: EventRefused, Run: s.Run, Space: s.Space, Member: s.Member, Agent: &s.Agent, Trigger: &s.Trigger, Controls: s.Controls,
 		Models: s.Models, Tools: s.Tools, Input: &s.Input, Started: now, Ended: now, Status: &st}
 	rec, _, err := r.append(ChainID(s.Space, s.To), s.To, body, nil, "")
 	return rec, err

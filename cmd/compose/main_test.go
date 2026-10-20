@@ -481,6 +481,9 @@ func TestTrustArgs(t *testing.T) {
 		!strings.Contains(logged, "-operator-key "+operatorKey) {
 		t.Errorf("with a genesis: %s", logged)
 	}
+	if !strings.Contains(legacy, "-personal-spaces") || !strings.Contains(logged, "-personal-spaces") {
+		t.Error("f_chat's VM is the shared chat VM: people's personal spaces run there")
+	}
 	if keylogCarry != safety.ChatPolicyV1+","+safety.ChatPolicyV2 || !strings.HasPrefix(safety.ChatPolicyV2, "b1cf194b") {
 		t.Error("the carried documents are the two chat policies the old admin key signed (v2 in force)")
 	}

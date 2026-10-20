@@ -1,6 +1,8 @@
 package safety
 
 import (
+	"bytes"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"regexp"
@@ -37,6 +39,11 @@ type Policy struct {
 	// "always", which caps nothing). A person's setting above the cap is lowered to it: a firm can make its members
 	// be asked every time, or turn a kind off. Unnamed kinds aren't capped.
 	AskCap map[string]string `json:"ask_cap,omitzero"`
+	// Seal is the space's seal public key ("x25519:<base64>"; space policies only, keys v2 slice 6): a run in the
+	// space must prove it holds the private half (runauth), and its activity records are sealed to it. A space key
+	// rotation makes a new seal key, so the space's holders sign a new policy naming it. On a firm's VM (not the
+	// shared chat VM) a space can't run without a signed policy naming its seal key.
+	Seal string `json:"seal,omitzero"`
 }
 
 // Permission settings, from the most open to the narrowest.
@@ -75,10 +82,14 @@ type Connector struct {
 	Fetch []string `json:"fetch,omitzero"`
 }
 
-// Budgets: per run (task) and per space per UTC day. Zero fields add no limit of their own.
+// Budgets: per run (task), per space per UTC day, per member per UTC day (all the member's spaces together) and for
+// the whole VM per UTC day. Zero fields add no limit of their own. A member is a firm's identity, or on the shared chat
+// VM the relay's daily per-user tag (proto.Verified.Member).
 type Budgets struct {
-	Run Limits `json:"run"`
-	Day Limits `json:"day"`
+	Run    Limits `json:"run"`
+	Day    Limits `json:"day"`
+	Member Limits `json:"member,omitzero"`
+	VM     Limits `json:"vm,omitzero"`
 }
 
 // Limits of one budget.
@@ -125,6 +136,13 @@ func validHost(s string) bool {
 	return true
 }
 
+// validSeal: "x25519:<base64 of 32 bytes>" in its one canonical spelling, not all zero.
+func validSeal(s string) bool {
+	raw, ok := strings.CutPrefix(s, "x25519:")
+	b, err := base64.StdEncoding.Strict().DecodeString(raw)
+	return ok && err == nil && len(b) == 32 && base64.StdEncoding.EncodeToString(b) == raw && !bytes.Equal(b, make([]byte, 32))
+}
+
 func validPattern(s string) bool {
 	if s == "*" {
 		return true
@@ -139,6 +157,10 @@ func (p *Policy) Validate() error {
 		return errors.New("policy: type must be " + PolicyType)
 	case !ValidID(p.Firm) || p.Space != "" && !ValidID(p.Space):
 		return errors.New("policy: bad firm or space id")
+	case p.Seal != "" && p.Space == "":
+		return errors.New("policy: only a space's policy names a seal key")
+	case p.Seal != "" && !validSeal(p.Seal):
+		return errors.New("policy: bad seal key")
 	case p.Version == 0:
 		return errors.New("policy: version must be at least 1")
 	case p.IssuedAt.IsZero():
@@ -184,7 +206,7 @@ func (p *Policy) Validate() error {
 			return fmt.Errorf("policy: bad ask_cap %q: %q", k, v)
 		}
 	}
-	for _, l := range []Limits{p.Budget.Run, p.Budget.Day} {
+	for _, l := range []Limits{p.Budget.Run, p.Budget.Day, p.Budget.Member, p.Budget.VM} {
 		if l.Tokens < 0 || l.ToolCalls < 0 || l.WallSeconds < 0 || l.CostMicros < 0 {
 			return errors.New("policy: negative budget")
 		}
@@ -292,8 +314,19 @@ func (e *Effective) Budget() Budgets {
 	var b Budgets
 	for _, p := range e.Layers {
 		b.Run, b.Day = minLimits(b.Run, p.Budget.Run), minLimits(b.Day, p.Budget.Day)
+		b.Member, b.VM = minLimits(b.Member, p.Budget.Member), minLimits(b.VM, p.Budget.VM)
 	}
 	return b
+}
+
+// Seal is the seal key the space's own signed policy names ("": none).
+func (e *Effective) Seal() string {
+	for _, p := range e.Layers {
+		if p.Space != "" && p.Seal != "" {
+			return p.Seal
+		}
+	}
+	return ""
 }
 
 func minRate(a, b Rate) Rate {
@@ -366,7 +399,7 @@ func Widens(old, p *Policy) bool {
 		return true
 	}
 	looser := func(o, n int64) bool { return o > 0 && (n <= 0 || n > o) }
-	for _, l := range [][2]Limits{{old.Budget.Run, p.Budget.Run}, {old.Budget.Day, p.Budget.Day}} {
+	for _, l := range [][2]Limits{{old.Budget.Run, p.Budget.Run}, {old.Budget.Day, p.Budget.Day}, {old.Budget.Member, p.Budget.Member}, {old.Budget.VM, p.Budget.VM}} {
 		o, n := l[0], l[1]
 		if looser(o.Tokens, n.Tokens) || looser(o.ToolCalls, n.ToolCalls) || looser(o.WallSeconds, n.WallSeconds) || looser(o.CostMicros, n.CostMicros) {
 			return true

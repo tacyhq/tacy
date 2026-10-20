@@ -101,8 +101,13 @@ type TaskOptions struct {
 	CacheSecret     string `json:"cache_secret,omitzero"`     // scopes Tinfoil's prompt cache (user_cache_secret); "": the guard's per-boot one
 	User            string `json:"user,omitzero"`             // whose tool caps (the relay's opaque X-Agent-User tag)
 	Space           string `json:"space,omitzero"`            // the task's space: whose policy, stop and rates apply
-	// RecordTo is who the run's activity record is sealed to ("x25519:<base64>", docs/24); "": not recorded.
+	// RecordTo is who the run's activity record is sealed to: the space's seal key ("x25519:<base64>", docs/24 and
+	// docs/26 section 6, from proto.Verified); "": not recorded.
 	RecordTo string `json:"record_to,omitzero"`
+	// Identity is who asked for the run ("i_…", proven by its signature); Member whose member budget it uses (the
+	// identity on a firm's VM, the relay's daily per-user tag on the shared chat VM). Keys v2 slice 6.
+	Identity string `json:"identity,omitzero"`
+	Member   string `json:"member,omitzero"`
 	// Via is how the task was started: ViaRun (POST /run's shim) or ViaTasks (POST /tasks); see tasks.go.
 	Via string `json:"via,omitzero"`
 	// Question is the person's last message (capped): what the quarantined reader reads each source for.
@@ -536,7 +541,17 @@ func startFor(r *proto.RunRequest, now time.Time, reader bool) (harness.Start, T
 	if err := checkPermissions(r.Permissions); err != nil {
 		return s, TaskOptions{}, err
 	}
-	s.Space, s.Attempt, s.Agent = "s_chat", 1, chatAgent
+	// The run's space (keys v2 slice 6): the one agentd verified (runauth), or as the request names it for a guard
+	// that runs alone (local development and tests: nothing is recorded there). No default: every run names one.
+	switch {
+	case r.Verified != nil:
+		s.Space = r.Verified.Space
+	case r.Space != "":
+		s.Space = r.Space
+	default:
+		return s, TaskOptions{}, fmt.Errorf("the request names no space")
+	}
+	s.Attempt, s.Agent = 1, chatAgent
 	// One date, the person's: the chat's system note states today in the browser's time zone ("Today is Friday,
 	// October 16, 2026."). The VM's own UTC date said "tomorrow" late in a US evening, and an answer called
 	// yesterday's event "two days ago" (2026-10-16). A request without such a note (cmd/client, an older tab)

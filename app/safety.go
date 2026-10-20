@@ -27,12 +27,13 @@ import (
 // Step 6 on the runtime's side (docs/23-safety-controls.md). agentd checks every task and every brain request
 // against the signed controls it verified itself before the guard sees them:
 //   - admission: the space isn't stopped, a policy covers it (when admin keys are pinned), the model is allowed,
-//     the day's budget isn't used up; the policy narrows the task's tools and its deadline;
+//     the space's, the member's and the VM's day budgets aren't used up; the policy narrows the task's tools and its
+//     deadline;
 //   - running time: a run ends when its running time reaches the run's limit (the policy's run wall_seconds, at
 //     most the release's 5 minutes); time it only waits for its person (a permission prompt) doesn't count (watch);
-//   - budgets: each model call and action reserves what it may use from the run's and the space's day budget,
-//     under one lock, before it runs (parallel requests can't each see room only one has), then commits what it
-//     used;
+//   - budgets: each model call and action reserves what it may use from the run's budget and the space's, the
+//     member's and the VM's day budgets, under one lock, before it runs (parallel requests can't each see room only
+//     one has), then commits what it used;
 //   - the kill switch: when a stop list stops a running task's space, or the operator's list goes stale or silent
 //     (nothing goes out then, safety.State.Check), the task is cancelled ("kill_switch") within seconds;
 //   - people see why (proto.Event.Code) and which policy the run started under (meta.controls).
@@ -57,6 +58,7 @@ type safeGateway struct {
 
 type safeTask struct {
 	space     string
+	member    string // whose member budget (guard.TaskOptions.Member)
 	code, msg string // the first control that refused something (Why)
 	timer     *time.Timer
 	timedOut  bool // watch cancelled it: its running time reached the release's limit (TimedOut)
@@ -95,7 +97,12 @@ func coded(err error) (string, string) {
 // out (the model never sees them); the deadline (the run's overall cap, guard.RunCap) is moved earlier when the
 // day's running time has less left. The run's own running-time limit isn't a deadline: watch enforces it.
 func (g *safeGateway) StartFor(r *proto.RunRequest) (harness.Start, guard.TaskOptions, error) {
-	const space = "s_chat" // guard.StartFor's (one space until step 8)
+	// The space and member agentd verified (recGateway.Verify, keys v2 slice 6): whose stops, policy and budgets.
+	v := r.Verified
+	if v == nil {
+		return harness.Start{}, guard.TaskOptions{}, errors.New("the request's space and identity aren't verified")
+	}
+	space := v.Space
 	g.waitFirstHeard()
 	e, err := g.st.Check(space, false)
 	if err != nil {
@@ -128,7 +135,7 @@ func (g *safeGateway) StartFor(r *proto.RunRequest) (harness.Start, guard.TaskOp
 		}
 	}
 	r.Tools = tools
-	end, err := g.ledger.Admit(space, e.Budget())
+	end, err := g.ledger.Admit(space, v.Member, e.Budget())
 	if err != nil {
 		return harness.Start{}, guard.TaskOptions{}, err
 	}
@@ -139,6 +146,7 @@ func (g *safeGateway) StartFor(r *proto.RunRequest) (harness.Start, guard.TaskOp
 	if start.Space != space {
 		return start, opts, errors.New("safety: unexpected space")
 	}
+	opts.Identity, opts.Member = v.Identity, v.Member
 	if d, err := time.Parse(time.RFC3339, start.Limits.Deadline); err == nil && !end.IsZero() && end.Before(d) {
 		start.Limits.Deadline = end.UTC().Format(time.RFC3339)
 	}
@@ -149,7 +157,12 @@ func (g *safeGateway) StartFor(r *proto.RunRequest) (harness.Start, guard.TaskOp
 // search not allowed and a used-up day are refused (*safety.Error), as a run's start; the deadline moves earlier
 // when the day's running time has less left. Its budget is reserved with its one action (Action), as any search's.
 func (g *safeGateway) StartSearch(r *proto.SearchRequest) (harness.Start, guard.TaskOptions, []byte, error) {
-	const space = "s_chat"
+	// The space and member agentd verified (recGateway.VerifySearch, v0.10.0): whose stops, policy and budgets.
+	v := r.Verified
+	if v == nil {
+		return harness.Start{}, guard.TaskOptions{}, nil, errors.New("the request's space and identity aren't verified")
+	}
+	space := v.Space
 	g.waitFirstHeard()
 	e, err := g.st.Check(space, false)
 	if err != nil {
@@ -158,7 +171,7 @@ func (g *safeGateway) StartSearch(r *proto.SearchRequest) (harness.Start, guard.
 	if !e.AllowsTool("web.search") {
 		return harness.Start{}, guard.TaskOptions{}, nil, &safety.Error{Code: safety.CodePolicyDenied, Msg: "web search isn't allowed by the policy"}
 	}
-	end, err := g.ledger.Admit(space, e.Budget())
+	end, err := g.ledger.Admit(space, v.Member, e.Budget())
 	if err != nil {
 		return harness.Start{}, guard.TaskOptions{}, nil, err
 	}
@@ -166,6 +179,10 @@ func (g *safeGateway) StartSearch(r *proto.SearchRequest) (harness.Start, guard.
 	if err != nil {
 		return start, opts, nil, err
 	}
+	if start.Space != space {
+		return start, opts, nil, errors.New("safety: unexpected space")
+	}
+	opts.Identity, opts.Member = v.Identity, v.Member
 	if d, err := time.Parse(time.RFC3339, start.Limits.Deadline); err == nil && !end.IsZero() && end.Before(d) {
 		start.Limits.Deadline = end.UTC().Format(time.RFC3339)
 	}
@@ -175,7 +192,12 @@ func (g *safeGateway) StartSearch(r *proto.SearchRequest) (harness.Start, guard.
 // StartPictures applies the policy to a pictures request (POST /pictures, guard.PicturesStart) as StartSearch does
 // to a search: stopped, no policy, image search not allowed and a used-up day are refused.
 func (g *safeGateway) StartPictures(r *proto.PicturesRequest) (harness.Start, guard.TaskOptions, []byte, error) {
-	const space = "s_chat"
+	// The space and member agentd verified (recGateway.VerifyPictures, v0.10.0): whose stops, policy and budgets.
+	v := r.Verified
+	if v == nil {
+		return harness.Start{}, guard.TaskOptions{}, nil, errors.New("the request's space and identity aren't verified")
+	}
+	space := v.Space
 	g.waitFirstHeard()
 	e, err := g.st.Check(space, false)
 	if err != nil {
@@ -184,7 +206,7 @@ func (g *safeGateway) StartPictures(r *proto.PicturesRequest) (harness.Start, gu
 	if !e.AllowsTool("web.images") {
 		return harness.Start{}, guard.TaskOptions{}, nil, &safety.Error{Code: safety.CodePolicyDenied, Msg: "image search isn't allowed by the policy"}
 	}
-	end, err := g.ledger.Admit(space, e.Budget())
+	end, err := g.ledger.Admit(space, v.Member, e.Budget())
 	if err != nil {
 		return harness.Start{}, guard.TaskOptions{}, nil, err
 	}
@@ -192,6 +214,10 @@ func (g *safeGateway) StartPictures(r *proto.PicturesRequest) (harness.Start, gu
 	if err != nil {
 		return start, opts, nil, err
 	}
+	if start.Space != space {
+		return start, opts, nil, errors.New("safety: unexpected space")
+	}
+	opts.Identity, opts.Member = v.Identity, v.Member
 	if d, err := time.Parse(time.RFC3339, start.Limits.Deadline); err == nil && !end.IsZero() && end.Before(d) {
 		start.Limits.Deadline = end.UTC().Format(time.RFC3339)
 	}
@@ -212,9 +238,9 @@ func (g *safeGateway) waitFirstHeard() {
 
 // Open registers the task (budgets, kill switch) and wraps its session (meta carries the controls).
 func (g *safeGateway) Open(id string, opts guard.TaskOptions, emit func(proto.Event) error) guard.Session {
-	g.ledger.Begin(id, opts.Space)
+	g.ledger.Begin(id, opts.Space, opts.Member)
 	g.mu.Lock()
-	g.tasks[id] = &safeTask{space: opts.Space}
+	g.tasks[id] = &safeTask{space: opts.Space, member: opts.Member}
 	g.mu.Unlock()
 	g.watch(id)
 	return &safeSession{Session: g.inner.Open(id, opts, emit), g: g, id: id, space: opts.Space}
@@ -351,8 +377,8 @@ func (g *safeGateway) Why(task string) (string, string) {
 	}
 	b := e.Budget()
 	runOut := b.Run.WallSeconds > 0 && time.Duration(b.Run.WallSeconds)*time.Second < g.releaseLimit() && el >= time.Duration(b.Run.WallSeconds)*time.Second
-	_, dayErr := g.ledger.Admit(t.space, b)
-	if runOut || b.Day.WallSeconds > 0 && dayErr != nil {
+	_, dayErr := g.ledger.Admit(t.space, t.member, b)
+	if runOut || (b.Day.WallSeconds > 0 || b.Member.WallSeconds > 0 || b.VM.WallSeconds > 0) && dayErr != nil {
 		return coded(&safety.Error{Code: safety.CodeBudgetExceeded, Msg: "running time"})
 	}
 	return "", ""
@@ -537,7 +563,7 @@ var _ guard.TaskResumer = (*safeGateway)(nil)
 // counts against its run budget again, and its running time counts from when it started. Without it a restart would
 // hand a task a fresh budget. The session it then opens registers it for the kill switch, as any task.
 func (g *safeGateway) ResumeTask(task string, start *harness.Start, opts guard.TaskOptions, started time.Time, journal []harness.Record) {
-	g.ledger.Resume(task, cmp.Or(opts.Space, start.Space), started, journalUsage(journal))
+	g.ledger.Resume(task, cmp.Or(opts.Space, start.Space), opts.Member, started, journalUsage(journal))
 }
 
 // journalUsage is what a task's journal shows it used, counted as the checks above count it: each model call by
@@ -668,7 +694,7 @@ func (s *server) safetyIn(w http.ResponseWriter, r *http.Request) {
 	out := struct {
 		Results []string      `json:"results"` // "ok" or why it was refused, per document
 		Status  safety.Status `json:"status"`
-	}{Status: s.safety.StatusOf("s_chat")}
+	}{Status: s.safety.StatusOf("")} // the firm's: spaces are people's own
 	for _, e := range errs {
 		if e == nil {
 			out.Results = append(out.Results, "ok")

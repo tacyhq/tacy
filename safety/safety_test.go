@@ -1,9 +1,12 @@
 package safety
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json/v2"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -510,7 +513,7 @@ func TestThreshold(t *testing.T) {
 func TestBudgetParallelEvasion(t *testing.T) {
 	l := &Ledger{}
 	b := Budgets{Run: Limits{ToolCalls: 5, Tokens: 10_000}, Day: Limits{ToolCalls: 7}}
-	if _, err := l.Start("t1", "s_a", b); err != nil {
+	if _, err := l.Start("t1", "s_a", "m1", b); err != nil {
 		t.Fatal(err)
 	}
 	var ok atomic.Int32
@@ -534,7 +537,7 @@ func TestBudgetParallelEvasion(t *testing.T) {
 		t.Fatalf("%d tool calls ran in parallel, budget 5", ok.Load())
 	}
 	// The day budget spans runs: a second run gets the 2 left.
-	l.Start("t2", "s_a", b)
+	l.Start("t2", "s_a", "m1", b)
 	n := 0
 	for range 5 {
 		if c, err := l.Reserve("t2", Usage{ToolCalls: 1}, b); err == nil {
@@ -547,13 +550,13 @@ func TestBudgetParallelEvasion(t *testing.T) {
 	}
 	l.End("t1")
 	l.End("t2")
-	l.Start("t3", "s_a", b)
+	l.Start("t3", "s_a", "m1", b)
 	if _, err := l.Reserve("t3", Usage{ToolCalls: 1}, b); CodeOf(err) != CodeBudgetExceeded {
 		t.Fatalf("the day's tool calls are used up: %v", err)
 	}
 	// Reservations count while they run: two model calls that each fit alone don't both start.
 	l2 := &Ledger{}
-	l2.Start("t", "s", b)
+	l2.Start("t", "s", "m1", b)
 	c1, err := l2.Reserve("t", Usage{Tokens: 6000}, b)
 	if err != nil {
 		t.Fatal(err)
@@ -575,7 +578,7 @@ func TestBudgetWallAndPersist(t *testing.T) {
 	dir := t.TempDir()
 	l := &Ledger{Dir: dir, Now: func() time.Time { return now }}
 	b := Budgets{Run: Limits{WallSeconds: 60}, Day: Limits{WallSeconds: 100, Tokens: 1000}}
-	end, err := l.Start("t1", "s_a", b)
+	end, err := l.Start("t1", "s_a", "m1", b)
 	if err != nil || !end.Equal(t0.Add(100*time.Second)) { // the day's: the run's own isn't a fixed end (v0.8.1)
 		t.Fatalf("deadline %v %v", end, err)
 	}
@@ -588,7 +591,7 @@ func TestBudgetWallAndPersist(t *testing.T) {
 	l.End("t1")
 	// Restarted: the day's tokens and time are still counted.
 	l2 := &Ledger{Dir: dir, Now: func() time.Time { return now }}
-	end, err = l2.Start("t2", "s_a", b)
+	end, err = l2.Start("t2", "s_a", "m1", b)
 	if err != nil || !end.Equal(now.Add(39*time.Second)) {
 		t.Fatalf("second run: deadline %v (want 39 s left of the day), %v", end, err)
 	}
@@ -597,7 +600,7 @@ func TestBudgetWallAndPersist(t *testing.T) {
 	}
 	c2, _ := l2.Reserve("t2", Usage{Tokens: 100}, b)
 	c2(Usage{Tokens: 100})
-	if _, err := l2.Start("t3", "s_a", b); CodeOf(err) != CodeBudgetExceeded {
+	if _, err := l2.Start("t3", "s_a", "m1", b); CodeOf(err) != CodeBudgetExceeded {
 		t.Fatalf("a new run must be refused once the day's tokens are used up: %v", err)
 	}
 	if ModelCost("gpt-oss-120b", 1_000_000, 1_000_000) != 750_000 || ModelCost("unknown", 1, 0) != 4 {
@@ -612,7 +615,7 @@ func TestBudgetWaitingForThePerson(t *testing.T) {
 	now := t0
 	l := &Ledger{Now: func() time.Time { return now }}
 	b := Budgets{Run: Limits{WallSeconds: 60}, Day: Limits{WallSeconds: 1000}}
-	if _, err := l.Start("t1", "s_a", b); err != nil {
+	if _, err := l.Start("t1", "s_a", "m1", b); err != nil {
 		t.Fatal(err)
 	}
 	el := func(want time.Duration) {
@@ -744,5 +747,149 @@ func TestPermissionCap(t *testing.T) {
 	bad.AskCap = map[string]string{"Web Search": PermAsk}
 	if bad.Validate() == nil {
 		t.Error("a bad ask_cap kind was accepted")
+	}
+}
+
+// Keys v2 slice 6: the member's and the VM's day budgets (docs/26 section 7). A member's runs count together in
+// every space, so a new space gets no new budget; parallel runs of one member in many spaces can't each see room
+// only one has; one member using up their day leaves the others theirs, until the VM's day is used up for all.
+func TestBudgetPerMemberAndVM(t *testing.T) {
+	now := t0
+	dir := t.TempDir()
+	l := &Ledger{Dir: dir, Now: func() time.Time { return now }}
+	b := Budgets{Run: Limits{ToolCalls: 100}, Day: Limits{ToolCalls: 100}, Member: Limits{ToolCalls: 10}, VM: Limits{ToolCalls: 25}}
+	// m1 runs in 20 spaces at once (each a fresh s_ id), every run sending 5 tool calls in parallel.
+	var ok atomic.Int32
+	var wg sync.WaitGroup
+	for i := range 20 {
+		task, space := fmt.Sprintf("a%d", i), fmt.Sprintf("s_m1space%d", i)
+		if _, err := l.Start(task, space, "m1", b); err != nil {
+			t.Fatal(err)
+		}
+		for range 5 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				commit, err := l.Reserve(task, Usage{ToolCalls: 1}, b)
+				if err == nil {
+					ok.Add(1)
+					commit(Usage{ToolCalls: 1})
+				} else if CodeOf(err) != CodeBudgetExceeded || !strings.Contains(err.Error(), "member's daily") {
+					t.Error(err)
+				}
+			}()
+		}
+	}
+	wg.Wait()
+	if ok.Load() != 10 {
+		t.Fatalf("member m1 ran %d tool calls across new spaces, budget 10", ok.Load())
+	}
+	// Another new space: its tool calls are refused too (used-up tool calls refuse tool calls, not the run).
+	refused := func(l *Ledger, task, space, member, why string) {
+		t.Helper()
+		if _, err := l.Start(task, space, member, b); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := l.Reserve(task, Usage{ToolCalls: 1}, b); CodeOf(err) != CodeBudgetExceeded || !strings.Contains(err.Error(), why) {
+			t.Fatalf("%s in %s: %v, want the %s budget", member, space, err, why)
+		}
+	}
+	refused(l, "a-new", "s_m1another", "m1", "member's daily")
+	// Others still have theirs, until the VM's day (25) is used up for everyone.
+	n := 0
+	for i, m := range []string{"m2", "m3"} {
+		task := fmt.Sprintf("b%d", i)
+		if _, err := l.Start(task, "s_shared", m, b); err != nil {
+			t.Fatal(err)
+		}
+		for range 10 {
+			if c, err := l.Reserve(task, Usage{ToolCalls: 1}, b); err == nil {
+				c(Usage{ToolCalls: 1})
+				n++
+			} else if !strings.Contains(err.Error(), "agent VM's daily") {
+				t.Fatalf("m%d: %v", i+2, err)
+			}
+		}
+	}
+	if n != 15 {
+		t.Fatalf("m2 and m3 got %d, want 15 (VM day 25, m1 used 10)", n)
+	}
+	refused(l, "c", "s_new", "m4", "agent VM's daily")
+	// Counters persist on disk (ids and counts only) and a new day starts over.
+	l2 := &Ledger{Dir: dir, Now: func() time.Time { return now }}
+	refused(l2, "d", "s_x", "m1", "member's daily")
+	now = now.Add(24 * time.Hour)
+	l2.Start("e", "s_x", "m1", b)
+	if _, err := l2.Reserve("e", Usage{ToolCalls: 1}, b); err != nil {
+		t.Fatalf("next day: %v", err)
+	}
+	// Model tokens used up: a member's new run is refused at the door, in any space.
+	bt := Budgets{Member: Limits{Tokens: 100}}
+	l2.Start("f", "s_a", "m5", bt)
+	c, _ := l2.Reserve("f", Usage{Tokens: 100}, bt)
+	c(Usage{Tokens: 100})
+	if _, err := l2.Admit("s_brand_new", "m5", bt); CodeOf(err) != CodeBudgetExceeded || !strings.Contains(err.Error(), "member's daily budget for model tokens") {
+		t.Fatalf("a new space must get no new budget: %v", err)
+	}
+	// Running time: the member's day counts runs in every space.
+	l3 := &Ledger{Now: func() time.Time { return now }}
+	bw := Budgets{Member: Limits{WallSeconds: 100}}
+	l3.Start("w1", "s_one", "m1", bw)
+	l3.Start("w2", "s_two", "m1", bw)
+	now = now.Add(60 * time.Second)
+	if _, err := l3.Admit("s_three", "m1", bw); CodeOf(err) != CodeBudgetExceeded {
+		t.Fatalf("two runs of 60 s each passed the member's 100 s: %v", err)
+	}
+	if end, err := l3.Admit("s_three", "m2", bw); err != nil || !end.Equal(now.Add(100*time.Second)) {
+		t.Fatalf("another member: %v %v", end, err)
+	}
+}
+
+// Keys v2 slice 6: a space's policy may name its seal key (a firm policy may not); the member's and the VM's day
+// budgets narrow across layers like the others, and raising or removing one widens.
+func TestPolicySealAndNewBudgets(t *testing.T) {
+	seal := "x25519:" + base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32))
+	sp := policy(1, "s_a")
+	sp.Seal = seal
+	if err := sp.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{"x25519:AAAA", "x25519:" + base64.StdEncoding.EncodeToString(make([]byte, 32)), strings.TrimSuffix(seal, "="), "ed25519:" + seal[7:]} {
+		p := policy(1, "s_a")
+		p.Seal = bad
+		if p.Validate() == nil {
+			t.Errorf("seal %q accepted", bad)
+		}
+	}
+	fp := policy(1, "")
+	fp.Seal = seal
+	if fp.Validate() == nil {
+		t.Error("a firm policy named a seal key")
+	}
+	firm := policy(1, "")
+	firm.Budget.Member, firm.Budget.VM = Limits{Tokens: 1000, ToolCalls: 5}, Limits{CostMicros: 900}
+	space := policy(1, "s_a")
+	space.Seal = seal
+	space.Budget.Member = Limits{Tokens: 400}
+	e := &Effective{Layers: []*Policy{ChatRelease("f_test", "", []string{"gpt-oss-120b"}, 300), firm, space}}
+	b := e.Budget()
+	if b.Member != (Limits{Tokens: 400, ToolCalls: 5, WallSeconds: 6 * 3600, CostMicros: 50_000_000}) || b.VM.CostMicros != 900 || b.VM.Tokens != 200_000_000 {
+		t.Fatalf("narrowed: member %+v vm %+v", b.Member, b.VM)
+	}
+	if e.Seal() != seal || (&Effective{Layers: []*Policy{firm}}).Seal() != "" {
+		t.Error("Effective.Seal")
+	}
+	up := *firm
+	up.Budget.Member = Limits{Tokens: 2000, ToolCalls: 5}
+	if !Widens(firm, &up) {
+		t.Error("a raised member budget doesn't widen")
+	}
+	up.Budget.Member, up.Budget.VM = firm.Budget.Member, Limits{}
+	if !Widens(firm, &up) {
+		t.Error("a removed VM budget doesn't widen")
+	}
+	up.Budget.VM = Limits{CostMicros: 800}
+	if Widens(firm, &up) {
+		t.Error("a lowered VM budget widens")
 	}
 }

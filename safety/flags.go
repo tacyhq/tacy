@@ -14,6 +14,7 @@ type Flags struct {
 	Threshold              int
 	Genesis, Carry         string
 	MaxStopAge             time.Duration
+	PersonalSpaces         bool
 }
 
 // Register adds the flags to fs.
@@ -25,11 +26,13 @@ func (f *Flags) Register(fs *flag.FlagSet) {
 	fs.StringVar(&f.Genesis, "keylog-genesis", "", "the firm key log's genesis hash (64 hex): admin signers come from the log (not with -admin-keys)")
 	fs.StringVar(&f.Carry, "keylog-carry", "", "hashes of documents signed before the key log, by the key that is now its recovery kit, comma-separated")
 	fs.DurationVar(&f.MaxStopAge, "stop-max-age", DefaultMaxStopAge, "how old the newest operator stop list may get")
+	fs.BoolVar(&f.PersonalSpaces, "personal-spaces", false, "the shared chat VM: spaces without a signed policy of their own run under the firm's, with the seal key their request proves")
 }
 
 // Config makes the State config with the release's ceiling and where to persist ("" for memory).
 func (f *Flags) Config(release *Policy, dir string) (Config, error) {
-	c := Config{Firm: f.Firm, Threshold: f.Threshold, Release: release, MaxStopAge: f.MaxStopAge, Dir: dir, Genesis: f.Genesis}
+	c := Config{Firm: f.Firm, Threshold: f.Threshold, Release: release, MaxStopAge: f.MaxStopAge, Dir: dir, Genesis: f.Genesis,
+		PersonalSpaces: f.PersonalSpaces}
 	for _, h := range strings.Split(f.Carry, ",") {
 		if h = strings.TrimSpace(h); h != "" {
 			c.Carry = append(c.Carry, h)

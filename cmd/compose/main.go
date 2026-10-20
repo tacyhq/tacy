@@ -169,10 +169,18 @@ const (
 // safetyArgs are the trust-root flags every guard process gets.
 func safetyArgs() []string { return trustArgs(adminKeys, keylogGenesis, keylogCarry) }
 
+// personalSpaces: f_chat's VM is the shared chat VM (keys v2 slice 6, docs/26 section 7): people's personal spaces
+// run under the firm's policy with the seal key their request proves, and member budgets count per the relay's
+// daily per-user tag. A firm's own VM leaves it off: a space there runs only under its own signed policy.
+const personalSpaces = true
+
 // trustArgs: the firm, the operator key, and either the admin keys or the key log genesis (with the carried
-// documents), never both.
+// documents), never both; and whether people's personal spaces run here.
 func trustArgs(admins, genesis, carry string) []string {
 	a := []string{"-firm", safetyFirm}
+	if personalSpaces {
+		a = append(a, "-personal-spaces")
+	}
 	if operatorKey != "" {
 		a = append(a, "-operator-key", operatorKey)
 	}

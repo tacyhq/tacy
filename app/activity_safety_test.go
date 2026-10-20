@@ -169,7 +169,7 @@ func TestActivityKeylessReleaseOnTheRecord(t *testing.T) {
 	priv, _ := recipientKey(t)
 	evs := runParity(t, e.s, e.recorded(priv, proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("hello")}))
 	runs := openedActivity(t, evs, priv, e.rec.Signer.Public())
-	rel := e.s.safety.StatusOf("s_chat").Release
+	rel := e.s.safety.StatusOf(testSpace).Release
 	if len(runs) != 2 || runs[1].Status.State != "succeeded" || runs[0].Controls == nil || rel == "" || runs[0].Controls.ReleasePolicy != rel {
 		t.Fatalf("keyless: %+v (release %q)", runs, rel)
 	}

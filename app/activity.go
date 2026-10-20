@@ -19,6 +19,7 @@ import (
 	"github.com/tacyhq/tacy/guard"
 	"github.com/tacyhq/tacy/harness"
 	"github.com/tacyhq/tacy/proto"
+	"github.com/tacyhq/tacy/runauth"
 	"github.com/tacyhq/tacy/safety"
 )
 
@@ -37,9 +38,12 @@ const recordKeep = 30 * 24 * time.Hour
 type recGateway struct {
 	*safeGateway
 	rec *activity.Recorder
-	// vmKey is this boot's EHBP private key: a run's record_to must come with a proof made against it
-	// (activity.RecordProof), so nobody can open records in, or read the length of, a chain whose key they don't hold.
+	// vmKey is this boot's EHBP private key: a run's space and seal key must come with a proof made against it
+	// (runauth.SpaceProof), so nobody can open records in, or read the length of, a chain whose key they don't hold,
+	// and its identity's signature covers it, so a request can't be replayed to another boot.
 	vmKey *ecdh.PrivateKey
+	// nonces this boot took (Verify): a request runs at most once.
+	nonces *runauth.Nonces
 
 	mu    sync.Mutex
 	bg    map[string]guard.FactsData // site icons' egress per task, from the session's End
@@ -59,51 +63,100 @@ var (
 )
 
 func newRecGateway(sg *safeGateway, rec *activity.Recorder, vmKey *ecdh.PrivateKey) *recGateway {
-	return &recGateway{safeGateway: sg, rec: rec, vmKey: vmKey, bg: map[string]guard.FactsData{}}
+	return &recGateway{safeGateway: sg, rec: rec, vmKey: vmKey, bg: map[string]guard.FactsData{}, nonces: &runauth.Nonces{}}
 }
 
-// StartFor: the safety checks, then the recipient of the run's record into its options.
-func (g *recGateway) StartFor(r *proto.RunRequest) (harness.Start, guard.TaskOptions, error) {
-	if r.RecordTo != "" {
-		if _, err := activity.ParseRecipient(r.RecordTo); err != nil {
-			return harness.Start{}, guard.TaskOptions{}, errors.New("record_to must be an x25519 public key")
-		}
-		if g.vmKey == nil || activity.CheckRecordProof(g.vmKey, r.RecordTo, r.RecordProof) != nil {
-			return harness.Start{}, guard.TaskOptions{}, errors.New("record_to needs a valid record_proof")
-		}
+// Verify checks a request's where and who once, when it arrives (keys v2 slice 6, docs/26 section 6; package
+// runauth), and notes what it verified in r.Verified, which StartFor then requires: the space proof and the identity's
+// signature against this boot's attested key (so the request can't be replayed to another boot), the time, and the
+// nonce, claimed here (so it runs at most once on this one). On a firm's VM the seal key must be the one the space's
+// own signed policy names and the identity must be current in the firm key log with that key: the identity is then
+// whose member budget the run uses. On the shared chat VM (State.PersonalSpaces) people's personal spaces have no
+// signed policy: the seal key is the one the request proves, and the member budget is the relay's daily per-user tag
+// user (accounts are free to make; only the relay knows who is who). Errors are plain (400): nothing was recorded.
+func (g *recGateway) Verify(r *proto.RunRequest, user string) error {
+	v, err := g.verify(func(vm *ecdh.PrivateKey) (runauth.Who, error) { return runauth.Check(vm, r, time.Now()) }, r.Nonce, r.SignedAt, user)
+	if err == nil {
+		r.Verified = v
 	}
+	return err
+}
+
+// VerifySearch is Verify for a plain chat's search (POST /search; v0.10.0): its own label and digest, the same
+// space, identity and nonce checks, so a search is no unsigned way in and lands in the space's chain.
+func (g *recGateway) VerifySearch(r *proto.SearchRequest, user string) error {
+	v, err := g.verify(func(vm *ecdh.PrivateKey) (runauth.Who, error) { return runauth.CheckSearch(vm, r, time.Now()) }, r.Nonce, r.SignedAt, user)
+	if err == nil {
+		r.Verified = v
+	}
+	return err
+}
+
+// VerifyPictures is Verify for an answer's held-back pictures (POST /pictures; v0.10.0). The ticket is then good
+// only in the space its run was in (guard/pictures.go takePictures).
+func (g *recGateway) VerifyPictures(r *proto.PicturesRequest, user string) error {
+	v, err := g.verify(func(vm *ecdh.PrivateKey) (runauth.Who, error) { return runauth.CheckPictures(vm, r, time.Now()) }, r.Nonce, r.SignedAt, user)
+	if err == nil {
+		r.Verified = v
+	}
+	return err
+}
+
+// verify is Verify's checks for any kind of request: check is its runauth check against this boot's key.
+func (g *recGateway) verify(check func(vm *ecdh.PrivateKey) (runauth.Who, error), nonce string, signedAt int64, user string) (*proto.Verified, error) {
+	if g.vmKey == nil {
+		return nil, errors.New("this VM can't check a request's space proof")
+	}
+	who, err := check(g.vmKey)
+	if err != nil {
+		return nil, err
+	}
+	v := &proto.Verified{Space: who.Space, Seal: who.Seal, Identity: who.Identity, Member: user}
+	if !g.st.PersonalSpaces() {
+		e, err := g.st.Policy(who.Space)
+		switch {
+		case err != nil:
+			return nil, err
+		case e.Seal() == "":
+			return nil, &safety.Error{Code: safety.CodePolicyMissing, Msg: "no signed policy names this space's seal key"}
+		case e.Seal() != who.Seal:
+			return nil, &safety.Error{Code: safety.CodePolicyDenied, Msg: "the space's seal key isn't the one its signed policy names"}
+		case !g.st.CurrentIdentity(who.Identity, who.Key):
+			return nil, &safety.Error{Code: safety.CodePolicyDenied, Msg: "the identity isn't current in the firm key log"}
+		}
+		v.Member = who.Identity
+	}
+	if err := g.nonces.Claim(nonce, signedAt); err != nil {
+		return nil, err
+	}
+	return v, nil
+}
+
+// StartFor: the safety checks, then the recipient of the run's record (the space's seal key) into its options.
+func (g *recGateway) StartFor(r *proto.RunRequest) (harness.Start, guard.TaskOptions, error) {
 	start, opts, err := g.safeGateway.StartFor(r)
-	opts.RecordTo = r.RecordTo
+	if r.Verified != nil {
+		opts.RecordTo = r.Verified.Seal
+	}
 	return start, opts, err
 }
 
-// StartSearch: the record's recipient checked as for a run, then the safety checks (safeGateway.StartSearch).
+// StartSearch: the safety checks (safeGateway.StartSearch), then the recipient of the search's record: the space's
+// seal key, as for a run (VerifySearch).
 func (g *recGateway) StartSearch(r *proto.SearchRequest) (harness.Start, guard.TaskOptions, []byte, error) {
-	if r.RecordTo != "" {
-		if _, err := activity.ParseRecipient(r.RecordTo); err != nil {
-			return harness.Start{}, guard.TaskOptions{}, nil, errors.New("record_to must be an x25519 public key")
-		}
-		if g.vmKey == nil || activity.CheckRecordProof(g.vmKey, r.RecordTo, r.RecordProof) != nil {
-			return harness.Start{}, guard.TaskOptions{}, nil, errors.New("record_to needs a valid record_proof")
-		}
-	}
 	start, opts, args, err := g.safeGateway.StartSearch(r)
-	opts.RecordTo = r.RecordTo
+	if r.Verified != nil {
+		opts.RecordTo = r.Verified.Seal
+	}
 	return start, opts, args, err
 }
 
-// StartPictures: the record's recipient checked as for a search, then the safety checks.
+// StartPictures: as StartSearch, for a pictures request (VerifyPictures).
 func (g *recGateway) StartPictures(r *proto.PicturesRequest) (harness.Start, guard.TaskOptions, []byte, error) {
-	if r.RecordTo != "" {
-		if _, err := activity.ParseRecipient(r.RecordTo); err != nil {
-			return harness.Start{}, guard.TaskOptions{}, nil, errors.New("record_to must be an x25519 public key")
-		}
-		if g.vmKey == nil || activity.CheckRecordProof(g.vmKey, r.RecordTo, r.RecordProof) != nil {
-			return harness.Start{}, guard.TaskOptions{}, nil, errors.New("record_to needs a valid record_proof")
-		}
-	}
 	start, opts, args, err := g.safeGateway.StartPictures(r)
-	opts.RecordTo = r.RecordTo
+	if r.Verified != nil {
+		opts.RecordTo = r.Verified.Seal
+	}
 	return start, opts, args, err
 }
 
@@ -170,7 +223,7 @@ func recordStart(task string, start *harness.Start, opts guard.TaskOptions, cont
 	if opts.Via == guard.ViaSearch || opts.Via == guard.ViaPictures { // a plain chat's search, or an answer's held-back pictures: no model
 		kind = "search"
 	}
-	return activity.Start{Run: task, Space: start.Space, To: opts.RecordTo,
+	return activity.Start{Run: task, Space: start.Space, To: opts.RecordTo, Member: opts.Identity,
 		Agent:   activity.Agent{ID: start.Agent.ID, Version: start.Agent.Version, Digest: start.Agent.Digest},
 		Trigger: activity.Trigger{Kind: kind, Via: via}, Controls: controls, Models: start.Models, Tools: tools,
 		Limits: activity.Limits{MaxSteps: start.Limits.MaxSteps, MaxModelCalls: start.Limits.MaxModelCalls, Deadline: start.Limits.Deadline},
@@ -256,10 +309,11 @@ func activityEvent(recs ...activity.Sealed) proto.Event {
 // Refused records a run refused before it started (agentd's admission: a stop, no policy, a model the policy
 // doesn't allow, the day used up) and returns the event that carries its record, or false.
 func (g *recGateway) Refused(r *proto.RunRequest, err error) (proto.Event, bool) {
-	if r.RecordTo == "" {
+	v := r.Verified
+	if v == nil {
 		return proto.Event{}, false
 	}
-	const space = "s_chat"
+	space := v.Space
 	st := g.st.StatusOf(space)
 	code, msg := coded(err)
 	model := r.Model
@@ -270,7 +324,7 @@ func (g *recGateway) Refused(r *proto.RunRequest, err error) (proto.Event, bool)
 	for _, m := range r.Messages {
 		in.Bytes += len(m.Content)
 	}
-	rec, rerr := g.rec.Refused(activity.Start{Run: harness.NewTaskID(), Space: space, To: r.RecordTo,
+	rec, rerr := g.rec.Refused(activity.Start{Run: harness.NewTaskID(), Space: space, To: v.Seal, Member: v.Identity,
 		Agent: activity.Agent{ID: "a_chat", Version: "1", Digest: "unsigned"}, Trigger: activity.Trigger{Kind: "chat", Via: "relay"},
 		Controls: &activity.Controls{Policy: st.Policy, ReleasePolicy: st.Release, OperatorSeq: st.OperatorSeq, FirmSeq: st.FirmSeq, Fresh: st.Fresh},
 		Models:   []string{model}, Input: in}, activity.Status{Code: code, Detail: msg})
@@ -286,13 +340,13 @@ func (g *recGateway) Refused(r *proto.RunRequest, err error) (proto.Event, bool)
 // RefusedSearch records a plain chat's search (POST /search) refused before it started (a stop, no policy, web search
 // not allowed, the day used up) and returns the event that carries its record, or false. Sizes and codes only.
 func (g *recGateway) RefusedSearch(r *proto.SearchRequest, err error) (proto.Event, bool) {
-	if r.RecordTo == "" {
+	v := r.Verified
+	if v == nil {
 		return proto.Event{}, false
 	}
-	const space = "s_chat"
-	st := g.st.StatusOf(space)
+	st := g.st.StatusOf(v.Space)
 	code, msg := coded(err)
-	rec, rerr := g.rec.Refused(activity.Start{Run: harness.NewTaskID(), Space: space, To: r.RecordTo,
+	rec, rerr := g.rec.Refused(activity.Start{Run: harness.NewTaskID(), Space: v.Space, To: v.Seal, Member: v.Identity,
 		Agent: activity.Agent{ID: "a_search", Version: "1", Digest: "unsigned"}, Trigger: activity.Trigger{Kind: "search", Via: "relay"},
 		Controls: &activity.Controls{Policy: st.Policy, ReleasePolicy: st.Release, OperatorSeq: st.OperatorSeq, FirmSeq: st.FirmSeq, Fresh: st.Fresh},
 		Tools:    []string{"web.search"}}, activity.Status{Code: code, Detail: msg})

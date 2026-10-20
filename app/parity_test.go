@@ -208,6 +208,7 @@ func (m *parityModel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // runParity sends the request to the server's /run handler (as the EHBP middleware hands it on: plaintext body,
 // the model header) and returns the events.
 func runParity(t *testing.T, s *server, req proto.RunRequest) []proto.Event {
+	authorizeFor(t, s, &req)
 	body, _ := json.Marshal(req)
 	r := httptest.NewRequest("POST", "/run", bytes.NewReader(body))
 	model := req.Model

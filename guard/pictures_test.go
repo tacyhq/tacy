@@ -18,11 +18,16 @@ type lookupSearch struct {
 	mu      sync.Mutex
 	asked   []string
 	answers map[string][]ImageCandidate
+	badCtx  bool
 }
 
-func (s *lookupSearch) Images(_ context.Context, q string, _ int) ([]ImageCandidate, error) {
+func (s *lookupSearch) Images(ctx context.Context, q string, _ int) ([]ImageCandidate, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// The vault leases the provider's key for the task's space only (VaultLease): a lookup carries both.
+	if SpaceFrom(ctx) != "s_chat" || taskFrom(ctx) != "t1" {
+		s.badCtx = true
+	}
 	s.asked = append(s.asked, q)
 	return s.answers[q], nil
 }
@@ -51,7 +56,7 @@ func lookupRun(t *testing.T, s *lookupSearch, web stubWeb, setting string, items
 		}
 		return nil
 	}
-	tk := g.open("t1", TaskOptions{Permissions: map[string]string{"web.search": "always", "web.images": setting}}, out)
+	tk := g.open("t1", TaskOptions{Space: "s_chat", Permissions: map[string]string{"web.search": "always", "web.images": setting}}, out)
 	read := &readerResult{}
 	for _, n := range items {
 		read.items = append(read.items, keptItem{name: n})
@@ -101,6 +106,9 @@ func TestCardLookupsSendOnlyReaderNames(t *testing.T) {
 	s, web := espressoWeb()
 	items := []string{"Profitec GO", "Breville Barista Express BES870XL", "Gaggia Classic Pro"}
 	imgs := lookupRun(t, s, web, "always", items, espressoCards)
+	if s.badCtx {
+		t.Fatal("a lookup's image search ran without the task's id and space (the vault refuses its key lease)")
+	}
 	asked := s.queries()
 	slices.Sort(asked)
 	want := []string{"Breville Barista Express BES870XL", "Gaggia Classic Pro", "Profitec GO"}

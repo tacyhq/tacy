@@ -146,7 +146,9 @@ func (g *Guard) lookupCardPicture(t *task, it taskItem) bool {
 	if !ok {
 		return false
 	}
-	ctx, cancel := context.WithTimeout(t.ctx, lookupTime)
+	// The task and its space, as an action's context has them: the vault leases the image provider's key only for a
+	// space whose policy allows it (v0.8.18's first live run had neither: every lookup's lease was refused).
+	ctx, cancel := context.WithTimeout(withSpace(withTask(t.ctx, t.id), t.opts.Space), lookupTime)
 	defer cancel()
 	q, _ := maskPII(capRunes(strings.TrimSpace(it.name), maxQueryRunes))
 	if q == "" || HiddenChars(q) || outboundLeak([]byte(q)) != nil {
@@ -163,6 +165,9 @@ func (g *Guard) lookupCardPicture(t *task, it taskItem) bool {
 	cp.lookedUp++
 	cp.mu.Unlock()
 	if err != nil {
+		cp.mu.Lock()
+		cp.st.fail(imageFailReason(err))
+		cp.mu.Unlock()
 		return false
 	}
 	var list []ImageCandidate

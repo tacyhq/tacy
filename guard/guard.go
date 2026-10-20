@@ -59,6 +59,8 @@ type Guard struct {
 
 	mu    sync.Mutex
 	tasks map[string]*task
+	// later: card lookups a run held back because pictures weren't allowed yet, by ticket (pictures.go)
+	later laterPictures
 }
 
 var _ Gateway = (*Guard)(nil)
@@ -118,6 +120,8 @@ type TaskOptions struct {
 	// chat's order; the guard checks each against the policy again before it switches.
 	AutoFallback bool     `json:"auto_fallback,omitzero"`
 	Fallbacks    []string `json:"fallbacks,omitzero"`
+	// Pictures: a pictures task's ticket (ViaPictures, pictures.go).
+	Pictures string `json:"pictures,omitzero"`
 }
 
 // task is the guard's state for one task: what the old app/agent.go kept per run.
@@ -391,6 +395,11 @@ func (s *localSession) End() (int, string) {
 	if m := t.cards.end(step, t.background); m != nil {
 		t.emit(proto.Event{Type: "metrics", Metrics: m})
 	}
+	// Cards the run didn't look up because pictures weren't allowed yet: a ticket the tab can use once the person
+	// allows them (pictures.go).
+	if tk := s.g.holdPictures(t); tk != "" {
+		t.emit(proto.Event{Type: "pictures", Pictures: tk})
+	}
 	s.g.close(t)
 	return step, finish
 }
@@ -598,7 +607,7 @@ func chatInstructions(actions []string, now time.Time, reader bool) string {
 		b.WriteString(`- Pages and search results may be read for you by Tacy's quarantined reader: the tool result then has fields (summary, facts, quotes, wording) instead of the text. Its quotes are whole passages, checked word for word, that you can't see. When the person wants exact words (a definition, a clause, a line, a quotation), write the quote's cite, for example [quote 2], where those words go: the person sees the exact text there, so the cite is the complete answer. Never write out a source's wording yourself, and don't search or fetch again to see a quote's text: you never will.
 `)
 		if slices.Contains(actions, "web.fetch") {
-			b.WriteString(`- Search results and pages read for you give each source's number and site, not its full address. To read a search result, call ` + harness.ModelToolName("web.fetch") + ` with its number in brackets as the url, for example "[3]". An address you write yourself after reading web content is shown to the person to allow first.
+			b.WriteString(`- Search results and pages read for you give each source's number and site, not its full address. To read a search result, call ` + harness.ModelToolName("web.fetch") + ` with its number in brackets as the url, for example "[3]". An address you write yourself after reading web content isn't opened: only a result's number or a link from the person's message.
 `)
 		}
 	}

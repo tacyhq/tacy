@@ -381,7 +381,7 @@ func (r recSearch) Search(_ context.Context, q string, n int) ([]guard.SearchRes
 }
 
 // agentd's taint travels with each action: on a tainted task gatewayd won't fetch an address the model composed under
-// Always allow (nothing reaches the page); the same request untainted goes.
+// Always allow (not_from_results: nothing reaches the page); the same request untainted goes.
 func TestTaintAcrossTheSocket(t *testing.T) {
 	var hits atomic.Int32
 	page := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -402,7 +402,7 @@ func TestTaintAcrossTheSocket(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if tainted && (res.Status != harness.ActionDenied || hits.Load() != 0) || !tainted && (res.Status != harness.ActionDone || hits.Load() != 1) {
+		if tainted && (res.Status != harness.ActionDenied || res.Error != guard.NotFromResultsError || hits.Load() != 0) || !tainted && (res.Status != harness.ActionDone || hits.Load() != 1) {
 			t.Fatalf("tainted %v: %+v (hits %d)", tainted, res, hits.Load())
 		}
 	}

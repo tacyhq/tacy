@@ -71,6 +71,9 @@ func (g *Guard) Action(ctx context.Context, ti *harness.TaskInfo, id string, req
 		}
 		return nil, err
 	}
+	if t.opts.Via == ViaPictures { // the held-back card lookups the person just allowed (pictures.go)
+		return g.pictureLookups(t)
+	}
 	// Permission prompts: nothing goes out without the person's answer (permission.go): their setting, or a valid grant from
 	// their tab; an edited value replaces the model's.
 	args, denied := g.permit(ctx, t, ti, id, req)

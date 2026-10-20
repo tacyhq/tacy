@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tacyhq/tacy/harness"
 	"github.com/tacyhq/tacy/proto"
 )
 
@@ -25,7 +26,7 @@ func (s *lookupSearch) Images(ctx context.Context, q string, _ int) ([]ImageCand
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// The vault leases the provider's key for the task's space only (VaultLease): a lookup carries both.
-	if SpaceFrom(ctx) != "s_chat" || taskFrom(ctx) != "t1" {
+	if SpaceFrom(ctx) != "s_chat" || taskFrom(ctx) == "" {
 		s.badCtx = true
 	}
 	s.asked = append(s.asked, q)
@@ -230,5 +231,95 @@ func TestRoundupBannerNotACardPicture(t *testing.T) {
 	named := picCand{url: "https://cdn.thewirecutter.com/wp-content/media/2025/profitec-go-espresso.jpg", kind: picPage}
 	if why := cardPicRefused("Profitec GO Espresso Machine", src, named, cardCaptionMin); why != "" {
 		t.Fatalf("a roundup's picture named for the item: %q", why)
+	}
+}
+
+// v0.8.20: a run whose pictures setting was Ask holds its cards' lookups back and ends with a ticket; the person's
+// Allow then looks those (and only those) up under a pictures task, with the VM's own names, once, for the same user.
+func TestHeldBackLookupsAfterAllow(t *testing.T) {
+	s, web := espressoWeb()
+	g := New(Config{Search: s, Fetcher: &http.Client{Transport: web}, Icons: &http.Client{Transport: stubWeb{}}, Now: time.Now})
+	var mu sync.Mutex
+	var evs []proto.Event
+	out := func(e proto.Event) error { mu.Lock(); evs = append(evs, e); mu.Unlock(); return nil }
+	sess := g.Open("t1", TaskOptions{User: "u1", Space: "s_chat", Permissions: map[string]string{"web.images": "ask"}}, out)
+	tk := g.task(&harness.TaskInfo{ID: "t1"})
+	read := &readerResult{}
+	for _, n := range []string{"Profitec GO", "Breville Barista Express BES870XL", "Gaggia Classic Pro"} {
+		read.items = append(read.items, keptItem{name: n})
+	}
+	tk.noteItems("c1", read)
+	g.cardText(tk, espressoCards)
+	g.cardTextDone(tk)
+	sess.End()
+	sess.Close()
+	if q := s.queries(); len(q) != 0 {
+		t.Fatalf("looked up before the person allowed it: %q", q)
+	}
+	ticket := ""
+	for _, e := range evs {
+		if e.Type == "pictures" {
+			ticket = e.Pictures
+		}
+	}
+	if len(ticket) != 32 {
+		t.Fatalf("no ticket at the run's end: %+v", evs)
+	}
+	run := func(user, ticket string) (*harness.ActionResult, []*proto.Image) {
+		start, opts, args, err := PicturesStart(&proto.PicturesRequest{Ticket: ticket}, time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		opts.User, opts.Space = user, start.Space
+		var imgs []*proto.Image
+		id := "p-" + user + ticket[:4]
+		ps := g.Open(id, opts, func(e proto.Event) error {
+			if e.Type == "image" {
+				if e.ID != "c1" {
+					t.Errorf("picture under %q", e.ID)
+				}
+				imgs = append(imgs, e.Image)
+			}
+			return nil
+		})
+		ti := &harness.TaskInfo{ID: id, Start: &start}
+		res, err := g.Action(context.Background(), ti, PicturesActionID, &harness.Action{Name: "web.images", Call: PicturesActionID, Args: args})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ps.End()
+		ps.Close()
+		return res, imgs
+	}
+	// Another user tag can't use it (and doesn't use it up).
+	if res, imgs := run("u2", ticket); res.Status != harness.ActionFailed || len(imgs) != 0 {
+		t.Fatalf("another user: %+v %d", res, len(imgs))
+	}
+	res, imgs := run("u1", ticket)
+	if res.Status != harness.ActionDone || len(imgs) != 3 {
+		t.Fatalf("allowed: %+v, %d pictures", res, len(imgs))
+	}
+	asked := s.queries()
+	slices.Sort(asked)
+	if !slices.Equal(asked, []string{"Breville Barista Express BES870XL", "Gaggia Classic Pro", "Profitec GO"}) || s.badCtx {
+		t.Fatalf("queries %q (ctx ok: %v)", asked, !s.badCtx)
+	}
+	// Once only.
+	if res, _ := run("u1", ticket); res.Status != harness.ActionFailed {
+		t.Fatalf("a second use: %+v", res)
+	}
+	// Photos off (Never) hold the lookups back too, and nothing goes out.
+	s2, web2 := espressoWeb()
+	g2 := New(Config{Search: s2, Fetcher: &http.Client{Transport: web2}, Icons: &http.Client{Transport: stubWeb{}}, Now: time.Now})
+	var got []proto.Event
+	sess2 := g2.Open("t2", TaskOptions{User: "u1", Space: "s_chat", Permissions: map[string]string{"web.images": "never"}}, func(e proto.Event) error { got = append(got, e); return nil })
+	tk2 := g2.task(&harness.TaskInfo{ID: "t2"})
+	tk2.noteItems("c1", read)
+	g2.cardText(tk2, espressoCards)
+	g2.cardTextDone(tk2)
+	sess2.End()
+	sess2.Close()
+	if q := s2.queries(); len(q) != 0 || !slices.ContainsFunc(got, func(e proto.Event) bool { return e.Type == "pictures" }) {
+		t.Fatalf("photos off: queries %q, ticket %v", q, slices.ContainsFunc(got, func(e proto.Event) bool { return e.Type == "pictures" }))
 	}
 }

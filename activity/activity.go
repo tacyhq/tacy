@@ -180,7 +180,9 @@ type Call struct {
 	Reader *Reader `json:"reader,omitzero"`
 	// Permission is how the person's permission for an action that sends data out was given: allowed_once,
 	// allowed_always, always_setting (not asked: their setting), denied, timed_out, never (not asked: off in their
-	// settings), unavailable (the run couldn't ask). Edited: they changed what was sent. Never the value itself.
+	// settings), unavailable (the run couldn't ask), hidden_characters, not_from_results (not asked: a page address
+	// the model composed after reading the web, never opened). Edited: they changed what was sent. Never the value
+	// itself.
 	Permission string `json:"permission,omitzero"`
 	Edited     bool   `json:"edited,omitzero"`
 	// Images (web.images): the pictures shown, and those that didn't make it by reason. Fixed words and counts only.

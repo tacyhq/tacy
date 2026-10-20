@@ -44,7 +44,14 @@ const (
 	PermNeverSetting  = "never"             // not asked: the setting (or the firm's cap) is Never
 	PermUnavailable   = "unavailable"       // the setting is Ask but the run can't ask (no run secret): refused
 	PermHidden        = "hidden_characters" // not asked: the value has hidden characters, never allowed
+	// not asked: on a tainted task, a page address the model composed (ComposedFetch): never opened, whatever the
+	// setting or a grant says; the model is told to open results by number.
+	PermNotFromResults = "not_from_results"
 )
+
+// NotFromResultsError is what the model sees for a PermNotFromResults fetch.
+const NotFromResultsError = "not_from_results: only open addresses from your search results (their [n]) or the person's message; " +
+	"this one wasn't, so it wasn't opened. Open a result by its number, or answer with what you have."
 
 // grantLabel prefixes a grant's MAC input.
 const grantLabel = "tacy-grant/v1"
@@ -154,8 +161,10 @@ func Outgoing(action string, args []byte, sources map[int]string) (value string,
 }
 
 // ComposedFetch: a page fetch, on a tainted task, of an address that didn't come from code (FetchTarget): not one of
-// the task's sources, not in the person's messages. The model wrote it after it read outside content, so Always
-// allow doesn't cover it: the person is asked for this one (docs/27 section 6).
+// the task's sources, not in the person's messages. The model wrote it after it read outside content (a page may
+// have steered it, or it made the address up), so it isn't opened at all, under Always allow or Ask, and the person
+// isn't asked about it: agentd (Prompts.Hold) and gatewayd (permit) both refuse it as PermNotFromResults
+// (docs/27 section 6).
 func ComposedFetch(action string, args []byte, sources map[int]string, links []string, tainted bool) bool {
 	if !tainted || PermissionKind(action) != "web.fetch" {
 		return false
@@ -163,9 +172,6 @@ func ComposedFetch(action string, args []byte, sources map[int]string, links []s
 	_, fromCode, ok := FetchTarget(args, sources, links)
 	return ok && !fromCode
 }
-
-// ComposedReason is what the person is told about a prompt for a ComposedFetch (proto.Permission.Reason).
-const ComposedReason = "This link wasn't in your search results or your message."
 
 // withValue is an action's arguments with the person's value in place of the model's (an edited query or address).
 // The rest (a search's count) stays.
@@ -296,8 +302,10 @@ func (g *Guard) permissionCap(space, kind string) string {
 
 // permit is gatewayd's own check of an action that sends data out, before anything is sent: the setting for
 // its kind is Always allow, or the request carries a grant from the run's tab (its MAC checks with the run secret) for
-// this task and kind: Allow once for this very request, or Always allow for this kind. It returns the arguments to
-// run with (the person's edited value, when the grant is for this request), or the denial the model sees.
+// this task and kind: Allow once for this very request, or Always allow for this kind. A fetch of an address the
+// model composed on a tainted task (ComposedFetch) is refused whatever the setting or a grant says. It returns the
+// arguments to run with (the person's edited value, when the grant is for this request), or the denial the model
+// sees.
 func (g *Guard) permit(ctx context.Context, t *task, ti *harness.TaskInfo, id string, req *harness.Action) (jsontext.Value, *harness.ActionResult) {
 	kind := PermissionKind(req.Name)
 	if kind == "" {
@@ -319,23 +327,25 @@ func (g *Guard) permit(ctx context.Context, t *task, ti *harness.TaskInfo, id st
 		}
 		args = a
 	}
-	// On a tainted task, an address the model composed needs a grant for this very request (task.taintFor).
-	composed := ComposedFetch(req.Name, req.Args, sources, t.opts.Links, t.taintFor(ti, req.Call))
-	switch PermissionSetting(t.opts, kind, g.permissionCap(t.opts.Space, kind)) {
-	case safety.PermAlways:
-		if !composed {
-			return args, nil
-		}
-	case safety.PermNever:
+	setting := PermissionSetting(t.opts, kind, g.permissionCap(t.opts.Space, kind))
+	if setting == safety.PermNever {
 		return nil, PermissionDenial(kind, PermNeverSetting)
+	}
+	// On a tainted task, an address the model composed is never opened (task.taintFor): agentd doesn't ask about it,
+	// so no grant covers it.
+	if ComposedFetch(req.Name, req.Args, sources, t.opts.Links, t.taintFor(ti, req.Call)) {
+		return nil, PermissionDenial(kind, PermNotFromResults)
+	}
+	if setting == safety.PermAlways {
+		return args, nil
 	}
 	gr := GrantFrom(ctx)
 	switch {
 	case gr == nil || gr.Task != ti.ID || gr.Kind != kind || !gr.Verify(t.opts.RunSecret):
-		return nil, PermissionDenial(kind, permComposed(composed))
-	case gr.Decision == DecideOnce && gr.Request == id, gr.Decision == DecideAlways && (gr.Request == id || !composed):
+		return nil, PermissionDenial(kind, "")
+	case gr.Decision == DecideOnce && gr.Request == id, gr.Decision == DecideAlways:
 	default:
-		return nil, PermissionDenial(kind, permComposed(composed))
+		return nil, PermissionDenial(kind, "")
 	}
 	if gr.Request != id || gr.Value == value {
 		return args, nil
@@ -350,17 +360,13 @@ func (g *Guard) permit(ctx context.Context, t *task, ti *harness.TaskInfo, id st
 	return args, nil
 }
 
-// permComposed is PermissionDenial's outcome for a missing grant: why, when the address was the model's own.
-func permComposed(composed bool) string {
-	if composed {
-		return "composed"
-	}
-	return ""
-}
-
 // PermissionDenial is what the model sees for an action that didn't run for want of the person's permission: why,
 // in words, and that it should answer without it and say it didn't check. outcome "" is a missing or invalid grant.
+// PermNotFromResults is no question of permission: the model is told to open results by number instead.
 func PermissionDenial(kind, outcome string) *harness.ActionResult {
+	if outcome == PermNotFromResults {
+		return &harness.ActionResult{Status: harness.ActionDenied, Error: NotFromResultsError}
+	}
 	what := kindLabel(kind)
 	var why string
 	switch outcome {
@@ -372,8 +378,6 @@ func PermissionDenial(kind, outcome string) *harness.ActionResult {
 		why = "the person's settings don't allow " + what
 	case PermUnavailable:
 		why = "this app can't ask the person for permission, and " + what + " needs it"
-	case "composed":
-		why = "this address wasn't in the search results or the person's message, so it needs the person's answer for this " + what
 	case PermHidden:
 		why = "the " + what + "'s value has hidden or control characters, which Tacy never sends"
 	default:

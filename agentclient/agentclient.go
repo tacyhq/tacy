@@ -173,8 +173,18 @@ func (c *Conn) Run(ctx context.Context, req proto.RunRequest, on func(proto.Even
 // Search sends one web search (POST /search, the plain chat's: agentd app/search.go) and calls on for each event
 // until [DONE].
 func (c *Conn) Search(ctx context.Context, req proto.SearchRequest, on func(proto.Event)) error {
+	return c.stream(ctx, "/search", req, on)
+}
+
+// Pictures asks for an answer's held-back card photos (POST /pictures, v0.8.20) and calls on for each event until
+// [DONE].
+func (c *Conn) Pictures(ctx context.Context, req proto.PicturesRequest, on func(proto.Event)) error {
+	return c.stream(ctx, "/pictures", req, on)
+}
+
+func (c *Conn) stream(ctx context.Context, path string, req any, on func(proto.Event)) error {
 	body, _ := json.Marshal(req)
-	r, _ := http.NewRequestWithContext(ctx, "POST", c.Base+"/search", bytes.NewReader(body))
+	r, _ := http.NewRequestWithContext(ctx, "POST", c.Base+path, bytes.NewReader(body))
 	r.Header.Set("Content-Type", "application/json")
 	r.Header.Set("Authorization", "Bearer "+c.Token)
 	if c.User != "" {
@@ -187,7 +197,7 @@ func (c *Conn) Search(ctx context.Context, req proto.SearchRequest, on func(prot
 	defer res.Body.Close()
 	if res.StatusCode != 200 {
 		b, _ := io.ReadAll(io.LimitReader(res.Body, 2000))
-		return fmt.Errorf("search: HTTP %d: %s", res.StatusCode, strings.TrimSpace(string(b)))
+		return fmt.Errorf("%s: HTTP %d: %s", strings.TrimPrefix(path, "/"), res.StatusCode, strings.TrimSpace(string(b)))
 	}
 	sc := bufio.NewScanner(res.Body)
 	sc.Buffer(make([]byte, 0, 64<<10), 8<<20)

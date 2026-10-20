@@ -120,6 +120,9 @@ var errSearchOnly = harness.Errf(harness.CodeNotAllowed, "a search task makes on
 // searchOnly says why a request of a search task is refused, or nil: model calls, other actions and a second
 // search are (t.mu not held).
 func (t *task) searchOnly(req any) error {
+	if t.opts.Via == ViaPictures {
+		return t.picturesOnly(req)
+	}
 	if t.opts.Via != ViaSearch {
 		return nil
 	}

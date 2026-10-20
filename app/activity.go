@@ -92,6 +92,21 @@ func (g *recGateway) StartSearch(r *proto.SearchRequest) (harness.Start, guard.T
 	return start, opts, args, err
 }
 
+// StartPictures: the record's recipient checked as for a search, then the safety checks.
+func (g *recGateway) StartPictures(r *proto.PicturesRequest) (harness.Start, guard.TaskOptions, []byte, error) {
+	if r.RecordTo != "" {
+		if _, err := activity.ParseRecipient(r.RecordTo); err != nil {
+			return harness.Start{}, guard.TaskOptions{}, nil, errors.New("record_to must be an x25519 public key")
+		}
+		if g.vmKey == nil || activity.CheckRecordProof(g.vmKey, r.RecordTo, r.RecordProof) != nil {
+			return harness.Start{}, guard.TaskOptions{}, nil, errors.New("record_to needs a valid record_proof")
+		}
+	}
+	start, opts, args, err := g.safeGateway.StartPictures(r)
+	opts.RecordTo = r.RecordTo
+	return start, opts, args, err
+}
+
 // Open wraps the session so its End passes on the site icons' egress.
 func (g *recGateway) Open(id string, opts guard.TaskOptions, emit func(proto.Event) error) guard.Session {
 	return &recSession{Session: g.safeGateway.Open(id, opts, emit), g: g, id: id}
@@ -152,7 +167,7 @@ func recordStart(task string, start *harness.Start, opts guard.TaskOptions, cont
 		tools = append(tools, t.Name)
 	}
 	kind := "chat"
-	if opts.Via == guard.ViaSearch { // the plain chat's search (POST /search): one approved search, no model
+	if opts.Via == guard.ViaSearch || opts.Via == guard.ViaPictures { // a plain chat's search, or an answer's held-back pictures: no model
 		kind = "search"
 	}
 	return activity.Start{Run: task, Space: start.Space, To: opts.RecordTo,
@@ -422,7 +437,7 @@ func (g *recGateway) ModelCall(ctx context.Context, ti *harness.TaskInfo, req *h
 		c.Prompt, c.Completion = res.Usage.Prompt, res.Usage.Completion
 	})
 	if err == nil && g.prompts != nil {
-		g.prompts.ModelCalled(ti, res) // the taint its tool calls are asked about with (a composed address)
+		g.prompts.ModelCalled(ti, res) // the taint its tool calls are checked with (a composed address is refused)
 	}
 	return res, err
 }

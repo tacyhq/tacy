@@ -369,6 +369,9 @@ type cardPics struct {
 	items    map[string]taskItem
 	lookups  int
 	lookedUp int
+	// deferred: cards that named a reader item but weren't looked up because the run's pictures setting was Ask
+	// (pictures.go holdPictures), at most maxCardLookups
+	deferred []taskItem
 }
 
 func newCardPics() *cardPics {
@@ -451,13 +454,21 @@ func (g *Guard) cardPicture(t *task, card cardRef, ownOnly bool) {
 	key := own + "|" + strings.ToLower(card.title) // a card once (two cards may cite one roundup)
 	// No picture from the sources: looked up (pictures.go), when pictures are allowed and the title names one of
 	// the run's reader items. Never for a plain chat's search (resultPictures: ownOnly).
-	var lookup *taskItem
-	if !ownOnly && g.lookupAllowed(t) {
+	var lookup, later *taskItem
+	if !ownOnly && t.opts.Via != ViaSearch {
 		if it, ok := t.cards.matchItem(card.title); ok {
-			lookup = &it
+			switch {
+			case g.lookupAllowed(t):
+				lookup = &it
+			case g.lookupAskable(t):
+				later = &it // held back until the person allows pictures (pictures.go holdPictures)
+			}
 		}
 	}
 	if len(tries) == 0 && lookup == nil {
+		if later != nil {
+			t.cards.deferItem(*later)
+		}
 		return
 	}
 	cp := t.cards
@@ -501,6 +512,9 @@ func (g *Guard) cardPicture(t *task, card cardRef, ownOnly bool) {
 		shown := len(tries) > 0 && g.fetchCardPicture(t, card.title, tries)
 		if !shown && lookup != nil && t.ctx.Err() == nil {
 			shown = g.lookupCardPicture(t, *lookup)
+		}
+		if !shown && later != nil {
+			cp.deferItem(*later)
 		}
 		if !shown {
 			t.tools.returnImages(1)

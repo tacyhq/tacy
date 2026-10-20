@@ -93,9 +93,6 @@ type prompt struct {
 	task, request, call, kind, value, secret string
 	sent                                     string // allowed: the value that goes out ("": value)
 	timer                                    *time.Timer
-	// composed: a fetch on a tainted task of an address the model wrote (ComposedFetch): only its own answer
-	// allows it, never an Always allow given to another prompt.
-	composed bool
 }
 
 // Errors of Answer.
@@ -157,9 +154,10 @@ func key(task, id string) string { return task + "\x00" + id }
 
 // Hold is the runtime's HoldGuard: an action of a permission kind waits for the person (WaitPermission) unless their
 // setting already decides it (Always allow, Never), an Always allow earlier in the run covers its kind, or the run
-// can't ask (no run secret: denied). On a tainted task a fetch of an address the model composed (ComposedFetch) is
-// asked about even under Always allow, and the prompt says why. A value with hidden characters is denied without
-// asking. Actions that send nothing out, and model calls, aren't held.
+// can't ask (no run secret: denied). On a tainted task a fetch of an address the model composed (ComposedFetch: not
+// a result's [n], not in the person's messages) is refused without asking, under Always allow or Ask
+// (PermNotFromResults); before taint it goes as any fetch. A value with hidden characters is denied without asking.
+// Actions that send nothing out, and model calls, aren't held.
 func (p *Prompts) Hold(ti *harness.TaskInfo, id string, req any) string {
 	a, ok := req.(*harness.Action)
 	if !ok {
@@ -185,9 +183,11 @@ func (p *Prompts) Hold(ti *harness.TaskInfo, id string, req any) string {
 		p.outcomes[k] = PermissionOutcome{Outcome: PermHidden}
 	case setting == safety.PermNever:
 		p.outcomes[k] = PermissionOutcome{Outcome: PermNeverSetting}
-	case setting == safety.PermAlways && !composed:
+	case composed: // never opened, so never asked about
+		p.outcomes[k] = PermissionOutcome{Outcome: PermNotFromResults}
+	case setting == safety.PermAlways:
 		p.outcomes[k] = PermissionOutcome{Outcome: PermAlwaysSetting}
-	case p.always[ti.ID][kind] != nil && !composed:
+	case p.always[ti.ID][kind] != nil:
 		p.grants[k] = p.always[ti.ID][kind]
 		p.outcomes[k] = PermissionOutcome{Outcome: PermAllowedAlways}
 	case !validRunSecret(opts.RunSecret):
@@ -198,12 +198,7 @@ func (p *Prompts) Hold(ti *harness.TaskInfo, id string, req any) string {
 			p.outcomes[k] = PermissionOutcome{Outcome: PermTimedOut}
 			break
 		}
-		pr := &prompt{task: ti.ID, request: id, call: cmp.Or(a.Call, id), kind: kind, value: value, secret: opts.RunSecret,
-			composed: composed}
-		reason := ""
-		if composed {
-			reason = ComposedReason
-		}
+		pr := &prompt{task: ti.ID, request: id, call: cmp.Or(a.Call, id), kind: kind, value: value, secret: opts.RunSecret}
 		p.open[k] = pr
 		if p.OnWait != nil {
 			p.OnWait(ti.ID, true)
@@ -211,7 +206,7 @@ func (p *Prompts) Hold(ti *harness.TaskInfo, id string, req any) string {
 		pr.timer = time.AfterFunc(timeout, func() { p.expire(ti.ID, id) })
 		p.mu.Unlock()
 		p.Emit(ti.ID, proto.Event{Type: "permission", ID: pr.call, Permission: &proto.Permission{Task: ti.ID, Request: id,
-			Kind: kind, Value: value, TimeoutS: int(timeout.Round(time.Second) / time.Second), Reason: reason}})
+			Kind: kind, Value: value, TimeoutS: int(timeout.Round(time.Second) / time.Second)}})
 		return harness.WaitPermission
 	}
 	p.mu.Unlock()
@@ -265,8 +260,8 @@ func (p *Prompts) Answer(g Grant) (string, error) {
 			p.always[g.Task] = map[string]*Grant{}
 		}
 		p.always[g.Task][g.Kind] = &gr
-		for k2, o := range p.open { // the run's other prompts of this kind: allowed too (but not a composed address)
-			if o.task == g.Task && o.kind == g.Kind && !o.composed {
+		for k2, o := range p.open { // the run's other prompts of this kind: allowed too
+			if o.task == g.Task && o.kind == g.Kind {
 				p.close(k2, o)
 				p.grants[k2] = &gr
 				settled = append(settled, settle{o, PermissionOutcome{Outcome: PermAllowedAlways}})
@@ -340,8 +335,8 @@ func (p *Prompts) release(task, id string) error {
 }
 
 // Attach is called with each action the runtime hands on: an action whose permission was denied (by the person, a
-// timeout, the setting, or a run that can't ask) is answered with the denial (the person sees it under the tool
-// call); an allowed one goes on with its grant (WithGrant), for gatewayd to check.
+// timeout, the setting, a run that can't ask, or a composed address on a tainted task) is answered with the denial
+// (the person sees it under the tool call); an allowed one goes on with its grant (WithGrant), for gatewayd to check.
 func (p *Prompts) Attach(ctx context.Context, ti *harness.TaskInfo, id string, a *harness.Action) (context.Context, *harness.ActionResult) {
 	kind := PermissionKind(a.Name)
 	if kind == "" {
@@ -357,10 +352,10 @@ func (p *Prompts) Attach(ctx context.Context, ti *harness.TaskInfo, id string, a
 		return ctx, nil // not held here (unusable arguments, or a rerun after a restart): gatewayd decides
 	}
 	switch o.Outcome {
-	case PermDenied, PermTimedOut, PermNeverSetting, PermUnavailable, PermHidden:
+	case PermDenied, PermTimedOut, PermNeverSetting, PermUnavailable, PermHidden, PermNotFromResults:
 		deny := PermissionDenial(kind, o.Outcome)
 		call := cmp.Or(a.Call, id)
-		if o.Outcome == PermNeverSetting || o.Outcome == PermUnavailable { // never asked: say why under the call
+		if o.Outcome == PermNeverSetting || o.Outcome == PermUnavailable || o.Outcome == PermNotFromResults { // never asked: say why under the call
 			value, _ := Outgoing(a.Name, a.Args, p.sources(ti.ID, kind))
 			p.Emit(ti.ID, proto.Event{Type: "permission", ID: call, Permission: &proto.Permission{Task: ti.ID, Request: id,
 				Kind: kind, Value: value, Decision: o.Outcome}})

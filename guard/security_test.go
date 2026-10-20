@@ -68,9 +68,9 @@ func TestSourcesByNumber(t *testing.T) {
 }
 
 // gatewayd's own check: on a tainted task (agentd says so, or a web result of this task came back before the model
-// call that proposed it), Always allow doesn't cover a fetch of an address the model composed: it needs a grant for
-// this very request. "[n]", an address a search returned and one in the person's message are covered. An unknown
-// [n] fetches nothing.
+// call that proposed it), a fetch of an address the model composed is refused (not_from_results), under Always allow
+// and with a grant, even one for this very request. "[n]", an address a search returned and one in the person's
+// message are covered. An unknown [n] fetches nothing.
 func TestPermitComposedFetch(t *testing.T) {
 	sm := &splitModel{reader: func(string) string { return answerJSON(t, nil) }}
 	e := newReaderE2E(t, sm, stubWeb{
@@ -106,15 +106,14 @@ func TestPermitComposedFetch(t *testing.T) {
 	e.web.urls = nil
 	denied := func(name string, res *harness.ActionResult) {
 		t.Helper()
-		if res.Status != harness.ActionDenied || !strings.Contains(res.Error, "wasn't in the search results") {
+		if res.Status != harness.ActionDenied || res.Error != NotFromResultsError {
 			t.Fatalf("%s: %+v", name, res)
 		}
 	}
 	denied("tainted by agentd, Always setting", act("r2", "web.fetch", `{"url":"`+evil+`"}`, true, nil))
 	denied("Always grant from another request", act("r3", "web.fetch", `{"url":"`+evil+`"}`, true, grant("r9", DecideAlways, evil)))
-	if res := act("r4", "web.fetch", `{"url":"`+evil+`"}`, true, grant("r4", DecideOnce, evil)); res.Status != harness.ActionDone {
-		t.Fatalf("its own grant: %+v", res)
-	}
+	denied("its own Allow once", act("r4", "web.fetch", `{"url":"`+evil+`"}`, true, grant("r4", DecideOnce, evil)))
+	denied("its own Always allow", act("r4", "web.fetch", `{"url":"`+evil+`"}`, true, grant("r4", DecideAlways, evil)))
 	for _, args := range []string{`{"url":"[1]"}`, `{"url":"https://github.com/Dstack-TEE/dstack/releases/tag/v0.6.1"}`,
 		`{"url":"https://MINE.example/notes#top"}`} {
 		if res := act("r5", "web.fetch", args, true, nil); res.Status == harness.ActionDenied { // allowed (the stub may 404)
@@ -124,8 +123,7 @@ func TestPermitComposedFetch(t *testing.T) {
 	if res := act("r6", "web.fetch", `{"url":"[7]"}`, true, nil); res.Status == harness.ActionDone && !strings.Contains(string(res.Output), "no source [7]") {
 		t.Fatalf("unknown [7]: %+v", res)
 	}
-	// A page the person allowed is one of the task's sources from then on.
-	if n := len(e.web.urls); n != 4 { // r4, and r5 three times
+	if n := len(e.web.urls); n != 3 { // r5 three times; never the composed address
 		t.Fatalf("fetched %v", e.web.urls)
 	}
 	// gatewayd's own view: agentd says untainted, but a web result came back before the model call that proposed
@@ -134,9 +132,9 @@ func TestPermitComposedFetch(t *testing.T) {
 	denied("tainted by what this guard gave the task", act("r7", "web.fetch", `{"url":"`+evil+`x"}`, false, nil))
 }
 
-// agentd's prompts: a composed address on a tainted task is asked about under Always allow, with the reason; an
-// Always allow given to another prompt doesn't settle it; "[n]" shows the source's address; hidden characters are
-// never asked about.
+// agentd's prompts: a composed address on a tainted task is refused without asking (not_from_results) under Always
+// allow and Ask, an Always allow given earlier in the run included; the browser sees the decision under the call and
+// the model the not_from_results error; "[n]" shows the source's address; hidden characters are never asked about.
 func TestPromptsComposedAndHidden(t *testing.T) {
 	var mu sync.Mutex
 	var shown []proto.Event
@@ -160,15 +158,34 @@ func TestPromptsComposedAndHidden(t *testing.T) {
 	if sub := p.Hold(&untainted, "r0", fetch("https://evil.example/")); sub != "" {
 		t.Fatal("untainted composed address held under Always")
 	}
-	if sub := p.Hold(tainted, "r1", fetch("https://evil.example/a")); sub != harness.WaitPermission {
-		t.Fatal("composed address not held")
+	refused := func(ti *harness.TaskInfo, id, u string) {
+		t.Helper()
+		a := fetch(u)
+		if sub := p.Hold(ti, id, a); sub != "" {
+			t.Fatalf("composed address %s held", u)
+		}
+		if o, _ := p.Outcome(ti.ID, id); o.Outcome != PermNotFromResults {
+			t.Fatalf("composed address %s: outcome %+v", u, o)
+		}
+		mu.Lock()
+		n := len(shown)
+		mu.Unlock()
+		if _, deny := p.Attach(context.Background(), ti, id, a); deny == nil || deny.Error != NotFromResultsError {
+			t.Fatalf("composed address %s: %+v", u, deny)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		got := shown[n:]
+		if len(got) != 2 || got[0].Type != "permission" || got[0].Permission.Decision != PermNotFromResults || got[0].Permission.Value != u ||
+			got[0].Permission.TimeoutS != 0 || got[1].Type != "tool_result" || !strings.Contains(string(got[1].Result), "not_from_results") {
+			t.Fatalf("composed address %s shown %+v", u, got)
+		}
 	}
-	mu.Lock()
-	if len(shown) != 1 || shown[0].Permission.Reason != ComposedReason || shown[0].Permission.Value != "https://evil.example/a" {
-		t.Fatalf("shown %+v", shown)
+	refused(tainted, "r1", "https://evil.example/a")
+	if p.Waiting("tk_h") != 0 {
+		t.Fatal("a composed address waits for the person")
 	}
-	mu.Unlock()
-	// Another prompt of the kind answered Always allow (the person's setting is Ask for it here): r1 still waits.
+	// Under Ask, after an Always allow for the kind earlier in the run: still refused, never asked.
 	ask, _ := json.Marshal(TaskOptions{RunSecret: testSecret})
 	ti := &harness.TaskInfo{ID: "tk_h", Start: &harness.Start{}, Options: ask, Tainted: true}
 	if sub := p.Hold(ti, "r2", fetch("[1]")); sub != harness.WaitPermission {
@@ -184,13 +201,11 @@ func TestPromptsComposedAndHidden(t *testing.T) {
 	if _, err := p.Answer(g); err != nil {
 		t.Fatal(err)
 	}
-	if p.Waiting("tk_h") != 1 {
-		t.Fatalf("the composed prompt was settled by another prompt's Always allow (%d waiting)", p.Waiting("tk_h"))
-	}
-	// A later composed address isn't covered by that Always allow either.
-	if sub := p.Hold(ti, "r3", fetch("https://evil.example/b")); sub != harness.WaitPermission {
-		t.Fatal("composed address covered by an earlier Always allow")
-	}
+	refused(ti, "r3", "https://evil.example/b")
+	// Under Ask with no Always allow yet: refused, not asked.
+	fresh0 := &harness.TaskInfo{ID: "tk_a", Start: &harness.Start{}, Options: ask, Tainted: true}
+	refused(fresh0, "r4", "https://news.ycombinator.com/item?id=40000000")
+	p.Forget("tk_a")
 	// Calls proposed together in one step: the model call was made before outside content came in, so a fetch of
 	// that step isn't asked about even if its request arrived after another call's result (ti.Tainted by then).
 	fresh := &harness.TaskInfo{ID: "tk_s", Start: &harness.Start{}, Options: opts}
@@ -202,8 +217,11 @@ func TestPromptsComposedAndHidden(t *testing.T) {
 		t.Fatal("a fetch proposed before outside content was held")
 	}
 	other := &harness.Action{Name: "web.fetch", Call: "c9", Args: []byte(`{"url":"https://evil.example/c"}`)}
-	if sub := p.Hold(&late, "r21", other); sub != harness.WaitPermission {
-		t.Fatal("a fetch from no known model call, after outside content, wasn't held")
+	if sub := p.Hold(&late, "r21", other); sub != "" {
+		t.Fatal("a fetch from no known model call, after outside content, was held")
+	}
+	if o, _ := p.Outcome("tk_s", "r21"); o.Outcome != PermNotFromResults {
+		t.Fatalf("a fetch from no known model call, after outside content: %+v", o)
 	}
 	p.Forget("tk_s")
 	// Hidden characters: never asked, denied with why.

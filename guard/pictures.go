@@ -26,12 +26,18 @@ package guard
 import (
 	"cmp"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
+	"github.com/tacyhq/tacy/harness"
 	"github.com/tacyhq/tacy/proto"
 	"github.com/tacyhq/tacy/safety"
 )
@@ -347,4 +353,194 @@ func (c *cardPics) endWait() time.Duration {
 		return cardLookupWait
 	}
 	return cardEndWait
+}
+
+// ---- after the answer: the person allows pictures (v0.8.21) -----------------------------------------------------
+//
+// A run whose pictures setting was still Ask doesn't look its cards up (nothing goes out without the person's
+// answer); its answer offers "Show product photos?". Until v0.8.19 an Allow there only changed the setting for later
+// runs, so the answer on screen kept its placeholders (2026-10-20). Now the run holds back, in this
+// gatewayd's memory only, the reader items its photo-less cards named (deferItem), and its end sends the tab a
+// ticket for them (a "pictures" event, holdPictures). When the person allows pictures, the tab sends that ticket to
+// POST /pictures: a task of its own kind (ViaPictures) with one action, web.images, which looks those items up
+// (pictureLookups) exactly as the run would have (lookupCardPicture: the VM's own copy of each name, the same
+// checks), and shows each picture under the call that brought its item, for that answer's cards. The tab sends no
+// names: the exfil guard is unchanged. A ticket is good once, for 30 minutes, under the run's user tag and space.
+
+// ViaPictures is a task started by POST /pictures (TaskOptions.Via).
+const ViaPictures = "pictures"
+
+const (
+	laterTTL  = 30 * time.Minute
+	maxLater  = 2048 // tickets held at once (the oldest go first)
+	laterWait = 20 * time.Second
+)
+
+// picturesAgent names what runs a pictures task in its activity record: no agent definition, no brain.
+var picturesAgent = harness.AgentRef{ID: "a_search", Version: "1", Digest: "unsigned"}
+
+type laterEntry struct {
+	user, space string
+	items       []taskItem
+	expires     time.Time
+}
+
+// laterPictures are the held-back lookups by ticket.
+type laterPictures struct {
+	mu    sync.Mutex
+	m     map[string]*laterEntry
+	order []string
+}
+
+// lookupAskable: the run's pictures setting isn't Always allow (Ask, or photos off for the chat or in Settings): its
+// cards' lookups are held back, in memory only, for the person turning photos on for that answer (POST /pictures).
+// Nothing leaves until then.
+func (g *Guard) lookupAskable(t *task) bool {
+	return t.opts.Via != ViaSearch && t.opts.Via != ViaPictures &&
+		PermissionSetting(t.opts, "web.images", g.permissionCap(t.opts.Space, "web.images")) != safety.PermAlways
+}
+
+// deferItem holds back a card's lookup (once per item, at most maxCardLookups).
+func (c *cardPics) deferItem(it taskItem) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.final || len(c.deferred) >= maxCardLookups || slices.ContainsFunc(c.deferred, func(x taskItem) bool { return x.name == it.name }) {
+		return
+	}
+	c.deferred = append(c.deferred, it)
+}
+
+// holdPictures keeps a run's held-back lookups under a new ticket and returns it ("": none).
+func (g *Guard) holdPictures(t *task) string {
+	t.cards.mu.Lock()
+	items := slices.Clone(t.cards.deferred)
+	t.cards.mu.Unlock()
+	if len(items) == 0 {
+		return ""
+	}
+	b := make([]byte, 16)
+	rand.Read(b)
+	id := hex.EncodeToString(b)
+	now := g.cfg.Now()
+	l := &g.later
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.m == nil {
+		l.m = map[string]*laterEntry{}
+	}
+	l.order = slices.DeleteFunc(l.order, func(k string) bool {
+		if e := l.m[k]; e == nil || now.After(e.expires) {
+			delete(l.m, k)
+			return true
+		}
+		return false
+	})
+	for len(l.order) >= maxLater {
+		delete(l.m, l.order[0])
+		l.order = l.order[1:]
+	}
+	l.m[id] = &laterEntry{user: t.opts.User, space: t.opts.Space, items: items, expires: now.Add(laterTTL)}
+	l.order = append(l.order, id)
+	return id
+}
+
+// errNoTicket: the same words for every refusal, so a tab learns nothing about other tickets.
+var errNoTicket = errors.New("these pictures can't be looked up now (the answer is too old, or they were looked up already)")
+
+// takePictures is a ticket's held-back lookups, once, for the same user tag and space.
+func (g *Guard) takePictures(ticket, user, space string) ([]taskItem, error) {
+	l := &g.later
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	e := l.m[ticket]
+	if e == nil || e.user != user || e.space != space || g.cfg.Now().After(e.expires) {
+		return nil, errNoTicket
+	}
+	delete(l.m, ticket)
+	return e.items, nil
+}
+
+// PicturesStart checks a pictures request and makes its task: web.images only, no models, no input; its setting
+// for web.images is Always allow (the person just allowed pictures), still under the policy's cap.
+func PicturesStart(r *proto.PicturesRequest, now time.Time) (harness.Start, TaskOptions, []byte, error) {
+	var s harness.Start
+	if len(r.Ticket) != 32 || strings.Trim(r.Ticket, "0123456789abcdef") != "" {
+		return s, TaskOptions{}, nil, errors.New("ticket must be the run's (32 hex)")
+	}
+	secret := make([]byte, 32)
+	rand.Read(secret)
+	args, _ := json.Marshal(map[string]any{"query": "pictures"})
+	s.Space, s.Attempt, s.Agent = "s_chat", 1, picturesAgent
+	s.Tools = ToolDefs("web.images")
+	s.Limits = harness.TaskLimits{Deadline: now.Add(time.Minute).UTC().Format(time.RFC3339)}
+	return s, TaskOptions{Via: ViaPictures, Pictures: r.Ticket, RunSecret: hex.EncodeToString(secret),
+		Permissions: map[string]string{"web.search": "never", "web.fetch": "never", "web.images": "always"}}, args, nil
+}
+
+// PicturesActionID is the request id of a pictures task's one action.
+const PicturesActionID = "pictures"
+
+var errPicturesOnly = harness.Errf(harness.CodeNotAllowed, "a pictures task looks up its ticket's pictures and nothing else")
+
+// picturesOnly: a pictures task makes one web.images action and nothing else (t.mu not held).
+func (t *task) picturesOnly(req any) error {
+	a, ok := req.(*harness.Action)
+	if !ok || a.Name != "web.images" {
+		return errPicturesOnly
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.searched {
+		return errPicturesOnly
+	}
+	t.searched = true
+	return nil
+}
+
+// pictureLookups is a pictures task's one action: its ticket's held-back lookups, at once, each shown under the call
+// that brought its item; done when all ended (at most laterWait), with how many were shown.
+func (g *Guard) pictureLookups(t *task) (*harness.ActionResult, error) {
+	if PermissionSetting(t.opts, "web.images", g.permissionCap(t.opts.Space, "web.images")) != safety.PermAlways {
+		return PermissionDenial("web.images", PermNeverSetting), nil
+	}
+	items, err := g.takePictures(t.opts.Pictures, t.opts.User, t.opts.Space)
+	if err != nil {
+		return &harness.ActionResult{Status: harness.ActionFailed, Error: err.Error()}, nil
+	}
+	cp := t.cards
+	cp.mu.Lock()
+	cp.cards += len(items)
+	cp.lookups = len(items)
+	if cp.first.IsZero() {
+		cp.first = time.Now()
+	}
+	cp.mu.Unlock()
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	shown := 0
+	for _, it := range items {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if g.lookupCardPicture(t, it) {
+				mu.Lock()
+				shown++
+				mu.Unlock()
+			}
+		}()
+	}
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(laterWait):
+	}
+	cp.mu.Lock()
+	cp.last = time.Now()
+	cp.mu.Unlock()
+	mu.Lock()
+	n := shown
+	mu.Unlock()
+	out, _ := json.Marshal(map[string]int{"looked_up": len(items), "shown": n})
+	return &harness.ActionResult{Status: harness.ActionDone, Output: out}, nil
 }

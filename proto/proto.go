@@ -113,6 +113,17 @@ type SearchRequest struct {
 	RecordProof []byte `json:"record_proof,omitzero"`
 }
 
+// PicturesRequest is the body of POST /pictures (v0.8.21): the person turned product photos on after an answer whose
+// cards the VM didn't look up (photos weren't on for it). The ticket is the one the run's "pictures"
+// event carried; it names, in the VM's memory only, the run's checked reader items its cards named, under the run's
+// user tag, for 30 minutes and one use. Nothing else goes out: the tab sends no names.
+type PicturesRequest struct {
+	Ticket string `json:"ticket"`
+	// RecordTo and RecordProof: the activity record's recipient and the proof, as for a search.
+	RecordTo    string `json:"record_to,omitzero"`
+	RecordProof []byte `json:"record_proof,omitzero"`
+}
+
 // Search decisions (SearchRequest.Decision).
 const (
 	SearchOnce    = "once"
@@ -142,7 +153,9 @@ const (
 //	permission   a tool call that would send data out of the VM waits for the person: id is the tool call,
 //	             permission has the kind and exactly what would go out. Sent again with permission.decision once
 //	             it is settled (allowed_once, allowed_always, denied, timed_out, never, unavailable). Never sent
-//	             for a kind set to Always allow.
+//	             for a kind set to Always allow. Sent once, with its decision only, for an action refused without
+//	             asking (never, unavailable, not_from_results: a page address the model composed after reading
+//	             the web).
 //	model_slow   a model call (step) got no first token in time (20 s, more for big requests), or the provider
 //	             answered 503/429 or "overloaded": model, waited_ms, fallback (the model the step switches to; empty
 //	             when there is none or the run isn't on Auto). Once per step at most; the provider's own text is never
@@ -165,14 +178,17 @@ type Event struct {
 	Citations []Citation      `json:"citations,omitempty"`
 	// Quotes: tool_result of a source the quarantined reader read (docs/27 section 5): the exact passages the
 	// answer may cite as [quote N]. The acting model never sees their text; the browser shows it.
-	Quotes  []Quote  `json:"quotes,omitempty"`
-	Image   *Image   `json:"image,omitempty"`
-	Favicon *Favicon `json:"favicon,omitempty"`
-	Usage   *Usage   `json:"usage,omitempty"`
-	Meta    *Meta    `json:"meta,omitempty"`
-	Metrics *Metric  `json:"metrics,omitempty"`
-	Error   string   `json:"error,omitempty"`
-	Code    string   `json:"code,omitempty"` // error: why a safety control ended the run (stopped, stop_list_stale, policy_missing, policy_denied, budget_exceeded, rate_limited), or model_overloaded
+	Quotes []Quote `json:"quotes,omitempty"`
+	// Pictures: a "pictures" event (v0.8.21), at a run's end: the ticket for its cards' photos the VM didn't look up
+	// because pictures weren't allowed yet (POST /pictures, once the person allows them).
+	Pictures string   `json:"pictures,omitempty"`
+	Image    *Image   `json:"image,omitempty"`
+	Favicon  *Favicon `json:"favicon,omitempty"`
+	Usage    *Usage   `json:"usage,omitempty"`
+	Meta     *Meta    `json:"meta,omitempty"`
+	Metrics  *Metric  `json:"metrics,omitempty"`
+	Error    string   `json:"error,omitempty"`
+	Code     string   `json:"code,omitempty"` // error: why a safety control ended the run (stopped, stop_list_stale, policy_missing, policy_denied, budget_exceeded, rate_limited), or model_overloaded
 	// Activity: the run's sealed activity records (its start and end, or the one record of a refused run), sent
 	// right before done or error. Each is signed by Meta.Activity.Key and sealed to RunRequest.RecordTo.
 	Activity     []json.RawMessage `json:"activity,omitempty"`
@@ -196,11 +212,12 @@ type Permission struct {
 	Request  string `json:"request"`             // the held request (grants name it)
 	Kind     string `json:"kind"`                // web.search | web.fetch | web.images
 	Value    string `json:"value"`               // what would go out
-	Decision string `json:"decision,omitempty"`  // "": waiting; allowed_once | allowed_always | denied | timed_out | never | unavailable
+	Decision string `json:"decision,omitempty"`  // "": waiting; allowed_once | allowed_always | denied | timed_out | never | unavailable | not_from_results
 	TimeoutS int    `json:"timeout_s,omitempty"` // waiting: seconds until no answer counts as denied
 	Edited   bool   `json:"edited,omitempty"`    // settled: the person changed the value before allowing
 	// Reason: why this prompt is shown although the person's setting is Always allow, in words for the person
-	// (fixed in the release): a page fetch, after outside content, of an address the model composed.
+	// (fixed in the release). v0.8.2 set it for a page fetch, after outside content, of an address the model
+	// composed; such a fetch is now refused without a prompt (decision not_from_results), so none sets it.
 	Reason string `json:"reason,omitempty"`
 }
 

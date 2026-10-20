@@ -55,6 +55,96 @@ func (s *server) searchRoutes(mux *http.ServeMux, id *ehbpidentity.Identity) {
 	s.searchSlots = make(chan struct{}, maxSearches)
 	s.userSearches = map[string]int{}
 	mux.Handle("POST /search", s.searchGuard(id.Middleware()(http.HandlerFunc(s.search))))
+	mux.Handle("POST /pictures", s.searchGuard(id.Middleware()(http.HandlerFunc(s.pictures))))
+}
+
+// picturesStarter makes a pictures task: agentd's recorder and safety checks (recGateway.StartPictures).
+type picturesStarter interface {
+	StartPictures(r *proto.PicturesRequest) (harness.Start, guard.TaskOptions, []byte, error)
+}
+
+// picturesTimeout bounds one pictures stream: the lookups' own bound (20 s) and the end's grace.
+const picturesTimeout = 40 * time.Second
+
+// POST /pictures (v0.8.21): an answer's cards' held-back photos, once the person allows pictures (guard/pictures.go).
+//
+//	POST /pictures  {ticket, record_to?, record_proof?}
+//	              -> EHBP-encrypted SSE of proto.Event: meta, image (under the run's calls, "for" its item), metrics,
+//	              activity, then done or error. Same token, slots and user tag as /search; nothing is kept.
+func (s *server) pictures(w http.ResponseWriter, r *http.Request) {
+	var req proto.PicturesRequest
+	body, err := io.ReadAll(io.LimitReader(r.Body, 16<<10))
+	if err == nil {
+		err = jsonv2.Unmarshal(body, &req, jsonv2.RejectUnknownMembers(true))
+	}
+	if err != nil {
+		fail(w, 400, "body must be a JSON pictures request")
+		return
+	}
+	starter, ok := s.agent.(picturesStarter)
+	if !ok {
+		fail(w, 404, "pictures_unavailable")
+		return
+	}
+	start, opts, args, err := starter.StartPictures(&req)
+	if err != nil && safety.CodeOf(err) == "" {
+		fail(w, 400, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(200)
+	out := newEventStream(w, keepaliveEvery)
+	defer out.stop()
+	emit := out.emit
+	if err != nil {
+		code, msg := coded(err)
+		emit(proto.Event{Type: "error", Error: msg, Code: code})
+		out.done()
+		return
+	}
+	opts.User, opts.Space = userFrom(r.Context()), start.Space
+	id := harness.NewTaskID()
+	ctx, cancel := context.WithTimeout(r.Context(), picturesTimeout)
+	defer cancel()
+	sess := s.agent.Open(id, opts, emit)
+	defer sess.Close()
+	obs, _ := s.agent.(guard.RunObserver)
+	end := func(e guard.RunEnd, last proto.Event) {
+		if obs != nil {
+			for _, ev := range obs.RunEnded(id, e) {
+				emit(ev)
+			}
+		}
+		emit(last)
+		out.done()
+	}
+	meta := &proto.Meta{Tools: []string{"image_search"}} // no model: nothing to verify
+	if obs != nil {
+		obs.RunStarted(id, &start, opts, meta)
+	}
+	emit(proto.Event{Type: "meta", Meta: meta})
+	optsJSON, _ := json.Marshal(opts)
+	ti := &harness.TaskInfo{ID: id, Start: &start, Options: optsJSON}
+	actx := harness.WithRequestID(ctx, guard.PicturesActionID)
+	res, err := s.agent.Action(actx, ti, guard.PicturesActionID, &harness.Action{Name: "web.images", Call: guard.PicturesActionID, Args: args})
+	step, finish := sess.End()
+	switch {
+	case r.Context().Err() != nil:
+		end(guard.RunEnd{State: harness.OutcomeCancelled, Reason: "person", Steps: step}, proto.Event{Type: "error", Error: "cancelled"})
+	case ctx.Err() != nil:
+		end(guard.RunEnd{State: harness.OutcomeCancelled, Reason: "deadline", Steps: step}, proto.Event{Type: "error", Error: "timed out"})
+	case err != nil:
+		code, msg := s.why(id, err)
+		if code == "" {
+			msg = "the pictures couldn't be looked up"
+		}
+		end(guard.RunEnd{State: harness.OutcomeFailed, Code: code, Msg: msg, Steps: step}, proto.Event{Type: "error", Error: msg, Code: code})
+	case res.Status == harness.ActionDone:
+		end(guard.RunEnd{State: harness.OutcomeSucceeded, Steps: step, Finish: finish}, proto.Event{Type: "done", Step: step})
+	default:
+		end(guard.RunEnd{State: harness.OutcomeFailed, Steps: step}, proto.Event{Type: "error", Error: cmp.Or(res.Error, "the pictures couldn't be looked up"), Code: "pictures_" + res.Status})
+	}
 }
 
 // searchGuard is the checks before EHBP decryption: token, encrypted body, user tag, a slot. Plaintext errors,

@@ -16,8 +16,8 @@ import (
 //
 // That also tells the guard which addresses came from code: a [n] (an address a search returned or a page the task
 // read), or an address in the person's own messages (TaskOptions.Links). Anything else the model composed itself.
-// On a tainted task such an address is always asked about, even under Always allow (Prompts.Hold, permit): a page
-// that steered the model can't send data out through an address it made up.
+// On a tainted task such an address is never opened, and the person isn't asked about it (Prompts.Hold, permit:
+// PermNotFromResults): a page that steered the model can't send data out through an address it made up.
 
 // maxPersonLinks caps the addresses kept from the person's messages.
 const maxPersonLinks = 64

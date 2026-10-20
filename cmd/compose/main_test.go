@@ -481,8 +481,8 @@ func TestTrustArgs(t *testing.T) {
 		!strings.Contains(logged, "-operator-key "+operatorKey) {
 		t.Errorf("with a genesis: %s", logged)
 	}
-	if keylogCarry != safety.ChatPolicyV1 || !strings.HasPrefix(keylogCarry, "e6f08a76") {
-		t.Error("the carried document is the live chat policy")
+	if keylogCarry != safety.ChatPolicyV1+","+safety.ChatPolicyV2 || !strings.HasPrefix(safety.ChatPolicyV2, "b1cf194b") {
+		t.Error("the carried documents are the two chat policies the old admin key signed (v2 in force)")
 	}
 	if p := strings.Join(pullArgs(g), " "); !strings.Contains(p, "-keylog-url "+keylogURL) || !strings.Contains(p, "-safety-url "+safetyURL) {
 		t.Errorf("gatewayd pulls: %s", p)

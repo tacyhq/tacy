@@ -155,14 +155,14 @@ const (
 // its genesis entry's hash (safetysign keylog-check prints it) and the admin key leaves the compose: the VM takes
 // admin signers from the log's current key admins and verifies the log itself (entries from keylogURL, pulled by
 // gatewayd with the documents, or POST /keylog). Our offline admin key becomes the log's recovery kit, so
-// the policy it signed (chat-v1, safety.ChatPolicyV1) is carried: taken as signed by the key admins while it is
-// the one in force, nothing else the kit signs is. Empty: the release pins adminKeys as before.
+// the policies it signed (chat-v1 and chat-v2, safety.ChatPolicyV1 and ChatPolicyV2; v2 is the one in force) are
+// carried: taken as signed by the key admins, nothing else the kit signs is. Empty: the release pins adminKeys as before.
 //
 // f_chat's genesis was signed offline on 2026-10-18 (its owner's identity i_nrqykwaqqhlrcbdruyhwgqty2i as the
 // first key admin, the offline admin key as the kit); the entry is testdata/fchat-genesis.json. Pinned from v0.9.0.
 const (
 	keylogGenesis = "a35f4cb79bd5066638a0fd0aa8dc855b951febba003e6a6fd3e335adc8d47cfd"
-	keylogCarry   = safety.ChatPolicyV1
+	keylogCarry   = safety.ChatPolicyV1 + "," + safety.ChatPolicyV2
 	keylogURL     = "https://chat.tacy.io/api/safety/keylog"
 )
 

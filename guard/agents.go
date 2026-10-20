@@ -32,6 +32,10 @@ import (
 const (
 	AgentChat     = "a_chat"
 	AgentResearch = "a_research"
+	// AgentScheduled is the limits every unattended task runs under (a schedule's or an event's: guard.StartTriggered).
+	// Its instructions, tools and models come from the task's signed definition (TaskOptions.DefAgent); this only
+	// fixes the ceilings. Nobody can start it through POST /tasks (Startable).
+	AgentScheduled = "a_scheduled"
 )
 
 // AgentDef is one built-in agent's definition.
@@ -85,6 +89,25 @@ var researchDef = AgentDef{ID: AgentResearch, Version: "1", Tools: []string{"web
 
 var agentDefs = map[string]*AgentDef{AgentChat: &chatDef, AgentResearch: &researchDef}
 
+// scheduledDef is AgentScheduled (docs/30 "Scheduled tasks", decision 8): at most 20 steps and $0.25 per run (the
+// definition's max_steps may ask for fewer), 10 page reads and 5 searches per step budget's worth, 10 minutes of work.
+// No site icons or card pictures. Its result is sealed to the space's seal key when it ends and kept 7 days (agentd's
+// schedules.go); the task itself is then forgotten.
+var scheduledDef = AgentDef{ID: AgentScheduled, Version: "1", Tools: []string{"web_search", "fetch_page", "image_search"},
+	Steps: 20, Searches: 10, Reads: 25, Work: 10 * time.Minute,
+	Run: safety.Limits{Tokens: 4_000_000, ToolCalls: 40, WallSeconds: 10 * 60, CostMicros: 250_000},
+	// Kept for the digest's last answer over a long conversation (a cent or two on the default model).
+	FinalReserve: 30_000, Keep: 7 * 24 * time.Hour}
+
+// internalDefs are definitions a request can't name (Startable is false): only the VM starts their tasks.
+var internalDefs = map[string]*AgentDef{AgentScheduled: &scheduledDef}
+
+// Startable: a person's request may name agent id (POST /tasks); the internal ones (AgentScheduled) can't.
+func Startable(id string) bool {
+	_, internal := internalDefs[id]
+	return !internal
+}
+
 // agentRefs are the definitions' references for start.agent (and the activity records): the research agent's
 // digest is the SHA-256 of its definition as compiled (instructions template, tools and limits); the chat's stays
 // "unsigned".
@@ -110,6 +133,9 @@ func Definition(id string) (AgentDef, bool) {
 		id = AgentChat
 	}
 	d, ok := agentDefs[id]
+	if !ok {
+		d, ok = internalDefs[id]
+	}
 	if !ok {
 		return AgentDef{}, false
 	}

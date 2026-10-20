@@ -45,7 +45,7 @@ func (c *readCache) put(key [32]byte, r *readerResult) {
 // clone copies what view changes (the quotes' task numbers); the decoded fields and the checked items are only
 // read from here on (before v0.8.16 a cached answer lost its items).
 func (r *readerResult) clone() *readerResult {
-	c := &readerResult{out: r.out, quotes: slices.Clone(r.quotes), items: r.items, err: r.err}
+	c := &readerResult{out: r.out, quotes: slices.Clone(r.quotes), items: r.items, err: r.err, strict: r.strict}
 	for _, p := range r.parts {
 		c.parts = append(c.parts, p.clone())
 	}
@@ -68,6 +68,9 @@ func (d *readerDoc) key(rc *ReaderConfig, question string) [32]byte {
 	put(rc.Fallback + "/" + rc.FallbackEffort)
 	put(strconv.FormatBool(rc.Spans) + "/" + strconv.Itoa(facts) + "/" + strconv.Itoa(quotes) + "/" + strconv.Itoa(spans))
 	put(question)
+	if d.linked {
+		put("linked")
+	}
 	put(d.kind)
 	put(d.url)
 	put(d.title)

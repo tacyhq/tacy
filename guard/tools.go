@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -76,6 +77,9 @@ type toolOutcome struct {
 	tail     *imageTail    // image_search: images still loading after the call returned (nil: none)
 	istats   *imageStats   // image_search: numbers for the metrics event
 	quotes   []proto.Quote // read by the quarantined reader: the exact passages, for the person only (tool_result)
+	// links: a page's links numbered as sources (links.go): fetchable by number and shown to people with the
+	// citations, but not sources of the page's own (no site icons, no card pictures).
+	links []proto.Citation
 }
 
 // pending is one tool call's result before citation numbers are given (Finish). Calls of a step run in
@@ -92,7 +96,9 @@ type pending struct {
 
 type fetched struct {
 	title, text, final string
-	pics               []picCand // the page's own pictures, from its metadata (pagePictures)
+	pics               []picCand  // the page's own pictures, from its metadata (pagePictures)
+	links              []pageLink // the page's own links (pageLinks): numbered sources when the task has PageLinks
+	asked              string     // the address asked for (before redirects)
 }
 
 // Tools runs tool calls for one /run request. Citation numbers continue across calls within the run. Exec may
@@ -111,6 +117,16 @@ type Tools struct {
 	// plain: a plain chat's search task (ViaSearch, searchtask.go), which can't fetch: its results' note says nothing
 	// about fetching.
 	plain bool
+	// links: a page read comes with its own links as numbered sources (links.go; TaskOptions.PageLinks), when its
+	// address is one of personal (the person's own addresses, TaskOptions.Links, as linkKeys). strictPages are the
+	// pages (linkKey of the address asked for) found trying to instruct an AI in this task: a later read of one
+	// stays strict, however that read goes. Guarded by mu.
+	links    bool
+	personal []string
+	// linked: the linkKeys of the page links handed out as numbered sources (a page opened from one is read as one
+	// of the items the question covers: readerDoc.linked). Guarded by mu.
+	linked      map[string]bool
+	strictPages map[string]bool
 	// decodes bounds image decodes at once across the VM (shared by every run; nil = no bound).
 	decodes    chan struct{}
 	mu         sync.Mutex
@@ -221,9 +237,14 @@ func (t *Tools) Exec(ctx context.Context, name string, args json.RawMessage) (pe
 			return pending{out: errorOutcome(fmt.Sprintf("there is no source [%d] in this task's results; use a number a search or page gave", n))}, args
 		}
 		// URLs are checked for the unambiguous kinds only: long numbers and IPs are normal in URLs (article ids;
-		// private IPs are refused by the dialer anyway).
+		// private IPs are refused by the dialer anyway). An address code gave (a source: a search result, a page's
+		// link) isn't: the model didn't write it, so it can't carry the person's data (two Hacker News stories'
+		// message ids read as card numbers, cmd/digestlab 2026-10-20).
 		var kinds []string
-		_, found := maskPII(a.URL)
+		var found []string
+		if !t.isSource(a.URL) {
+			_, found = maskPII(a.URL)
+		}
 		for _, k := range found {
 			if k == "email" || k == "ssn" || k == "card" || k == "iban" || k == "url-credentials" {
 				kinds = append(kinds, k)
@@ -240,6 +261,7 @@ func (t *Tools) Exec(ctx context.Context, name string, args json.RawMessage) (pe
 		var page fetched
 		if err == nil {
 			page, err = t.fetch(ctx, a.URL)
+			page.asked = a.URL
 		}
 		release()
 		if err != nil {
@@ -291,7 +313,31 @@ func (t *Tools) Exec(ctx context.Context, name string, args json.RawMessage) (pe
 func (t *Tools) Finish(p pending) toolOutcome {
 	out := t.finish(p)
 	t.addSources(out.citations)
+	t.addSources(out.links)
+	if len(out.links) > 0 {
+		t.mu.Lock()
+		if t.linked == nil {
+			t.linked = map[string]bool{}
+		}
+		for _, c := range out.links {
+			if k, ok := linkKey(c.URL); ok {
+				t.linked[k] = true
+			}
+		}
+		t.mu.Unlock()
+	}
 	return out
+}
+
+// isLinked: address is one of the page links this task handed out as numbered sources.
+func (t *Tools) isLinked(address string) bool {
+	k, ok := linkKey(address)
+	if !ok {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.linked[k]
 }
 
 func (t *Tools) finish(p pending) toolOutcome {
@@ -343,12 +389,25 @@ func (t *Tools) finish(p pending) toolOutcome {
 		t.cites++
 		// The page's own title is its text too: the model gets the reader's (read.source.title), people the page's.
 		// Its address (after redirects: the page's author chose it) too: the model gets its site and number.
-		head := map[string]any{"note": readerNote, "n": t.cites, "site": siteOf(p.page.final)}
+		n := t.cites
+		head := map[string]any{"note": readerNote, "n": n, "site": siteOf(p.page.final)}
 		if t.pictureFlag(p.page.final, p.page.title, p.page.pics...) {
 			head["picture"] = true // its card gets the page's own picture (cardpics.go)
 		}
-		return t.finishRead(p, out, []int{t.cites}, head,
-			[]proto.Citation{{Index: t.cites, Title: p.page.title, URL: p.page.final, Snippet: capRunes(p.page.text, 200)}})
+		if t.links {
+			// The page's own links, numbered after it (links.go): a page whose address the person gave, without the
+			// links in or next to text that tries to instruct an AI.
+			kept, withheld := t.pageLinks(p.page, p.read)
+			if withheld != "" {
+				head["links_withheld"] = withheld
+			}
+			if len(kept) > 0 {
+				views, cites := t.numberLinks(kept)
+				head["note"], head["links"], out.links = readerNote+" "+linksNote, views, cites
+			}
+		}
+		return t.finishRead(p, out, []int{n}, head,
+			[]proto.Citation{{Index: n, Title: p.page.title, URL: p.page.final, Snippet: capRunes(p.page.text, 200)}})
 	case p.page != nil:
 		t.cites++
 		res := map[string]any{"note": untrustedNote, "n": t.cites, "url": p.page.final, "title": p.page.title, "text": p.page.text}
@@ -521,7 +580,7 @@ func (t *Tools) fetch(ctx context.Context, raw string) (fetched, error) {
 		if err != nil {
 			return fetched{}, errors.New("fetch failed while reading")
 		}
-		f.title, f.text, f.pics = htmlPage(string(page), res.Request.URL)
+		f.title, f.text, f.pics, f.links = htmlPage(string(page), res.Request.URL)
 	case strings.HasPrefix(ct, "text/") || ct == "application/json":
 		body, err := io.ReadAll(io.LimitReader(res.Body, maxPageBytes))
 		if err != nil {
@@ -549,4 +608,39 @@ func errText(err error) string {
 		return "unknown host"
 	}
 	return "network error"
+}
+
+// isSource: raw is the address of one of the task's sources (it came from code).
+func (t *Tools) isSource(raw string) bool {
+	k, ok := linkKey(raw)
+	if !ok {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, u := range t.sources {
+		if uk, _ := linkKey(u); uk == k {
+			return true
+		}
+	}
+	return false
+}
+
+// pageLinks are the links of a page read that the model gets (keptLinks), remembering a page found strict.
+func (t *Tools) pageLinks(pg *fetched, r *readerResult) ([]pageLink, string) {
+	k, _ := linkKey(pg.asked)
+	t.mu.Lock()
+	personal := slices.Contains(t.personal, k)
+	before := t.strictPages[k]
+	t.mu.Unlock()
+	kept, strict, withheld := keptLinks(pg, r, personal, before)
+	if strict {
+		t.mu.Lock()
+		if t.strictPages == nil {
+			t.strictPages = map[string]bool{}
+		}
+		t.strictPages[k] = true
+		t.mu.Unlock()
+	}
+	return kept, withheld
 }

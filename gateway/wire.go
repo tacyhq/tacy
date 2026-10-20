@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/tacyhq/tacy/approval"
 	"github.com/tacyhq/tacy/guard"
 	"github.com/tacyhq/tacy/harness"
 	"github.com/tacyhq/tacy/proto"
@@ -71,6 +72,9 @@ type frame struct {
 	// action: the person's answer to its permission prompt, which gatewayd checks itself before anything
 	// is sent (guard.Grant); none for a kind the person always allows.
 	Grant *guard.Grant `json:"grant,omitzero"`
+	// action: the person's approval of its effect (approve before send, docs/27 section 4), which gatewayd checks
+	// itself (guard.checkApproval) before the effect happens.
+	Approval *approval.Submission `json:"approval,omitzero"`
 	// model, action: the task had received outside content when the request reached agentd (harness.TaskInfo.Tainted,
 	// the runtime's taint); gatewayd also counts what it gave the task itself.
 	Tainted bool `json:"tainted,omitzero"`

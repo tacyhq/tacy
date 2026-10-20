@@ -93,12 +93,18 @@ func journaledOutput(action string, out []byte) (cite, images int, urls []string
 		}
 	case "web.fetch":
 		var o struct {
-			N    int    `json:"n"`
-			URL  string `json:"url"`
-			Site string `json:"site"`
+			N     int    `json:"n"`
+			URL   string `json:"url"`
+			Site  string `json:"site"`
+			Links []struct {
+				N int `json:"n"`
+			} `json:"links"` // the page's own links, numbered after it (links.go)
 		}
 		if json.Unmarshal(out, &o) == nil {
 			cite, urls = o.N, []string{cmp.Or(o.URL, o.Site)}
+			for _, l := range o.Links {
+				cite = max(cite, l.N)
+			}
 		}
 	case "web.images":
 		var o struct {

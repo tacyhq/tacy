@@ -577,6 +577,19 @@ func (s *State) blocked() bool {
 	return s.cfg.Operator != nil && (s.stale() || s.silent())
 }
 
+// OperatorTime is the operator's latest signed time (its stop list's issued_at, the heartbeat) and whether that
+// list is fresh and heard (not stale, not silent). Schedules fire only near it (docs/27 section 3, "Clock"): the
+// host controls the VM's clock, the operator's signature it can't make.
+func (s *State) OperatorTime() (time.Time, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	d := s.stops[IssuerOperator]
+	if d == nil || s.stale() || s.silent() {
+		return time.Time{}, false
+	}
+	return d.l.IssuedAt, true
+}
+
 // Heard says whether the operator's list has been delivered since this process started (pulled or pushed).
 func (s *State) Heard() bool {
 	s.mu.Lock()

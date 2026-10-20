@@ -67,21 +67,25 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	_ "time/tzdata" // the daily schedules' zones, fixed by the attested build (trigger/daily.go)
 
 	ehbpidentity "github.com/tinfoilsh/encrypted-http-body-protocol/identity"
 	ehbpproto "github.com/tinfoilsh/encrypted-http-body-protocol/protocol"
 
 	"github.com/tacyhq/tacy/activity"
+	"github.com/tacyhq/tacy/approval"
 	"github.com/tacyhq/tacy/brain"
 	"github.com/tacyhq/tacy/gateway"
 	"github.com/tacyhq/tacy/guard"
 	"github.com/tacyhq/tacy/harness"
+	"github.com/tacyhq/tacy/identity"
 	"github.com/tacyhq/tacy/internal/procinfo"
 	"github.com/tacyhq/tacy/internal/tinfoil"
 	"github.com/tacyhq/tacy/proto"
 	"github.com/tacyhq/tacy/queue"
 	"github.com/tacyhq/tacy/runner"
 	"github.com/tacyhq/tacy/safety"
+	"github.com/tacyhq/tacy/trigger"
 )
 
 type server struct {
@@ -114,6 +118,15 @@ type server struct {
 	searchSlots  chan struct{}
 	searchMu     sync.Mutex
 	userSearches map[string]int
+	// Triggers and approvals (step7.go): the identity directory (keys v2's key log; nil until it reaches this VM, and then
+	// nothing that needs a person's signature works), approvals (POST /approvals) and triggers (POST /triggers).
+	dir       identity.Directory
+	approvals *guard.Approvals
+	triggers  *trigger.Engine
+	// Schedules for personal spaces (schedules.go, v0.12.0): who proved they hold a space, and scheduled runs'
+	// sealed results. nil on a firm VM.
+	holders trigger.HolderStore
+	results trigger.ResultStore
 }
 
 type ticketKey struct{}
@@ -505,13 +518,67 @@ func main() {
 	// OnWait stops the run's running-time clock while a prompt waits for the person (v0.8.1).
 	rg.prompts = &guard.Prompts{Release: rt.Release, Emit: host.Emit, Cap: permissionCap(st), OnWait: sg.waiting,
 		Sources: host.Sources}
+	// Approve before send and triggers (docs/27 sections 3 and 4): their records in the queue's side file (its own
+	// file, so a rollback's older agentd still opens the queue). No identity directory on this VM yet (keys v2's key
+	// log comes with slices 5 and 6): no approval, definition or event verifies, so sends are denied and nothing is
+	// triggered.
+	var side interface {
+		approval.Store
+		trigger.Store
+		trigger.HolderStore
+		trigger.ResultStore
+	}
+	if dir := p.StoragePath(); dir != "" {
+		q, err := queue.OpenSide(filepath.Join(dir, "side.db"))
+		if err != nil {
+			log.Fatalf("queue side: %v", err)
+		}
+		side = q
+	} else {
+		side = memSide{approval.NewMemStore(), trigger.NewMemStore(), &trigger.MemHolders{}, &trigger.MemResults{}}
+	}
+	// Schedules (v0.12.0, schedules.go): on the shared chat VM, the directory is who proved they hold a personal
+	// space (recorded at a schedule's install). A firm VM's comes with its key log (later): none, nothing installs.
+	// Approvals keep no directory either way: no definition a personal space can install sends or changes anything.
+	var directory identity.Directory
+	var holders trigger.HolderStore
+	var results trigger.ResultStore
+	if st.PersonalSpaces() {
+		holders, results = side, side
+		directory = &trigger.HolderDirectory{Firm: st.Firm(), Store: side}
+	}
+	rg.approvals = &guard.Approvals{Release: rt.Release, Emit: host.Emit, Store: side, IDKey: idKey, OnWait: sg.waiting,
+		Check: approval.Config{Dir: nil, RP: ReleaseRP},
+		Listed: func(space, action string) bool {
+			e, err := st.Policy(space)
+			return err == nil && e.NeedsApproval(action)
+		}}
+	host.Forgotten = func(id string) { side.DeleteApprovals(id) } // with the task, after its keep
+	if unknown, err := rg.approvals.Recover(); err != nil {
+		log.Fatalf("approvals: %v", err)
+	} else if len(unknown) > 0 {
+		log.Printf("approvals: %d effects were being sent when the last process stopped: unknown, never sent again", len(unknown))
+	}
+	engine := trigger.New(trigger.Config{Firm: st.Firm(), Dir: directory, Store: side, IDKey: idKey, Trusted: st.OperatorTime})
+	if directory != nil {
+		if n, err := engine.Load(); err != nil {
+			log.Fatalf("triggers: %v", err)
+		} else if n > 0 {
+			log.Printf("triggers: %d agent definitions loaded", n)
+		}
+	}
 	s := &server{platform: p, id: id, agent: rg, rt: rt, rec: rec, token: p.Secret("AGENT_VM_TOKEN"), booted: time.Now().UTC(),
 		sched: newScheduler(lim), lim: lim, quotes: make(chan struct{}, 8), safety: st, gw: gw, safetySlots: make(chan struct{}, 4),
-		host: host, prompts: rg.prompts}
+		host: host, prompts: rg.prompts, dir: directory, approvals: rg.approvals, triggers: engine, holders: holders, results: results}
+	host.TriggeredDone = s.triggeredDone
 	ctx := context.Background()
 	s.resumeTasks(ctx, ids, log.Printf)
 	if d, ok := p.(*dstack); ok { // the first /attest after a cold start then waits for one guest agent call, not two
 		go d.PrefetchInfo(ctx, 2*time.Second, 3*time.Minute)
+	}
+	go s.runTriggers(ctx, 30*time.Second)
+	if results != nil {
+		go s.pruneResults(ctx)
 	}
 	go sg.enforce(ctx, 2*time.Second)
 	go pruneActivity(ctx, astore)
@@ -551,6 +618,8 @@ func main() {
 	s.taskRoutes(mux, id)
 	// The plain chat's web search (search.go, docs/29).
 	s.searchRoutes(mux, id)
+	s.step7Routes(mux, id)
+	s.scheduleRoutes(mux, id)                      // schedules for personal spaces (schedules.go, SCHEDULES.md)
 	mux.HandleFunc("GET /activity", s.activityOut) // sealed activity records, for the relay (docs/24)
 	// Signed policies and stop lists; the signature is the authorization. Only served when the compose pins a key
 	// (stage 2): without one nothing could verify, so there's nothing to take.

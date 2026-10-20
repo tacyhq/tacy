@@ -54,6 +54,9 @@ type recGateway struct {
 	// prompts holds actions that send data out until the person answered (guard.Prompts); nil: none held
 	// (gatewayd then refuses every kind not set to Always allow).
 	prompts *guard.Prompts
+	// approvals holds actions that need a person's approval (approve before send, guard.Approvals); nil: none held
+	// (gatewayd then refuses every action that needs one).
+	approvals *guard.Approvals
 }
 
 var (
@@ -186,6 +189,9 @@ func (s *recSession) Close() {
 	if s.g.prompts != nil {
 		s.g.prompts.Forget(s.id)
 	}
+	if s.g.approvals != nil {
+		s.g.approvals.Forget(s.id)
+	}
 	s.g.mu.Lock()
 	delete(s.g.bg, s.id)
 	s.g.mu.Unlock()
@@ -222,6 +228,12 @@ func recordStart(task string, start *harness.Start, opts guard.TaskOptions, cont
 	kind := "chat"
 	if opts.Via == guard.ViaSearch || opts.Via == guard.ViaPictures { // a plain chat's search, or an answer's held-back pictures: no model
 		kind = "search"
+	}
+	if opts.Via == guard.ViaTrigger { // an unattended run: its schedule or event fired it, on the VM (via "trigger")
+		kind = cmp.Or(opts.TriggerKind, "schedule")
+		if via != "resume" {
+			via = "trigger"
+		}
 	}
 	return activity.Start{Run: task, Space: start.Space, To: opts.RecordTo, Member: opts.Identity,
 		Agent:   activity.Agent{ID: start.Agent.ID, Version: start.Agent.Version, Digest: start.Agent.Digest},
@@ -502,13 +514,21 @@ func (g *recGateway) Action(ctx context.Context, ti *harness.TaskInfo, id string
 	connector, _, _ := strings.Cut(req.Name, ".")
 	done := g.begin(ti, id, "action", req.Name, connector, req)
 	// Permission prompts: an action that sends data out goes on with the person's grant, or is denied here without running.
+	// Approve before send: an action decided here without running is answered now; an approved one goes on with
+	// its approval (gatewayd checks it again) and its effect marked sending first.
 	var res *harness.ActionResult
 	var err error
-	if g.prompts != nil {
+	if g.approvals != nil {
+		ctx, res = g.approvals.Attach(ctx, ti, id, req)
+	}
+	if res == nil && g.prompts != nil {
 		ctx, res = g.prompts.Attach(ctx, ti, id, req)
 	}
 	if res == nil {
 		res, err = g.safeGateway.Action(guard.WithFacts(ctx, f), ti, id, req)
+		if g.approvals != nil {
+			g.approvals.Done(ti.ID, id, res, err)
+		}
 	}
 	done(f, res, err, func(c *activity.Call) {
 		if g.prompts != nil {
@@ -533,8 +553,15 @@ var (
 	_ guard.TaskFollower = (*recGateway)(nil)
 )
 
-// Hold: an action that would send data out waits for the person's answer (guard.Prompts.Hold).
+// Hold: an action that needs a person's approval waits for it (guard.Approvals.Hold); one that would send data
+// out waits for the person's answer (guard.Prompts.Hold). An approval decided without asking (nobody can
+// approve it) is answered by Attach, never asked about as a prompt as well.
 func (g *recGateway) Hold(ti *harness.TaskInfo, id string, req any) string {
+	if g.approvals != nil {
+		if sub, decided := g.approvals.Hold(ti, id, req); sub != "" || decided {
+			return sub
+		}
+	}
 	if g.prompts == nil {
 		return ""
 	}
@@ -543,14 +570,17 @@ func (g *recGateway) Hold(ti *harness.TaskInfo, id string, req any) string {
 
 // TaskResumed shows a resumed task's waiting prompts again (guard.Prompts.Resume).
 func (g *recGateway) TaskResumed(task string, start *harness.Start, opts guard.TaskOptions, journal []harness.Record) {
-	if g.prompts == nil {
-		return
-	}
 	b, err := json.Marshal(opts)
 	if err != nil {
 		return
 	}
-	g.prompts.Resume(&harness.TaskInfo{ID: task, Start: start, Options: b}, journal)
+	ti := &harness.TaskInfo{ID: task, Start: start, Options: b}
+	if g.approvals != nil {
+		g.approvals.Resume(ti, journal)
+	}
+	if g.prompts != nil {
+		g.prompts.Resume(ti, journal)
+	}
 }
 
 func (g *recGateway) Exec(ctx context.Context, ti *harness.TaskInfo, id string, req *harness.Exec) (*harness.ExecResult, error) {

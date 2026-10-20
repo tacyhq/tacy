@@ -28,6 +28,18 @@ type Target interface {
 	ScriptModel(replies ...*harness.ModelResult)
 }
 
+// HoldTarget is a Target whose guard can hold an action for a person's decision before it runs (approve before
+// send, a permission prompt: docs/27 sections 4 and 6). The runtime suite's approval scenarios run only on one.
+type HoldTarget interface {
+	Target
+	// HoldActions makes the guard hold every action named name, with wait sub-state sub.
+	HoldActions(name, sub string)
+	// Held is the task's requests held now.
+	Held(task string) []harness.Held
+	// Release decides a held request (allow: run it once; deny: answer it denied without running it).
+	Release(task, id string, allow bool, reason string) error
+}
+
 // FakeTarget is the fake runtime as a Target.
 func FakeTarget(t testing.TB) Target { return FakeTargetOn(t, harness.NewMemStore()) }
 
@@ -53,6 +65,19 @@ func (ft *fakeTarget) Start(id string, s harness.Start) error { return ft.f.Star
 func (ft *fakeTarget) ActionRuns(task, name string) int       { return ft.f.ActionRuns(task, name) }
 func (ft *fakeTarget) ScriptModel(replies ...*harness.ModelResult) {
 	ft.f.Model = harness.Script(replies...)
+}
+func (ft *fakeTarget) HoldActions(name, sub string) {
+	if ft.f.Holds == nil {
+		ft.f.Holds = map[string]string{}
+	}
+	ft.f.Holds[name] = sub
+}
+func (ft *fakeTarget) Held(task string) []harness.Held {
+	st, _ := ft.f.Status(task)
+	return st.Held
+}
+func (ft *fakeTarget) Release(task, id string, allow bool, reason string) error {
+	return ft.f.Release(task, id, allow, reason)
 }
 
 // raw is a brain that writes whatever it's told to.
@@ -368,6 +393,96 @@ func RunRuntime(t *testing.T, newTarget func(testing.TB) Target) {
 		r.expect(checkpoint("t1", "c2", 1, 1), "t1", "c2", harness.CodeInvalid) // no steer was sent
 		r.expect(checkpoint("t1", "c3", 1, 0), "t1", "c3", "")
 		r.expect(checkpoint("t1", "c4", 1, 0), "t1", "c4", harness.CodeInvalid) // an old checkpoint can't overwrite
+	})
+
+	// A task id derived from what makes a start unique (a schedule slot, an event delivery, a retried start's key;
+	// docs/27 section 1) can't make a second task: the second start is refused, whatever its content.
+	t.Run("derived task id is once-only", func(t *testing.T) {
+		tg, _ := connect(t)
+		if err := tg.Start("tk_derived", Task("test.echo")); err != nil {
+			t.Fatal(err)
+		}
+		if err := tg.Start("tk_derived", Task("test.other")); err == nil {
+			t.Fatal("a second task under the same id was started")
+		}
+	})
+
+	// Approve before send (docs/27 section 4): a held action doesn't run, and the brain gets no result, until a person
+	// decides. Approved, it runs once; its id re-sent gets the journaled result. Denied, it never runs and the brain
+	// gets a denied result (a normal outcome the model sees), again on a re-send.
+	holds := func(t *testing.T) (HoldTarget, *raw) {
+		tg, r := connect(t)
+		ht, ok := tg.(HoldTarget)
+		if !ok {
+			t.Skip("target can't hold actions")
+		}
+		ht.HoldActions("sink.post", harness.WaitApproval)
+		ht.ScriptModel(harness.Calls(call("c1", "sink.post", `{"to":"client"}`), call("c2", "sink.post", `{"to":"other"}`)))
+		r.hello()
+		if err := ht.Start("t1", Task("sink.post")); err != nil {
+			t.Fatal(err)
+		}
+		r.start("t1")
+		r.expect(modelCall("t1", "m0"), "t1", "m0", "")
+		return ht, r
+	}
+	waitHeld := func(t *testing.T, ht HoldTarget, n int) []harness.Held {
+		t.Helper()
+		for deadline := time.Now().Add(wait); ; time.Sleep(5 * time.Millisecond) {
+			if h := ht.Held("t1"); len(h) == n {
+				return h
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("held %+v, want %d", ht.Held("t1"), n)
+			}
+		}
+	}
+	noFrame := func(t *testing.T, r *raw, d time.Duration) {
+		t.Helper()
+		r.c.SetReadDeadline(time.Now().Add(d))
+		if b, err := harness.ReadFrame(r.c, harness.MaxFrame); err == nil {
+			t.Fatalf("a frame arrived while the action was held: %s", b)
+		}
+	}
+	t.Run("held action runs once, after approval", func(t *testing.T) {
+		ht, r := holds(t)
+		r.send(actionFor("t1", "a1", "sink.post", "c1", `{"to":"client"}`))
+		h := waitHeld(t, ht, 1)
+		noFrame(t, r, 200*time.Millisecond)
+		if ht.ActionRuns("t1", "sink.post") != 0 {
+			t.Fatal("ran before approval")
+		}
+		if err := ht.Release("t1", h[0].ID, true, ""); err != nil {
+			t.Fatal(err)
+		}
+		r.c.SetReadDeadline(time.Time{})
+		first := r.result("t1", "a1")
+		if first.Error != nil || !strings.Contains(string(first.Body), `"done"`) {
+			t.Fatalf("approved result %s %v", first.Body, first.Error)
+		}
+		again := r.expect(actionFor("t1", "a1", "sink.post", "c1", `{"to":"client"}`), "t1", "a1", "")
+		if !bytes.Equal(first.Body, again.Body) || ht.ActionRuns("t1", "sink.post") != 1 {
+			t.Fatalf("re-sent approved action: %s, ran %d times", again.Body, ht.ActionRuns("t1", "sink.post"))
+		}
+		if err := ht.Release("t1", h[0].ID, true, ""); err == nil {
+			t.Error("a decided request was decided again")
+		}
+	})
+	t.Run("denied action never runs", func(t *testing.T) {
+		ht, r := holds(t)
+		r.send(actionFor("t1", "a2", "sink.post", "c2", `{"to":"other"}`))
+		h := waitHeld(t, ht, 1)
+		if err := ht.Release("t1", h[0].ID, false, "the person declined"); err != nil {
+			t.Fatal(err)
+		}
+		e := r.result("t1", "a2")
+		if e.Error != nil || !strings.Contains(string(e.Body), `"denied"`) || !strings.Contains(string(e.Body), "declined") {
+			t.Fatalf("denied result %s %v", e.Body, e.Error)
+		}
+		again := r.expect(actionFor("t1", "a2", "sink.post", "c2", `{"to":"other"}`), "t1", "a2", "")
+		if !bytes.Equal(e.Body, again.Body) || ht.ActionRuns("t1", "sink.post") != 0 {
+			t.Fatalf("denied action re-sent: %s, ran %d times", again.Body, ht.ActionRuns("t1", "sink.post"))
+		}
 	})
 
 	t.Run("after done", func(t *testing.T) {

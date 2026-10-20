@@ -3,12 +3,15 @@
 // RunBrain runs a brain (a harness: our Go loop, a Pi adapter, a builder's SDK) against the fake runtime through
 // what every harness must handle: the handshake, a task with a tool call, steering mid-run, cancel, a crash
 // while an action runs (the replayed action must not run twice), a crash and resume from a checkpoint, a runtime
-// restart mid-task, a request the runtime refuses, arguments the model got wrong, the safety controls (kill switch,
-// a budget refusal, a policy refusal), and malformed or oversize frames from the runtime. Every frame the brain sends goes through the runtime's strict decoder; one refusal fails the
+// restart mid-task, a request held for a person across a runtime restart, an approval denied, an approval wait
+// longer than the idle timeout, a request the runtime refuses, arguments the model got wrong, the safety controls
+// (kill switch, a budget refusal, a policy refusal), and malformed or oversize frames from the runtime. Every frame the brain sends goes through the runtime's strict decoder; one refusal fails the
 // test, as does an action that doesn't name the model tool call it carries out.
 //
 // RunRuntime plays a hostile brain against a runtime: malformed and oversize frames, wrong order, an unsupported
-// version, a reused action id, requests for unknown or closed tasks, checkpoint rules, replay after reconnecting.
+// version, a reused action id, requests for unknown or closed tasks, checkpoint rules, replay after reconnecting, a
+// derived task id started twice, and (on a target that can hold actions) a held action that runs once after its
+// approval and a denied one that never runs.
 package conformance
 
 import (
@@ -589,6 +592,83 @@ func RunBrain(t *testing.T, brain Brain) {
 		calls := modelCalls(t, e.snapshot(), "t1")
 		if last := calls[len(calls)-1]; toolResult(last, "c1", harness.CodeInterrupted) || toolResult(last, "c1", harness.CodeCancelled) {
 			t.Error("the model was told the held mail was interrupted")
+		}
+		e.clean()
+	})
+
+	// Approve before send (docs/27 section 4): a person denies a held send. The brain gets a denied result like a
+	// policy refusal: it tells the model and goes on, and it doesn't send the action again under another id (a
+	// denial is the person's answer, not a failure to retry).
+	t.Run("approval denied", func(t *testing.T) {
+		e := newEnv(t, brain)
+		e.f.Model = harness.Script(harness.Calls(call("c1", "sink.post", `{"to":"client"}`)), harness.Text("not sent"))
+		e.f.Holds = map[string]string{"sink.post": harness.WaitApproval}
+		e.launch()
+		e.f.Start("t1", Task("sink.post"))
+		var held []harness.Held
+		for deadline := time.Now().Add(wait); len(held) == 0; time.Sleep(5 * time.Millisecond) {
+			st, _ := e.f.Status("t1")
+			held = st.Held
+			if time.Now().After(deadline) {
+				t.Fatal("the send wasn't held")
+			}
+		}
+		if err := e.f.Release("t1", held[0].ID, false, "approval_denied: the person declined"); err != nil {
+			t.Fatal(err)
+		}
+		o := e.outcome("t1")
+		if o.State != harness.OutcomeSucceeded || o.Done.Text != "not sent" {
+			t.Fatalf("outcome %+v: a denial goes back to the model, it doesn't end the task", o)
+		}
+		if e.f.ActionRuns("t1", "sink.post") != 0 {
+			t.Error("the denied send ran")
+		}
+		fs := e.snapshot()
+		if n := count(fs, true, harness.TypeAction, "t1"); n != 1 {
+			t.Errorf("%d actions sent, want 1: the brain mustn't retry a denied send", n)
+		}
+		calls := modelCalls(t, fs, "t1")
+		if len(calls) != 2 || !toolResult(calls[1], "c1", "declined") {
+			t.Error("the model wasn't told the person declined")
+		}
+		e.clean()
+	})
+
+	// An unattended task can wait hours for its sponsor's approval (docs/27 section 4). A held request is in flight:
+	// the brain must keep waiting quietly, and the runtime mustn't count the wait as a hung brain (the idle timeout
+	// only applies with nothing in flight). Approved after more than the idle timeout, it runs once and the task
+	// finishes on its first attempt.
+	t.Run("approval wait outlasts the idle timeout", func(t *testing.T) {
+		e := newEnv(t, brain)
+		e.f.Limits.IdleTimeoutMs = 200
+		e.f.Model = harness.Script(harness.Calls(call("c1", "sink.post", `{"to":"client"}`)), harness.Text("sent"))
+		e.f.Holds = map[string]string{"sink.post": harness.WaitApproval}
+		e.launch()
+		e.f.Start("t1", Task("sink.post"))
+		var held []harness.Held
+		for deadline := time.Now().Add(wait); len(held) == 0; time.Sleep(5 * time.Millisecond) {
+			st, _ := e.f.Status("t1")
+			held = st.Held
+			if time.Now().After(deadline) {
+				t.Fatal("the send wasn't held")
+			}
+		}
+		time.Sleep(800 * time.Millisecond) // four idle timeouts
+		st, _ := e.f.Status("t1")
+		if st.State != harness.StateWaiting || st.Sub != harness.WaitApproval || st.Failures != 0 {
+			t.Fatalf("while waiting: %+v", st)
+		}
+		if err := e.f.Release("t1", held[0].ID, true, ""); err != nil {
+			t.Fatal(err)
+		}
+		if o := e.outcome("t1"); o.State != harness.OutcomeSucceeded || o.Done.Text != "sent" {
+			t.Fatalf("outcome %+v", o)
+		}
+		if n := e.f.ActionRuns("t1", "sink.post"); n != 1 {
+			t.Errorf("sink.post ran %d times, want 1", n)
+		}
+		if n := count(e.snapshot(), false, harness.TypeStart, "t1"); n != 1 {
+			t.Errorf("%d starts: the wait restarted the brain", n)
 		}
 		e.clean()
 	})

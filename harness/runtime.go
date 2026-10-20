@@ -370,6 +370,13 @@ func (r *Runtime) Start(id string, s Start) error { return r.StartWith(id, s, ni
 // task is in the Store before StartWith returns, so a restarted runtime picks it up again (Restore). An id that
 // exists, or existed and wasn't forgotten, is refused with ErrTaskExists.
 func (r *Runtime) StartWith(id string, s Start, opts jsontext.Value) error {
+	return r.StartTainted(id, s, opts, "")
+}
+
+// StartTainted is StartWith for a task whose input the runtime side already knows is untrusted (a task an inbound
+// event started: no person typed what it carries, docs/27 section 5): taint, when set, is recorded as the task's
+// taint before the brain gets the task, as for StartTaintGuard's. A StartTaintGuard's reason wins when it has one.
+func (r *Runtime) StartTainted(id string, s Start, opts jsontext.Value, taint string) error {
 	r.init()
 	s.Attempt, s.Checkpoint = 1, nil
 	if !ValidID(id) {
@@ -396,7 +403,9 @@ func (r *Runtime) StartWith(id string, s Start, opts jsontext.Value) error {
 		}
 		return Errf(CodeInternal, "task not stored: %v", err)
 	}
-	taint := r.startTaint(&s)
+	if t := r.startTaint(&s); t != "" {
+		taint = t
+	}
 	if taint != "" {
 		if err := r.Store.SetTaint(id, taint); err != nil {
 			r.Store.DeleteTask(id)

@@ -73,8 +73,8 @@ func (g *Guard) checkSafety(space string, req any) error {
 	case *harness.Action:
 		if !e.AllowsTool(b.Name) {
 			why := "isn't allowed by the policy"
-			if e.NeedsApproval(b.Name) {
-				why = "needs approval, which isn't available yet"
+			if e.NeedsApproval(b.Name) && e.AllowsToolApproved(b.Name) {
+				why = "needs a person's approval"
 			}
 			return &policyDenial{msg: safety.CodePolicyDenied + ": " + b.Name + " " + why}
 		}

@@ -491,10 +491,12 @@ func (g *safeGateway) Action(ctx context.Context, ti *harness.TaskInfo, id strin
 	if err != nil {
 		return nil, g.refuse(ti.ID, harness.CodeNotAllowed, err)
 	}
-	if !e.AllowsTool(req.Name) {
+	// An action a policy layer holds for approval runs only with the person's approval (guard.Approvals put it
+	// in after checking it; gatewayd checks it again).
+	if !e.AllowsTool(req.Name) && !(e.NeedsApproval(req.Name) && guard.ApprovalFrom(ctx) != nil && e.AllowsToolApproved(req.Name)) {
 		why := "isn't allowed by the policy"
-		if e.NeedsApproval(req.Name) {
-			why = "needs approval, which isn't available yet"
+		if e.NeedsApproval(req.Name) && e.AllowsToolApproved(req.Name) {
+			why = "needs a person's approval"
 		}
 		return &harness.ActionResult{Status: harness.ActionDenied, Error: safety.CodePolicyDenied + ": " + req.Name + " " + why}, nil
 	}

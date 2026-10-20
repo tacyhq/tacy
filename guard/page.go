@@ -148,25 +148,29 @@ var blockTags = map[string]bool{"p": true, "div": true, "br": true, "li": true, 
 	"table": true, "ul": true, "ol": true, "header": true, "main": true, "dt": true, "dd": true, "figcaption": true,
 	"details": true, "summary": true, "fieldset": true, "legend": true}
 
+// HTMLText is htmlText for tools outside the VM (cmd/digestlab: its judge gets an article's text as the VM reads it).
+func HTMLText(src string) (title, text string) { return htmlText(src) }
+
 // htmlText extracts the title and readable text of an HTML page: its structured facts, then its main content,
 // or the whole page when no content element is found.
 func htmlText(src string) (title, text string) {
-	title, text, _ = htmlPage(src, nil)
+	title, text, _, _ = htmlPage(src, nil)
 	return title, text
 }
 
-// htmlPage is htmlText plus the page's own pictures as its metadata names them (pagePictures; none without base,
-// the page's address after redirects, which relative addresses resolve against).
-func htmlPage(src string, base *url.URL) (title, text string, pics []picCand) {
+// htmlPage is htmlText plus the page's own pictures as its metadata names them (pagePictures) and its links
+// (pageLinks); none of either without base, the page's address after redirects, which relative addresses resolve
+// against.
+func htmlPage(src string, base *url.URL) (title, text string, pics []picCand, links []pageLink) {
 	doc, err := html.Parse(strings.NewReader(src))
 	if err != nil {
-		return "", "", nil
+		return "", "", nil, nil
 	}
 	if base != nil {
-		pics = pagePictures(doc, base)
+		pics, links = pagePictures(doc, base), pageLinks(doc, base)
 	}
 	title, text = htmlDoc(doc)
-	return title, text, pics
+	return title, text, pics, links
 }
 
 func htmlDoc(doc *html.Node) (title, text string) {

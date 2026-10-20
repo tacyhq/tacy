@@ -31,6 +31,9 @@ import (
 const (
 	ViaRun   = "run"   // POST /run's shim: followed by its one request, deleted when it ends, abandoned at a restart
 	ViaTasks = "tasks" // POST /tasks: kept until it ends plus Keep, followed by its starter, resumed after a restart
+	// ViaTrigger: started by a schedule or an inbound event for its sponsor (StartTriggered); kept and resumed like
+	// ViaTasks.
+	ViaTrigger = "trigger"
 )
 
 // TaskResumer is a Gateway with per-task state of its own that must be taken up again when a task is resumed after
@@ -63,6 +66,11 @@ type Host struct {
 	FlushEvery time.Duration
 	// MaxOpen caps the tasks one user may have open through POST /tasks (not ended); 0: 8.
 	MaxOpen int
+	// Forgotten, when set, is told each task Prune deleted (agentd deletes its approval records with it).
+	Forgotten func(id string)
+	// TriggeredDone, when set, is told when an unattended task (ViaTrigger) ended, once its last event is in the
+	// queue (agentd seals its result to the space's seal key and forgets the task: schedules.go).
+	TriggeredDone func(id string, opts TaskOptions)
 
 	once    sync.Once
 	mu      sync.Mutex
@@ -358,11 +366,25 @@ func (h *Host) Start(ctx context.Context, sr StartRequest) (id string, existed b
 	}
 	h.live[id] = l
 	h.mu.Unlock()
+	existed, err = h.launch(ctx, l, sr.Req.Model, sr.Req.Tools, "")
+	if err != nil {
+		return h.failed(l, err)
+	}
+	if existed {
+		return id, true, nil
+	}
+	return id, false, nil
+}
 
+// launch opens the task's guard session, emits its meta and hands it to the runtime (StartTainted with taint), then
+// follows it to its end. existed: another process made the task meanwhile. On an error the stream has it and l is
+// ended; the caller drops or keeps l (failed).
+func (h *Host) launch(ctx context.Context, l *hosted, model string, tools []string, taint string) (existed bool, err error) {
+	id, start, opts := l.id, l.start, l.opts
 	optsJSON, err := json.Marshal(opts)
 	if err != nil {
 		h.drop(l)
-		return "", false, err
+		return false, err
 	}
 	l.sess = h.GW.Open(id, opts, func(e proto.Event) error { l.emit(e, h.flushEvery()); return nil })
 	meta, err := l.sess.Meta(ctx)
@@ -371,9 +393,9 @@ func (h *Host) Start(ctx context.Context, sr StartRequest) (id string, existed b
 		l.emit(proto.Event{Type: "error", Error: err.Error()}, 0)
 		l.sess.Close()
 		l.end()
-		return h.failed(l, err)
+		return false, err
 	}
-	meta.Model, meta.Tools = sr.Req.Model, sr.Req.Tools
+	meta.Model, meta.Tools = model, tools
 	if !IsChat(opts.Agent) {
 		meta.Agent = opts.Agent
 	}
@@ -382,16 +404,16 @@ func (h *Host) Start(ctx context.Context, sr StartRequest) (id string, existed b
 		obs.RunStarted(id, &start, opts, meta)
 	}
 	l.emit(proto.Event{Type: "meta", Meta: meta}, 0)
-	if err := h.RT.StartWith(id, start, optsJSON); err != nil {
+	if err := h.RT.StartTainted(id, start, optsJSON, taint); err != nil {
 		h.ended(l, RunEnd{State: harness.OutcomeFailed, Msg: "the task wasn't started"})
 		l.emit(proto.Event{Type: "error", Error: err.Error()}, 0)
 		l.sess.Close()
 		l.end()
 		if errors.Is(err, harness.ErrTaskExists) { // made by another process meanwhile
 			h.drop(l)
-			return id, true, nil
+			return true, nil
 		}
-		return h.failed(l, err)
+		return false, err
 	}
 	l.mu.Lock()
 	l.stored = true
@@ -400,7 +422,7 @@ func (h *Host) Start(ctx context.Context, sr StartRequest) (id string, existed b
 	}
 	l.mu.Unlock()
 	go h.finish(l)
-	return id, false, nil
+	return false, nil
 }
 
 // failed ends a start that failed after it had an id: a /run shim still follows its stream (an error event, as
@@ -507,7 +529,7 @@ func (h *Host) timedOut(task string) bool {
 func (h *Host) close(l *hosted) {
 	l.sess.Close()
 	l.end()
-	if l.via == ViaTasks {
+	if l.via == ViaTasks || l.via == ViaTrigger {
 		h.drop(l)
 	}
 	l.mu.Lock()
@@ -516,6 +538,28 @@ func (h *Host) close(l *hosted) {
 	l.mu.Unlock()
 	if deleted {
 		h.RT.Forget(l.id)
+	}
+	if l.via == ViaTrigger && h.TriggeredDone != nil {
+		h.TriggeredDone(l.id, l.opts)
+	}
+}
+
+// Events is every event of a task kept in the queue, in order (an ended task's whole stream).
+func (h *Host) Events(id string) ([]proto.Event, error) {
+	var out []proto.Event
+	after := 0
+	for {
+		evs, err := h.stored(id, after, 0)
+		if err != nil {
+			return nil, err
+		}
+		if len(evs) == 0 {
+			return out, nil
+		}
+		for _, e := range evs {
+			out = append(out, *e.Ev)
+			after = e.Seq
+		}
 	}
 }
 
@@ -822,7 +866,7 @@ func (h *Host) Resume(ids []string) (resumed, abandoned int) {
 		st, err := h.RT.Store.Task(id)
 		var opts TaskOptions
 		var start harness.Start
-		if err != nil || st == nil || json.Unmarshal(st.Options, &opts) != nil || opts.Via != ViaTasks ||
+		if err != nil || st == nil || json.Unmarshal(st.Options, &opts) != nil || (opts.Via != ViaTasks && opts.Via != ViaTrigger) ||
 			jsonv2.Unmarshal(st.Start, &start) != nil {
 			h.RT.Cancel(id, "restart")
 			go func() {
@@ -838,7 +882,7 @@ func (h *Host) Resume(ids []string) (resumed, abandoned int) {
 			r.ResumeTask(id, &start, opts, st.Created, journal)
 		}
 		base := h.lastSeq(id, 0)
-		l := &hosted{id: id, user: opts.User, via: ViaTasks, start: start, opts: opts, changed: make(chan struct{}),
+		l := &hosted{id: id, user: opts.User, via: opts.Via, start: start, opts: opts, changed: make(chan struct{}),
 			st: h.RT.Store, stored: true, base: base, flushed: base}
 		for after := 0; after < base; { // its sources (and whether a model sent anything), from the events an earlier process showed
 			evs, err := h.stored(id, after, base)
@@ -885,6 +929,9 @@ func (h *Host) Prune(now time.Time) int {
 		}
 		if h.RT.Forget(id) == nil {
 			n++
+			if h.Forgotten != nil {
+				h.Forgotten(id)
+			}
 		}
 		h.mu.Lock()
 		delete(h.live, id)

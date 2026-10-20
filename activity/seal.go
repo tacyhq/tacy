@@ -261,3 +261,42 @@ func isHex(s string) bool {
 	}
 	return true
 }
+
+// SealTo seals body to the recipient key to ("x25519:<base64>") with the records' HPKE suite (RFC 9180 base mode,
+// DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-256-GCM) under info and aad, padded to a size bucket first (trailing
+// spaces: the same JSON). A scheduled run's result uses it (agentd, v0.12.0).
+func SealTo(to string, info, aad, body []byte) (enc, ct []byte, err error) {
+	pub, err := ParseRecipient(to)
+	if err != nil {
+		return nil, nil, err
+	}
+	hp, err := hpke.NewDHKEMPublicKey(pub)
+	if err != nil {
+		return nil, nil, err
+	}
+	enc, sender, err := hpke.NewSender(hp, suite.kdf, suite.aead, info)
+	if err != nil {
+		return nil, nil, err
+	}
+	pt := pad(bytes.Clone(body))
+	ct, err = sender.Seal(aad, pt)
+	clear(pt)
+	return enc, ct, err
+}
+
+// OpenFrom opens what SealTo sealed, with the recipient's private key (tests; the browser does the same).
+func OpenFrom(priv *ecdh.PrivateKey, info, aad, enc, ct []byte) ([]byte, error) {
+	hk, err := hpke.NewDHKEMPrivateKey(priv)
+	if err != nil {
+		return nil, err
+	}
+	rc, err := hpke.NewRecipient(enc, hk, suite.kdf, suite.aead, info)
+	if err != nil {
+		return nil, ErrCipher
+	}
+	pt, err := rc.Open(aad, ct)
+	if err != nil {
+		return nil, ErrCipher
+	}
+	return pt, nil
+}

@@ -110,7 +110,8 @@ func (c *Client) ModelCall(ctx context.Context, ti *harness.TaskInfo, req *harne
 func (c *Client) Action(ctx context.Context, ti *harness.TaskInfo, id string, req *harness.Action) (*harness.ActionResult, error) {
 	s, done := c.sessionFor(ti.ID)
 	defer done()
-	r, err := s.call(ctx, ti, &frame{T: tAction, ID: id, Action: req, Grant: guard.GrantFrom(ctx), Tainted: ti.Tainted})
+	r, err := s.call(ctx, ti, &frame{T: tAction, ID: id, Action: req, Grant: guard.GrantFrom(ctx),
+		Approval: guard.ApprovalFrom(ctx), Tainted: ti.Tainted})
 	if err != nil {
 		return nil, err
 	}

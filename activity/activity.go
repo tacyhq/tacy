@@ -122,8 +122,10 @@ type Agent struct {
 
 // Trigger says what started the run.
 type Trigger struct {
-	Kind string `json:"kind"`          // "chat": a person's browser, through the relay
-	Via  string `json:"via,omitempty"` // "relay"
+	// "chat": a person's browser, through the relay; "search": a plain chat's search; "schedule" or "event": an
+	// unattended run its signed definition's trigger started on the VM (via "trigger"; v0.12.0).
+	Kind string `json:"kind"`
+	Via  string `json:"via,omitempty"` // "relay", "trigger", or "resume" (taken up after a restart)
 }
 
 // Controls are the signed controls the run started under (the safety documents' hashes and numbers).

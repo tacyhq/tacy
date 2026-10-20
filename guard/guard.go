@@ -32,12 +32,15 @@ import (
 
 // Config is what a Guard runs with.
 type Config struct {
-	Up          Upstream       // the model gateway: Tinfoil's router, verified (tinfoilUpstream); required
-	Search      SearchProvider // web.search and web.images (an ImageSearcher for images); nil: none configured
-	Fetcher     *http.Client   // web.fetch and image downloads; nil: newFetcher(publicOnly)
-	Icons       *http.Client   // the sources' site icons (same guarded client in production); nil: none
-	Limits      *Limits        // per-user and VM-wide tool caps (limits.go); nil: none
-	CacheSecret string         // per-boot default scope of Tinfoil's prompt cache
+	Up      Upstream       // the model gateway: Tinfoil's router, verified (tinfoilUpstream); required
+	Search  SearchProvider // web.search and web.images (an ImageSearcher for images); nil: none configured
+	Fetcher *http.Client   // web.fetch and image downloads; nil: newFetcher(publicOnly)
+	Icons   *http.Client   // the sources' site icons (same guarded client in production); nil: none
+	Limits  *Limits        // per-user and VM-wide tool caps (limits.go); nil: none
+	// PageLinks overrides TaskOptions.PageLinks for every task: "on" (cmd/readereval -page-links) or "off"
+	// (cmd/digestlab's baseline: the release before numbered links); "": each task's own.
+	PageLinks   string
+	CacheSecret string // per-boot default scope of Tinfoil's prompt cache
 	Now         func() time.Time
 	Record      func(Egress) // leak-scan decisions (metadata only); nil: none
 	// Safety is the signed policy and stop lists this process verified itself (step 6, safety.go); nil: no
@@ -48,6 +51,11 @@ type Config struct {
 	Reader *ReaderConfig
 	// SlowAfter is the base of a model call's first-token wait (SlowThreshold); 0: DefaultSlowAfter. Tests shorten it.
 	SlowAfter time.Duration
+	// Sink is the test-only connector with effects (sink.go); nil in every release binary.
+	Sink *Sink
+	// Approvals checks a person's approval of an effect itself (sink.go, docs/27 section 4); nil: nothing that
+	// needs an approval runs.
+	Approvals *ApprovalCheck
 }
 
 // Guard is a harness.Guard: the runtime's Runtime.Guard. Run serves one chat request on a runtime with it.
@@ -61,6 +69,8 @@ type Guard struct {
 	tasks map[string]*task
 	// later: card lookups a run held back because pictures weren't allowed yet, by ticket (pictures.go)
 	later laterPictures
+	// usedApprovals: approval ids an effect ran with in this process (each is used once).
+	usedApprovals map[string]bool
 }
 
 var _ Gateway = (*Guard)(nil)
@@ -120,6 +130,9 @@ type TaskOptions struct {
 	// Links are the addresses in the person's own messages (personLinks): a fetch of one came from the person, not
 	// from the model (ComposedFetch).
 	Links []string `json:"links,omitzero"`
+	// PageLinks: a page read comes with the page's own links as numbered sources (links.go; docs/30 "Scheduled
+	// tasks", decision 9), with the reader on. An unattended task with page reads has it (TriggeredStart).
+	PageLinks bool `json:"page_links,omitzero"`
 	// AutoFallback: on Auto (proto.RunRequest.AutoFallback) a slow or overloaded step switches to the first allowed
 	// of Fallbacks (fallback.go). Fallbacks are the run's fallback models as the guard kept them (startFor), in the
 	// chat's order; the guard checks each against the policy again before it switches.
@@ -130,6 +143,26 @@ type TaskOptions struct {
 	// PrevUser: a pictures task's user tag for the same person on the previous UTC day (the relay's
 	// X-Agent-User-Prev), so a ticket from a run before midnight UTC is still theirs (pictures.go takePictures).
 	PrevUser string `json:"prev_user,omitzero"`
+	// Approvers may approve this task's held effects (i_ ids; approve before send, docs/27 section 4): the sponsor
+	// of an unattended task; for a task a person started, their verified identity (keys v2, not on this VM yet).
+	// None: nothing that needs an approval runs.
+	Approvers []string `json:"approvers,omitzero"`
+	// Firm is the task's firm (approval payloads name it).
+	Firm string `json:"firm,omitzero"`
+	// An unattended task (Via ViaTrigger, docs/27 section 3): its signed agent definition (DefAgent, an a_ id, and
+	// the envelope's digest), the trigger that started it, and the sponsor it runs for, until NotAfter. (Agent is the
+	// built-in agent; an unattended task runs on AgentScheduled's limits.)
+	DefAgent string `json:"def_agent,omitzero"`
+	Digest   string `json:"digest,omitzero"`
+	// DefVersion is the definition's version; TriggerKind schedule or event; Slot and Due a schedule slot's number
+	// and instant (a daily one's local date, trigger.DayOf).
+	DefVersion  uint64    `json:"def_version,omitzero"`
+	TriggerKind string    `json:"trigger_kind,omitzero"`
+	Slot        int64     `json:"slot,omitzero"`
+	Due         time.Time `json:"due,omitzero"`
+	Trigger     string    `json:"trigger,omitzero"`
+	Sponsor     string    `json:"sponsor,omitzero"`
+	NotAfter    time.Time `json:"not_after,omitzero"`
 	// Agent is the built-in agent the task runs when it isn't the chat (agents.go: "a_research"); "": the chat. Its
 	// caps (searches, page reads) are counted here; agentd applies its running time and budget.
 	Agent string `json:"agent,omitzero"`
@@ -334,7 +367,8 @@ func (g *Guard) open(id string, opts TaskOptions, out func(proto.Event) error) *
 	if g.cfg.Safety != nil { // site icons fetch under the task's context
 		t.ctx = withHostFilter(t.ctx, g.fetchFilter(opts.Space))
 	}
-	t.tools = &Tools{search: g.cfg.Search, fetcher: g.cfg.Fetcher, reader: g.cfg.Reader != nil, plain: opts.Via == ViaSearch, noPics: !t.def.Extras}
+	t.tools = &Tools{search: g.cfg.Search, fetcher: g.cfg.Fetcher, reader: g.cfg.Reader != nil, plain: opts.Via == ViaSearch, noPics: !t.def.Extras,
+		links: g.cfg.Reader != nil && (g.cfg.PageLinks == "on" || opts.PageLinks && g.cfg.PageLinks != "off"), personal: opts.Links}
 	if g.gates != nil {
 		t.tools.gate = g.gates.forUser(opts.User)
 		t.tools.decodes = g.gates.decodes
@@ -528,7 +562,7 @@ func StartFor(r *proto.RunRequest, now time.Time) (harness.Start, TaskOptions, e
 func startFor(r *proto.RunRequest, now time.Time, reader bool) (harness.Start, TaskOptions, error) {
 	var s harness.Start
 	def, ok := Definition(r.Agent)
-	if !ok {
+	if !ok || !Startable(r.Agent) {
 		return s, TaskOptions{}, fmt.Errorf("unknown agent %q", r.Agent)
 	}
 	if r.Model == "" {

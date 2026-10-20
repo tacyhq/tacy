@@ -196,3 +196,45 @@ func TestTaintAtStart(t *testing.T) {
 		t.Fatalf("stored after a restart %+v", st)
 	}
 }
+
+// A task started by an inbound event (docs/27 section 3) is tainted from its start by the runtime side's word
+// (StartTainted): stored before the brain gets it, kept after a restart, and its first request is marked.
+func TestStartTainted(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	mem := NewMemStore()
+	f := NewFakeWith(mem)
+	var first bool
+	f.Actions["mail.send"] = func(_ context.Context, ti *TaskInfo, _ jsontext.Value) (*ActionResult, error) {
+		first = ti.Tainted
+		return &ActionResult{Status: ActionDone, Output: jsontext.Value(`{}`)}, nil
+	}
+	f.Model = Script(Calls(ToolCall{ID: "c1", Name: "mail.send", Args: jsontext.Value(`{}`)}), Text("done"))
+	if err := f.StartTainted("t1", restartTask(), nil, "event"); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := mem.Task("t1"); st.Taint != "event" {
+		t.Fatalf("stored %+v, want taint event", st)
+	}
+	if err := f.StartTainted("t1", restartTask(), nil, "event"); err != ErrTaskExists {
+		t.Fatalf("second start with the same id: %v", err)
+	}
+	c, task := brainOn(t, ctx, f)
+	defer c.Close()
+	if _, err := task.ModelCall(ctx, "s1.m", ModelCall{Model: "m", Messages: []Message{{Role: "user", Content: "go"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if r, err := task.Action(ctx, "s1.a0", Action{Name: "mail.send", Args: jsontext.Value(`{}`), Call: "c1"}); err != nil || r.Status != ActionDone {
+		t.Fatalf("%+v %v", r, err)
+	}
+	if !first {
+		t.Error("the first request of an event-started task wasn't marked tainted")
+	}
+	f2 := NewFakeWith(mem)
+	if _, err := f2.Restore(); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := f2.Status("t1"); st.Taint != "event" {
+		t.Fatalf("after a restart %+v", st)
+	}
+}

@@ -43,10 +43,19 @@ import (
 )
 
 const (
-	maxCardLookups   = 6 // image searches for card pictures per run
-	lookupCandidates = 8 // candidates asked for per lookup
-	lookupTime       = 12 * time.Second
+	maxCardLookups   = 6   // image searches for card pictures per run
+	lookupCandidates = 8   // candidates asked for per lookup
 	maxTaskItems     = 200 // reader item names a run keeps for lookups
+)
+
+// lookupSearchTime is a lookup's image search, lookupFetchTime its downloads after it (each download also has
+// imageFetchTime). Until v0.8.22 one 12 s budget covered both, and Tavily's image search with image descriptions takes
+// 7-16 s on a query it hasn't seen (measured 2026-10-20 from a dev machine: response_time 6.9-15.6 s, 0.0 s once
+// cached; without descriptions about 2 s): running shoes' two late lookups timed out in the run and again in the
+// ticket's fill. Vars for the tests.
+var (
+	lookupSearchTime = 25 * time.Second
+	lookupFetchTime  = 12 * time.Second
 )
 
 // cardLookupWait: the end of a run waits at most this for lookups still loading (those still open then go into the
@@ -157,28 +166,35 @@ func (g *Guard) lookupCardPicture(t *task, it taskItem) bool {
 	}
 	// The task and its space, as an action's context has them: the vault leases the image provider's key only for a
 	// space whose policy allows it (v0.8.18's first live run had neither: every lookup's lease was refused).
-	ctx, cancel := context.WithTimeout(withSpace(withTask(t.ctx, t.id), t.opts.Space), lookupTime)
-	defer cancel()
+	base := withSpace(withTask(t.ctx, t.id), t.opts.Space)
+	sctx, scancel := context.WithTimeout(base, lookupSearchTime)
+	defer scancel()
 	q, _ := maskPII(capRunes(strings.TrimSpace(it.name), maxQueryRunes))
 	if q == "" || HiddenChars(q) || outboundLeak([]byte(q)) != nil {
 		return false
 	}
 	var gate toolOutcome
-	rel, err := t.tools.enter(ctx, "search", &gate)
+	rel, err := t.tools.enter(sctx, "search", &gate)
 	var cands []ImageCandidate
 	if err == nil {
-		cands, err = is.Images(ctx, q, lookupCandidates)
+		cands, err = is.Images(sctx, q, lookupCandidates)
 	}
 	rel()
 	cp.mu.Lock()
 	cp.lookedUp++
 	cp.mu.Unlock()
 	if err != nil {
+		why := imageFailReason(err)
+		if errors.Is(sctx.Err(), context.DeadlineExceeded) {
+			why = imageTimeout // the providers say "unreachable" for a request their context ended
+		}
 		cp.mu.Lock()
-		cp.st.fail(imageFailReason(err))
+		cp.st.fail(why)
 		cp.mu.Unlock()
 		return false
 	}
+	ctx, cancel := context.WithTimeout(base, lookupFetchTime)
+	defer cancel()
 	var list []ImageCandidate
 	seen := map[string]bool{}
 	for _, c := range cands {
@@ -380,8 +396,8 @@ const ViaPictures = "pictures"
 
 const (
 	laterTTL  = 30 * time.Minute
-	maxLater  = 2048 // tickets held at once (the oldest go first)
-	laterWait = 20 * time.Second
+	maxLater  = 2048             // tickets held at once (the oldest go first)
+	laterWait = 40 * time.Second // a lookup's search and downloads (lookupSearchTime + lookupFetchTime), with room
 )
 
 // picturesAgent names what runs a pictures task in its activity record: no agent definition, no brain.

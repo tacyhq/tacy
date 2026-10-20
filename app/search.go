@@ -64,8 +64,10 @@ type picturesStarter interface {
 	StartPictures(r *proto.PicturesRequest) (harness.Start, guard.TaskOptions, []byte, error)
 }
 
-// picturesTimeout bounds one pictures stream: the lookups' own bound (20 s) and the end's grace.
-const picturesTimeout = 40 * time.Second
+// picturesTimeout bounds one pictures stream: the lookups' own bound (guard laterWait, 40 s since v0.10.0: a 25 s image
+// search, then 12 s for downloads) and the end's grace. The stream carries keepalives meanwhile, so the chat's stall
+// check (6 s) and the relay don't cut it.
+const picturesTimeout = 45 * time.Second
 
 // POST /pictures (v0.8.21): an answer's cards' held-back photos, once the person allows pictures (guard/pictures.go).
 //

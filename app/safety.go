@@ -498,6 +498,11 @@ func (g *safeGateway) Action(ctx context.Context, ti *harness.TaskInfo, id strin
 		}
 		return &harness.ActionResult{Status: harness.ActionDenied, Error: safety.CodePolicyDenied + ": " + req.Name + " " + why}, nil
 	}
+	// An agent with no outbound tool (a_review): anything but its files is refused here too, not only in gatewayd.
+	if guard.NoEgress(g.agent(ti)) && !guard.IsFilesAction(req.Name) {
+		return &harness.ActionResult{Status: harness.ActionDenied, Error: guard.NoEgressDenied + ": " + req.Name +
+			" isn't available: this agent has no outbound tool, and nothing was sent. Work from the files only."}, nil
+	}
 	want := safety.Usage{ToolCalls: 1}
 	if req.Name == "web.search" || req.Name == "web.images" {
 		want.CostMicros = safety.SearchCost

@@ -32,6 +32,7 @@ import (
 const (
 	AgentChat     = "a_chat"
 	AgentResearch = "a_research"
+	AgentReview   = "a_review"
 )
 
 // AgentDef is one built-in agent's definition.
@@ -65,6 +66,10 @@ type AgentDef struct {
 	Extras bool `json:"extras,omitzero"`
 	// Instructions is the system prompt's template ({{date}} is today's line); the chat's is made by chatInstructions.
 	Instructions string `json:"instructions,omitzero"`
+	// Files: the brief's message carries the person's attached files (review.go), read only through files.* in the
+	// VM; NoEgress: the agent sends nothing out at all, enforced here in gatewayd (web.go Action, guard.go open).
+	Files    bool `json:"files,omitzero"`
+	NoEgress bool `json:"no_egress,omitzero"`
 }
 
 // chatDef stands for the chat agent. Its limits are what the chat had before agents existed: 10 steps at most
@@ -83,7 +88,7 @@ var researchDef = AgentDef{ID: AgentResearch, Version: "1", Tools: []string{"web
 	FinalReserve: 150_000,
 	BriefOnly:    true, Keep: 7 * 24 * time.Hour, Instructions: researchInstructions}
 
-var agentDefs = map[string]*AgentDef{AgentChat: &chatDef, AgentResearch: &researchDef}
+var agentDefs = map[string]*AgentDef{AgentChat: &chatDef, AgentResearch: &researchDef, AgentReview: &reviewDef}
 
 // agentRefs are the definitions' references for start.agent (and the activity records): the research agent's
 // digest is the SHA-256 of its definition as compiled (instructions template, tools and limits); the chat's stays
@@ -187,6 +192,8 @@ const maxBriefChars = 20_000
 // definition (fewer tools, fewer steps), and a brief-only agent takes one user message (after an optional date note).
 // The caller has checked the model, effort, run secret, permissions and space.
 func agentStart(d AgentDef, r *proto.RunRequest, s harness.Start, now time.Time, reader bool) (harness.Start, TaskOptions, error) {
+	brief := r.Messages[len(r.Messages)-1].Content
+	var files []TaskFile
 	if d.BriefOnly {
 		ms := r.Messages
 		if len(ms) == 2 && ms[0].Role == "system" && dateNote.MatchString(strings.TrimSpace(ms[0].Content)) {
@@ -196,7 +203,14 @@ func agentStart(d AgentDef, r *proto.RunRequest, s harness.Start, now time.Time,
 		if len(ms) != 1 || ms[0].Role != "user" {
 			return s, TaskOptions{}, fmt.Errorf("%s takes one message, the brief: no conversation history", d.ID)
 		}
-		if strings.TrimSpace(ms[0].Content) == "" || len([]rune(ms[0].Content)) > maxBriefChars {
+		if d.Files { // the files come first in the brief's message; the model gets the brief and a list (review.go)
+			var err error
+			if brief, files, err = reviewIntake(ms[0].Content); err != nil {
+				return s, TaskOptions{}, err
+			}
+			s.Input[len(s.Input)-1].Content = brief + fileList(files)
+		}
+		if strings.TrimSpace(brief) == "" || len([]rune(brief)) > maxBriefChars {
 			return s, TaskOptions{}, fmt.Errorf("the brief must be 1 to %d characters", maxBriefChars)
 		}
 	}
@@ -208,7 +222,7 @@ func agentStart(d AgentDef, r *proto.RunRequest, s harness.Start, now time.Time,
 		if !slices.Contains(d.Tools, n) {
 			return s, TaskOptions{}, fmt.Errorf("%s doesn't use tool %q", d.ID, n)
 		}
-		actions = append(actions, webAction(n))
+		actions = append(actions, toolAction(n))
 	}
 	if r.MaxSteps == 0 {
 		r.MaxSteps = d.Steps
@@ -229,10 +243,13 @@ func agentStart(d AgentDef, r *proto.RunRequest, s harness.Start, now time.Time,
 	s.Tools = ToolDefs(actions...)
 	s.Limits = harness.TaskLimits{MaxSteps: r.MaxSteps, MaxModelCalls: r.MaxSteps + 1,
 		Deadline: time.Now().Add(d.Overall).UTC().Format(time.RFC3339)}
-	brief := r.Messages[len(r.Messages)-1].Content
-	return s, TaskOptions{ReasoningEffort: r.ReasoningEffort, CacheSecret: r.CacheSecret, Agent: d.ID,
+	links := personLinks(r.Messages)
+	if d.Files {
+		links = nil // a file's addresses aren't the person's: nothing is fetched for a review anyway
+	}
+	return s, TaskOptions{ReasoningEffort: r.ReasoningEffort, CacheSecret: r.CacheSecret, Agent: d.ID, Files: files,
 		Question:  capRunes(strings.TrimSpace(brief), maxQuestionRunes),
-		RunSecret: r.RunSecret, Permissions: maps.Clone(r.Permissions), Links: personLinks(r.Messages),
+		RunSecret: r.RunSecret, Permissions: maps.Clone(r.Permissions), Links: links,
 		AutoFallback: r.AutoFallback, Fallbacks: r.FallbackModels}, nil
 }
 
@@ -248,12 +265,13 @@ func agentInstructions(d AgentDef, actions []string, now time.Time, reader bool)
 		tools = append(tools, harness.ModelToolName(a))
 	}
 	text := d.Instructions
-	if reader {
+	if reader && !d.Files {
 		text += researchReaderNote
 	}
 	return strings.NewReplacer("{{date}}", date, "{{tools}}", strings.Join(tools, ", "),
 		"{{searches}}", fmt.Sprint(d.Searches), "{{reads}}", fmt.Sprint(d.Reads), "{{steps}}", fmt.Sprint(d.Steps),
-		"{{fetch}}", harness.ModelToolName("web.fetch")).Replace(text)
+		"{{fetch}}", harness.ModelToolName("web.fetch"), "{{read}}", harness.ModelToolName("files.read"),
+		"{{list}}", harness.ModelToolName("files.list"), "{{per}}", fmt.Sprint(maxSectionsPerRead)).Replace(text)
 }
 
 // researchInstructions is a_research's system prompt (agentInstructions fills it in).

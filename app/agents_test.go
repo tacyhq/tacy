@@ -91,7 +91,7 @@ type agentEnv struct {
 func newAgentEnv(t *testing.T, edit func(p *safety.Policy), replies ...string) *agentEnv {
 	pages := standInPages(t)
 	ps := &pageSearch{base: pages.URL}
-	e := newSafeEnvWith(t, safeOpts{reader: readerAnswer, search: ps}, replies...)
+	e := newSafeEnvWith(t, safeOpts{reader: reviewReader, search: ps}, replies...) // readerAnswer, and a review's file sections
 	e.mustPost(e.policy(1, edit), e.heartbeat())
 	host := e.s.tasks()
 	pe := &permEnv{safeEnv: e, asks: make(chan proto.Permission, 16), settled: make(chan proto.Permission, 16)}

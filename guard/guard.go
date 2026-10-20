@@ -133,6 +133,9 @@ type TaskOptions struct {
 	// Agent is the built-in agent the task runs when it isn't the chat (agents.go: "a_research"); "": the chat. Its
 	// caps (searches, page reads) are counted here; agentd applies its running time and budget.
 	Agent string `json:"agent,omitzero"`
+	// Files are the person's attached files of a review task (review.go): read in the VM by the quarantined reader
+	// through files.*, never shown to the acting model. On the encrypted disk with the task, deleted with it.
+	Files []TaskFile `json:"files,omitzero"`
 }
 
 // task is the guard's state for one task: what the old app/agent.go kept per run.
@@ -180,6 +183,10 @@ type task struct {
 	// ("web.fetch") that went out, against its caps (guarded by mu; rebuilt from the journal after a restart).
 	def  AgentDef
 	sent map[string]int
+
+	files filesState // a review task's files and which sections were read (files.go)
+	// texted: the task's model wrote text people saw (guarded by emitMu)
+	texted bool
 }
 
 // takeCap counts one action of kind against the agent's cap for it, or says it's used up (the cap; -1 for a task
@@ -245,6 +252,9 @@ func (t *task) emit(e proto.Event) error {
 	if t.closed || t.out == nil {
 		return errClosed
 	}
+	if e.Type == "text" && e.Delta != "" {
+		t.texted = true
+	}
 	if err := t.out(e); err != nil {
 		t.closed = true
 		if t.gone != nil {
@@ -284,7 +294,7 @@ func ReplaySafe(req any) bool {
 	case *harness.ModelCall:
 		return true
 	case *harness.Action:
-		return appTool(b.Name) != "" // web.search, web.fetch, web.images
+		return appTool(b.Name) != "" || isFilesAction(b.Name) // web.search, web.fetch, web.images; files.* (read only)
 	}
 	return false
 }
@@ -298,7 +308,7 @@ func (g *Guard) Untrusted(_ *harness.TaskInfo, req any) bool { return Untrusted(
 // Untrusted is Guard.Untrusted for any gateway (it depends on the request only).
 func Untrusted(req any) bool {
 	a, ok := req.(*harness.Action)
-	return ok && appTool(a.Name) != ""
+	return ok && (appTool(a.Name) != "" || isFilesAction(a.Name)) // a person's file may carry an injection too
 }
 
 // TaintedAtStart: a task whose input holds an earlier assistant turn is tainted from its start (StartTaint).
@@ -335,6 +345,9 @@ func (g *Guard) open(id string, opts TaskOptions, out func(proto.Event) error) *
 		t.ctx = withHostFilter(t.ctx, g.fetchFilter(opts.Space))
 	}
 	t.tools = &Tools{search: g.cfg.Search, fetcher: g.cfg.Fetcher, reader: g.cfg.Reader != nil, plain: opts.Via == ViaSearch, noPics: !t.def.Extras}
+	if t.def.NoEgress { // nothing leaves the VM for this task, whatever asks (files.go noEgress)
+		t.tools.search, t.tools.fetcher = noEgressSearch{}, noEgressClient
+	}
 	if g.gates != nil {
 		t.tools.gate = g.gates.forUser(opts.User)
 		t.tools.decodes = g.gates.decodes
@@ -342,7 +355,7 @@ func (g *Guard) open(id string, opts TaskOptions, out func(proto.Event) error) *
 	t.background = &Facts{} // the site icons' egress, for the activity record
 	t.ctx = WithFacts(t.ctx, t.background)
 	icons := g.cfg.Icons
-	if !t.def.Extras { // site icons are the chat's display, not an agent's work: nothing fetched for them
+	if !t.def.Extras || t.def.NoEgress { // site icons are the chat's display, not an agent's work: nothing fetched for them
 		icons = nil
 	}
 	t.icons = newSiteIcons(t.ctx, icons, g.gates.iconGate(), t.tools.decodes, t.emit)
@@ -441,6 +454,10 @@ func (s *localSession) End() (int, string) {
 	<-cards
 	if m := t.cards.end(step, t.background); m != nil {
 		t.emit(proto.Event{Type: "metrics", Metrics: m})
+	}
+	// A review's last section, from the VM's own record: the sections it didn't read (files.go).
+	if text := t.coverageText(); text != "" {
+		t.emit(proto.Event{Type: "text", Delta: text})
 	}
 	// Cards the run didn't look up because pictures weren't allowed yet: a ticket the tab can use once the person
 	// allows them (pictures.go).
@@ -552,7 +569,7 @@ func startFor(r *proto.RunRequest, now time.Time, reader bool) (harness.Start, T
 		total += len(m.Content)
 		s.Input = append(s.Input, harness.Message{Role: m.Role, Content: m.Content})
 	}
-	if total > maxRequestChars {
+	if total > maxRequestChars && !(def.Files && total <= maxReviewBytes+4*maxBriefChars) {
 		return s, TaskOptions{}, fmt.Errorf("messages too long")
 	}
 	if r.Messages[len(r.Messages)-1].Role != "user" {
@@ -708,7 +725,7 @@ func chatInstructions(actions []string, now time.Time, reader bool) string {
 func ToolDefs(actions ...string) []harness.Tool {
 	var out []harness.Tool
 	for _, a := range actions {
-		d, ok := toolDefs[appTool(a)]
+		d, ok := toolDefs[toolName(a)]
 		if !ok {
 			continue
 		}

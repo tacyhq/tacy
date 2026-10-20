@@ -48,6 +48,9 @@ func (t *task) rebuild(ti *harness.TaskInfo) {
 				continue
 			}
 			outside = outside || Untrusted(&req)
+			if req.Name == "files.read" { // a review's sections read, and their quote numbers (files.go)
+				quotes = max(quotes, t.files.restore(t, res.Output))
+			}
 			n, used, urls := journaledOutput(req.Name, res.Output)
 			cites, images, quotes = max(cites, n), images+used, max(quotes, journaledQuotes(res.Output))
 			sites = append(sites, urls...)

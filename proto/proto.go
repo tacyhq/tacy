@@ -235,6 +235,10 @@ type Image struct {
 	Width  int    `json:"width"`
 	Height int    `json:"height"`
 	Data   []byte `json:"data"` // the JPEG (base64 in JSON)
+	// For: a card picture the VM looked up itself (guard/pictures.go, v0.8.18): the item name it searched for, the
+	// reader's checked name of one of the run's sources (never the answer's text). The chat puts it on the card that
+	// names this item.
+	For string `json:"for,omitempty"`
 }
 
 // Favicon is the icon of a site the run's sources are on: fetched by the VM (never by the browser, which would tell

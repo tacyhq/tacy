@@ -364,11 +364,16 @@ type cardPics struct {
 	slots  chan struct{}
 	// pre: downloads a plain chat's search started while its reader read (prefetchResult), by address.
 	pre map[string]*picFetch
+	// items: the run's checked reader items, by itemKey, for lookups (pictures.go); lookups: cards looked up (at
+	// most maxCardLookups), lookedUp: image searches made for them.
+	items    map[string]taskItem
+	lookups  int
+	lookedUp int
 }
 
 func newCardPics() *cardPics {
 	return &cardPics{tried: map[string]bool{}, taken: map[string]bool{}, sent: map[string]int{}, slots: make(chan struct{}, cardPicFetches),
-		pre: map[string]*picFetch{}}
+		pre: map[string]*picFetch{}, items: map[string]taskItem{}}
 }
 
 // reset starts a model call's text.
@@ -444,7 +449,15 @@ func (g *Guard) cardPicture(t *task, card cardRef, ownOnly bool) {
 		tries = append(tries, t.tools.otherSources(card.title, own)...)
 	}
 	key := own + "|" + strings.ToLower(card.title) // a card once (two cards may cite one roundup)
-	if len(tries) == 0 {
+	// No picture from the sources: looked up (pictures.go), when pictures are allowed and the title names one of
+	// the run's reader items. Never for a plain chat's search (resultPictures: ownOnly).
+	var lookup *taskItem
+	if !ownOnly && g.lookupAllowed(t) {
+		if it, ok := t.cards.matchItem(card.title); ok {
+			lookup = &it
+		}
+	}
+	if len(tries) == 0 && lookup == nil {
 		return
 	}
 	cp := t.cards
@@ -455,7 +468,17 @@ func (g *Guard) cardPicture(t *task, card cardRef, ownOnly bool) {
 	}
 	cp.tried[key] = true
 	cp.cards++
+	if lookup != nil {
+		if cp.lookups >= maxCardLookups {
+			lookup = nil
+		} else {
+			cp.lookups++
+		}
+	}
 	cp.mu.Unlock()
+	if len(tries) == 0 && lookup == nil {
+		return
+	}
 	if t.tools.reserveImages(1) == 0 {
 		return // the run shows the most pictures it can
 	}
@@ -475,7 +498,10 @@ func (g *Guard) cardPicture(t *task, card cardRef, ownOnly bool) {
 	t.lateMu.Unlock()
 	go func() {
 		defer cp.wg.Done()
-		shown := g.fetchCardPicture(t, card.title, tries)
+		shown := len(tries) > 0 && g.fetchCardPicture(t, card.title, tries)
+		if !shown && lookup != nil && t.ctx.Err() == nil {
+			shown = g.lookupCardPicture(t, *lookup)
+		}
 		if !shown {
 			t.tools.returnImages(1)
 		}
@@ -533,6 +559,15 @@ func cardPicRefused(title string, src citedSource, c picCand, min float64) strin
 	}
 	if why := picURLRefused(c.url); why != "" {
 		return imageLogo
+	}
+	// A roundup's or a review list's own picture is its banner (v0.8.18: "The 4 Best Home Espresso Machines" went
+	// on the Profitec GO's card, its title's "espresso machine" half the card's words): only its alt text or the
+	// picture's own address may name the item, closely.
+	if listTitleRe.MatchString(src.title) {
+		if !namesItem(title, ImageCandidate{URL: c.url, Title: c.alt}, cardOtherMin) {
+			return imageMismatch
+		}
+		return ""
 	}
 	if !namesItem(title, ImageCandidate{URL: c.url, Title: src.title + " " + c.alt, Source: src.url}, min) {
 		return imageMismatch

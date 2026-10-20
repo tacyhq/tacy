@@ -133,6 +133,7 @@ func (g *Guard) Action(ctx context.Context, ti *harness.TaskInfo, id string, req
 		FactsFrom(ctx).leak(false, ids)
 	}
 	t.tools.citedUnder(out.citations, call) // a card about one of these sources gets its picture there (cardpics.go)
+	t.noteItems(call, p.read)               // the reader's checked items: what a card may be looked up as (pictures.go)
 	if t.opts.Via == ViaSearch && p.read != nil && p.read.err == "" && len(out.citations) == len(p.results) {
 		defer g.resultPictures(t, p.read, out.citations) // after its result is shown (cardpics.go)
 	}

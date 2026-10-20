@@ -382,7 +382,7 @@ func (s *localSession) End() (int, string) {
 	// just now.
 	images, cards := make(chan struct{}), make(chan struct{})
 	go func() { t.waitLate(imageEndWait); close(images) }()
-	go func() { t.cards.wait(cardEndWait); close(cards) }()
+	go func() { t.cards.wait(t.cards.endWait()); close(cards) }()
 	if m := t.icons.finish(iconEndWait, step); m != nil {
 		t.emit(proto.Event{Type: "metrics", Metrics: m})
 	}

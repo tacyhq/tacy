@@ -324,8 +324,9 @@ func (g *recGateway) Refused(r *proto.RunRequest, err error) (proto.Event, bool)
 	for _, m := range r.Messages {
 		in.Bytes += len(m.Content)
 	}
+	ag := guard.AgentRef(r.Agent) // the built-in agent asked for (refused at the door when unknown: never here)
 	rec, rerr := g.rec.Refused(activity.Start{Run: harness.NewTaskID(), Space: space, To: v.Seal, Member: v.Identity,
-		Agent: activity.Agent{ID: "a_chat", Version: "1", Digest: "unsigned"}, Trigger: activity.Trigger{Kind: "chat", Via: "relay"},
+		Agent: activity.Agent{ID: ag.ID, Version: ag.Version, Digest: ag.Digest}, Trigger: activity.Trigger{Kind: "chat", Via: "relay"},
 		Controls: &activity.Controls{Policy: st.Policy, ReleasePolicy: st.Release, OperatorSeq: st.OperatorSeq, FirmSeq: st.FirmSeq, Fresh: st.Fresh},
 		Models:   []string{model}, Input: in}, activity.Status{Code: code, Detail: msg})
 	if rerr != nil {

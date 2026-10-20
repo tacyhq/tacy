@@ -21,6 +21,7 @@ func (t *task) rebuild(ti *harness.TaskInfo) {
 		return
 	}
 	steps, cites, images, quotes := 0, 0, 0, 0
+	sent := map[string]int{} // searches and page reads that went out (the agent's caps)
 	var sites []string
 	outside := false
 	for _, r := range recs {
@@ -37,7 +38,13 @@ func (t *task) rebuild(ti *harness.TaskInfo) {
 			}
 			var req harness.Action
 			var res harness.ActionResult
-			if json.Unmarshal(r.Req, &req) != nil || json.Unmarshal(r.Body, &res) != nil || res.Status != harness.ActionDone {
+			if json.Unmarshal(r.Req, &req) != nil || json.Unmarshal(r.Body, &res) != nil {
+				continue
+			}
+			if res.Status != harness.ActionDenied { // it went out (done, or failed after it was sent)
+				sent[req.Name]++
+			}
+			if res.Status != harness.ActionDone {
 				continue
 			}
 			outside = outside || Untrusted(&req)
@@ -49,6 +56,12 @@ func (t *task) rebuild(ti *harness.TaskInfo) {
 	t.mu.Lock()
 	t.step = max(t.step, steps)
 	t.returned, t.outside = t.returned || outside, t.outside || outside
+	if t.sent == nil {
+		t.sent = map[string]int{}
+	}
+	for k, n := range sent {
+		t.sent[k] = max(t.sent[k], n)
+	}
 	t.mu.Unlock()
 	t.numbering.Lock()
 	t.tools.cites = max(t.tools.cites, cites)

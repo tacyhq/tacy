@@ -14,10 +14,11 @@ const ChatPolicyV1 = "e6f08a761337f9a367594c3ed43a07723ac50cbf790f5b740e25442d9a
 // would leave that VM with no policy it can take (v2 not carried, v1 below the floor).
 const ChatPolicyV2 = "b1cf194b7246c31a565f7c11de8416f16c377a461976dd9eb8a4e290cef1fe1a"
 
-// ChatRelease is the release's ceiling and default policy for the chat agent's connectors: the given models, the
+// ChatRelease is the release's ceiling and default policy for the built-in agents' connectors: the given models, the
 // web connector with its three tools and any public host, the providers' hosts for the keys, reads go on while
 // the stop list is stale. A signed policy can only narrow it. Budgets and rates are generous ceilings today's runs
-// stay well under (6-10 steps, runSeconds). The vault passes no models (it never checks them).
+// stay well under; runSeconds is the longest running time any built-in agent may use (each agent's own limits
+// narrow the run budget per task: guard/agents.go). The vault passes no models (it never checks them).
 func ChatRelease(firm, tinfoilHost string, models []string, runSeconds int64) *Policy {
 	if tinfoilHost == "" {
 		tinfoilHost = "inference.tinfoil.sh"

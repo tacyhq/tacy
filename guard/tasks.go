@@ -54,7 +54,9 @@ type Host struct {
 	// key gets tk_ + HMAC(IDKey, space, user, key), so a repeated start finds the first task instead of making a
 	// second. nil: starts with a key are refused.
 	IDKey []byte
-	// Keep is how long an ended task's events and journal stay for its followers; 0: a day (docs/27 section 1).
+	// Keep is how long an ended task's events and journal stay for its followers; 0: a day (docs/27 section 1). A
+	// built-in agent's task may say longer (guard.AgentKeep: a_research's result stays until the browser collected
+	// it, POST /tasks/delete, at most 7 days; docs/30 decision 5).
 	Keep time.Duration
 	// FlushEvery is how long events wait before they are written to the queue together; 0: 100 ms. A process that
 	// dies loses at most that much of a stream; the task's outcome and its journal are written as they happen.
@@ -94,6 +96,9 @@ type hosted struct {
 	// cancel came in. Both are the billing witness Cancel gives (refundable: cancelled before any output).
 	output    bool
 	cancelled bool
+	// deleted: its starter deleted it while it ran (Delete); finished: finish is done with it. The one of finish and
+	// Delete that comes second forgets it.
+	deleted, finished bool
 }
 
 type hostedEvent struct {
@@ -161,6 +166,23 @@ func (h *Host) keep() time.Duration {
 	return 24 * time.Hour
 }
 
+// keepFor is how long an ended task of agent is kept: its agent's keep (guard.AgentKeep), else Keep.
+func (h *Host) keepFor(agent string) time.Duration {
+	if k := AgentKeep(agent); k > 0 {
+		return k
+	}
+	return h.keep()
+}
+
+// minAgentKeep is the shortest keep any built-in agent has (Keep for those without one of their own).
+func (h *Host) minAgentKeep() time.Duration {
+	m := h.keep()
+	for _, id := range AgentIDs() {
+		m = min(m, h.keepFor(id))
+	}
+	return m
+}
+
 // ---- events -------------------------------------------------------------------------------------------------
 
 // emit appends one event to the task's stream. It never fails: nobody watching is fine.
@@ -175,6 +197,12 @@ func (l *hosted) emit(e proto.Event, flushEvery time.Duration) {
 		return
 	}
 	seq := l.base + len(l.evs) + 1
+	if e.Type == "metrics" && e.Metrics != nil && !IsChat(l.opts.Agent) { // whose metric: the agent id (metadata only)
+		m := *e.Metrics
+		m.Agent = l.opts.Agent
+		e.Metrics = &m
+		data, _ = json.Marshal(e)
+	}
 	l.evs = append(l.evs, hostedEvent{seq: seq, ev: e, data: data})
 	if modelOutput(e.Type) {
 		l.output = true
@@ -289,6 +317,9 @@ func (h *Host) Start(ctx context.Context, sr StartRequest) (id string, existed b
 	if err != nil {
 		return "", false, err
 	}
+	if sr.Via != ViaTasks && !IsChat(opts.Agent) { // a /run task goes with its tab; an agent's task outlives it
+		return "", false, fmt.Errorf("%s starts through POST /tasks", opts.Agent)
+	}
 	opts.User, opts.Space, opts.Via = sr.User, start.Space, sr.Via
 	id = harness.NewTaskID()
 	if sr.Key != "" {
@@ -343,6 +374,9 @@ func (h *Host) Start(ctx context.Context, sr StartRequest) (id string, existed b
 		return h.failed(l, err)
 	}
 	meta.Model, meta.Tools = sr.Req.Model, sr.Req.Tools
+	if !IsChat(opts.Agent) {
+		meta.Agent = opts.Agent
+	}
 	obs, _ := h.GW.(RunObserver)
 	if obs != nil {
 		obs.RunStarted(id, &start, opts, meta)
@@ -468,12 +502,20 @@ func (h *Host) timedOut(task string) bool {
 }
 
 // close ends a task's stream once its last event is in. A POST /tasks task's events are all in the queue then, so
-// this process stops holding them (followers read the queue); a /run task's shim forgets it.
+// this process stops holding them (followers read the queue); a /run task's shim forgets it. A task its starter
+// deleted while it ran is deleted now.
 func (h *Host) close(l *hosted) {
 	l.sess.Close()
 	l.end()
 	if l.via == ViaTasks {
 		h.drop(l)
+	}
+	l.mu.Lock()
+	l.finished = true
+	deleted := l.deleted
+	l.mu.Unlock()
+	if deleted {
+		h.RT.Forget(l.id)
 	}
 }
 
@@ -624,7 +666,7 @@ func (h *Host) owned(id, user string) error {
 	return nil
 }
 
-// Authorize checks a call on a task (op: status, events, cancel): the task is user's, started through POST /tasks
+// Authorize checks a call on a task (op: status, events, cancel, delete): the task is user's, started through POST /tasks
 // with a run secret, and mac is TaskMAC with that secret for op and this task. Anything else is ErrNoTask (the same
 // answer as for an unknown task), so the relay, which sets the user tag but never sees the secret, can't read,
 // follow or cancel a task by itself.
@@ -713,6 +755,50 @@ func (h *Host) Cancel(id, user string) (refundable bool, err error) {
 	return refundable, nil
 }
 
+// Delete deletes the starter's task and everything kept for it (its start, journal, events: the result), as the
+// browser asks once it saved the result, or when the person deletes the conversation (docs/30). A task still running
+// is cancelled ("person") first and deleted as soon as it ended. refundable is Cancel's billing witness. Activity
+// records aren't touched: they are the space's history, sealed to its key.
+func (h *Host) Delete(id, user string) (refundable bool, err error) {
+	if err := h.owned(id, user); err != nil {
+		return false, err
+	}
+	h.init()
+	h.mu.Lock()
+	l := h.live[id]
+	h.mu.Unlock()
+	if l != nil {
+		l.mu.Lock()
+		running := !l.finished
+		l.deleted = true
+		l.mu.Unlock()
+		if running {
+			return h.Cancel(id, user) // close deletes it when it ended
+		}
+	}
+	st, err := h.RT.Status(id)
+	if err == nil && !harness.Terminal(st.State) {
+		// Not ended, and no process here serves it (being taken up after a restart): cancel, then delete once ended.
+		refundable, err = h.Cancel(id, user)
+		if err != nil {
+			return false, err
+		}
+		go func() {
+			if _, err := h.RT.Wait(context.Background(), id); err == nil {
+				h.RT.Forget(id)
+			}
+		}()
+		return refundable, nil
+	}
+	if err := h.RT.Forget(id); err != nil {
+		return false, err
+	}
+	h.mu.Lock()
+	delete(h.live, id)
+	h.mu.Unlock()
+	return false, nil
+}
+
 // lastSeq is the last event's seq in the queue (from after on).
 func (h *Host) lastSeq(id string, after int) int {
 	for {
@@ -780,16 +866,23 @@ func (h *Host) Resume(ids []string) (resumed, abandoned int) {
 	return resumed, abandoned
 }
 
-// Prune deletes the tasks that ended more than Keep ago (their start, journal and events), and forgets the ended
-// ones this process no longer needs to serve. Run it now and then.
+// Prune deletes the tasks that ended more than their keep ago (their start, journal and events: Keep, or their
+// agent's, guard.AgentKeep), and forgets the ended ones this process no longer needs to serve. Run it now and then.
 func (h *Host) Prune(now time.Time) int {
 	h.init()
-	ids, err := h.RT.Store.EndedBefore(now.Add(-h.keep()))
+	ids, err := h.RT.Store.EndedBefore(now.Add(-min(h.keep(), h.minAgentKeep())))
 	if err != nil {
 		return 0
 	}
 	n := 0
 	for _, id := range ids {
+		if st, err := h.RT.Store.Task(id); err == nil && st != nil {
+			var o TaskOptions
+			json.Unmarshal(st.Options, &o)
+			if !st.Ended.IsZero() && st.Ended.After(now.Add(-h.keepFor(o.Agent))) {
+				continue // its agent keeps it longer
+			}
+		}
 		if h.RT.Forget(id) == nil {
 			n++
 		}

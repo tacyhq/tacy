@@ -319,6 +319,13 @@ func (e *Effective) Budget() Budgets {
 	return b
 }
 
+// NarrowRun is b with its run budget narrowed to l as well (a built-in agent's own run budget: the policy can lower
+// it, never raise it).
+func (b Budgets) NarrowRun(l Limits) Budgets {
+	b.Run = minLimits(b.Run, l)
+	return b
+}
+
 // Seal is the seal key the space's own signed policy names ("": none).
 func (e *Effective) Seal() string {
 	for _, p := range e.Layers {

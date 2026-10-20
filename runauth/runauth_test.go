@@ -157,6 +157,14 @@ func makeVectors(t *testing.T) *vectors {
 	r = base
 	r.IdentitySig = Sign(id, &w, xkey(t, strings.Repeat("76", 32)).PublicKey().Bytes())
 	refuse("signed for another VM", r)
+	// Built-in agents (docs/30 slice 1), added after the vectors above: they keep their bytes (a request without an
+	// agent hashes as before), and these come after them.
+	add("research agent", proto.RunRequest{Model: "gpt-oss-120b", Agent: "a_research", RunSecret: strings.Repeat("cd", 32),
+		Tools: []string{"web_search", "fetch_page"}, Permissions: map[string]string{"web.search": "always", "web.fetch": "always"},
+		Messages: []proto.Message{{Role: "user", Content: "Brief: what changed in harbor lighting rules this year?"}}})
+	r = base
+	r.Agent = "a_research"
+	refuse("an agent added after signing", r)
 	return v
 }
 

@@ -247,10 +247,10 @@ func GrantMAC(secretHex string, g Grant) string {
 	return hex.EncodeToString(m.Sum(nil))
 }
 
-// taskLabel prefixes a task call's MAC input (POST /tasks/status, /tasks/events, /tasks/cancel).
+// taskLabel prefixes a task call's MAC input (POST /tasks/status, /tasks/events, /tasks/cancel, /tasks/delete).
 const taskLabel = "tacy-task/v1"
 
-// TaskMAC authorizes a call on a task (op: "status", "events" or "cancel") from the tab that started it: HMAC-SHA256
+// TaskMAC authorizes a call on a task (op: "status", "events", "cancel" or "delete") from the tab that started it: HMAC-SHA256
 // with the run's secret over "tacy-task/v1", op and the task id, NUL-separated, in lowercase hex.
 func TaskMAC(secretHex, op, task string) string {
 	key, _ := hex.DecodeString(secretHex)

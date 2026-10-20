@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"encoding/json/jsontext"
+	"fmt"
 	"slices"
 	"strings"
 	"time"
@@ -80,6 +81,12 @@ func (g *Guard) Action(ctx context.Context, ti *harness.TaskInfo, id string, req
 	if denied != nil {
 		g.record(Egress{Task: ti.ID, Action: id, Op: req.Name, Decision: "denied", Rule: "permission"})
 		return denied, nil
+	}
+	// The agent's caps on what goes out (agents.go): a search or page read past them is refused before anything is
+	// sent, and the model is told to write its answer.
+	if limit, ok := t.takeCap(req.Name); !ok {
+		g.record(Egress{Task: ti.ID, Action: id, Op: req.Name, Decision: "denied", Rule: "agent_cap"})
+		return capDenial(req.Name, limit), nil
 	}
 	if g.cfg.Safety != nil {
 		ctx = withHostFilter(ctx, g.fetchFilter(t.opts.Space))
@@ -160,6 +167,20 @@ func (g *Guard) Action(ctx context.Context, ti *harness.TaskInfo, id string, req
 		t.emit(proto.Event{Type: "metrics", Metrics: m})
 	}
 	return actionResult(out), nil
+}
+
+// CapDenied starts the denial a search or page read past its agent's cap gets (capDenial).
+const CapDenied = "agent_cap"
+
+// capDenial is what the model sees for an action past its agent's cap (limit; -1: an agent this release doesn't
+// have, which may send nothing): nothing was sent, and it should answer from what it has.
+func capDenial(action string, limit int) *harness.ActionResult {
+	what := map[string]string{"web.search": "searches", "web.fetch": "page reads"}[action]
+	msg := fmt.Sprintf("%s: this task has used its %d %s; nothing was sent. Don't call this tool again: write your answer now from what you have, and say what you couldn't check.", CapDenied, limit, what)
+	if limit < 0 {
+		msg = CapDenied + ": this task's agent isn't one this VM runs; nothing was sent."
+	}
+	return &harness.ActionResult{Status: harness.ActionDenied, Error: msg}
 }
 
 // lateImages shows the images of an image search that land after its result (findImages returned early): each

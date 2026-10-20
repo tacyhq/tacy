@@ -133,6 +133,9 @@ var listTitleRe = regexp.MustCompile(`(?i)\b(best|top \d+|\d+ (best|top|great|go
 // like one item's own page (not a list), so a card citing it needs no image search. The candidates are kept either
 // way: a card may still get them (namesItem decides), and another card may get them as another source.
 func (t *Tools) pictureFlag(page, title string, cs ...picCand) bool {
+	if t.noPics {
+		return false
+	}
 	return t.addPics(page, cs...) && !listTitleRe.MatchString(title)
 }
 
@@ -438,6 +441,9 @@ func (c *cardPics) newCards(final bool) []cardRef {
 // cardText watches a model call's answer text: the cards of each items block that closes get their sources'
 // pictures.
 func (g *Guard) cardText(t *task, delta string) {
+	if !t.def.Extras { // card pictures and their lookups are the chat's display (agents.go)
+		return
+	}
 	g.watchMentions(t, delta) // a reader item the answer names: its lookup starts now (pictures.go)
 	for _, c := range t.cards.feed(delta) {
 		g.cardPicture(t, c, false)
@@ -446,6 +452,9 @@ func (g *Guard) cardText(t *task, delta string) {
 
 // cardTextDone: the model call's answer ended; a block it left open counts now.
 func (g *Guard) cardTextDone(t *task) {
+	if !t.def.Extras {
+		return
+	}
 	for _, c := range t.cards.done() {
 		g.cardPicture(t, c, false)
 	}

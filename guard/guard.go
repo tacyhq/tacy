@@ -130,6 +130,9 @@ type TaskOptions struct {
 	// PrevUser: a pictures task's user tag for the same person on the previous UTC day (the relay's
 	// X-Agent-User-Prev), so a ticket from a run before midnight UTC is still theirs (pictures.go takePictures).
 	PrevUser string `json:"prev_user,omitzero"`
+	// Agent is the built-in agent the task runs when it isn't the chat (agents.go: "a_research"); "": the chat. Its
+	// caps (searches, page reads) are counted here; agentd applies its running time and budget.
+	Agent string `json:"agent,omitzero"`
 }
 
 // task is the guard's state for one task: what the old app/agent.go kept per run.
@@ -172,6 +175,33 @@ type task struct {
 
 	reads   readCache   // the reader's answers for this task (readcache.go)
 	sources taskSources // the sources the reader read in this task, for the verbatim cut (reader.go)
+
+	// def is the task's built-in agent (agents.go); sent counts the searches ("web.search") and page reads
+	// ("web.fetch") that went out, against its caps (guarded by mu; rebuilt from the journal after a restart).
+	def  AgentDef
+	sent map[string]int
+}
+
+// takeCap counts one action of kind against the agent's cap for it, or says it's used up (the cap; -1 for a task
+// whose agent this release doesn't have). Only searches and page reads have caps; other kinds always pass.
+func (t *task) takeCap(action string) (int, bool) {
+	limit := 0
+	switch action {
+	case "web.search":
+		limit = t.def.Searches
+	case "web.fetch":
+		limit = t.def.Reads
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if limit < 0 || limit > 0 && t.sent[action] >= limit {
+		return limit, false
+	}
+	if t.sent == nil {
+		t.sent = map[string]int{}
+	}
+	t.sent[action]++
+	return limit, true
 }
 
 // taintFor says whether an action was proposed after outside content reached the brain. One of the latest model
@@ -295,18 +325,27 @@ func (g *Guard) open(id string, opts TaskOptions, out func(proto.Event) error) *
 		return t
 	}
 	t := &task{id: id, opts: opts, out: out}
+	if d, ok := Definition(opts.Agent); ok {
+		t.def = d
+	} else {
+		t.def = AgentDef{ID: opts.Agent, Searches: -1, Reads: -1} // not a definition this release has: nothing goes out
+	}
 	t.ctx, t.cancel = context.WithCancel(context.Background())
 	if g.cfg.Safety != nil { // site icons fetch under the task's context
 		t.ctx = withHostFilter(t.ctx, g.fetchFilter(opts.Space))
 	}
-	t.tools = &Tools{search: g.cfg.Search, fetcher: g.cfg.Fetcher, reader: g.cfg.Reader != nil, plain: opts.Via == ViaSearch}
+	t.tools = &Tools{search: g.cfg.Search, fetcher: g.cfg.Fetcher, reader: g.cfg.Reader != nil, plain: opts.Via == ViaSearch, noPics: !t.def.Extras}
 	if g.gates != nil {
 		t.tools.gate = g.gates.forUser(opts.User)
 		t.tools.decodes = g.gates.decodes
 	}
 	t.background = &Facts{} // the site icons' egress, for the activity record
 	t.ctx = WithFacts(t.ctx, t.background)
-	t.icons = newSiteIcons(t.ctx, g.cfg.Icons, g.gates.iconGate(), t.tools.decodes, t.emit)
+	icons := g.cfg.Icons
+	if !t.def.Extras { // site icons are the chat's display, not an agent's work: nothing fetched for them
+		icons = nil
+	}
+	t.icons = newSiteIcons(t.ctx, icons, g.gates.iconGate(), t.tools.decodes, t.emit)
 	t.tools.bg = t.ctx // an image search's downloads may finish after its result (findImages)
 	t.cards = newCardPics()
 	g.tasks[id] = t
@@ -488,6 +527,10 @@ func StartFor(r *proto.RunRequest, now time.Time) (harness.Start, TaskOptions, e
 // instructions then say how to cite its quotes).
 func startFor(r *proto.RunRequest, now time.Time, reader bool) (harness.Start, TaskOptions, error) {
 	var s harness.Start
+	def, ok := Definition(r.Agent)
+	if !ok {
+		return s, TaskOptions{}, fmt.Errorf("unknown agent %q", r.Agent)
+	}
 	if r.Model == "" {
 		r.Model = defaultModel
 	}
@@ -515,6 +558,17 @@ func startFor(r *proto.RunRequest, now time.Time, reader bool) (harness.Start, T
 	if r.Messages[len(r.Messages)-1].Role != "user" {
 		return s, TaskOptions{}, fmt.Errorf("the last message must be from the user")
 	}
+	if !IsChat(def.ID) {
+		if err := checkRunOptions(r); err != nil {
+			return s, TaskOptions{}, err
+		}
+		space, err := runSpace(r)
+		if err != nil {
+			return s, TaskOptions{}, err
+		}
+		s.Space, s.Attempt = space, 1
+		return agentStart(def, r, s, now, reader)
+	}
 	if r.Tools == nil {
 		r.Tools = allTools
 	}
@@ -532,24 +586,12 @@ func startFor(r *proto.RunRequest, now time.Time, reader bool) (harness.Start, T
 	if r.MaxSteps < 1 || r.MaxSteps > maxSteps {
 		return s, TaskOptions{}, fmt.Errorf("max_steps must be 1 to %d", maxSteps)
 	}
-	if len(r.CacheSecret) > 256 {
-		return s, TaskOptions{}, fmt.Errorf("cache_secret too long")
-	}
-	if r.RunSecret != "" && !validRunSecret(r.RunSecret) {
-		return s, TaskOptions{}, fmt.Errorf("run_secret must be 64 lowercase hex characters")
-	}
-	if err := checkPermissions(r.Permissions); err != nil {
+	if err := checkRunOptions(r); err != nil {
 		return s, TaskOptions{}, err
 	}
-	// The run's space (keys v2 slice 6): the one agentd verified (runauth), or as the request names it for a guard
-	// that runs alone (local development and tests: nothing is recorded there). No default: every run names one.
-	switch {
-	case r.Verified != nil:
-		s.Space = r.Verified.Space
-	case r.Space != "":
-		s.Space = r.Space
-	default:
-		return s, TaskOptions{}, fmt.Errorf("the request names no space")
+	var err error
+	if s.Space, err = runSpace(r); err != nil {
+		return s, TaskOptions{}, err
 	}
 	s.Attempt, s.Agent = 1, chatAgent
 	// One date, the person's: the chat's system note states today in the browser's time zone ("Today is Friday,
@@ -577,6 +619,29 @@ func startFor(r *proto.RunRequest, now time.Time, reader bool) (harness.Start, T
 		Question:  capRunes(strings.TrimSpace(r.Messages[len(r.Messages)-1].Content), maxQuestionRunes),
 		RunSecret: r.RunSecret, Permissions: maps.Clone(r.Permissions), Links: personLinks(r.Messages),
 		AutoFallback: r.AutoFallback, Fallbacks: fallbacks}, nil
+}
+
+// checkRunOptions checks what every agent's request may carry: the cache scope, the run secret, the permissions.
+func checkRunOptions(r *proto.RunRequest) error {
+	if len(r.CacheSecret) > 256 {
+		return fmt.Errorf("cache_secret too long")
+	}
+	if r.RunSecret != "" && !validRunSecret(r.RunSecret) {
+		return fmt.Errorf("run_secret must be 64 lowercase hex characters")
+	}
+	return checkPermissions(r.Permissions)
+}
+
+// runSpace is the run's space (keys v2 slice 6): the one agentd verified (runauth), or as the request names it for a
+// guard that runs alone (local development and tests: nothing is recorded there). No default: every run names one.
+func runSpace(r *proto.RunRequest) (string, error) {
+	switch {
+	case r.Verified != nil:
+		return r.Verified.Space, nil
+	case r.Space != "":
+		return r.Space, nil
+	}
+	return "", fmt.Errorf("the request names no space")
 }
 
 // personDate finds a system note that states today's date ("Today is Friday, October 16, 2026": the chat's

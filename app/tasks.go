@@ -36,6 +36,11 @@ import (
 //	                     as they come, then "data: [DONE]" once the task ended; reconnect with the last id seen.
 //	                     At most 8 streams at once per user, 64 in all.
 //	POST /tasks/cancel   {task, mac} -> {task, state}
+//	POST /tasks/delete   {task, mac} -> {task, deleted: true}: deletes the task and everything kept for it (its
+//	                     start, journal and events: the result), as the browser asks once it saved the result or the
+//	                     person deleted the conversation (docs/30 decision 5); a task still running is cancelled
+//	                     first (billing witness as for cancel) and deleted as soon as it ended. Without a delete an
+//	                     ended task is kept a day, a built-in agent's result up to 7 days (guard.AgentKeep).
 //	GET  /tasks/open     -> {"open": n}: how many tasks are open (not ended), for the relay's idle timer
 //	                     (bearer token; plaintext, a count only).
 //	POST /tasks/grant    {task, request, kind, decision, value, mac} -> {outcome}: the person's answer to a
@@ -78,6 +83,7 @@ func (s *server) taskRoutes(mux *http.ServeMux, id *ehbpidentity.Identity) {
 	mux.Handle("POST /tasks/status", s.taskGuard(false, true, id.Middleware()(http.HandlerFunc(s.taskStatus))))
 	mux.Handle("POST /tasks/events", s.taskGuard(false, true, id.Middleware()(http.HandlerFunc(s.taskEvents))))
 	mux.Handle("POST /tasks/cancel", s.taskGuard(false, true, id.Middleware()(http.HandlerFunc(s.taskCancel))))
+	mux.Handle("POST /tasks/delete", s.taskGuard(false, true, id.Middleware()(http.HandlerFunc(s.taskDelete))))
 	// A grant's MAC is its authorization; the tag is optional there, as the chat's relay sends it.
 	mux.Handle("POST /tasks/grant", s.taskGuard(false, false, id.Middleware()(http.HandlerFunc(s.taskGrant))))
 	mux.HandleFunc("GET /tasks/open", s.tasksOpen)
@@ -327,6 +333,24 @@ func (s *server) taskCancel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, st)
+}
+
+// taskDelete is behind EHBP: POST /tasks/delete.
+func (s *server) taskDelete(w http.ResponseWriter, r *http.Request) {
+	ref, ok := readRef(w, r)
+	if !ok || !s.authorizedTask(w, r, ref, "delete") {
+		return
+	}
+	refundable, err := s.tasks().Delete(ref.Task, userFrom(r.Context()))
+	if err != nil {
+		taskFail(w, err)
+		return
+	}
+	w.Header().Set(billHeader, s.tasks().Bill(ref.Task))
+	if refundable {
+		w.Header().Set(refundableHeader, "1")
+	}
+	writeJSON(w, 200, map[string]any{"task": ref.Task, "deleted": true})
 }
 
 // taskEvents is behind EHBP: POST /tasks/events. The stream carries keepalives like /run's, and ends with [DONE]

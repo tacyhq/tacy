@@ -18,7 +18,8 @@
 //	         identity_key, model, reasoning_effort, max_steps (decimal, 0 if absent), tools ("*" when absent, else the
 //	         names joined by ","), cache_secret, run_secret, permissions (sorted "kind=setting" joined by ","),
 //	         fallback_models (in order, joined by ","), auto_fallback ("true" or "false"), the number of messages
-//	         (decimal), then each message's role and content
+//	         (decimal), then each message's role and content, then, only when the request names an agent, "agent="
+//	         and its id (docs/30; absent for the chat, so a chat request's digest is the one v0.10.0 checks)
 //	sig    = Ed25519(identity key, "tacy/v2/run-request" ‖ 0 ‖ digest)
 //
 // A plain chat's search (POST /search) and an answer's pictures (POST /pictures) carry the same where and who (v0.10.0),
@@ -200,6 +201,12 @@ func Digest(r *proto.RunRequest, vmPub []byte) [32]byte {
 		strings.Join(perms, ","), strings.Join(r.FallbackModels, ","), strconv.FormatBool(r.AutoFallback), strconv.Itoa(len(r.Messages))}
 	for _, m := range r.Messages {
 		rest = append(rest, m.Role, m.Content)
+	}
+	// The agent comes last and only when named: a request without one hashes exactly as before it existed. The
+	// message count fixes how many items come before it, so one more item can't be read as a message (an odd
+	// number of items after the count only ever ends with the agent).
+	if r.Agent != "" {
+		rest = append(rest, "agent="+r.Agent)
 	}
 	return digest(RequestLabel, vmPub, runFields(r), rest...)
 }

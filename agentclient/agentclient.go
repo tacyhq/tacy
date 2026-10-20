@@ -374,6 +374,20 @@ func (c *Conn) CancelTask(ctx context.Context, id string) (*Task, error) {
 	return c.taskCall(ctx, "/tasks/cancel", "", c.ref("cancel", id, nil))
 }
 
+// DeleteTask deletes a task and its result (cancelling it first if it still runs).
+func (c *Conn) DeleteTask(ctx context.Context, id string) (deleted bool, billing TaskBilling, err error) {
+	res, err := c.post(ctx, "/tasks/delete", "", c.ref("delete", id, nil))
+	if err != nil {
+		return false, TaskBilling{}, err
+	}
+	defer res.Body.Close()
+	var out struct {
+		Deleted bool `json:"deleted"`
+	}
+	json.NewDecoder(io.LimitReader(res.Body, 4096)).Decode(&out)
+	return out.Deleted, TaskBilling{Bill: res.Header.Get("X-Agent-Bill"), Refundable: res.Header.Get("X-Agent-Refundable") == "1"}, nil
+}
+
 // FollowTask calls on for each of the task's events after seq after, until the task ended ([DONE], nil) or ctx
 // ends. Reconnect with the last seq on saw to continue.
 func (c *Conn) FollowTask(ctx context.Context, id string, after int, on func(seq int, e proto.Event)) error {

@@ -239,6 +239,9 @@ func (s *server) run(w http.ResponseWriter, r *http.Request) {
 	}
 	// Where and who (keys v2 slice 6): checked once, here; StartFor then uses what was verified.
 	err = s.verifyWho(&req, userFrom(r.Context()))
+	if _, known := guard.Definition(req.Agent); err == nil && known && !guard.IsChat(req.Agent) {
+		err = fmt.Errorf("%s starts through POST /tasks", req.Agent) // its task outlives the tab (docs/30)
+	}
 	if err == nil {
 		_, _, err = s.agent.StartFor(&req) // the request checks (Run makes the task from it again)
 	}

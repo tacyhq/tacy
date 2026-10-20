@@ -153,8 +153,8 @@ func (c *cardPics) matchItem(title string) (taskItem, bool) {
 
 // lookupAllowed: the run's setting for pictures (web.images) is Always allow, under the policy's cap.
 func (g *Guard) lookupAllowed(t *task) bool {
-	if t.opts.Via == ViaSearch {
-		return false // a plain chat's search: its answer isn't written here
+	if t.opts.Via == ViaSearch || !t.def.Extras {
+		return false // a plain chat's search: its answer isn't written here; a built-in agent shows no pictures
 	}
 	return PermissionSetting(t.opts, "web.images", g.permissionCap(t.opts.Space, "web.images")) == safety.PermAlways
 }
@@ -451,8 +451,8 @@ func (c *cardPics) count(f func(st *imageStats)) {
 // that item's lookup, when pictures are allowed (lookupAllowed), at most maxEarlyLookups a run. The words only choose
 // which item: what goes out is the VM's copy of its name.
 func (g *Guard) watchMentions(t *task, delta string) {
-	if t.opts.Via == ViaSearch || t.opts.Via == ViaPictures || delta == "" {
-		return
+	if t.opts.Via == ViaSearch || t.opts.Via == ViaPictures || !t.def.Extras || delta == "" {
+		return // a plain search, a pictures fill, or a built-in agent without pictures (agents.go)
 	}
 	cp := t.cards
 	cp.mu.Lock()
@@ -621,8 +621,8 @@ func pictureNames(name string, c ImageCandidate) string {
 	}
 	captionNumbers := slices.ContainsFunc(imageWords(c.Title), func(w string) bool { return strings.ContainsAny(w, "0123456789") })
 	var got, total float64
-	for _, w := range q {
-		found := slices.Contains(text, w) || len(w) >= 3 && strings.Contains(joined, w) || unitNumber(w, text)
+	for i, w := range q {
+		found := slices.Contains(text, w) || len(w) >= 3 && strings.Contains(joined, w) || unitNumber(w, text) || spacedModel(q, i, text)
 		if strings.ContainsAny(w, "0123456789") {
 			if !found && captionNumbers {
 				return imageNumber
@@ -717,7 +717,7 @@ type laterPictures struct {
 // cards' lookups are held back, in memory only, for the person turning photos on for that answer (POST /pictures).
 // Nothing leaves until then.
 func (g *Guard) lookupAskable(t *task) bool {
-	return t.opts.Via != ViaSearch && t.opts.Via != ViaPictures &&
+	return t.opts.Via != ViaSearch && t.opts.Via != ViaPictures && t.def.Extras &&
 		PermissionSetting(t.opts, "web.images", g.permissionCap(t.opts.Space, "web.images")) != safety.PermAlways
 }
 

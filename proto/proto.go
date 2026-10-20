@@ -100,6 +100,11 @@ type RunRequest struct {
 	// retried once on the first allowed fallback (model_slow, model_switched). False for a hand-picked model: a slow
 	// one is waited for, an overloaded one ends the run (code model_overloaded).
 	AutoFallback bool `json:"auto_fallback,omitempty"`
+	// Agent names the built-in agent definition the task runs (docs/30-agents-in-chat.md): "a_chat" (the chat, also
+	// when absent) or "a_research". The definitions (instructions, tools, limits) are compiled into the release
+	// (guard/agents.go); a request only picks one, and an unknown one is refused. Covered by the run signature
+	// (runauth) when set. A non-chat agent starts only through POST /tasks and takes one message: the brief.
+	Agent string `json:"agent,omitempty"`
 }
 
 // SearchRequest is POST /search's body: the plain chat's one web search the person allowed in their tab (docs/29;
@@ -324,6 +329,8 @@ type Meta struct {
 	TinfoilMeasure string   `json:"tinfoil_measurement"` // SEV-SNP launch measurement, equal to the release's
 	TinfoilHPKEKey string   `json:"tinfoil_hpke_key"`    // key the request was encrypted to
 	Tools          []string `json:"tools"`
+	// Agent is the built-in agent the task runs when it isn't the chat ("a_research"); absent for the chat.
+	Agent string `json:"agent,omitempty"`
 	// Controls are the signed controls the run started under (docs/23-safety-controls.md).
 	Controls *Controls `json:"controls,omitempty"`
 	// Activity says where the run's activity record goes (docs/24); nil when it isn't recorded.
@@ -389,5 +396,7 @@ type Metric struct {
 	WaitMs     int64  `json:"wait_ms,omitempty"`    // search, fetch, images, favicons: time waiting for the per-user and global tool caps (not in ms)
 	Running    int    `json:"running,omitempty"`    // queue: runs running on the VM when this one started, itself included
 	Model      string `json:"model,omitempty"`      // model: the model this call went to
-	Outcome    string `json:"outcome"`              // ok | error | refused (fetch: the URL held personal data) | slow_switched (model: given up as slow or overloaded, the step ran again on the fallback)
+	// Agent is the built-in agent whose task this is, when it isn't the chat ("a_research"; metadata only).
+	Agent   string `json:"agent,omitempty"`
+	Outcome string `json:"outcome"` // ok | error | refused (fetch: the URL held personal data) | slow_switched (model: given up as slow or overloaded, the step ran again on the fallback)
 }

@@ -49,8 +49,10 @@ type safeGateway struct {
 	// firstHeard: how long a start waits, right after boot, for the first delivery of the operator's list (the pull
 	// reaches agentd within seconds of gatewayd starting); 0: no wait.
 	firstHeard time.Duration
-	// runTimeout is the release's running-time limit (guard.RunTimeout; 0: that). Tests shorten it.
+	// runTimeout is the chat's running-time limit (guard.RunTimeout; 0: that). Tests shorten it.
 	runTimeout time.Duration
+	// agentWork overrides a built-in agent's running-time limit (guard.AgentWork) by id. Tests shorten it.
+	agentWork map[string]time.Duration
 
 	mu    sync.Mutex
 	tasks map[string]*safeTask
@@ -59,6 +61,7 @@ type safeGateway struct {
 type safeTask struct {
 	space     string
 	member    string // whose member budget (guard.TaskOptions.Member)
+	agent     string // the built-in agent ("": the chat; guard.TaskOptions.Agent)
 	code, msg string // the first control that refused something (Why)
 	timer     *time.Timer
 	timedOut  bool // watch cancelled it: its running time reached the release's limit (TimedOut)
@@ -126,7 +129,7 @@ func (g *safeGateway) StartFor(r *proto.RunRequest) (harness.Start, guard.TaskOp
 	}
 	r.FallbackModels = fallbacks
 	if r.Tools == nil {
-		r.Tools = guard.AllTools()
+		r.Tools = guard.DefaultTools(r.Agent) // the agent's own tools (the chat: all)
 	}
 	tools := []string{} // not nil: none at all is a choice, not "all"
 	for _, t := range r.Tools {
@@ -240,7 +243,7 @@ func (g *safeGateway) waitFirstHeard() {
 func (g *safeGateway) Open(id string, opts guard.TaskOptions, emit func(proto.Event) error) guard.Session {
 	g.ledger.Begin(id, opts.Space, opts.Member)
 	g.mu.Lock()
-	g.tasks[id] = &safeTask{space: opts.Space, member: opts.Member}
+	g.tasks[id] = &safeTask{space: opts.Space, member: opts.Member, agent: opts.Agent}
 	g.mu.Unlock()
 	g.watch(id)
 	return &safeSession{Session: g.inner.Open(id, opts, emit), g: g, id: id, space: opts.Space}
@@ -285,10 +288,11 @@ func (s *safeSession) Close() {
 	s.g.mu.Unlock()
 }
 
-// runLimit is how much running time a run in space may use: the policy's run wall_seconds, at most the release's
-// guard.RunTimeout (the release's own policy has that, so the effective policy never allows more).
-func (g *safeGateway) runLimit(space string) time.Duration {
-	limit := g.releaseLimit()
+// runLimit is how much running time a run of agent in space may use: the policy's run wall_seconds, at most the
+// agent's own limit (agentLimit; the release's policy allows the longest of them, so the effective policy never
+// allows more).
+func (g *safeGateway) runLimit(space, agent string) time.Duration {
+	limit := g.agentLimit(agent)
 	if e, err := g.st.Policy(space); err == nil {
 		if w := e.Budget().Run.WallSeconds; w > 0 {
 			limit = min(limit, time.Duration(w)*time.Second)
@@ -297,7 +301,22 @@ func (g *safeGateway) runLimit(space string) time.Duration {
 	return limit
 }
 
-func (g *safeGateway) releaseLimit() time.Duration { return cmp.Or(g.runTimeout, guard.RunTimeout) }
+// agentLimit is a built-in agent's own running-time limit (guard.AgentWork; the chat's guard.RunTimeout).
+func (g *safeGateway) agentLimit(agent string) time.Duration {
+	if guard.IsChat(agent) {
+		return cmp.Or(g.runTimeout, guard.RunTimeout)
+	}
+	if d := g.agentWork[agent]; d > 0 {
+		return d
+	}
+	return guard.AgentWork(agent)
+}
+
+// budget is the budgets a task of agent runs under: the policy's, with the run budget narrowed to the agent's own
+// (guard.RunBudget; a signed policy can lower an agent's limits, never raise them).
+func budget(e *safety.Effective, agent string) safety.Budgets {
+	return e.Budget().NarrowRun(guard.RunBudget(agent))
+}
 
 // watch cancels a run ("deadline") once its running time (safety.Ledger.Elapsed) reaches runLimit. Waiting for
 // the person stops that clock, so the end isn't a fixed time: the timer looks again when it fires, and sets
@@ -314,7 +333,7 @@ func (g *safeGateway) watch(id string) {
 		g.mu.Unlock()
 		return
 	}
-	if left := g.runLimit(t.space) - el; left > 0 {
+	if left := g.runLimit(t.space, t.agent) - el; left > 0 {
 		t.timer = time.AfterFunc(left, func() { g.watch(id) })
 		g.mu.Unlock()
 		return
@@ -336,7 +355,7 @@ func (g *safeGateway) waiting(task string, open bool) {
 	}
 }
 
-// TimedOut says whether watch cancelled the task at the release's running-time limit (the error people see says
+// TimedOut says whether watch cancelled the task at its agent's running-time limit (the error people see says
 // the run timed out, as at the deadline).
 func (g *safeGateway) TimedOut(task string) bool {
 	g.mu.Lock()
@@ -369,14 +388,14 @@ func (g *safeGateway) Why(task string) (string, string) {
 	if t.code != "" {
 		return t.code, t.msg
 	}
-	// The run ended at a running-time budget tighter than the release's own 5 minutes, or at the day's.
+	// The run ended at a running-time budget tighter than its agent's own limit (the chat's 5 minutes), or at the day's.
 	e, err := g.st.Policy(t.space)
 	el, ok := g.ledger.Elapsed(task)
 	if err != nil || !ok {
 		return "", ""
 	}
 	b := e.Budget()
-	runOut := b.Run.WallSeconds > 0 && time.Duration(b.Run.WallSeconds)*time.Second < g.releaseLimit() && el >= time.Duration(b.Run.WallSeconds)*time.Second
+	runOut := b.Run.WallSeconds > 0 && time.Duration(b.Run.WallSeconds)*time.Second < g.agentLimit(t.agent) && el >= time.Duration(b.Run.WallSeconds)*time.Second
 	_, dayErr := g.ledger.Admit(t.space, t.member, b)
 	if runOut || (b.Day.WallSeconds > 0 || b.Member.WallSeconds > 0 || b.VM.WallSeconds > 0) && dayErr != nil {
 		return coded(&safety.Error{Code: safety.CodeBudgetExceeded, Msg: "running time"})
@@ -391,6 +410,18 @@ func (g *safeGateway) space(ti *harness.TaskInfo) string {
 	}
 	if ti.Start != nil {
 		return ti.Start.Space
+	}
+	return ""
+}
+
+// agent is the built-in agent a task runs ("": the chat): from its options, or its start's reference.
+func (g *safeGateway) agent(ti *harness.TaskInfo) string {
+	var o guard.TaskOptions
+	if ti.Options != nil && json.Unmarshal(ti.Options, &o) == nil && o.Agent != "" {
+		return o.Agent
+	}
+	if ti.Start != nil && !guard.IsChat(ti.Start.Agent.ID) {
+		return ti.Start.Agent.ID
 	}
 	return ""
 }
@@ -418,12 +449,21 @@ func (g *safeGateway) ModelCall(ctx context.Context, ti *harness.TaskInfo, req *
 		}
 	}
 	prompt := safety.EstimateTokens(n)
-	b := e.Budget()
+	agent := g.agent(ti)
+	b := budget(e, agent)
 	// The completion gets what the budget has left, at most CompletionReserve; the guard ends the call if its
 	// output passes it (the upstream sets no cap of its own).
 	completion := int64(safety.CompletionReserve)
 	if left := g.ledger.TokensLeft(ti.ID, b); left >= 0 {
 		completion = min(completion, left-prompt)
+	}
+	// A built-in agent's run has a small cost budget (a_research's $1): the completion is what its cost left can pay
+	// for, so a long task's last calls still run with a smaller cap instead of being refused. (The chat's $20 run
+	// budget reserves the full completion, as before.)
+	if !guard.IsChat(agent) {
+		if left := g.ledger.CostLeft(ti.ID, b); left >= 0 {
+			completion = min(completion, safety.CompletionFor(req.Model, prompt, left))
+		}
 	}
 	if completion < safety.MinCompletion {
 		return nil, g.refuse(ti.ID, harness.CodeLimit, &safety.Error{Code: safety.CodeBudgetExceeded, Msg: "the budget for model tokens is used up"})
@@ -465,7 +505,18 @@ func (g *safeGateway) Action(ctx context.Context, ti *harness.TaskInfo, id strin
 	// The quarantined reader's model call for a page or a search (guard/reader.go) is reserved with the action, at
 	// its largest: an action whose reader the budget can't cover doesn't run (the model never gets raw text instead).
 	reader := readerReserve(req.Name, e)
-	commit, err := g.ledger.Reserve(ti.ID, addUsage(want, reader), e.Budget())
+	agent := g.agent(ti)
+	b := budget(e, agent)
+	// A built-in agent keeps part of its cost budget for its answer (guard.FinalReserve): a search or read that
+	// would eat into it is refused, and the model told to write its answer now.
+	if keep := guard.FinalReserve(agent); keep > 0 {
+		if left := g.ledger.CostLeft(ti.ID, b); left >= 0 && left-want.CostMicros-reader.CostMicros < keep {
+			return &harness.ActionResult{Status: harness.ActionDenied, Error: safety.CodeBudgetExceeded +
+				": this task's budget for searches and page reads is used up (the rest is kept for the answer); nothing was sent. " +
+				"Don't call any more tools: write your answer now from what you have, and say what you couldn't check."}, nil
+		}
+	}
+	commit, err := g.ledger.Reserve(ti.ID, addUsage(want, reader), b)
 	if err != nil {
 		return nil, g.refuse(ti.ID, harness.CodeLimit, err)
 	}

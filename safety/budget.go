@@ -297,6 +297,45 @@ func (l *Ledger) TokensLeft(task string, b Budgets) int64 {
 	return left
 }
 
+// CostLeft is how much estimated cost (micro-USD) the run may still reserve: the least of the run's and its days'
+// cost budgets left after what is used and reserved (-1: no cost limit; 0 for a run it doesn't know).
+func (l *Ledger) CostLeft(task string, b Budgets) int64 {
+	l.init()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	r := l.runs[task]
+	if r == nil {
+		return 0
+	}
+	left := int64(-1)
+	take := func(lim, used, res int64) {
+		if lim > 0 {
+			if v := max(0, lim-used-res); left < 0 || v < left {
+				left = v
+			}
+		}
+	}
+	take(b.Run.CostMicros, r.used.CostMicros, r.reserved.CostMicros)
+	for _, dl := range l.daysOf(r.space, r.member, b) {
+		take(dl.lim.CostMicros, dl.d.Used.CostMicros, dl.d.reserved.CostMicros)
+	}
+	return left
+}
+
+// CompletionFor is the most completion tokens a call to model with a prompt of prompt tokens can have for cost
+// micro-USD (0 when the prompt alone costs more).
+func CompletionFor(model string, prompt, cost int64) int64 {
+	p, ok := modelPrices[model]
+	if !ok {
+		p = unknownPrice
+	}
+	left := cost*1_000_000 - prompt*p[0] // then ModelCost(model, prompt, left/p[1]) <= cost, its rounding included
+	if left <= 0 || p[1] <= 0 {
+		return 0
+	}
+	return left / p[1]
+}
+
 // Used is what the run used so far.
 func (l *Ledger) Used(task string) (Usage, bool) {
 	l.init()
@@ -409,8 +448,10 @@ func ModelCost(model string, prompt, completion int64) int64 {
 	return (prompt*p[0] + completion*p[1] + 999_999) / 1_000_000
 }
 
-// SearchCost is one search provider call (web.search, web.images), in millionths of a USD.
-const SearchCost = 50_000
+// SearchCost is one search provider call (web.search, web.images), in millionths of a USD: about what the providers
+// charge, rounded up (Exa $0.007, Tavily ~$0.008 a basic search, Brave $0.005; checked 2026-10-18). It was $0.05,
+// which made a_research's $1 budget bind after about 16 searches (docs/30 slice 1).
+const SearchCost = 10_000
 
 // CompletionReserve is the most a model call reserves for its completion before it runs (less when the budget
 // has less left); the guard ends the call if its output passes the reservation, and the model's real count

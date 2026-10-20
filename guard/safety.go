@@ -19,10 +19,11 @@ import (
 // connector and tool are allowed, and, when the stop list is stale, only reads go on (if the policy allows). Fetches
 // (pages, images, site icons) go only to hosts the policy allows, checked on every request and redirect.
 
-// ReleasePolicy is the release's ceiling and default policy for the chat agent (safety.ChatRelease) with every
-// model this VM runs.
+// ReleasePolicy is the release's ceiling and default policy for the built-in agents (safety.ChatRelease) with every
+// model this VM runs. Its run running time is the longest any agent may use (MaxWork): each agent's own limit
+// (agents.go; the chat's five minutes) narrows it per task, as a signed policy's run budget does.
 func ReleasePolicy(firm, tinfoilHost string) *safety.Policy {
-	return safety.ChatRelease(firm, tinfoilHost, slices.Sorted(maps.Keys(models)), int64(RunTimeout/time.Second))
+	return safety.ChatRelease(firm, tinfoilHost, slices.Sorted(maps.Keys(models)), int64(MaxWork()/time.Second))
 }
 
 type maxTokensKey struct{}

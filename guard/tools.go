@@ -124,6 +124,8 @@ type Tools struct {
 	// cites is each citation number's source as people see it and the call it was shown under. Guarded by mu.
 	pics  map[string][]picCand
 	cited map[int]citedSource
+	// noPics: the task's agent shows no card pictures (agents.go), so results aren't marked "picture".
+	noPics bool
 }
 
 // sourceMap is a copy of the task's sources ([n] -> address).

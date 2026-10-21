@@ -14,6 +14,13 @@ const ChatPolicyV1 = "e6f08a761337f9a367594c3ed43a07723ac50cbf790f5b740e25442d9a
 // would leave that VM with no policy it can take (v2 not carried, v1 below the floor).
 const ChatPolicyV2 = "b1cf194b7246c31a565f7c11de8416f16c377a461976dd9eb8a4e290cef1fe1a"
 
+// The hosts the files connector reads stored files from (storedfiles.R2Host, storedfiles.ChatHost; a guard test
+// checks they're the same): the files bucket's S3 endpoint, and the chat's Worker for a schedule run's read URLs.
+const (
+	FilesR2Host   = "df4bf4829cdbbca3dca42a266b41b170.r2.cloudflarestorage.com"
+	FilesChatHost = "chat.tacy.io"
+)
+
 // ChatRelease is the release's ceiling and default policy for the built-in agents' connectors: the given models, the
 // web connector with its three tools and any public host, the providers' hosts for the keys, reads go on while
 // the stop list is stale. A signed policy can only narrow it. Budgets and rates are generous ceilings today's runs
@@ -29,8 +36,12 @@ func ChatRelease(firm, tinfoilHost string, models []string, runSeconds int64) *P
 			"model": {Hosts: []string{tinfoilHost}},
 			"web": {Tools: []string{"web.search", "web.fetch", "web.images"}, Hosts: []string{"api.tavily.com", "api.search.brave.com", "api.exa.ai"},
 				Fetch: []string{"*"}},
-			// The person's attached files, read inside the VM (a_review): no host, nothing leaves.
-			"files": {Tools: []string{"files.list", "files.read"}, Hosts: []string{}},
+			// The person's attached files, read inside the VM (a_review): no host, nothing leaves. Their stored files
+			// (files.fetch, branch files-vm-read): ciphertext fetched from the files bucket with the presigned URLs the
+			// chat's Worker mints, and, for a schedule's run, those URLs asked of the chat's Worker; nothing is sent but
+			// the request (GET of one object; the grant and the object ids). No key leased.
+			"files": {Tools: []string{"files.list", "files.read", "files.fetch"}, Hosts: []string{},
+				Fetch: []string{FilesR2Host, FilesChatHost}},
 			// Documents in a run's result (guard/documents.go): no host, nothing leaves; the content goes only into
 			// the person's own encrypted conversation.
 			"document": {Tools: []string{"document.create"}, Hosts: []string{}},

@@ -16,6 +16,7 @@ import (
 	"github.com/tacyhq/tacy/harness"
 	"github.com/tacyhq/tacy/proto"
 	"github.com/tacyhq/tacy/safety"
+	"github.com/tacyhq/tacy/storedfiles"
 )
 
 // a_review (docs/30 slice 3): the person's files in the brief's message, read only inside the VM through files.*
@@ -70,8 +71,10 @@ func TestReviewDefinition(t *testing.T) {
 	if r, _ := json.Marshal(researchDef); strings.Contains(string(r), "no_egress") || !strings.Contains(string(r), `"files":true,"files_optional":true,"file_parts":60`) {
 		t.Fatalf("research's definition: %s", r)
 	}
-	// The release ceiling allows the files connector's two tools (a signed policy must list them too).
-	if p := ReleasePolicy("f_chat", ""); !slices.Equal(p.Connectors["files"].Tools, []string{"files.list", "files.read"}) || len(p.Connectors["files"].Hosts) != 0 {
+	// The release ceiling allows the files connector's two tools, and files.fetch from the files bucket and the chat's
+	// Worker (stored files, branch files-vm-read), with no key leased (a signed policy must list them too).
+	if p := ReleasePolicy("f_chat", ""); !slices.Equal(p.Connectors["files"].Tools, []string{"files.list", "files.read", "files.fetch"}) ||
+		len(p.Connectors["files"].Hosts) != 0 || !slices.Equal(p.Connectors["files"].Fetch, []string{storedfiles.R2Host, storedfiles.ChatHost}) {
 		t.Fatalf("ceiling %+v", p.Connectors["files"])
 	}
 }

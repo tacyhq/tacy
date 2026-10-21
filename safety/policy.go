@@ -286,10 +286,14 @@ func (e *Effective) AllowsLeaseHost(conn, host string) bool {
 }
 
 // AllowsFetch: every layer's web fetch patterns match host.
-func (e *Effective) AllowsFetch(host string) bool {
+func (e *Effective) AllowsFetch(host string) bool { return e.AllowsConnectorFetch("web", host) }
+
+// AllowsConnectorFetch: every layer's fetch patterns for the connector match host (the files connector's: where the
+// person's stored files are read from, files.fetch).
+func (e *Effective) AllowsConnectorFetch(conn, host string) bool {
 	host = strings.ToLower(strings.TrimSuffix(host, "."))
 	return e.all(func(p *Policy) bool {
-		c, ok := p.Connectors["web"]
+		c, ok := p.Connectors[conn]
 		if !ok {
 			return false
 		}

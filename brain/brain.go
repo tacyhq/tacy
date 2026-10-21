@@ -35,6 +35,20 @@ const finalNudge = "You can't call any more tools. Answer my question now from t
 // emptyNudge asks once more when an earlier step's reply had neither text nor a tool call (see loop).
 const emptyNudge = "Your last reply was empty. Continue: call the tools you need, or answer my question."
 
+// asTextNudge asks once more when an earlier step's reply was only a tool call's arguments written as text (see loop).
+const asTextNudge = "That reply was a tool call's arguments written as text, so nothing ran. Call the tool instead, or answer my question."
+
+// callAsText: a reply that is only a JSON object: a tool call's arguments the model wrote as its message instead of
+// calling the tool (no answer is a bare JSON object).
+func callAsText(s string) bool {
+	s = strings.TrimSpace(s)
+	if len(s) < 2 || s[0] != '{' || s[len(s)-1] != '}' {
+		return false
+	}
+	var v map[string]any
+	return json.Unmarshal([]byte(s), &v) == nil
+}
+
 // Version names this brain in hello (logs only).
 const Version = "0.1"
 
@@ -168,12 +182,19 @@ func loop(ctx context.Context, t *harness.Task, parallel, maxState int) (harness
 			if r2, err := t.ModelCall(rctx, fmt.Sprintf("s%d.m2", st.Step), retry); err == nil && strings.TrimSpace(r2.Message.Content) != "" {
 				res = r2
 			}
-		} else if !last && empty && len(res.Message.ToolCalls) == 0 && !st.Retried {
+		} else if asText := !empty && callAsText(res.Message.Content); !last && (empty || asText) && len(res.Message.ToolCalls) == 0 && !st.Retried {
 			// Neither text nor a tool call before the last step (gpt-oss-120b's reasoning ends "Let's search." and
-			// nothing follows), which ended the run with an empty answer. Ask once more, tools offered, once per task.
+			// nothing follows), which ended the run with an empty answer; or, as the whole reply, a tool call's
+			// arguments written as text ({"query": "...", "count": 5}: 4 of 28 runs of cmd/e2e's research-files
+			// request, research-web scorecard 2026-10-21), which ended the run with that JSON as its answer. Ask once
+			// more, tools offered, once per task.
 			st.Retried = true
 			retry := mc
-			retry.Messages = append(slices.Clone(st.Messages), harness.Message{Role: "user", Content: emptyNudge})
+			if asText {
+				retry.Messages = append(slices.Clone(st.Messages), res.Message, harness.Message{Role: "user", Content: asTextNudge})
+			} else {
+				retry.Messages = append(slices.Clone(st.Messages), harness.Message{Role: "user", Content: emptyNudge})
+			}
 			if r2, err := t.ModelCall(rctx, fmt.Sprintf("s%d.m2", st.Step), retry); err == nil &&
 				(strings.TrimSpace(r2.Message.Content) != "" || len(r2.Message.ToolCalls) > 0) {
 				res = r2

@@ -128,7 +128,12 @@ type MemResults struct {
 	mu  sync.Mutex
 	seq int64
 	rs  []Result
+	// the collect counters (collect.go): runs in a row whose result nobody collected, and the version stopped for it
+	missed  map[string]int
+	stopped map[string]uint64
 }
+
+var _ CollectStore = (*MemResults)(nil)
 
 func (m *MemResults) PutResult(r Result) (int64, error) {
 	m.mu.Lock()
@@ -141,6 +146,10 @@ func (m *MemResults) PutResult(r Result) (int64, error) {
 	m.seq++
 	r.Seq = m.seq
 	m.rs = append(m.rs, r)
+	if m.missed == nil {
+		m.missed = map[string]int{}
+	}
+	m.missed[r.Agent]++
 	return r.Seq, nil
 }
 
@@ -189,13 +198,52 @@ func (m *MemResults) DeleteResults(space, seal string, tasks []string) (int, err
 	for _, t := range tasks {
 		set[t] = true
 	}
-	return m.del(func(r Result) bool { return !(r.Space == space && r.Seal == seal && set[r.Task]) }), nil
+	return m.del(func(r Result) bool {
+		if r.Space == space && r.Seal == seal && set[r.Task] {
+			delete(m.missed, r.Agent) // collected: the count starts again
+			return false
+		}
+		return true
+	}), nil
 }
 
 func (m *MemResults) DeleteAgentResults(space, agent string) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	delete(m.missed, agent)
+	delete(m.stopped, agent)
 	return m.del(func(r Result) bool { return !(r.Space == space && r.Agent == agent) }), nil
+}
+
+func (m *MemResults) Uncollected(agent string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.missed[agent], nil
+}
+
+func (m *MemResults) SetStoppedUncollected(agent string, version uint64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.stopped == nil {
+		m.stopped = map[string]uint64{}
+	}
+	m.stopped[agent] = version
+	return nil
+}
+
+func (m *MemResults) StoppedUncollected(agent string, version uint64) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	v, ok := m.stopped[agent]
+	return ok && v == version, nil
+}
+
+func (m *MemResults) ResetCollect(agent string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.missed, agent)
+	delete(m.stopped, agent)
+	return nil
 }
 
 func (m *MemResults) PruneResults(t time.Time) error {

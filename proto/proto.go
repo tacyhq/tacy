@@ -127,6 +127,33 @@ type RunRequest struct {
 	// fallback dearer than it is dropped, so a run never switches to a model it wasn't charged for. Set by agentd
 	// from the headers, never read from or written to the wire; "": nothing dropped (in-process tests, scheduled runs).
 	ChargedModel string `json:"-"`
+	// StoredFiles are files the person picked from their encrypted file storage for an agent that reads files
+	// (a_research, a_review; branch files-vm-read, not released): each names one stored object, the key that opens it
+	// and a short-lived read URL the chat's Worker minted for it. The VM fetches the ciphertext itself, checks every
+	// chunk as the browser does and keeps the text in memory only (package storedfiles). Covered by the run
+	// signature, one item each after the images (runauth.Digest); an older VM refuses the field (strict decoding).
+	StoredFiles []StoredFile `json:"stored_files,omitempty"`
+}
+
+// StoredFile is one object of the person's encrypted file storage that a run (or a schedule's runs) may read: the
+// object, how its chunks are bound (file, epoch, padded size), its plaintext length, what to call it, its key, and
+// (for a run a person starts) where to fetch it. The layout is the chat's src/shared/file-format.ts.
+type StoredFile struct {
+	Object string `json:"object"` // ob_: the version's object, or its extracted-text sibling (Extracted)
+	File   string `json:"file"`   // fl_: the file every chunk's AAD names
+	Owner  string `json:"owner"`  // ow_: the R2 prefix (f/<owner>/<object>)
+	Epoch  int    `json:"epoch"`
+	Padded int64  `json:"padded"` // the padded plaintext size: paddedSize(8 + Size)
+	Size   int64  `json:"size"`   // the object's plaintext bytes
+	Name   string `json:"name"`   // the file's name as the person sees it
+	Type   string `json:"type"`   // the file's MIME type as the browser reported it ("" when unknown)
+	// Extracted: the object is the text the browser extracted from a PDF or Office file at upload, not the file.
+	Extracted bool `json:"extracted,omitempty"`
+	// Key is the object's AES-256-GCM key (32 bytes, base64 in JSON), unwrapped in the browser for this request only.
+	Key []byte `json:"key,omitempty"`
+	// URL is a presigned GET for f/<owner>/<object> in the files bucket (an hour); absent in a schedule's
+	// definition, whose runs ask the Worker for one with the schedule's grant (storedfiles.URLSource).
+	URL string `json:"url,omitempty"`
 }
 
 // SearchRequest is POST /search's body: the plain chat's one web search the person allowed in their tab (docs/29;

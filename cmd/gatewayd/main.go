@@ -110,6 +110,7 @@ func main() {
 	reader := guard.DefaultReader
 	g := guard.New(guard.Config{Up: guard.WithModelFaults(guard.NewTinfoilUpstream(tc, lease), faults), Search: search, Fetcher: fetcher, Reader: &reader,
 		Icons: fetcher, Limits: &lim, CacheSecret: randomHex(32), Now: func() time.Time { return time.Now().UTC() }, Safety: st,
+		Stored: guard.NewStoredConfig(), // the person's stored files (guard/stored.go; the policy must allow files.fetch)
 		Record: func(e guard.Egress) { // metadata only: ids, operation, decision, pattern ids
 			logMu.Lock()
 			defer logMu.Unlock()

@@ -33,7 +33,9 @@ import (
 	"time"
 
 	"github.com/tacyhq/tacy/identity"
+	"github.com/tacyhq/tacy/proto"
 	"github.com/tacyhq/tacy/safety"
+	"github.com/tacyhq/tacy/storedfiles"
 )
 
 // DefinitionType names an agent definition's payload; KindAgent is its envelope kind.
@@ -95,11 +97,19 @@ type Definition struct {
 	// Notify is when a run tells the person: "" every run (as before), or NotifyChanges: only when it found something
 	// that changed against what it remembers (it needs Memory); a run that found nothing new ends quiet (no message,
 	// its result marked quiet) through the schedule.no_change tool, never by reading its text.
-	Notify   string    `json:"notify,omitzero"`
-	Author   string    `json:"author"`  // i_
-	Sponsor  string    `json:"sponsor"` // i_
-	IssuedAt time.Time `json:"issued_at"`
-	NotAfter time.Time `json:"not_after"` // the sponsor's authority ends here
+	Notify string `json:"notify,omitzero"`
+	// Files (branch files-vm-read, not released): stored files the sponsor picked for every run, each with its
+	// object's key (proto.StoredFile, no URL), unwrapped in their browser at install and sent only inside this
+	// definition (EHBP to the attested VM key, signed with it); FilesGrant is the chat Worker's read grant for exactly
+	// these objects, with which a run asks for an hour's read URLs (guard/stored.go). A run reads the versions picked:
+	// a newer version is another object, with a key the definition doesn't have (the chat installs it again). An older
+	// VM refuses a definition with them (strict decoding), never runs it without.
+	Files      []proto.StoredFile `json:"files,omitzero"`
+	FilesGrant string             `json:"files_grant,omitzero"`
+	Author     string             `json:"author"`  // i_
+	Sponsor    string             `json:"sponsor"` // i_
+	IssuedAt   time.Time          `json:"issued_at"`
+	NotAfter   time.Time          `json:"not_after"` // the sponsor's authority ends here
 }
 
 // Trigger is one way a definition's tasks start.
@@ -127,6 +137,12 @@ func (t *Trigger) Period() time.Duration {
 }
 
 var nameRe = regexp.MustCompile(`^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$`)
+
+// grantRe is a read grant as the chat's Worker writes it: "g1." base64url payload "." base64url HMAC (opaque here; the
+// Worker checks it). At most 16 KiB: 200 object ids and the rest.
+var grantRe = regexp.MustCompile(`^g1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{16,128}\z`)
+
+const maxGrantBytes = 16 << 10
 
 func (t *Trigger) check() error {
 	if !identity.ValidID("tr", t.ID) {
@@ -205,6 +221,14 @@ func (d *Definition) check(firm string, now time.Time) error {
 		return errors.New("the sponsorship has ended (not_after)")
 	case d.NotAfter.Sub(d.IssuedAt) > MaxSponsorship:
 		return errors.New("not_after may be at most a year after issued_at")
+	}
+	if len(d.Files) > 0 || d.FilesGrant != "" {
+		if err := storedfiles.Check(d.Files, false); err != nil {
+			return err
+		}
+		if len(d.Files) == 0 || len(d.FilesGrant) > maxGrantBytes || !grantRe.MatchString(d.FilesGrant) {
+			return errors.New("stored files need their read grant, and a grant its files")
+		}
 	}
 	for _, n := range d.Tools {
 		if !nameRe.MatchString(n) || len(n) > 64 {

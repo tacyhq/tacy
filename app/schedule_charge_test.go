@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tacyhq/tacy/proto"
 	"github.com/tacyhq/tacy/runauth"
 	"github.com/tacyhq/tacy/safety"
 	"github.com/tacyhq/tacy/trigger"
@@ -42,9 +43,37 @@ func TestScheduleRunCostVectors(t *testing.T) {
 		{"glm-5-3", false, 145_340}, {"glm-5-3", true, 250_000},
 		{"kimi-k3", false, 250_000}, {"kimi-k3", true, 250_000},
 	} {
-		if got := scheduleRunCost(v.model, v.search); got != v.want {
+		if got := scheduleRunCost(v.model, v.search, false); got != v.want {
 			t.Errorf("%s search=%v: %d, want %d", v.model, v.search, got, v.want)
 		}
+	}
+	// With stored files (v0.17.0): the files' share on top (fixed 40,000, model 10,000 scaled), still capped.
+	for _, v := range []struct {
+		model  string
+		search bool
+		want   int64
+	}{
+		{"deepseek-v4-1-flash", false, 120_000}, {"deepseek-v4-1-flash", true, 200_000},
+		{"gpt-oss-120b", false, 93_773}, {"gpt-oss-120b", true, 160_659},
+		{"gemma4-31b", false, 106_459}, {"gemma4-31b", true, 179_688},
+		{"glm-5-3", false, 220_453}, {"glm-5-3", true, 250_000},
+		{"kimi-k3", false, 250_000}, {"kimi-k3", true, 250_000},
+	} {
+		if got := scheduleRunCost(v.model, v.search, true); got != v.want {
+			t.Errorf("files %s search=%v: %d, want %d", v.model, v.search, got, v.want)
+		}
+	}
+}
+
+// A definition with stored files is charged their share: deepseek reading pages and files, every day, 120,000 a run.
+func TestScheduleChargeWithFiles(t *testing.T) {
+	e := newSchedEnv(t)
+	d := e.daily(e.me, func(d *trigger.Definition) {
+		d.Files = []proto.StoredFile{{Object: "ob_aaaaaaaaaaaaaaaaaaaaaaaaaa"}}
+		d.NotAfter = time.Date(2027, 1, 19, 9, 0, 0, 0, time.UTC)
+	})
+	if got, want := scheduleCharge(&d), "v1 "+d.Agent+" daily=120000 once=0 until=2027-01-19"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
 	}
 }
 

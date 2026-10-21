@@ -126,7 +126,14 @@ var scheduledDef = AgentDef{ID: AgentScheduled, Version: "1", Tools: []string{"w
 	Steps: 20, Searches: 6, Reads: 25, Work: 10 * time.Minute,
 	Run: safety.Limits{Tokens: 4_000_000, ToolCalls: 40, WallSeconds: 10 * 60, CostMicros: 250_000},
 	// Kept for the digest's last answer over a long conversation (a cent or two on the default model).
-	FinalReserve: 30_000}
+	FinalReserve: 30_000,
+	// A definition with stored files (branch files-vm-read) reads them as research reads the person's files, at most
+	// scheduledFileParts parts; one without has no files tools.
+	Files: true, FilesOptional: true, FileParts: scheduledFileParts}
+
+// scheduledFileParts is the most parts of its stored files a scheduled run reads (about 96,000 characters, about
+// $0.08 of reader calls, inside the run's $0.25).
+const scheduledFileParts = 24
 
 // internalDefs are definitions a request can't name (Startable is false): only the VM starts their tasks.
 var internalDefs = map[string]*AgentDef{AgentScheduled: &scheduledDef}
@@ -287,21 +294,30 @@ func agentStart(d AgentDef, r *proto.RunRequest, s harness.Start, now time.Time,
 		}
 		if d.Files { // the files come first in the brief's message; the model gets the brief and a list (review.go)
 			var err error
-			if brief, files, err = fileIntake(d, ms[0].Content); err != nil {
+			fd := d
+			fd.FilesOptional = d.FilesOptional || len(r.StoredFiles) > 0 // stored files alone are files too
+			if brief, files, err = fileIntake(fd, ms[0].Content); err != nil {
 				return s, TaskOptions{}, err
 			}
-			if len(files) > 0 {
-				s.Input[len(s.Input)-1].Content = brief + fileList(d, files)
+			if err := storedIntake(d, len(files), r.StoredFiles); err != nil {
+				return s, TaskOptions{}, err
+			}
+			if len(files) > 0 || len(r.StoredFiles) > 0 {
+				s.Input[len(s.Input)-1].Content = brief + fileList(d, files) + storedList(len(files), r.StoredFiles)
 			}
 		}
 		if strings.TrimSpace(brief) == "" || len([]rune(brief)) > maxBriefChars {
 			return s, TaskOptions{}, fmt.Errorf("the brief must be 1 to %d characters", maxBriefChars)
 		}
 	}
+	if len(r.StoredFiles) > 0 && (!d.Files || !d.BriefOnly) {
+		return s, TaskOptions{}, fmt.Errorf("%s doesn't read stored files", d.ID)
+	}
+	hasFiles := len(files) > 0 || len(r.StoredFiles) > 0
 	if r.Tools == nil {
 		r.Tools = slices.Clone(d.Tools)
 	}
-	if d.FilesOptional && len(files) == 0 { // no files: no files tools (the default list has them)
+	if d.FilesOptional && !hasFiles { // no files: no files tools (the default list has them)
 		r.Tools = slices.DeleteFunc(slices.Clone(r.Tools), func(n string) bool { return isFilesAction(toolAction(n)) })
 	}
 	var actions []string
@@ -314,7 +330,7 @@ func agentStart(d AgentDef, r *proto.RunRequest, s harness.Start, now time.Time,
 		}
 		actions = append(actions, toolAction(n))
 	}
-	if len(files) > 0 && !slices.Contains(actions, "files.read") {
+	if hasFiles && !slices.Contains(actions, "files.read") {
 		return s, TaskOptions{}, fmt.Errorf("%s: the request has files but not files_read, which reads them", d.ID)
 	}
 	if r.MaxSteps == 0 {
@@ -347,12 +363,13 @@ func agentStart(d AgentDef, r *proto.RunRequest, s harness.Start, now time.Time,
 	switch {
 	case d.NoEgress:
 		links = nil // nothing is fetched for a review anyway
-	case len(files) > 0:
+	case hasFiles:
 		// A file's addresses aren't links the person gave: only the brief's are (a page read never opens an address
 		// that is only in their files, and sends nothing of them).
 		links = personLinks([]proto.Message{{Role: "user", Content: brief}})
 	}
 	return s, TaskOptions{ReasoningEffort: r.ReasoningEffort, CacheSecret: r.CacheSecret, Agent: d.ID, Files: files,
+		Stored:    r.StoredFiles,
 		Question:  capRunes(strings.TrimSpace(brief), maxQuestionRunes),
 		RunSecret: r.RunSecret, Permissions: maps.Clone(r.Permissions), Links: links,
 		// Numbered links (links.go, v0.14.0): a page the brief names comes with its links to open and cite, as a

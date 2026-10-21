@@ -231,3 +231,37 @@ func TestDocumentCap(t *testing.T) {
 		t.Fatal("a document marked the task as having outside content")
 	}
 }
+
+// revises: the attached file's name a document revises, kept (with its extension), cleaned of hidden and control
+// characters and capped; absent when not given or empty after cleaning.
+func TestCheckDocumentRevises(t *testing.T) {
+	args := func(revises any) []byte {
+		b, _ := json.Marshal(map[string]any{"name": "Lease", "format": "docx", "content": "x", "revises": revises})
+		return b
+	}
+	if m, p := CheckDocument(args("lease-2026.docx")); p != "" || m.Revises != "lease-2026.docx" {
+		t.Fatalf("kept: %+v %q", m, p)
+	}
+	if m, _ := CheckDocument(args("le\u202ease\u200b\n  2026.docx\u0000")); m.Revises != "lease 2026.docx" {
+		t.Fatalf("cleaned: %q", m.Revises)
+	}
+	if m, _ := CheckDocument(args(strings.Repeat("a", 300) + ".md")); len([]rune(m.Revises)) != maxRevisesName {
+		t.Fatalf("capped: %d", len([]rune(m.Revises)))
+	}
+	for _, empty := range []string{"", "  \u200b\t "} {
+		m, _ := CheckDocument(args(empty))
+		if m.Revises != "" {
+			t.Fatalf("empty kept: %q", m.Revises)
+		}
+		if out, _ := json.Marshal(m); strings.Contains(string(out), "revises") {
+			t.Fatalf("empty in the result: %s", out)
+		}
+	}
+	m, _ := CheckDocument(docArgs("Lease", "docx", "x"))
+	if out, _ := json.Marshal(m); m.Revises != "" || strings.Contains(string(out), "revises") {
+		t.Fatalf("absent: %s", out)
+	}
+	if out, _ := json.Marshal(func() documentMade { m, _ := CheckDocument(args("a.txt")); return m }()); !strings.Contains(string(out), `"revises":"a.txt"`) {
+		t.Fatalf("not in the result: %s", out)
+	}
+}

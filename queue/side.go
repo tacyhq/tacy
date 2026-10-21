@@ -25,11 +25,12 @@ type Side struct {
 }
 
 var (
-	_ approval.Store      = (*Side)(nil)
-	_ trigger.Store       = (*Side)(nil)
-	_ trigger.HolderStore = (*Side)(nil)
-	_ trigger.ResultStore = (*Side)(nil)
-	_ trigger.MemoryStore = (*Side)(nil)
+	_ approval.Store       = (*Side)(nil)
+	_ trigger.Store        = (*Side)(nil)
+	_ trigger.HolderStore  = (*Side)(nil)
+	_ trigger.ResultStore  = (*Side)(nil)
+	_ trigger.MemoryStore  = (*Side)(nil)
+	_ trigger.CollectStore = (*Side)(nil)
 )
 
 // sideMigrations are the side file's schema versions (PRAGMA user_version), forward only.
@@ -138,6 +139,14 @@ var sideExtras = []struct {
 		space TEXT PRIMARY KEY,
 		seal  TEXT NOT NULL,
 		at    INTEGER NOT NULL
+	);`},
+	// v0.17.0: per schedule, how many runs in a row left a result nobody collected, and the version that stopped
+	// itself for it (trigger/collect.go). An older release never reads it: its schedules just don't stop themselves.
+	{`SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'collect'`,
+		`CREATE TABLE collect (
+		agent   TEXT PRIMARY KEY,
+		missed  INTEGER NOT NULL,
+		stopped INTEGER NOT NULL DEFAULT 0
 	);`},
 }
 
@@ -395,6 +404,19 @@ func (s *Side) SetState(agent string, version uint64, state string) error {
 	return nil
 }
 
+func (s *Side) ExpireDefinition(agent string, version uint64, env []byte) error {
+	res, err := s.db.Exec(`UPDATE definitions SET state = ?, env = ? WHERE agent = ? AND version = ? AND state != ?`,
+		trigger.StateExpired, env, agent, int64(version), trigger.StateRemoved)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return trigger.ErrStale
+	}
+	s.truncateWAL() // the old envelope's keys out of the log too (secure_delete clears the pages)
+	return nil
+}
+
 // purgeRemoved empties the envelopes of definitions removed before removals did (v0.12.0-v0.15.0, or while one of
 // them ran after a rollback). Idempotent.
 func purgeRemoved(db *sql.DB) error {
@@ -475,15 +497,29 @@ func (s *Side) Holder(space, id string) (*trigger.Holder, error) {
 }
 
 func (s *Side) PutResult(r trigger.Result) (int64, error) {
-	if _, err := s.db.Exec(`INSERT INTO results (task, space, seal, agent, version, trigger, day, scheduled_at, started_at,
-		ended_at, state, code, enc, ct, quiet) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (task) DO NOTHING`,
-		r.Task, r.Space, r.Seal, r.Agent, int64(r.Version), r.Trigger, r.Day, ms(r.ScheduledAt), ms(r.StartedAt), ms(r.EndedAt),
-		r.State, r.Code, r.Enc, r.CT, r.Quiet); err != nil {
+	tx, err := s.db.Begin()
+	if err != nil {
 		return 0, err
 	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`INSERT INTO results (task, space, seal, agent, version, trigger, day, scheduled_at, started_at,
+		ended_at, state, code, enc, ct, quiet) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (task) DO NOTHING`,
+		r.Task, r.Space, r.Seal, r.Agent, int64(r.Version), r.Trigger, r.Day, ms(r.ScheduledAt), ms(r.StartedAt), ms(r.EndedAt),
+		r.State, r.Code, r.Enc, r.CT, r.Quiet)
+	if err != nil {
+		return 0, err
+	}
+	if n, _ := res.RowsAffected(); n == 1 { // one more result nobody has collected yet (trigger/collect.go)
+		if _, err := tx.Exec(`INSERT INTO collect (agent, missed) VALUES (?, 1) ON CONFLICT (agent) DO UPDATE SET missed = missed + 1`,
+			r.Agent); err != nil {
+			return 0, err
+		}
+	}
 	var seq int64
-	err := s.db.QueryRow(`SELECT seq FROM results WHERE task = ?`, r.Task).Scan(&seq)
-	return seq, err
+	if err := tx.QueryRow(`SELECT seq FROM results WHERE task = ?`, r.Task).Scan(&seq); err != nil {
+		return 0, err
+	}
+	return seq, tx.Commit()
 }
 
 const resultCols = `seq, task, space, seal, agent, version, trigger, day, scheduled_at, started_at, ended_at, state, code, quiet`
@@ -534,17 +570,34 @@ func (s *Side) GetResult(space, seal, task string) (*trigger.Result, error) {
 	return &r, nil
 }
 
+// DeleteResults is the person's delete after collecting: the schedules of the results it deletes start their
+// uncollected count again (trigger/collect.go), in the same transaction.
 func (s *Side) DeleteResults(space, seal string, tasks []string) (int, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
 	n := 0
 	for _, t := range tasks {
-		res, err := s.db.Exec(`DELETE FROM results WHERE space = ? AND seal = ? AND task = ?`, space, seal, t)
+		var agent string
+		switch err := tx.QueryRow(`SELECT agent FROM results WHERE space = ? AND seal = ? AND task = ?`, space, seal, t).Scan(&agent); {
+		case errors.Is(err, sql.ErrNoRows):
+			continue
+		case err != nil:
+			return 0, err
+		}
+		res, err := tx.Exec(`DELETE FROM results WHERE space = ? AND seal = ? AND task = ?`, space, seal, t)
 		if err != nil {
-			return n, err
+			return 0, err
 		}
 		k, _ := res.RowsAffected()
 		n += int(k)
+		if _, err := tx.Exec(`UPDATE collect SET missed = 0 WHERE agent = ?`, agent); err != nil {
+			return 0, err
+		}
 	}
-	return n, nil
+	return n, tx.Commit()
 }
 
 func (s *Side) DeleteAgentResults(space, agent string) (int, error) {
@@ -553,7 +606,41 @@ func (s *Side) DeleteAgentResults(space, agent string) (int, error) {
 		return 0, err
 	}
 	k, _ := res.RowsAffected()
+	if _, err := s.db.Exec(`DELETE FROM collect WHERE agent = ?`, agent); err != nil {
+		return int(k), err
+	}
 	return int(k), nil
+}
+
+// ---- schedules whose results nobody collects (trigger.CollectStore) ----------------------------------------
+
+func (s *Side) Uncollected(agent string) (int, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT missed FROM collect WHERE agent = ?`, agent).Scan(&n)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	return n, err
+}
+
+func (s *Side) SetStoppedUncollected(agent string, version uint64) error {
+	_, err := s.db.Exec(`INSERT INTO collect (agent, missed, stopped) VALUES (?, 0, ?) ON CONFLICT (agent) DO UPDATE SET stopped = excluded.stopped`,
+		agent, int64(version))
+	return err
+}
+
+func (s *Side) StoppedUncollected(agent string, version uint64) (bool, error) {
+	var v int64
+	err := s.db.QueryRow(`SELECT stopped FROM collect WHERE agent = ?`, agent).Scan(&v)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil && v > 0 && uint64(v) == version, err
+}
+
+func (s *Side) ResetCollect(agent string) error {
+	_, err := s.db.Exec(`DELETE FROM collect WHERE agent = ?`, agent)
+	return err
 }
 
 func (s *Side) PruneResults(t time.Time) error {

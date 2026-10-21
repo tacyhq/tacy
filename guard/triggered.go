@@ -57,6 +57,9 @@ var ErrUnknownTool = errors.New("the definition names a tool this release doesn'
 // searchNote is added to a scheduled run's note when its definition lets it search (schedule upgrades).
 const searchNote = "\n\nYou can search the web (%s): short, generic queries made from the instructions, never personal details; at most %d searches this run. Open a result by its number, like [3]."
 
+// scheduledFilesNote heads the list of a schedule's stored files in its run's first message.
+const scheduledFilesNote = "\n\nThe sponsor's files for this task (you never see their text: read them with files_read; cite what they say as [file quote N]):"
+
 // TriggeredStart makes the start and options of a fired task (StartTriggered). mem is its schedule's memory, newest
 // first (trigger.MemoryStore; only for a definition with memory): it goes in the run's first message as data
 // (MemoryNote), and with notify "changes" and an earlier run to compare with, the run may call schedule.no_change.
@@ -133,6 +136,21 @@ func TriggeredStartFor(f trigger.Fire, firm string, now time.Time, mem []trigger
 	if noChange {
 		tools = append(tools, noChangeToolDef())
 	}
+	// Stored files the sponsor picked (stored.go): read through files_list and files_read, as research reads the
+	// person's files; a run under a policy without files.fetch can't do its job, so it doesn't start.
+	if len(d.Files) > 0 {
+		if !allows("files.read") || !allows(storedFetchAction) {
+			return s, TaskOptions{}, errors.New("reading stored files isn't allowed by the policy (it has no files.fetch)")
+		}
+		ft := ToolDefs("files.list", "files.read")
+		for i := range ft {
+			if ft[i].Name == "files.read" {
+				ft[i].Description = researchFilesReadDesc
+			}
+		}
+		tools = append(tools, ft...)
+		note += scheduledFilesNote + storedList(0, d.Files)
+	}
 	s = harness.Start{Space: d.Space, Attempt: 1,
 		Agent:        harness.AgentRef{ID: d.Agent, Version: strconv.FormatUint(d.Version, 10), Digest: f.Digest},
 		Instructions: strings.TrimSpace(d.Instructions) + "\n" + unattendedNote + documentNote(docs), Models: d.Models,
@@ -157,7 +175,8 @@ func TriggeredStartFor(f trigger.Fire, firm string, now time.Time, mem []trigger
 		Slot: f.Slot, Due: f.Due,
 		Permissions: maps.Clone(perms), Approvers: []string{d.Sponsor}, Agent: AgentScheduled, DefAgent: d.Agent, Digest: f.Digest, Trigger: f.Trigger.ID,
 		Sponsor: d.Sponsor, NotAfter: d.NotAfter, Links: personLinks([]proto.Message{{Role: "user", Content: d.Instructions}}),
-		PageLinks: slices.Contains(web, "web.fetch"), Memory: d.Memory, NoChange: noChange}
+		PageLinks: slices.Contains(web, "web.fetch"), Memory: d.Memory, NoChange: noChange,
+		Stored: slices.Clone(d.Files), FilesGrant: d.FilesGrant}
 	// The run uses the definition's first model; the others it lists (signed by the sponsor, each allowed by the
 	// policy at install) are its fallbacks, in order: an overloaded or slow step switches to the first still allowed,
 	// as a chat run on Auto does (fallback.go). One model: none.

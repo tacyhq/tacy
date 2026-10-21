@@ -11,12 +11,12 @@
 # sha256 180dd277f657c1478f09490e8a9a595f7378257510b43d1d3694a769aef9ed02, each binary checked; its Apache-2.0 LICENSE at
 # /tacy/gvisor/LICENSE). Rebuild them from the tagged source (scripts/reproduce.sh) to get the same digests.
 # Binaries (linux/amd64, sha256):
-#   agentd   a3ae973d1419dbeccb2e6bb456fedbadd57bcb5d30058fbb75badee06a1d7436
-#   brain    d739d8b50f285e10cdee058f4da6f69340d46c1e88add049883a102a845fcbbc
-#   gatewayd 6306249fb7a0abe1c73aeb3005a48228a1a0ab33d617b929beaed2bd80ae3714
+#   agentd   10620ac32a08dc3c7e336d3e00cb0f263b006fa45f4ec9c2ac4d2e27f54391d7
+#   brain    7c984294c1b91fd5c27fb407d655bb2536b35e427b23b6d5082055e73d88cf60
+#   gatewayd 20d91ed800a573c0f2dfa8fe7a609e77857a7f92ff46b8f15759ec8538d3f727
 #   runnerd  b1c1a2432beaf866395941d4d598ade89a0e885e226c6e13c5d2a4c359990bcb
 #   setup    80f380d97b1cc77da758d69ba978e5f09c720f10ef853f6afa06e06ffa006de6
-#   vaultd   eb086ba99364b6284ba266d13e741bfe17dea319734289ddbdd6e3369303204b
+#   vaultd   cc3b882a568e81bcfc3e9ad515400ccf592db5835444a50e606c161ede10429d
 #            56996c546dbafd5716e1d09e307a131d97eb3b6483c22a1178631751f3e0392f (gVisor runsc)
 #            1755e10a4c9d1db4973c0155497348db3737543b4c2e6a9f663a271ee71433d5 (gVisor gvisor-bin/gvisor_sentry)
 #            46d5c028723ac5fbe40b863f95100f15a00d2aa0cd39c69d892500a988c930bd (gVisor gvisor-bin/gvisor-sentry-prewarmer)
@@ -39,7 +39,7 @@ services:
       - state:/state
     command: ["-dir", "/run/tacy/agent=10003:10001:0770", "-dir", "/run/tacy/vault=10002:10001:0750", "-dir", "/run/tacy/runner=10004:10003:0750", "-remove", "/state/queue.db", "-remove", "/state/queue.db-wal", "-remove", "/state/queue.db-shm", "-remove", "/state/queue.db-journal", "-tree", "/state/agentd=10003:10003:0700"]
   agentd:
-    image: ghcr.io/tacyhq/tacy/agentd@sha256:c692bae6d42cba47f65b6852ce7e6ac16eef0cea1fc8ab120d3aa1df1fe5b00a
+    image: ghcr.io/tacyhq/tacy/agentd@sha256:1344d2a345f4c8f2cb816f571b20975d787d96d80a9e3fed4d1bc1a8f80f0ba2
     entrypoint: ["/tacy/agentd"]
     network_mode: none
     restart: unless-stopped
@@ -60,7 +60,7 @@ services:
       AGENT_VM_TOKEN: ${AGENT_VM_TOKEN}
     command: ["-storage", "/state/agentd", "-runner-socket", "/run/tacy/runner/runner.sock", "-gateway-socket", "/run/tacy/agent/gateway.sock", "-listen-unix", "/run/tacy/agent/http.sock", "-listen-uid", "10001", "-listen-gid", "10001", "-mem-limit-mib", "600", "-firm", "f_chat", "-personal-spaces", "-operator-key", "ed25519:UjnT9P6APMBeNg5pJlGCLbwOKDlVJQO3m3+yDzby2os=", "-keylog-genesis", "a35f4cb79bd5066638a0fd0aa8dc855b951febba003e6a6fd3e335adc8d47cfd", "-keylog-carry", "e6f08a761337f9a367594c3ed43a07723ac50cbf790f5b740e25442d9a8c7496,b1cf194b7246c31a565f7c11de8416f16c377a461976dd9eb8a4e290cef1fe1a"]
   runner:
-    image: ghcr.io/tacyhq/tacy/runnerd@sha256:9899de124b8090a673d5c1b5092daa66d58ff033df9a4b9b3b8aac0ab84ce060
+    image: ghcr.io/tacyhq/tacy/runnerd@sha256:989357aeb6526b7e688c8a10827f6e84c53d2ac8890542ff800e0c121fe00e41
     entrypoint: ["/tacy/runnerd"]
     network_mode: none
     restart: unless-stopped
@@ -77,9 +77,9 @@ services:
     tmpfs: ["/run/runner:exec,size=64m,mode=0700,uid=10004,gid=10003", "/tmp:size=16m"]
     volumes:
       - runnersock:/run/tacy/runner
-    command: ["-socket", "/run/tacy/runner/runner.sock", "-agent-uid", "10003", "-gvisor", "/tacy/gvisor", "-gvisor-release", "20261012.0", "-runsc-sha256", "56996c546dbafd5716e1d09e307a131d97eb3b6483c22a1178631751f3e0392f", "-brain", "/tacy/brain", "-brain-sha256", "d739d8b50f285e10cdee058f4da6f69340d46c1e88add049883a102a845fcbbc", "-dir", "/run/runner", "-platform", "systrap", "-rootless"]
+    command: ["-socket", "/run/tacy/runner/runner.sock", "-agent-uid", "10003", "-gvisor", "/tacy/gvisor", "-gvisor-release", "20261012.0", "-runsc-sha256", "56996c546dbafd5716e1d09e307a131d97eb3b6483c22a1178631751f3e0392f", "-brain", "/tacy/brain", "-brain-sha256", "7c984294c1b91fd5c27fb407d655bb2536b35e427b23b6d5082055e73d88cf60", "-dir", "/run/runner", "-platform", "systrap", "-rootless"]
   agentvm:
-    image: ghcr.io/tacyhq/tacy/gatewayd@sha256:ffab9411e8acfb4b23adae95e7080d904bf66a135186f6253c68c54c22ddb1bd
+    image: ghcr.io/tacyhq/tacy/gatewayd@sha256:91ddf18c814ea9df44e2e2da9ec0120f583a4e32b1634f9f126cca7684718ae7
     entrypoint: ["/tacy/gatewayd"]
     restart: unless-stopped
     depends_on:
@@ -100,7 +100,7 @@ services:
       HOME: /tmp
     command: ["-socket", "/run/tacy/agent/gateway.sock", "-agent-uid", "10003", "-vault-socket", "/run/tacy/vault/vault.sock", "-listen", ":8080", "-forward", "/run/tacy/agent/http.sock", "-firm", "f_chat", "-personal-spaces", "-operator-key", "ed25519:UjnT9P6APMBeNg5pJlGCLbwOKDlVJQO3m3+yDzby2os=", "-keylog-genesis", "a35f4cb79bd5066638a0fd0aa8dc855b951febba003e6a6fd3e335adc8d47cfd", "-keylog-carry", "e6f08a761337f9a367594c3ed43a07723ac50cbf790f5b740e25442d9a8c7496,b1cf194b7246c31a565f7c11de8416f16c377a461976dd9eb8a4e290cef1fe1a", "-safety-url", "https://chat.tacy.io/api/safety/docs", "-keylog-url", "https://chat.tacy.io/api/safety/keylog"]
   vaultd:
-    image: ghcr.io/tacyhq/tacy/vaultd@sha256:0e29cfca397606a27b8a14a16b9c9c4168ba6fea892b872e766b90695d51a98b
+    image: ghcr.io/tacyhq/tacy/vaultd@sha256:7e7857383bbfe86d13f4664458a5f3e3184eb6996f4d80ba0fad30909b36e647
     entrypoint: ["/tacy/vaultd"]
     network_mode: none
     restart: unless-stopped

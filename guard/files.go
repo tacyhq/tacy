@@ -22,7 +22,8 @@ import (
 
 // The files connector (a_review, docs/30 slice 3): files.list and files.read over a review task's own files
 // (TaskOptions.Files), inside the VM. Nothing here reaches the network except the quarantined reader's model calls
-// (the attested inference enclave, through the model gateway like every model call).
+// (the attested inference enclave, through the model gateway like every model call), and, for the person's stored
+// files (TaskOptions.Stored, stored.go), the fetch of their ciphertext when a files.read first needs one.
 //
 // Each file is cut by code into sections (splitSections: at clause and article headings where it can, about
 // maxSectionRunes each), numbered per file. files.read reads up to maxSectionsPerRead sections at once, in parallel,
@@ -483,6 +484,11 @@ type reviewFile struct {
 	secs       []fileSection
 	state      []secState
 	cross      secState // the whole-file cross-check (crossDue); injected unused
+	// A stored file (stored.go): its ref; opened once its text is here (secs and state with it), openErr why it
+	// couldn't be; truncated: only its start fit what the task holds.
+	stored            *proto.StoredFile
+	opened, truncated bool
+	openErr           string
 }
 
 type secState struct {
@@ -497,16 +503,23 @@ type filesState struct {
 	once  sync.Once
 	mu    sync.Mutex
 	files []reviewFile
-	// the files' passages, for the outbound check (files_guard.go)
+	// the files' passages, for the outbound check (files_guard.go); a stored file's are added when it opens
 	guardOnce sync.Once
+	shMu      sync.Mutex
 	shingles  map[uint64]struct{}
+	brief     map[uint64]struct{}
+	// the stored files' fetch budget, read URLs and restored reads (stored.go)
+	stored storedState
 }
 
 func (s *filesState) init(opts TaskOptions, d AgentDef) {
 	s.once.Do(func() {
 		for _, f := range opts.Files {
 			secs := splitSections(f.Text, d.PartRunes)
-			s.files = append(s.files, reviewFile{name: f.Name, text: f.Text, secs: secs, state: make([]secState, len(secs))})
+			s.files = append(s.files, reviewFile{name: f.Name, text: f.Text, secs: secs, state: make([]secState, len(secs)), opened: true})
+		}
+		for i := range opts.Stored { // numbered after the attached ones; opened when first read
+			s.files = append(s.files, reviewFile{name: storedName(opts.Stored[i]), stored: &opts.Stored[i]})
 		}
 	})
 }
@@ -523,6 +536,9 @@ func (s *filesState) pick(file int, secs []int, limit int) ([]secRef, error) {
 	defer s.mu.Unlock()
 	if file < 0 || file > len(s.files) {
 		return nil, fmt.Errorf("there's no file %d (the task has %d)", file, len(s.files))
+	}
+	if file > 0 && s.files[file-1].stored != nil && !s.files[file-1].opened { // a stored file that couldn't be opened
+		return nil, fmt.Errorf("file %d (%s) %s", file, s.files[file-1].name, s.files[file-1].storedNote())
 	}
 	var out []secRef
 	if len(secs) > 0 {
@@ -737,6 +753,10 @@ type fileListed struct {
 	Read   []int  `json:"read"`
 	Failed []int  `json:"failed,omitempty"`
 	Unread []int  `json:"unread"`
+	// A stored file not opened yet: its size in bytes, and the note says so (or why it couldn't be opened, or that
+	// only its start was read).
+	Bytes int64  `json:"bytes,omitzero"`
+	Note  string `json:"note,omitzero"`
 }
 
 // filesAction runs files.list or files.read for a review task. Like a web action it is checked against the
@@ -745,7 +765,7 @@ type fileListed struct {
 func (g *Guard) filesAction(ctx context.Context, ti *harness.TaskInfo, id string, req *harness.Action) (*harness.ActionResult, error) {
 	ctx = withTask(ctx, ti.ID)
 	t := g.task(ti)
-	if !t.def.Files || len(t.opts.Files) == 0 {
+	if !t.def.Files || !t.opts.HasFiles() {
 		return &harness.ActionResult{Status: harness.ActionDenied, Error: "this task has no files"}, nil
 	}
 	ctx = withSpace(ctx, t.opts.Space)
@@ -784,6 +804,10 @@ func (g *Guard) filesAction(ctx context.Context, ti *harness.TaskInfo, id string
 				break
 			}
 		}
+		g.openFor(ctx, t, a.File, limit) // the stored files this read needs (stored.go)
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		refs, err := t.files.pick(a.File, a.Parts, limit)
 		if err != nil {
 			out.content = errorJSON(err.Error())
@@ -813,7 +837,11 @@ func (s *filesState) list() string {
 	defer s.mu.Unlock()
 	var out []fileListed
 	for fi, f := range s.files {
-		l := fileListed{File: fi + 1, Name: f.name, Chars: utf8.RuneCountInString(f.text), Parts: len(f.secs), Read: []int{}, Unread: []int{}}
+		l := fileListed{File: fi + 1, Name: f.name, Chars: utf8.RuneCountInString(f.text), Parts: len(f.secs), Read: []int{}, Unread: []int{},
+			Note: f.storedNote()}
+		if f.stored != nil && !f.opened {
+			l.Bytes = f.stored.Size
+		}
 		for si, st := range f.state {
 			switch {
 			case st.ok:
@@ -1014,13 +1042,24 @@ func (g *Guard) readSections(ctx context.Context, t *task, task, id string, refs
 	if rc.Files { // a review's files only
 		left = t.files.checksLeft()
 	}
+	closed := t.files.unopened() // stored files not opened yet: their parts aren't counted until they are
 	switch {
+	case closed > 0:
+		out.Next = fmt.Sprintf("%d part%s not read yet, and %d stored file%s not opened yet (files_read opens the next one when it needs it): call files_read again (several calls in one step are fine), or write the review if the budget is used up.",
+			out.Unread, plural(out.Unread), closed, plural(closed))
+		if !t.def.NoEgress {
+			out.Next = fmt.Sprintf("%d part%s not read yet, and %d stored file%s not opened yet (files_read opens the next one when it needs it): call files_read again unless the task's file reading is used up; then go on.",
+				out.Unread, plural(out.Unread), closed, plural(closed))
+		}
 	case out.Unread == 0 && left > 0:
 		out.Next = fmt.Sprintf("Every part of every file is read, but %d whole-file check%s still to run: call files_read once more, with no arguments, then write the review.", left, map[bool]string{true: " is", false: "s are"}[left == 1])
 	case out.Unread == 0:
 		out.Next = "Every part of every file is read: write the review now."
 		if !t.def.NoEgress {
-			out.Next = "Every part of every file is read: plan your sub-questions with what they say, then search the web."
+			// Research-web scorecard (the chat's research-web scorecard, 2026-10-21): with "plan your sub-questions
+			// with what they say, then search the web", gpt-oss-120b at low effort often wrote its plan as the whole
+			// reply and the task ended there (cmd/e2e research-files, 2 of 7 live runs on v0.16.1).
+			out.Next = "Every part of every file is read. Keep your plan in your head (it goes at the top of the brief) and write no text yet: your next reply calls web_search for the sub-questions the files don't answer (several in one step), or, only if the files alone answer the whole brief, it is the complete brief. A reply without a tool call ends the task."
 		}
 	default:
 		out.Next = fmt.Sprintf("%d part%s not read yet: call files_read again (several calls in one step are fine), or write the review if the budget is used up.", out.Unread, plural(out.Unread))
@@ -1058,6 +1097,16 @@ func (s *filesState) restore(t *task, output []byte) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, so := range o.Parts {
+		if so.File >= 1 && so.File <= len(s.files) && s.files[so.File-1].needsOpen() { // applied when it opens again
+			if s.stored.restored == nil {
+				s.stored.restored = map[int][]fileSectionOut{}
+			}
+			s.stored.restored[so.File-1] = append(s.stored.restored[so.File-1], fileSectionOut{Part: so.Part, Read: so.Read})
+			for _, q := range quotesOf(so.Read) {
+				most = max(most, q)
+			}
+			continue
+		}
 		if so.File < 1 || so.File > len(s.files) || so.Part < 1 || so.Part > len(s.files[so.File-1].state) {
 			continue
 		}
@@ -1087,7 +1136,7 @@ func (s *filesState) restore(t *task, output []byte) int {
 // the sections that weren't read (never, or the reader couldn't), and where the reader found text addressed to an AI.
 // "" for a task without files, or one whose model wrote nothing.
 func (t *task) coverageText() string {
-	if !t.def.Files || len(t.opts.Files) == 0 {
+	if !t.def.Files || !t.opts.HasFiles() {
 		return ""
 	}
 	t.emitMu.Lock()
@@ -1113,6 +1162,20 @@ func (t *task) coverageText() string {
 	capped := tried >= t.def.FileParts
 	for _, f := range s.files {
 		total += len(f.secs)
+		switch { // a stored file never opened, refused, or cut (stored.go)
+		case f.stored != nil && f.openErr != "":
+			lines = append(lines, fmt.Sprintf("- %s: not read (%s)", f.name, f.openErr))
+			continue
+		case f.stored != nil && !f.opened:
+			why := "the task ended first"
+			if t.def.FileParts > 0 && capped {
+				why = fmt.Sprintf("past the %d parts this task reads", t.def.FileParts)
+			}
+			lines = append(lines, fmt.Sprintf("- %s: not opened (%s)", f.name, why))
+			continue
+		case f.truncated:
+			lines = append(lines, fmt.Sprintf("- %s: only its first %s characters were read; the rest is longer than a task can hold", f.name, thousands(utf8.RuneCountInString(f.text))))
+		}
 		var never, failed, inj []int
 		for si, st := range f.state {
 			switch {

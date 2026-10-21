@@ -57,6 +57,16 @@ func (m *MemStore) SetState(agent string, version uint64, state string) error {
 	return nil
 }
 
+func (m *MemStore) ExpireDefinition(agent string, version uint64, env []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if v, ok := m.vers[agent]; !ok || v != version || m.state[agent] == StateRemoved {
+		return ErrStale
+	}
+	m.defs[agent], m.state[agent] = slices.Clone(env), StateExpired
+	return nil
+}
+
 func (m *MemStore) LastFired(trigger string) (int64, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

@@ -299,6 +299,9 @@ type scheduleView struct {
 	Definition safety.Envelope `json:"definition"`
 	Triggers   []triggerView   `json:"triggers"`
 	Running    int             `json:"running"`
+	// StopReason (v0.17.0): "uncollected" when it stopped itself because nobody collected its last results
+	// (trigger/collect.go); absent otherwise.
+	StopReason string `json:"stop_reason,omitzero"`
 }
 
 // mine is the space's definitions sealed to seal.
@@ -336,7 +339,8 @@ func (s *server) scheduleList(w http.ResponseWriter, r *http.Request) {
 	for _, in := range s.mine(who) {
 		state := s.triggers.StateOf(in)
 		out = append(out, scheduleView{Agent: in.Def.Agent, Version: in.Def.Version, Digest: in.Digest, State: state,
-			NotAfter: in.Def.NotAfter.UTC(), Definition: in.Env, Triggers: s.triggerViews(in, state, true), Running: len(s.running(in.Def.Agent))})
+			NotAfter: in.Def.NotAfter.UTC(), Definition: in.Env, Triggers: s.triggerViews(in, state, true), Running: len(s.running(in.Def.Agent)),
+			StopReason: s.triggers.StopReason(in)})
 	}
 	writeJSON(w, 200, map[string]any{"schedules": out})
 }

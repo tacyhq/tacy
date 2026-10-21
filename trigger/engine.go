@@ -60,6 +60,10 @@ type Store interface {
 	// the stored one isn't that version. Removing keeps the version floor (the agent id and version) and nothing else:
 	// the definition's envelope (its instructions, in plaintext) goes.
 	SetState(agent string, version uint64, state string) error
+	// ExpireDefinition replaces the agent's stored envelope at version with env (a redacted one: its stored files'
+	// keys and read grant gone) and marks it StateExpired; ErrStale when the stored one isn't that version, or is
+	// removed. An expired row is the version floor like a stopped one.
+	ExpireDefinition(agent string, version uint64, env []byte) error
 	// LastFired is the highest slot recorded for a schedule trigger (ok false: none yet).
 	LastFired(trigger string) (slot int64, ok bool, err error)
 	// SetFired records that the trigger's slot fired; it never lowers what's recorded.
@@ -90,12 +94,15 @@ type Config struct {
 	// MaxAge is how old the operator's signed time may be (the stop list's freshness, 10 minutes); MaxSkew how far
 	// the VM's clock may run from it beyond that (5 minutes).
 	MaxAge, MaxSkew time.Duration
+	// Collect counts each schedule's uncollected results (collect.go): a schedule stops itself instead of firing once
+	// MaxUncollected of its runs in a row left one. nil: no such stop (labs, engine tests).
+	Collect CollectStore
 }
 
 // Stored is a definition as the store keeps it.
 type Stored struct {
 	Env   []byte
-	State string // StateActive or StateStopped (removed ones aren't returned)
+	State string // StateActive, StateStopped or StateExpired (removed ones aren't returned)
 }
 
 // Definition states.
@@ -103,7 +110,9 @@ const (
 	StateActive  = "active"
 	StateStopped = "stopped"
 	StateRemoved = "removed"
-	// StateExpired is what Schedules says of an active definition past its not_after (not stored).
+	// StateExpired is what Schedules says of an active definition past its not_after. It is stored only for a
+	// definition with stored files once it reaches not_after (ExpireFiles): its envelope is then kept redacted, the
+	// files' keys and read grant gone, so it no longer verifies and never runs again; only a new version does.
 	StateExpired = "expired"
 	// StateEnded is what StateOf says of an active definition whose triggers are all one-time ones that have run or
 	// been skipped (not stored: read from the fired slots).
@@ -122,7 +131,7 @@ type Installed struct {
 	Def    *Definition
 	Env    safety.Envelope
 	Digest string // the envelope's sha256 (start.agent.digest)
-	State  string // StateActive or StateStopped
+	State  string // StateActive, StateStopped, or StateExpired (stored redacted: ExpireFiles)
 }
 
 // Fire is one task to start: from a schedule slot or an event delivery. Task is its derived id.
@@ -182,11 +191,78 @@ func (e *Engine) Load() (int, error) {
 		if json.Unmarshal(env.Payload, &d) != nil {
 			continue
 		}
+		if st.State == StateExpired { // redacted at its not_after (ExpireFiles): listed, never run; not verified
+			if e.loadExpired(env, &d) {
+				n++
+			}
+			continue
+		}
 		if _, err := e.install(env, false, d.IssuedAt, cmp.Or(st.State, StateActive)); err == nil {
 			n++
 		}
 	}
-	return n, nil
+	// Definitions with stored files that reached their not_after while agentd was down lose their keys now.
+	return n, e.ExpireFiles()
+}
+
+// loadExpired keeps a stored expired definition (its envelope redacted, so its signature no longer checks): it is only
+// listed, so the chat can offer to start it again with fresh keys, and never fires or takes an event (not active).
+func (e *Engine) loadExpired(env safety.Envelope, d *Definition) bool {
+	if d.Agent == "" || d.Firm != e.cfg.Firm || d.Space == "" {
+		return false
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.defs[d.Agent] != nil {
+		return false
+	}
+	e.defs[d.Agent] = &Installed{Def: d, Env: env, Digest: env.Hash(), State: StateExpired}
+	return true
+}
+
+// ExpireFiles deletes the stored files' keys of every definition that has them and reached its not_after (active or
+// stopped): its stored envelope is replaced by one without the keys and the read grant, in state expired, and the
+// installed copy drops them too. A key must not wait on the VM's disk for a schedule that can't run any more (the design:
+// from install until the schedule is removed or expires). It runs on every tick and at Load; the VM's own clock
+// decides (a host moving it forward can only delete keys early).
+func (e *Engine) ExpireFiles() error {
+	now := e.cfg.Now()
+	var errs []error
+	for _, in := range e.Installed() {
+		if in.State == StateExpired || (len(in.Def.Files) == 0 && in.Def.FilesGrant == "") || now.Before(in.Def.NotAfter) {
+			continue
+		}
+		d := *in.Def
+		d.Files = slices.Clone(d.Files)
+		for i := range d.Files {
+			d.Files[i].Key, d.Files[i].URL = nil, ""
+		}
+		d.FilesGrant = ""
+		payload, err := json.Marshal(d)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		env := safety.Envelope{Kind: in.Env.Kind, Payload: payload, Sigs: in.Env.Sigs}
+		b, err := json.Marshal(env)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if err := e.cfg.Store.ExpireDefinition(d.Agent, d.Version, b); err != nil {
+			errs = append(errs, fmt.Errorf("trigger: expiring a definition's stored files: %w", err))
+			continue
+		}
+		e.mu.Lock()
+		if e.defs[d.Agent] == in {
+			for i := range in.Def.Files { // the installed copy's keys go too (a run started before holds its own)
+				clear(in.Def.Files[i].Key)
+			}
+			e.defs[d.Agent] = &Installed{Def: &d, Env: env, Digest: env.Hash(), State: StateExpired}
+		}
+		e.mu.Unlock()
+	}
+	return errors.Join(errs...)
 }
 
 // Install verifies a definition and keeps it: a newer version replaces the installed one; the same version again
@@ -258,6 +334,12 @@ func (e *Engine) install(env safety.Envelope, store bool, at time.Time, state st
 			}
 			return nil, err
 		}
+		// A new version (a Resume, a renewal, an edit): its uncollected count starts again (collect.go).
+		if e.cfg.Collect != nil {
+			if err := e.cfg.Collect.ResetCollect(d.Agent); err != nil {
+				return nil, err
+			}
+		}
 	}
 	e.defs[d.Agent] = in
 	return in, nil
@@ -300,7 +382,7 @@ func (e *Engine) Stop(agent string, remove bool) (*Installed, error) {
 	if remove {
 		state = StateRemoved
 	}
-	if in.State == state {
+	if in.State == state || (in.State == StateExpired && !remove) { // an expired one doesn't run: nothing to stop
 		return in, nil
 	}
 	if err := e.cfg.Store.SetState(agent, in.Def.Version, state); err != nil {
@@ -452,6 +534,7 @@ func (e *Engine) Due() ([]Fire, error) {
 		return nil, err
 	}
 	var out []Fire
+	var collectErr error
 	for _, in := range e.Installed() {
 		if in.State != StateActive || e.sponsorOK(in.Def) != nil {
 			continue
@@ -495,11 +578,54 @@ func (e *Engine) Due() ([]Fire, error) {
 				}
 				continue
 			}
+			// Nobody collected its last MaxUncollected results: it stops itself instead of running (collect.go). A
+			// count that can't be read fires nothing (tried again next tick).
+			stop, err := e.uncollected(in)
+			if err != nil {
+				collectErr = err
+				break
+			}
+			if stop {
+				break
+			}
 			out = append(out, Fire{Task: e.TaskFor(in.Def, &tr, slot), Def: in.Def, Digest: in.Digest, Trigger: tr, Slot: slot,
 				At: now, Due: at})
 		}
 	}
-	return out, nil
+	return out, collectErr
+}
+
+// uncollected checks, before a run of in fires, whether MaxUncollected of its runs in a row left a result nobody
+// collected; if so it stops in (recording why, for that version) and says so. An error: the run doesn't fire.
+func (e *Engine) uncollected(in *Installed) (bool, error) {
+	if e.cfg.Collect == nil {
+		return false, nil
+	}
+	n, err := e.cfg.Collect.Uncollected(in.Def.Agent)
+	if err != nil {
+		return false, fmt.Errorf("trigger: uncollected results unreadable, nothing fired: %w", err)
+	}
+	if n < MaxUncollected {
+		return false, nil
+	}
+	if err := e.cfg.Collect.SetStoppedUncollected(in.Def.Agent, in.Def.Version); err != nil {
+		return false, err
+	}
+	if _, err := e.Stop(in.Def.Agent, false); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// StopReason is why in is stopped when it stopped itself (StopUncollected); "" otherwise.
+func (e *Engine) StopReason(in *Installed) string {
+	if e.cfg.Collect == nil || in.State != StateStopped {
+		return ""
+	}
+	if ok, err := e.cfg.Collect.StoppedUncollected(in.Def.Agent, in.Def.Version); err == nil && ok {
+		return StopUncollected
+	}
+	return ""
 }
 
 // Fired records that a schedule fire's task was started (or found already started).

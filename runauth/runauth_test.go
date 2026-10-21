@@ -177,6 +177,25 @@ func makeVectors(t *testing.T) *vectors {
 	r = base
 	r.Messages = []proto.Message{{Role: "user", Content: "hi", Images: []string{img1}}}
 	refuse("an image added after signing", r)
+	// Stored files (branch files-vm-read), added after the vectors above: they keep their bytes (a request without
+	// stored files hashes as before), and these come after them. Fake ids and keys; the URL is never fetched.
+	stored := []proto.StoredFile{
+		{Object: "ob_6eaaaaaaaaaaaaaaaaaaaaaaau", File: "fl_6eaaaaaaaaaaaaaaaaaaaaaaai", Owner: "ow_6eaaaaaaaaaaaaaaaaaaaaaaaa", Epoch: 1,
+			Padded: 65536, Size: 100, Name: "Notes ü.md", Type: "text/markdown", Key: bytes.Repeat([]byte{0x21}, 32),
+			URL: "https://df4bf4829cdbbca3dca42a266b41b170.r2.cloudflarestorage.com/tacy-files/f/ow_6eaaaaaaaaaaaaaaaaaaaaaaaa/ob_6eaaaaaaaaaaaaaaaaaaaaaaau?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=00"},
+		{Object: "ob_6eaaaaaaaaaaaaaaaaaaaaaaay", File: "fl_6eaaaaaaaaaaaaaaaaaaaaaaai", Owner: "ow_6eaaaaaaaaaaaaaaaaaaaaaaaa", Epoch: 2,
+			Padded: 2097152, Size: 1348576, Name: "Lease 2026.pdf", Type: "application/pdf", Extracted: true, Key: bytes.Repeat([]byte{0x22}, 32)},
+	}
+	add("stored files", proto.RunRequest{Model: "gpt-oss-120b", Agent: "a_research", RunSecret: strings.Repeat("aa", 32),
+		Tools: []string{"files_list", "files_read"}, Permissions: map[string]string{"web.search": "never", "web.fetch": "never"},
+		Messages: []proto.Message{{Role: "user", Content: "Brief: what do my notes say about the lease?"}}, StoredFiles: stored})
+	r = base
+	r.StoredFiles = stored[:1]
+	refuse("a stored file added after signing", r)
+	r = sign(proto.RunRequest{Model: "gpt-oss-120b", Messages: []proto.Message{{Role: "user", Content: "hi"}}, StoredFiles: stored})
+	r.StoredFiles = []proto.StoredFile{stored[0], stored[1]}
+	r.StoredFiles[1].Key = bytes.Repeat([]byte{0x23}, 32)
+	refuse("a stored file's key changed after signing", r)
 	return v
 }
 

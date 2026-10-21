@@ -21,8 +21,10 @@
 //	         (decimal), then each message's role and content, then, only when the request names an agent, "agent="
 //	         and its id (docs/30; absent for the chat, so a chat request's digest is the one v0.10.0 checks), then
 //	         each image of each message, in order, as "image=<message index (decimal)>:<data URL>" (v0.12.0; none
-//	         without images, so such a request's digest is unchanged)
-//	sig    = Ed25519(identity key, "tacy/v2/run-request" ‖ 0 ‖ digest)
+//	         without images, so such a request's digest is unchanged), then each stored file (proto.StoredFile,
+//	         branch files-vm-read; none without them) as StoredItem: "stored=" and its object, file, owner, epoch,
+//	         padded, size, name, type, extracted ("1" or "0"), base64 key and url, joined by NUL
+//	sig   = Ed25519(identity key, "tacy/v2/run-request" ‖ 0 ‖ digest)
 //
 // A plain chat's search (POST /search) and an answer's pictures (POST /pictures) carry the same where and who (v0.10.0),
 // each with its own label, so no signature passes for another kind of request; the first eight items are a run's:
@@ -188,6 +190,18 @@ func digest(label string, vmPub []byte, f fields, rest ...string) [32]byte {
 	return d
 }
 
+// StoredItem is a stored file's item in a run's digest: "stored=" ‖ object ‖ 0 ‖ file ‖ 0 ‖ owner ‖ 0 ‖ epoch ‖ 0 ‖
+// padded ‖ 0 ‖ size ‖ 0 ‖ name ‖ 0 ‖ type ‖ 0 ‖ extracted ("1" | "0") ‖ 0 ‖ base64(key) ‖ 0 ‖ url (numbers decimal).
+// A name or type never holds a NUL (storedfiles.Check refuses one), so no two files spell the same item.
+func StoredItem(f proto.StoredFile) string {
+	x := "0"
+	if f.Extracted {
+		x = "1"
+	}
+	return "stored=" + strings.Join([]string{f.Object, f.File, f.Owner, strconv.Itoa(f.Epoch), strconv.FormatInt(f.Padded, 10),
+		strconv.FormatInt(f.Size, 10), f.Name, f.Type, x, base64.StdEncoding.EncodeToString(f.Key), f.URL}, "\x00")
+}
+
 // Digest is a run request's digest for vmPub (see the package doc). It reads the request as the VM decoded it.
 func Digest(r *proto.RunRequest, vmPub []byte) [32]byte {
 	tools := "*"
@@ -217,6 +231,11 @@ func Digest(r *proto.RunRequest, vmPub []byte) [32]byte {
 		for _, u := range m.Images {
 			rest = append(rest, "image="+strconv.Itoa(i)+":"+u)
 		}
+	}
+	// Stored files (branch files-vm-read) come last, one item each, only when there are any: a request without them
+	// hashes exactly as before, and an older release refuses the field (strict decoding), never drops it.
+	for _, f := range r.StoredFiles {
+		rest = append(rest, StoredItem(f))
 	}
 	return digest(RequestLabel, vmPub, runFields(r), rest...)
 }

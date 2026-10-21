@@ -74,7 +74,7 @@ func init() {
 			"Cite sources inside it as [n] with the numbers the tool results gave, as in an answer (in a CSV or HTML table, put [n] where a source's link goes: Tacy writes its address there); don't write a list of sources or links: Tacy adds the sources list with their links. "+
 			fmt.Sprintf("At most %d documents per task and %s characters each. ", MaxDocuments, "50,000")+
 			"After the call, end with a short message (two or three sentences: what the document covers); don't repeat the document.",
-		`{"type":"object","properties":{"name":{"type":"string","description":"the document's title, a few words, without an extension"},"format":{"type":"string","enum":["docx","pdf","md","txt","csv","html"],"description":"the format the person asked for; otherwise docx for a report or other prose, md for technical notes, csv for table data"},"content":{"type":"string","description":"the whole document"}},"required":["name","format","content"]}`)
+		`{"type":"object","properties":{"name":{"type":"string","description":"the document's title, a few words, without an extension"},"format":{"type":"string","enum":["docx","pdf","md","txt","csv","html"],"description":"the format the person asked for; otherwise docx for a report or other prose, md for technical notes, csv for table data"},"content":{"type":"string","description":"the whole document"},"revises":{"type":"string","description":"only when this document is a revised version of one of the attached files: that file's name exactly"}},"required":["name","format","content"]}`)
 }
 
 // isDocumentAction: the action is the document connector's.
@@ -157,6 +157,10 @@ type documentArgs struct {
 	Name    *string `json:"name"`
 	Format  *string `json:"format"`
 	Content *string `json:"content"`
+	// Revises: the attached file this document is a new version of, by its name as the run sees it (an
+	// <attachment name="…"> block, or a stored file's name in its file list), so the chat's card can offer "Save as
+	// new version" of it. Optional.
+	Revises *string `json:"revises"`
 }
 
 // documentMade is the result the model and the person's events get for a document made: the checked name and
@@ -166,7 +170,9 @@ type documentMade struct {
 	Name   string `json:"name"`
 	Format string `json:"format"`
 	Chars  int    `json:"chars"`
-	Note   string `json:"note"`
+	// Revises is the cleaned name of the attached file it revises (DocumentRevises); absent when not given or empty.
+	Revises string `json:"revises,omitzero"`
+	Note    string `json:"note"`
 }
 
 const documentMadeNote = "The document card is shown to the person with Copy and Download. Don't repeat the document: end with a short message (two or three sentences: what it covers, and anything they should check)."
@@ -203,7 +209,38 @@ func CheckDocument(raw []byte) (documentMade, string) {
 	if a.Name != nil {
 		name = *a.Name
 	}
-	return documentMade{Status: "created", Name: DocumentName(name), Format: format, Chars: n, Note: documentMadeNote}, ""
+	revises := ""
+	if a.Revises != nil {
+		revises = DocumentRevises(*a.Revises)
+	}
+	return documentMade{Status: "created", Name: DocumentName(name), Format: format, Chars: n, Revises: revises, Note: documentMadeNote}, ""
+}
+
+// maxRevisesName is the longest file name revises keeps, in characters (a stored file's name: storedfiles'
+// maxNameRunes, the browser's MAX_NAME_CHARS for files).
+const maxRevisesName = 255
+
+// DocumentRevises cleans revises' file name as a name is cleaned, but keeps it a file's name to match (its extension
+// stays): NFC; hidden characters removed; control characters as spaces; spaces collapsed and trimmed; at most
+// maxRevisesName characters. "" when nothing is left (then the result has none). Only a name: the chat matches it
+// against the conversation's own attachments, nothing is opened by it.
+func DocumentRevises(raw string) string {
+	s := strings.ToValidUTF8(raw, "")
+	s = norm.NFC.String(s)
+	s = strings.Map(func(r rune) rune {
+		if unicode.Is(unicode.Cc, r) {
+			return ' '
+		}
+		if hiddenRune(r) {
+			return -1
+		}
+		return r
+	}, s)
+	s = strings.TrimSpace(spacesRe.ReplaceAllString(s, " "))
+	if r := []rune(s); len(r) > maxRevisesName {
+		s = strings.TrimSpace(string(r[:maxRevisesName]))
+	}
+	return s
 }
 
 // documentAction runs document.create: checked against the space's policy, the task's cap on documents and its

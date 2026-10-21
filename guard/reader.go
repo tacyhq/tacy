@@ -663,6 +663,9 @@ func (d *readerDoc) prompt(question string, spans []span) string {
 	case "file":
 		if d.research {
 			b.WriteString("Kind: one part of a file the person attached to their research brief (the file's name and the part are the first line of the document; the part is Tacy's cut of the file, not one of its own sections)\n")
+			if strings.Contains(d.title, " (inside: ") {
+				b.WriteString("The part starts inside the headings the first line names after \"inside:\", outermost first: give locations with them (for example \"3.1 Personal Data\" for an item \"1. Personal Data\" inside \"3. Privacy & Security\").\n")
+			}
 		} else {
 			b.WriteString("Kind: one part of a file the person attached for review (the file's name and the part are the first line of the document)\n")
 		}

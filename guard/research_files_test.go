@@ -67,8 +67,17 @@ func TestResearchFilesIntake(t *testing.T) {
 		t.Fatalf("links %v", o.Links)
 	}
 	if !strings.Contains(s.Instructions, "Read the files first") || !strings.Contains(s.Instructions, "### From your files") ||
-		!strings.Contains(s.Instructions, "whose source is 0") || strings.Contains(s.Instructions, "{{") {
+		!strings.Contains(s.Instructions, "quotes as [file quote N] references (source 0") || strings.Contains(s.Instructions, "{{") {
 		t.Fatalf("instructions %q", s.Instructions)
+	}
+	// Its file quotes have a marker of their own, in the tool's description too (review's stays [quote N]).
+	for _, d := range s.Tools {
+		if d.Name == "files.read" && (d.Description != researchFilesReadDesc || !strings.Contains(d.Description, "[file quote N]")) {
+			t.Fatalf("files_read's description %q", d.Description)
+		}
+	}
+	if toolDefs["files_read"].Function.Description == researchFilesReadDesc {
+		t.Fatal("review's files_read description changed")
 	}
 	// Without files: no files tools and the prompt as before (no files words), the brief as the message.
 	s, o, err = StartFor(researchReq(proto.Message{Role: "user", Content: "Task: x\n\nWhat changed in the 2026 rules?"}), now)
@@ -231,6 +240,15 @@ func TestResearchWithFilesEndToEnd(t *testing.T) {
 	if len(quotes) != 1 || quotes[0].Index != 0 || quotes[0].File != "policy.txt" || !strings.HasPrefix(quotes[0].Location, "policy.txt, part 1 of 1") {
 		t.Fatalf("file quotes %+v", quotes)
 	}
+	// The model gets them as [file quote N], everywhere in the part's fields; never as a web quote's [quote N].
+	var read filesReadOut
+	if err := json.Unmarshal([]byte(results["c1"]), &read); err != nil || len(read.Parts) != 1 || read.Parts[0].Read == nil {
+		t.Fatalf("files_read %s", results["c1"])
+	}
+	if v := read.Parts[0].Read; v.Quotes[0].Cite != "[file quote 1]" || !strings.HasSuffix(v.Summary, "[file quote 1].") ||
+		!strings.HasSuffix(v.Facts[0], "[file quote 1].") || strings.Contains(results["c1"], "[quote 1]") || read.Note != researchReadNote {
+		t.Fatalf("files_read %s", results["c1"])
+	}
 	if !slices.Equal(e.fs.queries, []string{"laptop encryption standard 2026"}) {
 		t.Fatalf("searches sent %v", e.fs.queries)
 	}
@@ -311,4 +329,25 @@ func TestResearchFilesReserve(t *testing.T) {
 		t.Fatalf("files.read reserve $%.3f of research's $%.2f", float64(cost)/1e6, float64(researchDef.Run.CostMicros)/1e6)
 	}
 	t.Logf("files.read reserves $%.3f", float64(cost)/1e6)
+}
+
+// A research part that starts inside a clause names the headings it's under (the reader took the CSA's "3. Privacy &
+// Security" item "1. Personal Data", cut into the next part, for section 1); one at a top-level heading names none.
+func TestOuterHeadings(t *testing.T) {
+	text := "# Cloud Service Agreement\n\n1. Service\n    1. Access and Use.  Customer may use it.\n\n3. Privacy & Security\n    1. Personal Data.  Before submitting Personal Data, sign a DPA.\n        a. More detail.\n    2. Prohibited Data.  None.\n\n4. Payment & Taxes\n    1. Fees.  In dollars.\nA line that runs on.\n"
+	at := func(s string) int { return strings.Index(text, s) }
+	for _, c := range []struct{ start, want string }{
+		{"    1. Personal Data", "Cloud Service Agreement > 3. Privacy & Security"},
+		{"        a. More", "Cloud Service Agreement > 3. Privacy & Security > 1. Personal Data. Before submitting Personal Data, sign a DPA."},
+		{"4. Payment", "Cloud Service Agreement"},
+		{"A line that runs on", "Cloud Service Agreement > 4. Payment & Taxes > 1. Fees. In dollars."},
+		{"# Cloud", ""},
+	} {
+		if got := outerHeadings(text, at(c.start)); got != c.want {
+			t.Errorf("at %q: %q, want %q", c.start, got, c.want)
+		}
+	}
+	if got := outerHeadings("1. A\n"+strings.Repeat("    ", 0)+"   2. "+strings.Repeat("x", 200)+"\n      a. b\n", 0); got != "" {
+		t.Errorf("at the start: %q", got)
+	}
 }

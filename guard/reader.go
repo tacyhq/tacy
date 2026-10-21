@@ -89,6 +89,9 @@ type ReaderConfig struct {
 	NoItems bool
 	// Files: the reader of a review's file sections (files.go): its own prompt (readerFilesSystem), no items.
 	Files bool
+	// ResearchFiles: the reader of a research task's file parts (files.go, v0.13.x): its own question-led prompt
+	// (readerResearchFilesSystem), no items.
+	ResearchFiles bool
 }
 
 // DefaultReader is the release's reader (docs/27 section 5): deepseek-v4-1-flash with thinking off, gpt-oss-120b at
@@ -229,7 +232,8 @@ func readerCallMax(doc int) int64 {
 }
 
 // readerSystemBytes is the longer of the reader's prompts.
-var readerSystemBytes = max(len(readerSystem), len(readerSpansSystem)+16, len(readerItemsSystem)+16, len(readerFilesSystem)+16)
+var readerSystemBytes = max(len(readerSystem), len(readerSpansSystem)+16, len(readerItemsSystem)+16, len(readerFilesSystem)+16,
+	len(readerResearchFilesSystem)+16)
 
 // ReaderUse is one reader call as the activity record and the budget see it: numbers and fixed words only.
 type ReaderUse struct {
@@ -303,7 +307,9 @@ var (
 var readerMembers = []string{"summary", "facts", "entities", "dates", "amounts", "source", "quotes", "wording", "instructions_found", "instruction_count"}
 
 // items: the answer has the items list (quotes by reference, unless NoItems).
-func (rc *ReaderConfig) items() bool { return rc.Spans && !rc.NoItems && !rc.Files }
+func (rc *ReaderConfig) items() bool {
+	return rc.Spans && !rc.NoItems && !rc.Files && !rc.ResearchFiles
+}
 
 // members are the answer's members for rc.
 func (rc *ReaderConfig) members() []string {
@@ -448,6 +454,9 @@ func (rc *ReaderConfig) system() string {
 	facts, quotes, spans := rc.caps()
 	if rc.Files {
 		return fmt.Sprintf(readerFilesSystem, facts, quotes, spans)
+	}
+	if rc.ResearchFiles {
+		return fmt.Sprintf(readerResearchFilesSystem, facts, quotes, spans)
 	}
 	if rc.items() {
 		return fmt.Sprintf(readerItemsSystem, maxReaderItems, facts, quotes, spans)

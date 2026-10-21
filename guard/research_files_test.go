@@ -351,3 +351,32 @@ func TestOuterHeadings(t *testing.T) {
 		t.Errorf("at the start: %q", got)
 	}
 }
+
+// A research file part's sentence saying the part lacks something carries no quote (lab round 3): a quote can't show
+// an absence. A rule's own "not" or "no" keeps its quote.
+func TestAbsenceUncited(t *testing.T) {
+	for _, c := range []struct{ in, want string }{
+		{"No liability cap, security obligations or switching terms appear in this section [quote 15].",
+			"No liability cap, security obligations or switching terms appear in this section."},
+		{"This part does not mention Rule 10b5-1 plans [quote 3]. Blackouts end on the third trading day [quote 4].",
+			"This part does not mention Rule 10b5-1 plans. Blackouts end on the third trading day [quote 4]."},
+		{"It contains no blackout period [quote 2][quote 5]; pre-clearance is in Part III [quote 6].",
+			"It contains no blackout period; pre-clearance is in Part III [quote 6]."},
+		{"The excerpt says nothing about cooling-off periods [quote 9].", "The excerpt says nothing about cooling-off periods."},
+		{"The Customer may not resell or reverse engineer the Product [quote 3].", ""},
+		{"Customer has no right to a refund except on termination for breach [quote 5].", ""},
+		{"Pre-clearance is not required for trades under an Approved 10b5-1 Plan [quote 48].", ""},
+		{"8.4: nothing limits liability for gross negligence, willful misconduct or fraud [quote 26].", ""},
+		{"Section 8.2 does not apply to breaches of Section 10 [quote 24].", ""},
+	} {
+		want := c.want
+		if want == "" {
+			want = c.in
+		}
+		v := &readView{Summary: c.in, Facts: []string{c.in}, Wording: c.in}
+		absenceUncited(v)
+		if v.Summary != want || v.Facts[0] != want || v.Wording != want {
+			t.Errorf("absenceUncited(%q)\n got %q\nwant %q", c.in, v.Facts[0], want)
+		}
+	}
+}

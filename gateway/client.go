@@ -97,7 +97,8 @@ func (c *Client) Exec(context.Context, *harness.TaskInfo, string, *harness.Exec)
 func (c *Client) ModelCall(ctx context.Context, ti *harness.TaskInfo, req *harness.ModelCall) (*harness.ModelResult, error) {
 	s, done := c.sessionFor(ti.ID)
 	defer done()
-	r, err := s.call(ctx, ti, &frame{T: tModel, ID: harness.RequestID(ctx), Model: req, MaxTokens: guard.MaxTokensFrom(ctx), Tainted: ti.Tainted})
+	r, err := s.call(ctx, ti, &frame{T: tModel, ID: harness.RequestID(ctx), Model: req, MaxTokens: guard.MaxTokensFrom(ctx),
+		Priced: guard.PricedFrom(ctx), Tainted: ti.Tainted})
 	if err != nil {
 		return nil, err
 	}

@@ -5,19 +5,24 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/tacyhq/tacy/harness"
 	"github.com/tacyhq/tacy/proto"
+	"github.com/tacyhq/tacy/trigger"
 )
 
 // Slow and overloaded models (fallback.go), through the brain and the runtime with a scripted upstream per model.
 
 // modelUp answers per model: "slow" waits until the call is cancelled, "slow:<d>" waits d then answers, "503",
-// "429" and "500overloaded" refuse, "streamoverloaded" sends an error chunk; anything else answers at once.
+// "429" and "500overloaded" refuse, "streamoverloaded" sends an error chunk, "429xN" refuses the model's first N
+// calls (Tinfoil's rate limit, with its "Retry after 1 seconds") and answers after; anything else answers at once.
 // Answers are replies[model] in order (then a plain text).
 type modelUp struct {
 	mu      sync.Mutex
@@ -25,6 +30,7 @@ type modelUp struct {
 	replies map[string][]string
 	calls   []string         // models, in call order
 	bodies  []map[string]any // request bodies, in call order
+	at      []time.Time      // when each call came
 }
 
 func (m *modelUp) Meta(context.Context) (*proto.Meta, error) {
@@ -38,7 +44,16 @@ func (m *modelUp) Stream(ctx context.Context, body []byte) (io.ReadCloser, error
 	m.mu.Lock()
 	m.calls = append(m.calls, model)
 	m.bodies = append(m.bodies, b)
+	m.at = append(m.at, time.Now())
 	behave := m.behave[model]
+	if n, ok := strings.CutPrefix(behave, "429x"); ok {
+		limit, _ := strconv.Atoi(n)
+		if countOf(m.calls, model) <= limit {
+			m.mu.Unlock()
+			return nil, &StatusError{Status: 429, Msg: "Rate limit reached for requests. Retry after 1 seconds.", RetryAfter: time.Millisecond}
+		}
+		behave = ""
+	}
 	var reply string
 	if r := m.replies[model]; len(r) > 0 {
 		reply, m.replies[model] = r[0], r[1:]
@@ -69,6 +84,15 @@ func (m *modelUp) Stream(ctx context.Context, body []byte) (io.ReadCloser, error
 	return io.NopCloser(strings.NewReader(reply)), nil
 }
 
+func countOf(xs []string, x string) (n int) {
+	for _, v := range xs {
+		if v == x {
+			n++
+		}
+	}
+	return n
+}
+
 func (m *modelUp) called() []string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -84,7 +108,7 @@ func (m *modelUp) body(i int) map[string]any {
 const testSlowAfter = 80 * time.Millisecond
 
 func newFallbackE2E(t *testing.T, up *modelUp) *e2e {
-	return newE2E(t, func(c *Config) { c.Up, c.SlowAfter = up, testSlowAfter })
+	return newE2E(t, func(c *Config) { c.Up, c.SlowAfter, c.OverloadWait = up, testSlowAfter, 2*time.Millisecond })
 }
 
 func ofType(evs []proto.Event, typ string) []proto.Event {
@@ -231,16 +255,20 @@ func TestOverloadedSwitchesOnAuto(t *testing.T) {
 			if m := modelMetrics(evs); m[0].Outcome != "slow_switched" || m[0].Model != "glm-5-3" {
 				t.Fatalf("metrics %+v", m)
 			}
-			if up.body(1)["reasoning_effort"] != "low" {
-				t.Fatalf("the fallback lost an effort it accepts: %v", up.body(1)["reasoning_effort"])
+			// Tried again once after a short wait, then switched.
+			if !slices.Equal(up.called(), []string{"glm-5-3", "glm-5-3", "gpt-oss-120b"}) {
+				t.Fatalf("calls %v", up.called())
+			}
+			if up.body(2)["reasoning_effort"] != "low" {
+				t.Fatalf("the fallback lost an effort it accepts: %v", up.body(2)["reasoning_effort"])
 			}
 			noRawProviderText(t, evs)
 		})
 	}
 }
 
-// Hand-picked and overloaded: one model_slow, then the run ends with our words (model_overloaded), never the
-// provider's.
+// Hand-picked and overloaded: one model_slow, three more tries after jittered waits, then the run ends with our
+// words (model_overloaded), never the provider's.
 func TestOverloadedHandPickedEnds(t *testing.T) {
 	for _, b := range []string{"503", "429", "500overloaded"} {
 		t.Run(b, func(t *testing.T) {
@@ -258,7 +286,7 @@ func TestOverloadedHandPickedEnds(t *testing.T) {
 			if m := modelMetrics(evs); len(m) != 1 || m[0].Outcome != "error" || m[0].Model != "glm-5-3" {
 				t.Fatalf("metrics %+v", m)
 			}
-			if !slices.Equal(up.called(), []string{"glm-5-3"}) {
+			if !slices.Equal(up.called(), []string{"glm-5-3", "glm-5-3", "glm-5-3", "glm-5-3"}) {
 				t.Fatalf("calls %v", up.called())
 			}
 			noRawProviderText(t, evs)
@@ -355,5 +383,127 @@ func TestParseModelFaults(t *testing.T) {
 	cancel()
 	if _, err := WithModelFaults(up, map[string]string{"kimi-k3": FaultSlow}).Stream(ctx, []byte(`{"model":"kimi-k3"}`)); !errors.Is(err, context.Canceled) {
 		t.Fatalf("slow fault: %v", err)
+	}
+}
+
+// Tinfoil's rate limit (429 "Retry after N seconds") passes: a hand-picked model is tried again after a wait and
+// answers; no switch, one model_slow, and the answer is the run's. On Auto the same: one retry before any switch.
+func TestOverloadedRetriedThenAnswers(t *testing.T) {
+	up := &modelUp{behave: map[string]string{"deepseek-v4-1-flash": "429x2"}}
+	e := newFallbackE2E(t, up)
+	evs, err := e.run(proto.RunRequest{Space: testSpace, Permissions: AllowAll(), Model: "deepseek-v4-1-flash", Tools: []string{}, Messages: user("q")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := types(evs); got != "meta,step,model_slow,text,usage,metrics,done" {
+		t.Fatalf("events %s", got)
+	}
+	if !slices.Equal(up.called(), []string{"deepseek-v4-1-flash", "deepseek-v4-1-flash", "deepseek-v4-1-flash"}) {
+		t.Fatalf("calls %v", up.called())
+	}
+	if ofType(evs, "text")[0].Delta != "from deepseek-v4-1-flash" {
+		t.Fatalf("answer %+v", ofType(evs, "text"))
+	}
+	noRawProviderText(t, evs)
+
+	up = &modelUp{behave: map[string]string{"deepseek-v4-1-flash": "429x1"}}
+	e = newFallbackE2E(t, up)
+	evs, err = e.run(proto.RunRequest{Space: testSpace, Permissions: AllowAll(), Model: "deepseek-v4-1-flash", Tools: []string{},
+		AutoFallback: true, FallbackModels: []string{"glm-5-3"}, Messages: user("q")})
+	if err != nil || len(ofType(evs, "model_switched")) != 0 || evs[len(evs)-1].Type != "done" {
+		t.Fatalf("events %s %v", types(evs), err)
+	}
+	if !slices.Equal(up.called(), []string{"deepseek-v4-1-flash", "deepseek-v4-1-flash"}) {
+		t.Fatalf("calls %v", up.called())
+	}
+}
+
+// The fallback goes only to a model agentd priced the call for (WithPriced): with the fallback left out, an
+// overloaded model is tried again and the run ends without a switch.
+func TestOverloadedSwitchesOnlyToPriced(t *testing.T) {
+	up := &modelUp{behave: map[string]string{"deepseek-v4-1-flash": "503"}}
+	e := newFallbackE2E(t, up)
+	e.rt.Guard = pricedGuard{e.g, []string{"deepseek-v4-1-flash"}}
+	evs, _ := e.run(proto.RunRequest{Space: testSpace, Permissions: AllowAll(), Model: "deepseek-v4-1-flash", Tools: []string{},
+		AutoFallback: true, FallbackModels: []string{"kimi-k3"}, Messages: user("q")})
+	if len(ofType(evs, "model_switched")) != 0 || slices.Contains(up.called(), "kimi-k3") {
+		t.Fatalf("switched to an unpriced model: %s, calls %v", types(evs), up.called())
+	}
+	if er := evs[len(evs)-1]; er.Type != "error" || !strings.Contains(er.Error, OverloadedText("deepseek-v4-1-flash")) {
+		t.Fatalf("last %+v", er)
+	}
+	if n := len(up.called()); n != 4 {
+		t.Fatalf("%d calls, want 4 (the call and 3 tries)", n)
+	}
+}
+
+func TestRetryAfterOf(t *testing.T) {
+	h := http.Header{}
+	if d := retryAfterOf(h, "Rate limit reached for requests. Retry after 7 seconds."); d != 7*time.Second {
+		t.Errorf("message: %v", d)
+	}
+	if d := retryAfterOf(h, "Retry after 1 second"); d != time.Second {
+		t.Errorf("one second: %v", d)
+	}
+	h.Set("Retry-After", "3")
+	if d := retryAfterOf(h, "Retry after 7 seconds."); d != 3*time.Second {
+		t.Errorf("header first: %v", d)
+	}
+	if d := retryAfterOf(http.Header{}, "Model is overloaded."); d != 0 {
+		t.Errorf("none: %v", d)
+	}
+	h.Set("Retry-After", "Wed, 21 Oct 2026 07:28:00 GMT") // a date isn't read: the message's or none
+	if d := retryAfterOf(h, ""); d != 0 {
+		t.Errorf("date: %v", d)
+	}
+}
+
+func TestOverloadWait(t *testing.T) {
+	const base = time.Second
+	for i, want := range [][2]time.Duration{{base / 2, base}, {3 * base / 2, 3 * base}, {9 * base / 2, 9 * base}} {
+		lo, hi := overloadWait(base, i, 0, false, 0), overloadWait(base, i, 0, false, 0.999999)
+		if lo != want[0] || hi > want[1] || hi < want[1]-time.Millisecond {
+			t.Errorf("retry %d: %v..%v, want %v..%v", i, lo, hi, want[0], want[1])
+		}
+	}
+	if d := overloadWait(base, 0, 7*time.Second, false, 0); d != 7*time.Second {
+		t.Errorf("the provider's wait: %v", d)
+	}
+	if d := overloadWait(base, 2, 60*time.Second, false, 0.5); d != 15*base {
+		t.Errorf("capped: %v", d)
+	}
+	if d := overloadWait(base, 0, 7*time.Second, true, 0.5); d != 2*base {
+		t.Errorf("with a fallback: %v", d)
+	}
+}
+
+// pricedGuard is the guard with agentd's priced models on every model call (app/safety.go).
+type pricedGuard struct {
+	*Guard
+	priced []string
+}
+
+func (p pricedGuard) ModelCall(ctx context.Context, ti *harness.TaskInfo, req *harness.ModelCall) (*harness.ModelResult, error) {
+	return p.Guard.ModelCall(WithPriced(ctx, p.priced), ti, req)
+}
+
+// A scheduled run falls back within its signed definition's models (the first runs; the rest, in order, are its
+// fallbacks); a definition with one model has none.
+func TestTriggeredFallbacks(t *testing.T) {
+	fire := func(models ...string) trigger.Fire {
+		return trigger.Fire{Task: "tk_t", Def: &trigger.Definition{Agent: "a_x", Space: testSpace, Models: models, Instructions: "digest"},
+			Trigger: trigger.Trigger{ID: "tr_x", Kind: trigger.Schedule, Daily: "08:00", Zone: "UTC"}, At: time.Now()}
+	}
+	s, o, err := TriggeredStart(fire("deepseek-v4-1-flash", "glm-5-3", "nope", "deepseek-v4-1-flash", "gemma4-31b"), "f_x", time.Now())
+	if err == nil {
+		t.Fatal("a definition naming an unknown model started")
+	}
+	s, o, err = TriggeredStart(fire("deepseek-v4-1-flash", "glm-5-3", "deepseek-v4-1-flash", "gemma4-31b"), "f_x", time.Now())
+	if err != nil || !o.AutoFallback || !slices.Equal(o.Fallbacks, []string{"glm-5-3", "gemma4-31b"}) || s.Models[0] != "deepseek-v4-1-flash" {
+		t.Fatalf("fallbacks %v %v (models %v) %v", o.AutoFallback, o.Fallbacks, s.Models, err)
+	}
+	_, o, err = TriggeredStart(fire("deepseek-v4-1-flash"), "f_x", time.Now())
+	if err != nil || o.AutoFallback || o.Fallbacks != nil {
+		t.Fatalf("one model: %v %v %v", o.AutoFallback, o.Fallbacks, err)
 	}
 }

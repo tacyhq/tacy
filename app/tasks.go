@@ -237,6 +237,9 @@ func (s *server) taskStart(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, guard.ErrTooMany):
 		fail(w, 429, "too_many_tasks")
 		return
+	case errors.Is(err, guard.ErrDateNote): // the chat starts again with the date alone (its time's zone unknown here)
+		fail(w, 400, "bad_date_note")
+		return
 	case err != nil && safety.CodeOf(err) != "": // stopped, no policy, a model it doesn't allow, the day used up
 		code, msg := coded(err)
 		out := struct {

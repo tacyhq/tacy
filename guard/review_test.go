@@ -153,14 +153,14 @@ func TestSplitSections(t *testing.T) {
 	}
 	b.WriteString(strings.Repeat("One very long paragraph without headings. ", 400)) // ~17,000 characters
 	text := b.String()
-	secs := splitSections(text)
+	secs := splitSections(text, reviewPartRunes)
 	if len(secs) < 5 {
 		t.Fatalf("%d sections", len(secs))
 	}
 	prev := 0
 	for i, s := range secs {
 		n := len([]rune(text[s.start:s.end]))
-		if n > maxSectionRunes || s.start != prev {
+		if n > reviewPartRunes || s.start != prev {
 			t.Fatalf("section %d: %d runes, starts at %d (prev end %d)", i+1, n, s.start, prev)
 		}
 		prev = s.end
@@ -172,8 +172,13 @@ func TestSplitSections(t *testing.T) {
 	if prev != len(text) {
 		t.Fatal("sections don't cover the text")
 	}
-	if got := splitSections("short"); len(got) != 1 || got[0] != (fileSection{0, 5}) {
+	if got := splitSections("short", 0); len(got) != 1 || got[0] != (fileSection{0, 5}) {
 		t.Fatalf("short: %v", got)
+	}
+	// Review's parts are smaller than research's (lab round 5).
+	page := "1. Fees\n" + strings.Repeat("The Customer pays the fees monthly. ", 100) // 3,608 characters
+	if r, s := len(splitSections(page, reviewDef.PartRunes)), len(splitSections(page, researchDef.PartRunes)); r != 2 || s != 1 {
+		t.Fatalf("review %d parts, research %d", r, s)
 	}
 	if !headingLine("ARTICLE IV") || !headingLine("4.2 Termination for convenience") || !headingLine("CONFIDENTIALITY") ||
 		!headingLine("## Fees") || headingLine("the parties agree as follows") || headingLine("A.") {
@@ -283,7 +288,7 @@ func TestReviewReadsFiles(t *testing.T) {
 // Sections not read are listed by the VM: a review that ends before reading, one whose reader failed a section, and
 // a section where the reader found text addressed to an AI.
 func TestReviewCoverage(t *testing.T) {
-	long := strings.Repeat("1. Fees\n"+strings.Repeat("The Customer pays the fees monthly. ", 100)+"\n\n", 3) // three sections
+	long := strings.Repeat("1. Fees\n"+strings.Repeat("The Customer pays the fees monthly. ", 75)+"\n\n", 3) // three sections
 	files := []TaskFile{{Name: "msa.txt", Text: long}, {Name: "nda.txt", Text: ndaText()}}
 	// Never read.
 	sm := &splitModel{acting: []string{textSSE("## Summary\nNot read.")}, reader: func(string) string { return fileAnswer(t, nil) }}
@@ -320,7 +325,7 @@ func TestReviewCoverage(t *testing.T) {
 func TestFilesReadPick(t *testing.T) {
 	var s filesState
 	f := TaskFile{Name: "big.txt", Text: strings.Repeat(strings.Repeat("word ", 700)+"\n\n", 15)} // 15 sections
-	s.init(TaskOptions{Files: []TaskFile{f, {Name: "small.txt", Text: "Small."}}})
+	s.init(TaskOptions{Files: []TaskFile{f, {Name: "small.txt", Text: "Small."}}}, reviewDef)
 	n := len(s.files[0].secs)
 	first, err := s.pick(0, nil, maxSectionsPerRead)
 	if err != nil || len(first) != maxSectionsPerRead || first[0] != (secRef{0, 0}) {
@@ -517,6 +522,25 @@ func TestReviewEmptyRead(t *testing.T) {
 	}
 }
 
+// Nor is one with no quotes and barely a word for a part of a page (lab round 5: "Hmm" as summary and fact); a short
+// part (a signature block) may be described in a word or two.
+func TestReviewHmmRead(t *testing.T) {
+	hmm := answerJSON(t, func(m map[string]any) {
+		m["summary"], m["facts"], m["entities"], m["dates"], m["quotes"] = "Hmm", []string{"Hmm"}, []string{}, []string{}, []map[string]any{}
+	})
+	long := "MUTUAL NON-DISCLOSURE AGREEMENT\n\n" + strings.Repeat("1. Each party keeps the other's information confidential for five years. ", 20)
+	for _, c := range []struct {
+		text   string
+		listed bool
+	}{{long, true}, {"MUTUAL NON-DISCLOSURE AGREEMENT\n\nSigned: A. Person, B. Person.", false}} {
+		sm := &splitModel{acting: []string{toolCallSSE("c1", "files_read", `{}`), textSSE("## Summary\nDone.")}, reader: func(string) string { return hmm }}
+		text := eventText(newReviewE2E(t, sm).review(t, reviewReq(TaskFile{Name: "nda.txt", Text: c.text})))
+		if got := strings.Contains(text, "(the reader couldn't read it)"); got != c.listed {
+			t.Fatalf("%d characters: listed as not read %v, want %v: %q", len(c.text), got, c.listed, text)
+		}
+	}
+}
+
 // A part names the headings it continues under (its Part, its clause), so a document that numbers its clauses again
 // in each Part is cited right; the title block isn't one of them, and indentation nests (Markdown lists).
 func TestHeadingsAbove(t *testing.T) {
@@ -619,8 +643,8 @@ func TestCrossSlots(t *testing.T) {
 
 // crossFile is a file of two parts: Part I and Part II, each about 3,000 characters.
 func crossFile() TaskFile {
-	return TaskFile{Name: "policy.txt", Text: "Part I\n\n1. Rules. " + strings.Repeat("Officers should pre-clear trades. ", 90) +
-		"\n\nPart II\n\n1. Pre-clearance. " + strings.Repeat("Officers must pre-clear every trade. ", 85)}
+	return TaskFile{Name: "policy.txt", Text: "Part I\n\n1. Rules. " + strings.Repeat("Officers should pre-clear trades. ", 80) +
+		"\n\nPart II\n\n1. Pre-clearance. " + strings.Repeat("Officers must pre-clear every trade. ", 75)}
 }
 
 func isCross(prompt string) bool { return strings.Contains(prompt, "Kind: a whole file") }
@@ -697,10 +721,10 @@ func TestReviewCrossCheck(t *testing.T) {
 func TestReviewCrossCheckLater(t *testing.T) {
 	text := ""
 	for i := 1; i <= 9; i++ {
-		text += fmt.Sprintf("%d. Clause.\n%s\n\n", i, strings.Repeat("The parties agree to this term. ", 115))
+		text += fmt.Sprintf("%d. Clause.\n%s\n\n", i, strings.Repeat("The parties agree to this term. ", 90))
 	}
 	f := TaskFile{Name: "msa.txt", Text: text}
-	if n := len(splitSections(text)); n != 9 || crossSlots(len(text)) <= maxSectionsPerRead-9 {
+	if n := len(splitSections(text, reviewPartRunes)); n != 9 || crossSlots(len(text)) <= maxSectionsPerRead-9 {
 		t.Fatalf("%d parts, %d slots", n, crossSlots(len(text)))
 	}
 	sm := &splitModel{
@@ -770,5 +794,37 @@ func TestCeilingActionsClassified(t *testing.T) {
 				t.Errorf("connector %s: %s has no approval class (falls to send)", name, a)
 			}
 		}
+	}
+}
+
+// A review's file parts get more room than a page (lab round 5): 10 facts and 12 quotes, asked for in the prompt and
+// allowed when decoding; pages and research's files keep 8 and 8.
+func TestFileReaderCaps(t *testing.T) {
+	g := New(Config{Up: nil, Search: &fakeSearch{}, Reader: &DefaultReader})
+	if f, q, _ := DefaultReader.caps(); f != 8 || q != 8 {
+		t.Fatalf("page caps %d %d", f, q)
+	}
+	if f, q, _ := g.fileReader(false).caps(); f != 8 || q != 8 {
+		t.Fatalf("research file caps %d %d", f, q)
+	}
+	for _, rc := range []*ReaderConfig{g.fileReader(true), g.crossReader()} {
+		f, q, _ := rc.caps()
+		if f != 10 || q != 12 || !strings.Contains(rc.system(), "up to 10 ") || !strings.Contains(rc.system(), "up to 12 passages") {
+			t.Fatalf("review file caps %d %d", f, q)
+		}
+	}
+	twelve := make([]readerQuote, 12)
+	for i := range twelve {
+		twelve[i] = readerQuote{ID: i + 1, Location: "1", Topic: "t"}
+	}
+	o := readerOut{Summary: "s", Facts: make([]string, 10), Quotes: twelve, Source: readerSource{Kind: "legal"}}
+	for i := range o.Facts {
+		o.Facts[i] = "a fact"
+	}
+	if _, err := o.check(g.fileReader(true)); err != nil {
+		t.Fatalf("review file answer of 10 facts and 12 quotes refused: %v", err)
+	}
+	if _, err := o.check(&DefaultReader); err == nil {
+		t.Fatal("a page answer of 10 facts and 12 quotes allowed")
 	}
 }

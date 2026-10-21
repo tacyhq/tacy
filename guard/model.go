@@ -114,7 +114,8 @@ func (t *tinfoilUpstream) Stream(ctx context.Context, body []byte) (io.ReadClose
 			res.Body.Close()
 			b = exactRedact(b, []*vault.Secret{key})
 			key.Wipe()
-			return nil, &StatusError{Status: res.StatusCode, Msg: upstreamError(b)}
+			msg := upstreamError(b)
+			return nil, &StatusError{Status: res.StatusCode, Msg: msg, RetryAfter: retryAfterOf(res.Header, msg)}
 		}
 		return &leasedBody{ReadCloser: res.Body, key: key}, nil
 	}
@@ -159,7 +160,8 @@ func (p *plainUpstream) Stream(ctx context.Context, body []byte) (io.ReadCloser,
 	if res.StatusCode != 200 {
 		b, _ := io.ReadAll(io.LimitReader(res.Body, 2000))
 		res.Body.Close()
-		return nil, &StatusError{Status: res.StatusCode, Msg: upstreamError(b)}
+		msg := upstreamError(b)
+		return nil, &StatusError{Status: res.StatusCode, Msg: msg, RetryAfter: retryAfterOf(res.Header, msg)}
 	}
 	return res.Body, nil
 }

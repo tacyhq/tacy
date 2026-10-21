@@ -78,8 +78,10 @@ type toolOutcome struct {
 	istats   *imageStats   // image_search: numbers for the metrics event
 	quotes   []proto.Quote // read by the quarantined reader: the exact passages, for the person only (tool_result)
 	// links: a page's links numbered as sources (links.go): fetchable by number and shown to people with the
-	// citations, but not sources of the page's own (no site icons, no card pictures).
-	links []proto.Citation
+	// citations, but not sources of the page's own (no site icons, no card pictures). citeOnly: they are a page's
+	// links to cite only (TaskOptions.CiteLinks): numbered and shown when cited, never fetchable.
+	links    []proto.Citation
+	citeOnly bool
 }
 
 // pending is one tool call's result before citation numbers are given (Finish). Calls of a step run in
@@ -123,6 +125,10 @@ type Tools struct {
 	// stays strict, however that read goes. Guarded by mu.
 	links    bool
 	personal []string
+	// citeLinks: any other page read (not one opened from a page's link) comes with its links to cite only
+	// (TaskOptions.CiteLinks); citeOnly are their numbers (never sources: a fetch of one is refused). Guarded by mu.
+	citeLinks bool
+	citeOnly  map[int]bool
 	// linked: the linkKeys of the page links handed out as numbered sources (a page opened from one is read as one
 	// of the items the question covers: readerDoc.linked). Guarded by mu.
 	linked      map[string]bool
@@ -234,6 +240,9 @@ func (t *Tools) Exec(ctx context.Context, name string, args json.RawMessage) (pe
 			return pending{out: errorOutcome("arguments must be {\"url\": string}")}, args
 		}
 		if n, ok := SourceRef(a.URL); ok { // permit put the address of a source the task has in place of its [n]
+			if t.isCiteOnly(n) {
+				return pending{out: errorOutcome(fmt.Sprintf("[%d] is a link of a page you read, given to cite, not to open: cite it as [%d] to give the person that link; only the links of a page the person named can be opened", n, n))}, args
+			}
 			return pending{out: errorOutcome(fmt.Sprintf("there is no source [%d] in this task's results; use a number a search or page gave", n))}, args
 		}
 		// URLs are checked for the unambiguous kinds only: long numbers and IPs are normal in URLs (article ids;
@@ -313,6 +322,9 @@ func (t *Tools) Exec(ctx context.Context, name string, args json.RawMessage) (pe
 func (t *Tools) Finish(p pending) toolOutcome {
 	out := t.finish(p)
 	t.addSources(out.citations)
+	if out.citeOnly { // a page's links to cite only: never sources, so a fetch of one is refused (Exec)
+		return out
+	}
 	t.addSources(out.links)
 	if len(out.links) > 0 {
 		t.mu.Lock()
@@ -394,16 +406,21 @@ func (t *Tools) finish(p pending) toolOutcome {
 		if t.pictureFlag(p.page.final, p.page.title, p.page.pics...) {
 			head["picture"] = true // its card gets the page's own picture (cardpics.go)
 		}
-		if t.links {
-			// The page's own links, numbered after it (links.go): a page whose address the person gave, without the
-			// links in or next to text that tries to instruct an AI.
-			kept, withheld := t.pageLinks(p.page, p.read)
+		if t.links || t.citeLinks {
+			// The page's own links, numbered after it (links.go): to open and cite on a page whose address the person
+			// gave, to cite only on another page read (CiteLinks); without the links in or next to text that tries to
+			// instruct an AI.
+			kept, withheld, citeOnly := t.pageLinks(p.page, p.read)
 			if withheld != "" {
 				head["links_withheld"] = withheld
 			}
 			if len(kept) > 0 {
-				views, cites := t.numberLinks(kept)
-				head["note"], head["links"], out.links = readerNote+" "+linksNote, views, cites
+				views, cites := t.numberLinks(kept, citeOnly)
+				note := linksNote
+				if citeOnly {
+					note = linksCiteNote
+				}
+				head["note"], head["links"], out.links, out.citeOnly = readerNote+" "+note, views, cites, citeOnly
 			}
 		}
 		return t.finishRead(p, out, []int{n}, head,
@@ -626,14 +643,17 @@ func (t *Tools) isSource(raw string) bool {
 	return false
 }
 
-// pageLinks are the links of a page read that the model gets (keptLinks), remembering a page found strict.
-func (t *Tools) pageLinks(pg *fetched, r *readerResult) ([]pageLink, string) {
+// pageLinks are the links of a page read that the model gets (keptLinks), remembering a page found strict: to open
+// and cite when the person named the page (links), to cite only (citeOnly) when it is another page the task read
+// (citeLinks) and wasn't opened from a page's link (one hop: a page reached through one hands out none).
+func (t *Tools) pageLinks(pg *fetched, r *readerResult) (kept []pageLink, withheld string, citeOnly bool) {
 	k, _ := linkKey(pg.asked)
 	t.mu.Lock()
-	personal := slices.Contains(t.personal, k)
+	personal := t.links && slices.Contains(t.personal, k)
+	citeOnly = !personal && t.citeLinks && !t.linked[k]
 	before := t.strictPages[k]
 	t.mu.Unlock()
-	kept, strict, withheld := keptLinks(pg, r, personal, before)
+	kept, strict, withheld := keptLinks(pg, r, personal || citeOnly, before)
 	if strict {
 		t.mu.Lock()
 		if t.strictPages == nil {
@@ -642,5 +662,12 @@ func (t *Tools) pageLinks(pg *fetched, r *readerResult) ([]pageLink, string) {
 		t.strictPages[k] = true
 		t.mu.Unlock()
 	}
-	return kept, withheld
+	return kept, withheld, citeOnly
+}
+
+// isCiteOnly: n is a page's link given to cite only (citeLinks).
+func (t *Tools) isCiteOnly(n int) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.citeOnly[n]
 }

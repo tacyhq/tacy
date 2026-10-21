@@ -259,6 +259,10 @@ func agentStart(d AgentDef, r *proto.RunRequest, s harness.Start, now time.Time,
 	return s, TaskOptions{ReasoningEffort: r.ReasoningEffort, CacheSecret: r.CacheSecret, Agent: d.ID,
 		Question:  capRunes(strings.TrimSpace(brief), maxQuestionRunes),
 		RunSecret: r.RunSecret, Permissions: maps.Clone(r.Permissions), Links: personLinks(r.Messages),
+		// Numbered links (links.go, v0.14.0): a page the brief names comes with its links to open and cite, as a
+		// schedule's does. Not CiteLinks: a research task reads up to 40 pages, and every page's links would ride in
+		// each later step's input; its report cites the pages it read.
+		PageLinks:    true,
 		AutoFallback: r.AutoFallback, Fallbacks: r.FallbackModels}, nil
 }
 

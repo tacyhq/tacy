@@ -286,6 +286,9 @@ func (g *Guard) readerDoc(ctx context.Context, task, id, action string, p *pendi
 	switch {
 	case p.page != nil:
 		d = &readerDoc{kind: "page", title: add(p.page.title), url: p.page.final, text: add(p.page.text)}
+		for _, l := range p.page.links {
+			d.linkTexts = append(d.linkTexts, l.text)
+		}
 	case len(p.results) > 0:
 		d = &readerDoc{kind: "search"}
 		for _, r := range p.results {

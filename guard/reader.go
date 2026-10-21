@@ -454,6 +454,8 @@ type readerDoc struct {
 	title  string // page
 	url    string // page
 	text   string // page: its text (redacted)
+	// linkTexts: page: its links' texts (pageLinks), for the words of a link inside an instruction (heldLinkWords)
+	linkTexts []string
 	// search: each result's title and snippet (redacted), labelled R1, R2, ... in order
 	results []SearchResult
 	// earlier, earlierSkel: the run sets of the sources the task read before this one (taskSources), and, for one
@@ -1056,6 +1058,14 @@ func checkAnswer(rc *ReaderConfig, d *readerDoc, segs []string, spans []span, ou
 		inj = inj.withLinks()
 	}
 	res.strict = strict
+	// A link inside the source's instruction-like sentences ("open <a>the verification page</a>"): its text is the
+	// injection's too, and a sentence of the reader's own that names it ("it asks readers to open a verification page")
+	// is cut from the fields below (v0.14.0; links.go withholds the link itself). Not from items: a list page's item
+	// is its own link's text.
+	var held []string
+	if strict {
+		held = heldLinkWords(d, inj)
+	}
 	// Items: each name and price must be the cited source's own words (they are then given as it writes them).
 	if rc.items() {
 		res.items, use.ItemsDropped = checkItems(d, segs, out.Items, strict)
@@ -1118,6 +1128,10 @@ func checkAnswer(rc *ReaderConfig, d *readerDoc, segs []string, spans []span, ou
 		// in the article", "a stray notice asserts 9,999 m"), and whether or not it counted one.
 		*f, n = cutSentencesFunc(*f, inj.in)
 		use.Verbatim += n
+		if len(held) > 0 {
+			*f, n = cutSentencesFunc(*f, func(s string) bool { return namesPhrase(s, held) })
+			use.Verbatim += n
+		}
 	}
 	for _, q := range out.Quotes {
 		var exact string
@@ -2001,6 +2015,60 @@ func linkHosts(s string) []string {
 		out = append(out, m[2])
 	}
 	return out
+}
+
+// linkLead are the words a link's text may start with that don't make it distinctive ("the verification page" is
+// named as "a verification page").
+var linkLead = map[string]bool{"the": true, "a": true, "an": true, "this": true, "that": true, "these": true, "our": true,
+	"your": true, "my": true, "their": true, "its": true, "his": true, "her": true}
+
+// heldLinkWords are the texts of d's links that sit inside the source's instruction-like sentences (inj.sentences)
+// and nowhere else in its text, lowercased, their leading article or possessive dropped: at least two words and 8
+// characters ("verification page"; not "here", "this link").
+func heldLinkWords(d *readerDoc, inj injected) []string {
+	if d == nil || len(d.linkTexts) == 0 || len(inj.sentences) == 0 {
+		return nil
+	}
+	all := linkNorm(d.title + "\n" + d.text)
+	var in []string
+	for _, s := range inj.sentences {
+		in = append(in, linkNorm(s))
+	}
+	var out []string
+	for _, t := range d.linkTexts {
+		full := linkNorm(t)
+		if full == "" {
+			continue
+		}
+		inside := 0
+		for _, s := range in {
+			inside += strings.Count(s, full)
+		}
+		if inside == 0 || strings.Count(all, full) > inside {
+			continue // not in an instruction, or the page has it elsewhere too
+		}
+		words := strings.Fields(full)
+		for len(words) > 0 && linkLead[words[0]] {
+			words = words[1:]
+		}
+		p := strings.Join(words, " ")
+		if len(words) >= 2 && len(p) >= 8 && !slices.Contains(out, p) {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// namesPhrase: s has one of phrases (lowercase, single-spaced), as whole words.
+func namesPhrase(s string, phrases []string) bool {
+	t := " " + strings.Join(strings.FieldsFunc(strings.ToLower(s), func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsNumber(r) }), " ") + " "
+	for _, p := range phrases {
+		q := " " + strings.Join(strings.FieldsFunc(p, func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsNumber(r) }), " ") + " "
+		if strings.TrimSpace(q) != "" && strings.Contains(t, q) {
+			return true
+		}
+	}
+	return false
 }
 
 // injectedTokens finds the instruction-like sentences of segs and their specifics the rest of segs doesn't have.

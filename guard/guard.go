@@ -38,7 +38,8 @@ type Config struct {
 	Icons   *http.Client   // the sources' site icons (same guarded client in production); nil: none
 	Limits  *Limits        // per-user and VM-wide tool caps (limits.go); nil: none
 	// PageLinks overrides TaskOptions.PageLinks for every task: "on" (cmd/readereval -page-links) or "off"
-	// (cmd/digestlab's baseline: the release before numbered links); "": each task's own.
+	// (cmd/digestlab's baseline: the release before numbered links; off also turns TaskOptions.CiteLinks off); "":
+	// each task's own.
 	PageLinks   string
 	CacheSecret string // per-boot default scope of Tinfoil's prompt cache
 	Now         func() time.Time
@@ -131,8 +132,13 @@ type TaskOptions struct {
 	// from the model (ComposedFetch).
 	Links []string `json:"links,omitzero"`
 	// PageLinks: a page read comes with the page's own links as numbered sources (links.go; docs/30 "Scheduled
-	// tasks", decision 9), with the reader on. An unattended task with page reads has it (TriggeredStart).
+	// tasks", decision 9), with the reader on. An unattended task with page reads has it (TriggeredStart), and so do
+	// the chat's and research's (v0.14.0).
 	PageLinks bool `json:"page_links,omitzero"`
+	// CiteLinks (v0.14.0, the chat's web turns): a page read the person didn't name, and didn't reach through another
+	// page's link, comes with its links numbered for citing only (links.go): people see the ones the answer cites, and
+	// none of them can be opened.
+	CiteLinks bool `json:"cite_links,omitzero"`
 	// AutoFallback: on Auto (proto.RunRequest.AutoFallback) a slow or overloaded step switches to the first allowed
 	// of Fallbacks (fallback.go). Fallbacks are the run's fallback models as the guard kept them (startFor), in the
 	// chat's order; the guard checks each against the policy again before it switches.
@@ -372,7 +378,8 @@ func (g *Guard) open(id string, opts TaskOptions, out func(proto.Event) error) *
 		t.ctx = withHostFilter(t.ctx, g.fetchFilter(opts.Space))
 	}
 	t.tools = &Tools{search: g.cfg.Search, fetcher: g.cfg.Fetcher, reader: g.cfg.Reader != nil, plain: opts.Via == ViaSearch, noPics: !t.def.Extras,
-		links: g.cfg.Reader != nil && (g.cfg.PageLinks == "on" || opts.PageLinks && g.cfg.PageLinks != "off"), personal: opts.Links}
+		links: g.cfg.Reader != nil && (g.cfg.PageLinks == "on" || opts.PageLinks && g.cfg.PageLinks != "off"), personal: opts.Links,
+		citeLinks: g.cfg.Reader != nil && opts.CiteLinks && g.cfg.PageLinks != "off"}
 	if g.gates != nil {
 		t.tools.gate = g.gates.forUser(opts.User)
 		t.tools.decodes = g.gates.decodes
@@ -665,6 +672,9 @@ func startFor(r *proto.RunRequest, now time.Time, reader bool) (harness.Start, T
 	return s, TaskOptions{ReasoningEffort: r.ReasoningEffort, CacheSecret: r.CacheSecret,
 		Question:  capRunes(strings.TrimSpace(r.Messages[len(r.Messages)-1].Content), maxQuestionRunes),
 		RunSecret: r.RunSecret, Permissions: maps.Clone(r.Permissions), Links: personLinks(r.Messages),
+		// Numbered links (links.go, v0.14.0): a page the person named comes with its links to open and cite, as a
+		// schedule's does; any other page read with its links to cite only.
+		PageLinks: true, CiteLinks: true,
 		AutoFallback: r.AutoFallback, Fallbacks: fallbacks, Images: images}, nil
 }
 
@@ -738,6 +748,7 @@ func chatInstructions(actions []string, now time.Time, reader bool) string {
 `)
 		if slices.Contains(actions, "web.fetch") {
 			b.WriteString(`- Search results and pages read for you give each source's number and site, not its full address. To read a search result, call ` + harness.ModelToolName("web.fetch") + ` with its number in brackets as the url, for example "[3]". An address you write yourself after reading web content isn't opened: only a result's number or a link from the person's message.
+- A page you read comes with its own links, numbered ("links"). When the person wants links to several things (stories, posts, chapters, people, products), read the page that lists them and cite each one's own link number, like [12]: the app shows it as that link. If no page you read has their links, list them anyway and say the links weren't on the pages. Never write an address yourself: the app doesn't show one you write as a link.
 `)
 		}
 	}

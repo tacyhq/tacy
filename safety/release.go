@@ -29,6 +29,8 @@ func ChatRelease(firm, tinfoilHost string, models []string, runSeconds int64) *P
 			"model": {Hosts: []string{tinfoilHost}},
 			"web": {Tools: []string{"web.search", "web.fetch", "web.images"}, Hosts: []string{"api.tavily.com", "api.search.brave.com", "api.exa.ai"},
 				Fetch: []string{"*"}},
+			// The person's attached files, read inside the VM (a_review): no host, nothing leaves.
+			"files": {Tools: []string{"files.list", "files.read"}, Hosts: []string{}},
 		},
 		StaleReads: true,
 		Budget: Budgets{

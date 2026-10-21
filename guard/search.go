@@ -195,16 +195,16 @@ func (t *tavily) Search(ctx context.Context, query string, count int) ([]SearchR
 	req.Header.Set("Authorization", "Bearer "+string(key.Bytes()))
 	res, err := t.http.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("search provider unreachable")
+		return nil, transportFailure(err)
 	}
 	defer res.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(res.Body, 2<<20))
 	if err != nil {
-		return nil, err
+		return nil, transportFailure(err)
 	}
 	raw = exactRedact(raw, []*vault.Secret{key}) // an echoed key never reaches the brain
 	if res.StatusCode != 200 {
-		return nil, fmt.Errorf("search provider returned %d", res.StatusCode)
+		return nil, httpFailure(res)
 	}
 	var out struct {
 		Results []struct {
@@ -216,7 +216,7 @@ func (t *tavily) Search(ctx context.Context, query string, count int) ([]SearchR
 		} `json:"results"`
 	}
 	if err := json.Unmarshal(raw, &out); err != nil {
-		return nil, fmt.Errorf("search provider: bad response")
+		return nil, badResponse()
 	}
 	var rs []SearchResult
 	for _, r := range out.Results {
@@ -489,7 +489,8 @@ func (b *brave) Images(ctx context.Context, query string, count int) ([]ImageCan
 // NewSearch picks the provider: provider (SEARCH_PROVIDER: exa | brave | tavily) if set, else Exa when its key is
 // set (has: the vault's names, never values; the production default since v0.8.10, docs/29), else Brave when its key
 // is set, else Tavily. Keys are leased per request. Exa has no image search: with Exa, image_search goes to Brave
-// when its key is set, else Tavily (as before Exa).
+// when its key is set, else Tavily (as before Exa). With Exa and Tavily's key set, a search Exa fails on its side goes
+// to Tavily (searchfallback.go, v0.13.0).
 func NewSearch(provider string, has func(name string) bool, lease Lease) SearchProvider {
 	images := func() imageProvider {
 		if has(braveKey) {
@@ -497,16 +498,22 @@ func NewSearch(provider string, has func(name string) bool, lease Lease) SearchP
 		}
 		return newTavily(lease)
 	}
+	withFallback := func(e *exa) SearchProvider {
+		if !has(tavilyKey) {
+			return e
+		}
+		return newFallbackSearch(e, newTavily(lease))
+	}
 	switch provider {
 	case "exa":
-		return newExa(lease, images())
+		return withFallback(newExa(lease, images()))
 	case "brave":
 		return newBrave(lease)
 	case "tavily":
 		return newTavily(lease)
 	}
 	if has(exaKey) {
-		return newExa(lease, images())
+		return withFallback(newExa(lease, images()))
 	}
 	if has(braveKey) {
 		return newBrave(lease)

@@ -41,6 +41,8 @@ type FactsData struct {
 	// CardPictures: the answer's card pictures taken from the task's own sources (cardpics.go), on the task's
 	// background facts.
 	CardPictures *activity.Images `json:"card_pictures,omitzero"`
+	// Search: a web search's provider and, when it went to the fallback, why (searchfallback.go; v0.13.0).
+	Search *activity.Search `json:"search,omitzero"`
 }
 
 // ModelAttempt is a model call given up for a fallback (fallback.go): its model, why (abandoned_slow or
@@ -73,14 +75,14 @@ func (f *Facts) Data() FactsData {
 	defer f.mu.Unlock()
 	return FactsData{Hosts: slices.Clone(f.d.Hosts), Leases: slices.Clone(f.d.Leases), Blocked: slices.Clone(f.d.Blocked),
 		Redacted: slices.Clone(f.d.Redacted), Reader: slices.Clone(f.d.Reader), Model: f.d.Model, Abandoned: slices.Clone(f.d.Abandoned),
-		Images: f.d.Images.Clone(), CardPictures: f.d.CardPictures.Clone()}
+		Images: f.d.Images.Clone(), CardPictures: f.d.CardPictures.Clone(), Search: f.d.Search.Clone()}
 }
 
 // Ptr is Data as a pointer, nil when nothing was collected (nil f too): what gateway/v0 sends.
 func (f *Facts) Ptr() *FactsData {
 	d := f.Data()
 	if len(d.Hosts) == 0 && len(d.Leases) == 0 && len(d.Blocked) == 0 && len(d.Redacted) == 0 && len(d.Reader) == 0 &&
-		d.Model == "" && len(d.Abandoned) == 0 && d.Images == nil && d.CardPictures == nil {
+		d.Model == "" && len(d.Abandoned) == 0 && d.Images == nil && d.CardPictures == nil && d.Search == nil {
 		return nil
 	}
 	return &d
@@ -110,6 +112,9 @@ func (f *Facts) Merge(d FactsData) {
 	}
 	f.d.Images = f.d.Images.Add(d.Images)
 	f.d.CardPictures = f.d.CardPictures.Add(d.CardPictures)
+	if d.Search != nil {
+		f.d.Search = d.Search.Clone()
+	}
 	f.d.Blocked = addIDs(f.d.Blocked, d.Blocked)
 	f.d.Redacted = addIDs(f.d.Redacted, d.Redacted)
 }
@@ -174,6 +179,16 @@ func (f *Facts) abandoned(a ModelAttempt) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.d.Abandoned = append(f.d.Abandoned, a)
+}
+
+// search notes how a web search went: its provider, and why it went to the fallback.
+func (f *Facts) search(info SearchInfo) {
+	if f == nil || info.Provider == "" {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.d.Search = &activity.Search{Provider: info.Provider, Fallback: info.Fallback}
 }
 
 // used notes the model a model call ran on.

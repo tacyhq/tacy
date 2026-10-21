@@ -45,7 +45,7 @@ func webAction(app string) string {
 
 // eventName is the tool name people's events carry for an action.
 func eventName(action string) string {
-	if a := appTool(action); a != "" {
+	if a := toolName(action); a != "" {
 		return a
 	}
 	return action
@@ -55,6 +55,9 @@ func eventName(action string) string {
 // site icons, metrics) under the model tool call the action carries out, and returns what the model sees: done
 // with the tool's JSON; denied when policy refused it (a URL with personal data); failed with the tool's error.
 func (g *Guard) Action(ctx context.Context, ti *harness.TaskInfo, id string, req *harness.Action) (*harness.ActionResult, error) {
+	if isFilesAction(req.Name) { // the person's files, read in the VM (files.go)
+		return g.filesAction(ctx, ti, id, req)
+	}
 	if strings.HasPrefix(req.Name, "sink.") && g.cfg.Sink != nil { // the test-only connector with effects (sink.go)
 		return g.sinkAction(withTask(ctx, ti.ID), ti, id, req)
 	}
@@ -64,6 +67,18 @@ func (g *Guard) Action(ctx context.Context, ti *harness.TaskInfo, id string, req
 	}
 	ctx = withTask(ctx, ti.ID)
 	t := g.task(ti)
+	// An agent with no outbound tool (a_review): nothing goes out, before any other check, whatever the request, its
+	// permissions, the policy or a grant say (docs/30: enforced here in gatewayd, not by a prompt).
+	if t.def.NoEgress {
+		g.record(Egress{Task: ti.ID, Action: id, Op: req.Name, Decision: "denied", Rule: NoEgressDenied})
+		return noEgressDenial(req.Name), nil
+	}
+	// The person's files never leave the VM (files_guard.go): a search or page read whose arguments carry a passage
+	// of them is refused before the person is asked and before anything is sent.
+	if t.fileTextInArgs(req.Args) {
+		g.record(Egress{Task: ti.ID, Action: id, Op: req.Name, Decision: "denied", Rule: FileTextDenied})
+		return fileTextDenial(req.Name), nil
+	}
 	if err := t.searchOnly(req); err != nil { // a plain chat's search task: its one search only (searchtask.go)
 		return nil, err
 	}
@@ -354,7 +369,7 @@ func toolMetric(name string, step int, out toolOutcome, ms int64) *proto.Metric 
 	}
 	switch name {
 	case "web_search":
-		m.Kind, m.Provider = "search", out.provider
+		m.Kind, m.Provider, m.Fallback, m.Status = "search", out.provider, out.fallback, out.status
 		if out.failed == "" {
 			m.Results = len(out.citations)
 		}

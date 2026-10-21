@@ -104,6 +104,9 @@ const (
 	StateRemoved = "removed"
 	// StateExpired is what Schedules says of an active definition past its not_after (not stored).
 	StateExpired = "expired"
+	// StateEnded is what StateOf says of an active definition whose triggers are all one-time ones that have run or
+	// been skipped (not stored: read from the fired slots).
+	StateEnded = "ended"
 )
 
 // Engine verifies and keeps definitions, fires schedules and takes events. Safe for concurrent use.
@@ -127,8 +130,8 @@ type Fire struct {
 	Def      *Definition
 	Digest   string
 	Trigger  Trigger
-	Slot     int64     // schedule (a daily one's: the local date's day number, DayOf)
-	Due      time.Time // a daily schedule's: the slot's own instant (At is when it fired)
+	Slot     int64     // schedule (a daily or one-time one's: the local date's day number, DayOf)
+	Due      time.Time // a daily or one-time schedule's: the slot's own instant (At is when it fired)
 	Delivery string    // event
 	Ref      string    // event
 	SentAt   time.Time // event: when the sender says it sent it
@@ -143,6 +146,7 @@ var (
 	ErrSponsor = errors.New("trigger: the sponsor's authority has ended")
 	ErrStale   = errors.New("trigger: not newer than the stored version")
 	ErrNoAgent = errors.New("trigger: no such agent")
+	ErrPast    = errors.New("trigger: definition: the time of a one-time schedule has already passed")
 )
 
 func New(cfg Config) *Engine {
@@ -227,6 +231,10 @@ func (e *Engine) install(env safety.Envelope, store bool, at time.Time, state st
 			return nil, fmt.Errorf("%w: version %d isn't newer than the installed %d (%s)", ErrStale, d.Version, old.Def.Version, old.State)
 		}
 	}
+	// A new one-time run must still be ahead (a restart's Load keeps one that has passed: it has ended).
+	if store && slices.ContainsFunc(d.Triggers, func(t Trigger) bool { _, inst := t.OnceSlot(); return t.IsOnce() && !inst.After(at) }) {
+		return nil, ErrPast
+	}
 	// A trigger id belongs to one agent.
 	for agent, o := range e.defs {
 		if agent == d.Agent {
@@ -307,16 +315,33 @@ func (e *Engine) Stop(agent string, remove bool) (*Installed, error) {
 	return &out, nil
 }
 
-// StateOf is what a definition is now: active, stopped, or expired (active, but past not_after or its sponsor
-// gone).
+// StateOf is what a definition is now: active, stopped, ended (active, its one-time runs done or skipped) or expired
+// (active, but past not_after or its sponsor gone).
 func (e *Engine) StateOf(in *Installed) string {
 	if in.State != StateActive {
 		return in.State
+	}
+	if e.ended(in.Def) {
+		return StateEnded
 	}
 	if e.sponsorOK(in.Def) != nil {
 		return StateExpired
 	}
 	return StateActive
+}
+
+// ended: every trigger is a one-time schedule whose slot has fired or been skipped.
+func (e *Engine) ended(d *Definition) bool {
+	for _, t := range d.Triggers {
+		if !t.IsOnce() {
+			return false
+		}
+		slot, _ := t.OnceSlot()
+		if last, ok, err := e.cfg.Store.LastFired(slotKey(&t)); err != nil || !ok || last < slot {
+			return false
+		}
+	}
+	return true
 }
 
 // Active counts the definitions that can fire a schedule now: active, sponsor current, before not_after, with a
@@ -331,15 +356,18 @@ func (e *Engine) Active() int {
 	return n
 }
 
-// SpaceCount is how many definitions (active or stopped) are in space.
-func (e *Engine) SpaceCount(space string) int {
-	n := 0
+// SpaceCount is how many definitions (active or stopped, not removed) are in space: live leaves out the ended ones,
+// all counts them.
+func (e *Engine) SpaceCount(space string) (live, all int) {
 	for _, in := range e.Installed() {
 		if in.Def.Space == space {
-			n++
+			all++
+			if e.StateOf(in) != StateEnded {
+				live++
+			}
 		}
 	}
-	return n
+	return live, all
 }
 
 // LastRan is the last slot of a schedule trigger that started a task, and the last it skipped for being late (-1:
@@ -433,12 +461,18 @@ func (e *Engine) Due() ([]Fire, error) {
 			}
 			var slot int64
 			var at time.Time
-			if tr.IsDaily() {
+			switch {
+			case tr.IsDaily():
 				slot, at = tr.DailySlot(now)
-				if at.Before(in.Def.IssuedAt) { // a day before the schedule existed
+				if at.Before(in.Def.IssuedAt) || !tr.onDay(slot) { // a day before the schedule existed, or not one of its days
 					continue
 				}
-			} else {
+			case tr.IsOnce():
+				slot, at = tr.OnceSlot()
+				if now.Before(at) || at.Before(in.Def.IssuedAt) { // not yet (or, never, before the schedule existed)
+					continue
+				}
+			default:
 				slot = Slot(&tr, now)
 			}
 			if slot < 0 {
@@ -451,7 +485,7 @@ func (e *Engine) Due() ([]Fire, error) {
 			if ok && last >= slot {
 				continue
 			}
-			if tr.IsDaily() && now.Sub(at) > MaxLate { // too late for today: skipped, never fired later (decision 2)
+			if (tr.IsDaily() || tr.IsOnce()) && now.Sub(at) > MaxLate { // too late: skipped, never fired later (decision 2)
 				if err := e.cfg.Store.SetFired(slotKey(&tr), slot); err != nil {
 					return out, err
 				}
@@ -482,9 +516,14 @@ func (e *Engine) Fired(f Fire) error {
 // starts counting afresh instead of reading the old numbers.
 func slotKey(t *Trigger) string {
 	if t.IsDaily() {
-		// One count per trigger whatever its time or zone: a new version that moves the time can't make a day fire
-		// twice.
+		// One count per trigger whatever its time, days or zone: a new version that moves the time can't make a day
+		// fire twice.
 		return t.ID + "|daily"
+	}
+	if t.IsOnce() {
+		// Its own count per time: a new version that moves the run to another time is a new run (the person asked
+		// for it again); the same time again finds its slot recorded.
+		return t.ID + "|once|" + t.At + "|" + t.Zone
 	}
 	return t.ID + "|" + t.Every + "|" + strconv.FormatInt(t.Anchor.Unix(), 10)
 }

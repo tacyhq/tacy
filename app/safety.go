@@ -146,6 +146,11 @@ func (g *safeGateway) StartFor(r *proto.RunRequest) (harness.Start, guard.TaskOp
 	if err != nil {
 		return start, opts, err
 	}
+	// A task with the person's files (a_review, a_research) reads them through the files connector: under a policy
+	// without it (signed before v0.13.0) the start is refused, so nothing runs that couldn't read what it was given.
+	if len(opts.Files) > 0 && !e.AllowsTool("files.read") {
+		return harness.Start{}, guard.TaskOptions{}, &safety.Error{Code: safety.CodePolicyDenied, Msg: "reading attached files isn't allowed by the policy (it has no files connector)"}
+	}
 	if start.Space != space {
 		return start, opts, errors.New("safety: unexpected space")
 	}
@@ -519,6 +524,11 @@ func (g *safeGateway) Action(ctx context.Context, ti *harness.TaskInfo, id strin
 			why = "needs a person's approval"
 		}
 		return &harness.ActionResult{Status: harness.ActionDenied, Error: safety.CodePolicyDenied + ": " + req.Name + " " + why}, nil
+	}
+	// An agent with no outbound tool (a_review): anything but its files is refused here too, not only in gatewayd.
+	if guard.NoEgress(g.agent(ti)) && !guard.IsFilesAction(req.Name) {
+		return &harness.ActionResult{Status: harness.ActionDenied, Error: guard.NoEgressDenied + ": " + req.Name +
+			" isn't available: this agent has no outbound tool, and nothing was sent. Work from the files only."}, nil
 	}
 	want := safety.Usage{ToolCalls: 1}
 	if req.Name == "web.search" || req.Name == "web.images" {

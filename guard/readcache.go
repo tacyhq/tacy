@@ -71,7 +71,7 @@ func (d *readerDoc) key(rc *ReaderConfig, question string) [32]byte {
 	if d.linked {
 		put("linked")
 	}
-	put(d.kind)
+	put(d.kind + "/" + strconv.FormatBool(rc.Files) + "/" + strconv.FormatBool(rc.Cross) + "/" + strconv.FormatBool(d.whole))
 	put(d.url)
 	put(d.title)
 	put(d.text)

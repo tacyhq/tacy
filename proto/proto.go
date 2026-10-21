@@ -325,6 +325,9 @@ type Quote struct {
 	Location string `json:"location"` // where in the source (the reader's words)
 	Topic    string `json:"topic"`    // what it is about (the reader's words)
 	Text     string `json:"text"`
+	// File is the name of the person's file a quote is from (a_review's and a_research's files.read, v0.13.0); ""
+	// for a web source's. A research task's file quotes have Index 0: they are no web source's.
+	File string `json:"file,omitempty"`
 }
 
 // Image is one picture image_search shows: a JPEG the VM decoded, scaled to at most 1024 px and re-encoded from
@@ -439,4 +442,13 @@ type Metric struct {
 	// Agent is the built-in agent whose task this is, when it isn't the chat ("a_research"; metadata only).
 	Agent   string `json:"agent,omitempty"`
 	Outcome string `json:"outcome"` // ok | error | refused (fetch: the URL held personal data) | slow_switched (model: given up as slow or overloaded, the step ran again on the fallback)
+
+	// Fallback (search, v0.13.0): the search went to the fallback provider (Tavily, then in Provider) because the
+	// primary (Exa) failed on its side, by class: http_401 | http_402 | http_403 | http_429 (after its retry) |
+	// http_4xx | http_5xx | timeout | unreachable | bad_response; or breaker_open (Exa skipped after failures in a
+	// row). "" when it didn't.
+	Fallback string `json:"fallback,omitempty"`
+	// Status (search, v0.13.0): a failed search's failure class (the classes above, or refused: the fallback's key or
+	// host refused). Fixed words only, never the query or the provider's text.
+	Status string `json:"status,omitempty"`
 }

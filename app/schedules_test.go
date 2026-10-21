@@ -18,6 +18,7 @@ import (
 	"github.com/tacyhq/tacy/activity"
 	"github.com/tacyhq/tacy/guard"
 	"github.com/tacyhq/tacy/harness"
+	"github.com/tacyhq/tacy/proto"
 	"github.com/tacyhq/tacy/runauth"
 	"github.com/tacyhq/tacy/safety"
 	"github.com/tacyhq/tacy/trigger"
@@ -186,7 +187,7 @@ func TestScheduleInstallRefusals(t *testing.T) {
 			t.Errorf("%s: %d %v, want %d %s", name, code, out, c.code, c.err)
 		}
 	}
-	if n := e.s.triggers.SpaceCount(e.me.Space); n != 0 {
+	if _, n := e.s.triggers.SpaceCount(e.me.Space); n != 0 {
 		t.Fatalf("%d installed after refusals", n)
 	}
 	// The holder's install; the very same request again is a replay; the same definition in a new request is fine.
@@ -347,8 +348,12 @@ func TestScheduledRunRecordedAndSealed(t *testing.T) {
 				json.Unmarshal(raw, &s)
 				recs = append(recs, s)
 			}
-		case "reasoning", "metrics":
+		case "reasoning":
 			t.Fatalf("%s event kept in the result", ev.Type)
+		case "metrics": // only the web searches' (v0.13.0: the browser reports them)
+			if ev.Metrics == nil || ev.Metrics.Kind != "search" {
+				t.Fatalf("metrics event %+v kept in the result", ev.Metrics)
+			}
 		}
 	}
 	if !strings.Contains(text, "Today's digest") || prompted || !denied {
@@ -506,5 +511,25 @@ func TestScheduleInstallModels(t *testing.T) {
 	d := e.daily(e.me, func(d *trigger.Definition) { d.Models = []string{"gpt-9"} })
 	if code, out := e.install(e.me, e.sign(d, e.me.Key)); code != 403 || errOf(out) != "bad_definition" {
 		t.Fatalf("unknown model: %d %v", code, out)
+	}
+}
+
+// A scheduled run's result keeps its web searches' metrics events (v0.13.0: the browser that saves it reports them,
+// failed searches and fallbacks included), and no other metrics, reasoning or queue positions.
+func TestResultEventsKeepSearchMetrics(t *testing.T) {
+	evs := []proto.Event{
+		{Type: "queue"}, {Type: "reasoning", Delta: "x"},
+		{Type: "metrics", Metrics: &proto.Metric{Kind: "model", Outcome: "ok"}},
+		{Type: "metrics", Metrics: &proto.Metric{Kind: "search", Provider: "tavily", Fallback: "http_402", Outcome: "ok"}},
+		{Type: "metrics", Metrics: &proto.Metric{Kind: "fetch", Outcome: "ok"}},
+		{Type: "text", Step: 1, Delta: "a"}, {Type: "text", Step: 1, Delta: "b"}, {Type: "done"},
+	}
+	out := resultEvents(evs)
+	var types []string
+	for _, e := range out {
+		types = append(types, e.Type)
+	}
+	if strings.Join(types, ",") != "metrics,text,done" || out[0].Metrics.Fallback != "http_402" || out[1].Delta != "ab" {
+		t.Fatalf("kept %v %+v", types, out)
 	}
 }

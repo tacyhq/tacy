@@ -72,6 +72,10 @@ type toolOutcome struct {
 	ran      bool
 	provider string
 	failed   string
+	// web_search: why it went to the fallback provider ("" it didn't; searchfallback.go), and its own failure class
+	// when it failed. Fixed words.
+	fallback string
+	status   string
 	wait     time.Duration
 	images   []shownImage  // image_search: the images to send (image events), in order
 	tail     *imageTail    // image_search: images still loading after the call returned (nil: none)
@@ -215,17 +219,21 @@ func (t *Tools) Exec(ctx context.Context, name string, args json.RawMessage) (pe
 		var gate toolOutcome
 		release, err := t.enter(ctx, "search", &gate)
 		var rs []SearchResult
+		info := SearchInfo{Provider: t.search.Name()}
 		if err == nil {
-			rs, err = t.search.Search(ctx, q, a.Count)
+			rs, info, err = t.runSearch(ctx, q, a.Count, &gate)
 		}
 		release()
+		FactsFrom(ctx).search(info)
 		if err != nil {
 			o := errorOutcome(err.Error())
 			o.masked = masked
-			o.ran, o.provider, o.failed, o.wait = true, t.search.Name(), "error", gate.wait
+			o.ran, o.provider, o.failed, o.wait = true, info.Provider, "error", gate.wait
+			o.fallback, o.status = info.Fallback, info.Status
 			return pending{out: o}, shown
 		}
-		return pending{out: toolOutcome{masked: masked, ran: true, provider: t.search.Name(), wait: gate.wait}, query: q, results: rs}, shown
+		return pending{out: toolOutcome{masked: masked, ran: true, provider: info.Provider, fallback: info.Fallback, wait: gate.wait},
+			query: q, results: rs}, shown
 	case "fetch_page":
 		var a struct {
 			URL string `json:"url"`
@@ -307,6 +315,27 @@ func (t *Tools) Exec(ctx context.Context, name string, args json.RawMessage) (pe
 		return pending{out: out, query: q}, shown
 	}
 	return pending{out: errorOutcome("unknown tool " + name)}, args
+}
+
+// runSearch is one web search on the provider: with a fallback (searchfallback.go), each extra provider request
+// takes a token of the provider rate first (its wait added to gate's).
+func (t *Tools) runSearch(ctx context.Context, q string, count int, gate *toolOutcome) ([]SearchResult, SearchInfo, error) {
+	is, ok := t.search.(infoSearcher)
+	if !ok {
+		rs, err := t.search.Search(ctx, q, count)
+		info := SearchInfo{Provider: t.search.Name()}
+		if err != nil && ctx.Err() == nil {
+			info.Status = searchClass(err)
+		}
+		return rs, info, err
+	}
+	more := func(ctx context.Context) error {
+		var g toolOutcome
+		_, err := t.enter(ctx, searchMoreGate, &g)
+		gate.wait += g.wait
+		return err
+	}
+	return is.SearchInfo(ctx, q, count, more)
 }
 
 // Finish gives a call's results their citation numbers and builds what the model sees.

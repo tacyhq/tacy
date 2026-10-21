@@ -1,0 +1,75 @@
+{
+  "format": "tacy-golden-crypto-vectors",
+  "note": "VM v0.13.0 schedule kinds (poc/05-agent-vm/SCHEDULES.md): a definition on chosen weekdays (daily + days) and a one-time one (at), each envelope and its hash, and each install call's where and who. Made once from v2-search.json's fixed seeds with node:crypto (scripts/gen-golden-v2-schedule-kinds-vectors.mjs); never regenerate.",
+  "constants": {
+    "labels": {
+      "spaceProof": "tacy/v2/space-proof",
+      "scheduleInstall": "tacy/v2/schedule-install"
+    },
+    "definitionLabel": "tacy-agent/v1",
+    "envelopeHashLabel": "tacy-safety/v1"
+  },
+  "vm_private": "7171717171717171717171717171717171717171717171717171717171717171",
+  "vm_public": "ab4f197998fcc56cc6ed68c1d931af9bb522ec00743e181f7330915df4aa3176",
+  "seal_private": "7272727272727272727272727272727272727272727272727272727272727272",
+  "seal": "x25519:zUjQaB6nPwmgD4OFm9EIgN9WgiAZzaPIg+DRUU41sQY=",
+  "space": "s_aebagbafaydqqcikbmga2dqpca",
+  "proof": "zTb+BtQgYYMbLs86VLweygquYWFPiLcuVOZKLV+y+yw=",
+  "identity": {
+    "seed": "7373737373737373737373737373737373737373737373737373737373737373",
+    "id": "i_cahq4dimbmfascahaycqiaycae",
+    "key": "ed25519:/sFChnP2r+iSZLOAc0SuiyadElpQOFUgJofbWnEoV58="
+  },
+  "definitions": [
+    {
+      "name": "weekly",
+      "json": "{\"type\":\"tacy.agent/v1\",\"firm\":\"f_chat\",\"space\":\"s_aebagbafaydqqcikbmga2dqpca\",\"agent\":\"a_aebagbafaydqqcikbmga2dqpce\",\"version\":1,\"seal\":\"x25519:zUjQaB6nPwmgD4OFm9EIgN9WgiAZzaPIg+DRUU41sQY=\",\"instructions\":\"On Tuesdays and Thursdays, read https://news.ycombinator.com/ and send me a digest of the top 10 stories, each with one line on what it is and its link as [n].\",\"models\":[\"deepseek-v4-1-flash\"],\"tools\":[\"web.fetch\"],\"max_steps\":20,\"triggers\":[{\"id\":\"tr_cahq4dimbmfascahaycqiaycai\",\"kind\":\"schedule\",\"daily\":\"07:00\",\"days\":[\"tue\",\"thu\"],\"zone\":\"Europe/Lisbon\"}],\"allow\":{\"web.fetch\":\"always\"},\"author\":\"i_cahq4dimbmfascahaycqiaycae\",\"sponsor\":\"i_cahq4dimbmfascahaycqiaycae\",\"issued_at\":\"2026-10-21T09:00:00Z\",\"not_after\":\"2027-01-19T09:00:00Z\"}",
+      "envelope": {
+        "kind": "agent",
+        "payload": "eyJ0eXBlIjoidGFjeS5hZ2VudC92MSIsImZpcm0iOiJmX2NoYXQiLCJzcGFjZSI6InNfYWViYWdiYWZheWRxcWNpa2JtZ2EyZHFwY2EiLCJhZ2VudCI6ImFfYWViYWdiYWZheWRxcWNpa2JtZ2EyZHFwY2UiLCJ2ZXJzaW9uIjoxLCJzZWFsIjoieDI1NTE5OnpValFhQjZuUHdtZ0Q0T0ZtOUVJZ045V2dpQVp6YVBJZytEUlVVNDFzUVk9IiwiaW5zdHJ1Y3Rpb25zIjoiT24gVHVlc2RheXMgYW5kIFRodXJzZGF5cywgcmVhZCBodHRwczovL25ld3MueWNvbWJpbmF0b3IuY29tLyBhbmQgc2VuZCBtZSBhIGRpZ2VzdCBvZiB0aGUgdG9wIDEwIHN0b3JpZXMsIGVhY2ggd2l0aCBvbmUgbGluZSBvbiB3aGF0IGl0IGlzIGFuZCBpdHMgbGluayBhcyBbbl0uIiwibW9kZWxzIjpbImRlZXBzZWVrLXY0LTEtZmxhc2giXSwidG9vbHMiOlsid2ViLmZldGNoIl0sIm1heF9zdGVwcyI6MjAsInRyaWdnZXJzIjpbeyJpZCI6InRyX2NhaHE0ZGltYm1mYXNjYWhheWNxaWF5Y2FpIiwia2luZCI6InNjaGVkdWxlIiwiZGFpbHkiOiIwNzowMCIsImRheXMiOlsidHVlIiwidGh1Il0sInpvbmUiOiJFdXJvcGUvTGlzYm9uIn1dLCJhbGxvdyI6eyJ3ZWIuZmV0Y2giOiJhbHdheXMifSwiYXV0aG9yIjoiaV9jYWhxNGRpbWJtZmFzY2FoYXljcWlheWNhZSIsInNwb25zb3IiOiJpX2NhaHE0ZGltYm1mYXNjYWhheWNxaWF5Y2FlIiwiaXNzdWVkX2F0IjoiMjAyNi0xMC0yMVQwOTowMDowMFoiLCJub3RfYWZ0ZXIiOiIyMDI3LTAxLTE5VDA5OjAwOjAwWiJ9",
+        "sigs": [
+          {
+            "key": "ed25519:/sFChnP2r+iSZLOAc0SuiyadElpQOFUgJofbWnEoV58=",
+            "sig": "wEBUN2kpAk4kZsBCjBw1aC+x0G2r37BwGE1GCnGe36DjyJmvcSl+/DdBwIdAzp+FRMhspdNrz0mhsYuU33O7AQ=="
+          }
+        ]
+      },
+      "hash": "e78cdc4460ed1ca157668099cb0ec258308af671ab1db8bbc0578857261f72db"
+    },
+    {
+      "name": "once",
+      "json": "{\"type\":\"tacy.agent/v1\",\"firm\":\"f_chat\",\"space\":\"s_aebagbafaydqqcikbmga2dqpca\",\"agent\":\"a_aebagbafaydqqcikbmga2dqpci\",\"version\":1,\"seal\":\"x25519:zUjQaB6nPwmgD4OFm9EIgN9WgiAZzaPIg+DRUU41sQY=\",\"instructions\":\"Read https://news.ycombinator.com/ and send me a digest of the top 10 stories, each with one line on what it is and its link as [n].\",\"models\":[\"deepseek-v4-1-flash\"],\"tools\":[\"web.fetch\"],\"max_steps\":20,\"triggers\":[{\"id\":\"tr_cahq4dimbmfascahaycqiaycam\",\"kind\":\"schedule\",\"at\":\"2026-10-21T19:10\",\"zone\":\"Europe/Lisbon\"}],\"allow\":{\"web.fetch\":\"always\"},\"author\":\"i_cahq4dimbmfascahaycqiaycae\",\"sponsor\":\"i_cahq4dimbmfascahaycqiaycae\",\"issued_at\":\"2026-10-21T09:00:00Z\",\"not_after\":\"2027-01-19T09:00:00Z\"}",
+      "envelope": {
+        "kind": "agent",
+        "payload": "eyJ0eXBlIjoidGFjeS5hZ2VudC92MSIsImZpcm0iOiJmX2NoYXQiLCJzcGFjZSI6InNfYWViYWdiYWZheWRxcWNpa2JtZ2EyZHFwY2EiLCJhZ2VudCI6ImFfYWViYWdiYWZheWRxcWNpa2JtZ2EyZHFwY2kiLCJ2ZXJzaW9uIjoxLCJzZWFsIjoieDI1NTE5OnpValFhQjZuUHdtZ0Q0T0ZtOUVJZ045V2dpQVp6YVBJZytEUlVVNDFzUVk9IiwiaW5zdHJ1Y3Rpb25zIjoiUmVhZCBodHRwczovL25ld3MueWNvbWJpbmF0b3IuY29tLyBhbmQgc2VuZCBtZSBhIGRpZ2VzdCBvZiB0aGUgdG9wIDEwIHN0b3JpZXMsIGVhY2ggd2l0aCBvbmUgbGluZSBvbiB3aGF0IGl0IGlzIGFuZCBpdHMgbGluayBhcyBbbl0uIiwibW9kZWxzIjpbImRlZXBzZWVrLXY0LTEtZmxhc2giXSwidG9vbHMiOlsid2ViLmZldGNoIl0sIm1heF9zdGVwcyI6MjAsInRyaWdnZXJzIjpbeyJpZCI6InRyX2NhaHE0ZGltYm1mYXNjYWhheWNxaWF5Y2FtIiwia2luZCI6InNjaGVkdWxlIiwiYXQiOiIyMDI2LTEwLTIxVDE5OjEwIiwiem9uZSI6IkV1cm9wZS9MaXNib24ifV0sImFsbG93Ijp7IndlYi5mZXRjaCI6ImFsd2F5cyJ9LCJhdXRob3IiOiJpX2NhaHE0ZGltYm1mYXNjYWhheWNxaWF5Y2FlIiwic3BvbnNvciI6ImlfY2FocTRkaW1ibWZhc2NhaGF5Y3FpYXljYWUiLCJpc3N1ZWRfYXQiOiIyMDI2LTEwLTIxVDA5OjAwOjAwWiIsIm5vdF9hZnRlciI6IjIwMjctMDEtMTlUMDk6MDA6MDBaIn0=",
+        "sigs": [
+          {
+            "key": "ed25519:/sFChnP2r+iSZLOAc0SuiyadElpQOFUgJofbWnEoV58=",
+            "sig": "cpBlF32xmSXmgmXiMFFnu71y/jzRlCpHjG7rNasjtaOTVbnBnRyIJb2jwg3zayunB3x2cuF4llB0/2nl1j/nDg=="
+          }
+        ]
+      },
+      "hash": "7147ee500d4b5cdf378948cc991c673d8b9d773d133e832a40235277f305416d"
+    }
+  ],
+  "requests": [
+    {
+      "call": "install",
+      "name": "install the weekly digest",
+      "own": [
+        "e78cdc4460ed1ca157668099cb0ec258308af671ab1db8bbc0578857261f72db"
+      ],
+      "body": "{\"definition\":{\"kind\":\"agent\",\"payload\":\"eyJ0eXBlIjoidGFjeS5hZ2VudC92MSIsImZpcm0iOiJmX2NoYXQiLCJzcGFjZSI6InNfYWViYWdiYWZheWRxcWNpa2JtZ2EyZHFwY2EiLCJhZ2VudCI6ImFfYWViYWdiYWZheWRxcWNpa2JtZ2EyZHFwY2UiLCJ2ZXJzaW9uIjoxLCJzZWFsIjoieDI1NTE5OnpValFhQjZuUHdtZ0Q0T0ZtOUVJZ045V2dpQVp6YVBJZytEUlVVNDFzUVk9IiwiaW5zdHJ1Y3Rpb25zIjoiT24gVHVlc2RheXMgYW5kIFRodXJzZGF5cywgcmVhZCBodHRwczovL25ld3MueWNvbWJpbmF0b3IuY29tLyBhbmQgc2VuZCBtZSBhIGRpZ2VzdCBvZiB0aGUgdG9wIDEwIHN0b3JpZXMsIGVhY2ggd2l0aCBvbmUgbGluZSBvbiB3aGF0IGl0IGlzIGFuZCBpdHMgbGluayBhcyBbbl0uIiwibW9kZWxzIjpbImRlZXBzZWVrLXY0LTEtZmxhc2giXSwidG9vbHMiOlsid2ViLmZldGNoIl0sIm1heF9zdGVwcyI6MjAsInRyaWdnZXJzIjpbeyJpZCI6InRyX2NhaHE0ZGltYm1mYXNjYWhheWNxaWF5Y2FpIiwia2luZCI6InNjaGVkdWxlIiwiZGFpbHkiOiIwNzowMCIsImRheXMiOlsidHVlIiwidGh1Il0sInpvbmUiOiJFdXJvcGUvTGlzYm9uIn1dLCJhbGxvdyI6eyJ3ZWIuZmV0Y2giOiJhbHdheXMifSwiYXV0aG9yIjoiaV9jYWhxNGRpbWJtZmFzY2FoYXljcWlheWNhZSIsInNwb25zb3IiOiJpX2NhaHE0ZGltYm1mYXNjYWhheWNxaWF5Y2FlIiwiaXNzdWVkX2F0IjoiMjAyNi0xMC0yMVQwOTowMDowMFoiLCJub3RfYWZ0ZXIiOiIyMDI3LTAxLTE5VDA5OjAwOjAwWiJ9\",\"sigs\":[{\"key\":\"ed25519:/sFChnP2r+iSZLOAc0SuiyadElpQOFUgJofbWnEoV58=\",\"sig\":\"wEBUN2kpAk4kZsBCjBw1aC+x0G2r37BwGE1GCnGe36DjyJmvcSl+/DdBwIdAzp+FRMhspdNrz0mhsYuU33O7AQ==\"}]},\"space\":\"s_aebagbafaydqqcikbmga2dqpca\",\"space_seal\":\"x25519:zUjQaB6nPwmgD4OFm9EIgN9WgiAZzaPIg+DRUU41sQY=\",\"identity\":\"i_cahq4dimbmfascahaycqiaycae\",\"identity_key\":\"ed25519:/sFChnP2r+iSZLOAc0SuiyadElpQOFUgJofbWnEoV58=\",\"nonce\":\"51515151515151515151515151515151\",\"signed_at\":1792000000,\"space_proof\":\"zTb+BtQgYYMbLs86VLweygquYWFPiLcuVOZKLV+y+yw=\",\"identity_sig\":\"wWPBFx/ggI6MYYcnkT/vtUIROoznpeQf1xBqxT24YfmPRdMvKxejFZXAU48FuxFLFr1Izv3ooXSTWwur6MzzBQ==\"}",
+      "digest": "6b19353ea9c58db035a68d24e24fe485254b10d747ab2ece9d7b2b0dd9ac8691"
+    },
+    {
+      "call": "install",
+      "name": "install the one-time digest",
+      "own": [
+        "7147ee500d4b5cdf378948cc991c673d8b9d773d133e832a40235277f305416d"
+      ],
+      "body": "{\"definition\":{\"kind\":\"agent\",\"payload\":\"eyJ0eXBlIjoidGFjeS5hZ2VudC92MSIsImZpcm0iOiJmX2NoYXQiLCJzcGFjZSI6InNfYWViYWdiYWZheWRxcWNpa2JtZ2EyZHFwY2EiLCJhZ2VudCI6ImFfYWViYWdiYWZheWRxcWNpa2JtZ2EyZHFwY2kiLCJ2ZXJzaW9uIjoxLCJzZWFsIjoieDI1NTE5OnpValFhQjZuUHdtZ0Q0T0ZtOUVJZ045V2dpQVp6YVBJZytEUlVVNDFzUVk9IiwiaW5zdHJ1Y3Rpb25zIjoiUmVhZCBodHRwczovL25ld3MueWNvbWJpbmF0b3IuY29tLyBhbmQgc2VuZCBtZSBhIGRpZ2VzdCBvZiB0aGUgdG9wIDEwIHN0b3JpZXMsIGVhY2ggd2l0aCBvbmUgbGluZSBvbiB3aGF0IGl0IGlzIGFuZCBpdHMgbGluayBhcyBbbl0uIiwibW9kZWxzIjpbImRlZXBzZWVrLXY0LTEtZmxhc2giXSwidG9vbHMiOlsid2ViLmZldGNoIl0sIm1heF9zdGVwcyI6MjAsInRyaWdnZXJzIjpbeyJpZCI6InRyX2NhaHE0ZGltYm1mYXNjYWhheWNxaWF5Y2FtIiwia2luZCI6InNjaGVkdWxlIiwiYXQiOiIyMDI2LTEwLTIxVDE5OjEwIiwiem9uZSI6IkV1cm9wZS9MaXNib24ifV0sImFsbG93Ijp7IndlYi5mZXRjaCI6ImFsd2F5cyJ9LCJhdXRob3IiOiJpX2NhaHE0ZGltYm1mYXNjYWhheWNxaWF5Y2FlIiwic3BvbnNvciI6ImlfY2FocTRkaW1ibWZhc2NhaGF5Y3FpYXljYWUiLCJpc3N1ZWRfYXQiOiIyMDI2LTEwLTIxVDA5OjAwOjAwWiIsIm5vdF9hZnRlciI6IjIwMjctMDEtMTlUMDk6MDA6MDBaIn0=\",\"sigs\":[{\"key\":\"ed25519:/sFChnP2r+iSZLOAc0SuiyadElpQOFUgJofbWnEoV58=\",\"sig\":\"cpBlF32xmSXmgmXiMFFnu71y/jzRlCpHjG7rNasjtaOTVbnBnRyIJb2jwg3zayunB3x2cuF4llB0/2nl1j/nDg==\"}]},\"space\":\"s_aebagbafaydqqcikbmga2dqpca\",\"space_seal\":\"x25519:zUjQaB6nPwmgD4OFm9EIgN9WgiAZzaPIg+DRUU41sQY=\",\"identity\":\"i_cahq4dimbmfascahaycqiaycae\",\"identity_key\":\"ed25519:/sFChnP2r+iSZLOAc0SuiyadElpQOFUgJofbWnEoV58=\",\"nonce\":\"52525252525252525252525252525252\",\"signed_at\":1792000001,\"space_proof\":\"zTb+BtQgYYMbLs86VLweygquYWFPiLcuVOZKLV+y+yw=\",\"identity_sig\":\"cEgEYpsNr6VV7NAisZEVkTJrAK6V+OkO6frBdMD2BPq3itdpGHgtm6aA+TPx2RCsIEW3MgAiZu+fdAt2YqliCw==\"}",
+      "digest": "ecf993d496c5e70d964addebd3b2ae248fad1499665dcae83d312210744d9892"
+    }
+  ]
+}

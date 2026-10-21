@@ -8,6 +8,7 @@ import (
 	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"slices"
 	"time"
 
@@ -61,7 +62,7 @@ func (g *Guard) ModelCall(ctx context.Context, ti *harness.TaskInfo, req *harnes
 
 	// The model it goes to: the one the task switched to after a slow call, if it did (fallback.go), with the
 	// effort that model accepts; and the fallback this call may switch to.
-	model, fallback := g.route(t, req.Model)
+	model, fallback := g.route(t, req.Model, PricedFrom(ctx))
 	if model != req.Model {
 		effort = effortFor(model, effort)
 	}
@@ -123,12 +124,34 @@ func (g *Guard) ModelCall(ctx context.Context, ti *harness.TaskInfo, req *harnes
 		return nil // a person who went away cancels the task (Run); the model call itself finishes
 	}
 	t.cards.reset()
-	a := g.try(ctx, t, step, model, raw, fallback, onDelta)
+	said := false // model_slow, once per model a step tries
+	a := g.try(ctx, t, step, model, raw, fallback, &said, onDelta)
 	// For the activity record: one request to the model's host (the key's lease names it), the request's bytes
 	// before EHBP encryption and the answer's as it streamed back (text, reasoning and tool calls' names and
 	// arguments).
 	FactsFrom(ctx).model(int64(len(raw)), outBytes)
-	if a.abandon != "" {
+	// Overloaded before any token: the same call again after a short jittered wait (fallback.go overloadWait), each
+	// try on the record as given up (outcome overloaded, no tokens).
+	again := func() {
+		for i := 0; a.abandon == "overloaded" && i < overloadRetries(fallback); i++ {
+			FactsFrom(ctx).abandoned(ModelAttempt{Model: model, Outcome: a.abandon, Ms: msSince(t0)})
+			base := cmp.Or(g.cfg.OverloadWait, DefaultOverloadWait)
+			wait := time.NewTimer(overloadWait(base, i, overloadedAsk(a.err), fallback != "", rand.Float64()))
+			select {
+			case <-ctx.Done():
+				wait.Stop()
+				a = attempt{err: ctx.Err()}
+				return
+			case <-wait.C:
+			}
+			t0, outBytes = time.Now(), 0
+			t.cards.reset()
+			a = g.try(ctx, t, step, model, raw, fallback, &said, onDelta)
+			FactsFrom(ctx).model(int64(len(raw)), outBytes)
+		}
+	}
+	again()
+	if a.abandon != "" && fallback != "" {
 		// Given up as slow or overloaded (Auto): on the record as such, with its time and no tokens; the metric says
 		// slow_switched (the chat counts it toward its model_slow alert). The step runs again, once, on the
 		// fallback, which the task's later calls go straight to; that one is never switched again.
@@ -139,11 +162,16 @@ func (g *Guard) ModelCall(ctx context.Context, ti *harness.TaskInfo, req *harnes
 		t.switched = fallback
 		t.mu.Unlock()
 		t.emit(proto.Event{Type: "model_switched", Step: step, From: model, To: fallback})
-		model, effort = fallback, effortFor(fallback, effort)
+		model, fallback, effort = fallback, "", effortFor(fallback, effort)
 		raw, t0, outBytes = build(model, effort), time.Now(), 0
 		t.cards.reset()
-		a = g.try(ctx, t, step, model, raw, "", onDelta)
+		said = false
+		a = g.try(ctx, t, step, model, raw, "", &said, onDelta)
 		FactsFrom(ctx).model(int64(len(raw)), outBytes)
+		again()
+	}
+	if a.abandon == "overloaded" { // tried again and still overloaded, with no fallback left: our words, never the provider's
+		a = attempt{err: overloadedError(model)}
 	}
 	FactsFrom(ctx).used(model)
 	if a.err != nil {

@@ -6,7 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +25,13 @@ import (
 // first fallback the policy and this guard allow (model_switched); the run's later steps go straight to it. A
 // hand-picked model is waited for when slow, and ends the run with CodeModelOverloaded when overloaded. Billing is
 // unchanged: the relay charges the run's X-Agent-Model whatever model answered.
+//
+// Overloaded calls are made again first (v0.14.0, 2026-10-21): Tinfoil's "overloaded" is mostly its per-key request
+// rate ("429 Rate limit reached for requests. Retry after 7 seconds."), which passes in seconds. Before giving a
+// model up, the same call goes again after a short jittered wait (overloadWait), once when a fallback is there to
+// switch to, three times when there's none (a hand-picked model, or the fallback itself). Nothing of an overloaded
+// call reached the model, so a retry costs nothing; each one is on the activity record (Abandoned, overloaded). A
+// fallback goes only to a model agentd priced the call for (WithPriced), so its budget is never passed.
 
 // DefaultSlowAfter is the base of SlowThreshold: the chat's own first-token wait.
 const DefaultSlowAfter = 20 * time.Second
@@ -47,9 +57,63 @@ func SlowThreshold(base time.Duration, bytes int) time.Duration {
 
 // StatusError is an upstream's non-200 answer: its status and the error message it gave (capped). The message is
 // the provider's text: it may go into a run's error for most statuses (as before), never for an overloaded one.
+// RetryAfter is the wait it asked for (its Retry-After header, or "Retry after N seconds" in the message), 0: none.
 type StatusError struct {
-	Status int
-	Msg    string
+	Status     int
+	Msg        string
+	RetryAfter time.Duration
+}
+
+var retryAfterRe = regexp.MustCompile(`(?i)retry after (\d{1,4}) seconds?`)
+
+// retryAfterOf reads the wait an upstream asked for: a Retry-After header in seconds, else "Retry after N seconds"
+// in its message (Tinfoil's 429). 0: none.
+func retryAfterOf(h http.Header, msg string) time.Duration {
+	if n, err := strconv.Atoi(strings.TrimSpace(h.Get("Retry-After"))); err == nil && n > 0 {
+		return time.Duration(min(n, 3600)) * time.Second
+	}
+	if m := retryAfterRe.FindStringSubmatch(msg); m != nil {
+		n, _ := strconv.Atoi(m[1])
+		return time.Duration(n) * time.Second
+	}
+	return 0
+}
+
+// DefaultOverloadWait is the base of overloadWait.
+const DefaultOverloadWait = time.Second
+
+// overloadRetries is how many times an overloaded call goes again on the same model: once when a fallback is there
+// to switch to (a person may be waiting), three times when there's none.
+func overloadRetries(fallback string) int {
+	if fallback != "" {
+		return 1
+	}
+	return 3
+}
+
+// overloadWait is the wait before retry i (0, 1, 2) of an overloaded call: base·3^i with equal jitter (half fixed,
+// half random: many runs overloaded at once don't come back at once), at least the wait the provider asked for, and
+// never more than 15·base (2·base when a fallback is there: the switch is quicker than a long wait). r is in [0, 1).
+func overloadWait(base time.Duration, i int, asked time.Duration, fallback bool, r float64) time.Duration {
+	d := base
+	for range i {
+		d *= 3
+	}
+	d = d/2 + time.Duration(r*float64(d/2))
+	limit := 15 * base
+	if fallback {
+		limit = 2 * base
+	}
+	return min(max(d, asked), limit)
+}
+
+// overloadedAsk is the wait an overloaded attempt's provider asked for (0: none).
+func overloadedAsk(err error) time.Duration {
+	var se *StatusError
+	if errors.As(err, &se) {
+		return se.RetryAfter
+	}
+	return 0
 }
 
 func (e *StatusError) Error() string { return fmt.Sprintf("model returned %d: %s", e.Status, e.Msg) }
@@ -109,13 +173,17 @@ func (g *Guard) modelAllowed(space, m string) bool {
 
 // route is the model a call for asked goes to (the model the task switched to, if it did and it is still
 // allowed), and the fallback it may switch to if that one is slow ("" when none: not on Auto, switched already,
-// or no allowed fallback).
-func (g *Guard) route(t *task, asked string) (model, fallback string) {
+// or no allowed fallback). priced (PricedFrom) are the models agentd reserved the call's budget for: another model
+// goes only to one of them (nil: any; tests without agentd).
+func (g *Guard) route(t *task, asked string, priced []string) (model, fallback string) {
 	t.mu.Lock()
 	switched := t.switched
 	t.mu.Unlock()
+	ok := func(m string) bool {
+		return m != asked && (priced == nil || slices.Contains(priced, m)) && g.modelAllowed(t.opts.Space, m)
+	}
 	if switched != "" {
-		if switched != asked && g.modelAllowed(t.opts.Space, switched) {
+		if ok(switched) {
 			return switched, ""
 		}
 		return asked, ""
@@ -124,7 +192,7 @@ func (g *Guard) route(t *task, asked string) (model, fallback string) {
 		return asked, ""
 	}
 	for _, fb := range t.opts.Fallbacks {
-		if fb != asked && g.modelAllowed(t.opts.Space, fb) {
+		if ok(fb) {
 			return asked, fb
 		}
 	}
@@ -134,27 +202,28 @@ func (g *Guard) route(t *task, asked string) (model, fallback string) {
 // attempt is one try of a step's model call.
 type attempt struct {
 	res     *stepResult // with the leased key redacted
-	err     error
-	abandon string // "": not given up; "abandoned_slow" | "overloaded": given up for the fallback
+	err     error       // the call's error; with abandon "overloaded", the provider's (never shown: overloadedAsk)
+	abandon string      // "": not given up; "abandoned_slow" | "overloaded": given up (try again, switch or end)
 }
 
 var errAbandoned = errors.New("model call given up as slow")
 
 // try makes one streamed model call for step. Without a first token by the slow threshold it emits model_slow;
 // with a fallback it then gives the call up (cancels it: nothing more of it is shown) and says so (abandon),
-// without one it keeps waiting. An overloaded answer before any token is model_slow too, then abandon with a
-// fallback, or overloadedError without. onDelta gets each delta (after the first token) with the stream's leased
-// secrets.
-func (g *Guard) try(ctx context.Context, t *task, step int, model string, raw []byte, fallback string,
+// without one it keeps waiting. An overloaded answer before any token is model_slow too, then abandon
+// "overloaded" (with its error: the wait the provider asked for), which the caller tries again, switches or ends
+// (gateway.go). said is shared by a model's tries in a step: model_slow is said once. onDelta gets each delta
+// (after the first token) with the stream's leased secrets.
+func (g *Guard) try(ctx context.Context, t *task, step int, model string, raw []byte, fallback string, said *bool,
 	onDelta func(kind, delta string, leased []*vault.Secret) error) attempt {
 	callCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	t0 := time.Now()
 	var mu sync.Mutex
-	first, said, abandoned, over := false, false, false, false
+	first, abandoned, over := false, false, false
 	slow := func(waited time.Duration) { // under mu
-		if !said {
-			said = true
+		if !*said {
+			*said = true
 			t.emit(proto.Event{Type: "model_slow", Step: step, Model: model, WaitedMs: waited.Milliseconds(), Fallback: fallback})
 		}
 	}
@@ -194,10 +263,7 @@ func (g *Guard) try(ctx context.Context, t *task, step int, model string, raw []
 		}
 		slow(time.Since(t0))
 		abandoned = true // no slow event after this
-		if fallback != "" {
-			return attempt{abandon: "overloaded"}
-		}
-		return attempt{err: overloadedError(model)}
+		return attempt{abandon: "overloaded", err: err}
 	}
 	stream, err := g.cfg.Up.Stream(callCtx, raw)
 	if err != nil {
@@ -289,7 +355,7 @@ func (f *faultUpstream) Stream(ctx context.Context, body []byte) (io.ReadCloser,
 	json.Unmarshal(body, &b)
 	switch f.faults[b.Model] {
 	case FaultOverloaded:
-		return nil, &StatusError{Status: 503, Msg: "e2e fault: model is overloaded. Retry after 60 seconds."}
+		return nil, &StatusError{Status: 503, Msg: "e2e fault: model is overloaded."}
 	case FaultSlow:
 		select {
 		case <-time.After(SlowThreshold(DefaultSlowAfter, len(body)) + 10*time.Second):

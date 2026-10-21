@@ -51,6 +51,9 @@ type Config struct {
 	Reader *ReaderConfig
 	// SlowAfter is the base of a model call's first-token wait (SlowThreshold); 0: DefaultSlowAfter. Tests shorten it.
 	SlowAfter time.Duration
+	// OverloadWait is the base of the wait before an overloaded call goes again (overloadWait); 0:
+	// DefaultOverloadWait. Tests shorten it.
+	OverloadWait time.Duration
 	// Sink is the test-only connector with effects (sink.go); nil in every release binary.
 	Sink *Sink
 	// Approvals checks a person's approval of an effect itself (sink.go, docs/27 section 4); nil: nothing that

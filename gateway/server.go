@@ -223,7 +223,11 @@ func (s *Server) do(ctx context.Context, sess guard.Session, ti *harness.TaskInf
 			c.Tainted = true
 			ti = &c
 		}
-		res.ModelResult, err = s.G.ModelCall(guard.WithFacts(guard.WithMaxTokens(harness.WithRequestID(ctx, f.ID), f.MaxTokens), facts), ti, f.Model)
+		mctx := guard.WithMaxTokens(harness.WithRequestID(ctx, f.ID), f.MaxTokens)
+		if f.Priced != nil {
+			mctx = guard.WithPriced(mctx, f.Priced)
+		}
+		res.ModelResult, err = s.G.ModelCall(guard.WithFacts(mctx, facts), ti, f.Model)
 	case tAction:
 		facts = &guard.Facts{}
 		if f.Tainted {

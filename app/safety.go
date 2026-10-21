@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -449,6 +450,25 @@ func images(ti *harness.TaskInfo) int {
 	return 0
 }
 
+// pricedModels are the models a task's model call for asked may run on: asked, and on Auto the first of the task's
+// fallbacks (guard.TaskOptions) this release runs and the policy allows, which is the one the guard switches to.
+func pricedModels(ti *harness.TaskInfo, e *safety.Effective, asked string) []string {
+	out := []string{asked}
+	var o struct {
+		Auto      bool     `json:"auto_fallback"`
+		Fallbacks []string `json:"fallbacks"`
+	}
+	if ti.Options == nil || json.Unmarshal(ti.Options, &o) != nil || !o.Auto {
+		return out
+	}
+	for _, m := range o.Fallbacks {
+		if m != asked && guard.KnownModel(m) && e.AllowsModel(m) {
+			return append(out, m)
+		}
+	}
+	return out
+}
+
 // imageTokens is the most one of the person's images costs a model call (Kimi K3 on the chat's 1536 px images: about
 // 2,300; the chat's config), so the budget reserves enough for them.
 const imageTokens = 2600
@@ -471,6 +491,10 @@ func (g *safeGateway) ModelCall(ctx context.Context, ti *harness.TaskInfo, req *
 	prompt := safety.EstimateTokens(n) + int64(images(ti)*imageTokens)
 	agent := g.agent(ti)
 	b := budget(e, agent)
+	// The models this call may run on: the one asked for and, on Auto, the fallback the guard would switch a slow
+	// or overloaded call to (the first the policy allows, as guard/fallback.go route picks it). The reservation
+	// covers the dearest of them, and the guard sends the call to no other (guard.WithPriced).
+	priced := pricedModels(ti, e, req.Model)
 	// The completion gets what the budget has left, at most CompletionReserve; the guard ends the call if its
 	// output passes it (the upstream sets no cap of its own).
 	completion := int64(safety.CompletionReserve)
@@ -482,24 +506,41 @@ func (g *safeGateway) ModelCall(ctx context.Context, ti *harness.TaskInfo, req *
 	// budget reserves the full completion, as before.)
 	if !guard.IsChat(agent) {
 		if left := g.ledger.CostLeft(ti.ID, b); left >= 0 {
-			completion = min(completion, safety.CompletionFor(req.Model, prompt, left))
+			for _, m := range priced {
+				completion = min(completion, safety.CompletionFor(m, prompt, left))
+			}
 		}
 	}
 	if completion < safety.MinCompletion {
 		return nil, g.refuse(ti.ID, harness.CodeLimit, &safety.Error{Code: safety.CodeBudgetExceeded, Msg: "the budget for model tokens is used up"})
 	}
-	want := safety.Usage{Tokens: prompt + completion, CostMicros: safety.ModelCost(req.Model, prompt, completion)}
+	cost := func(p, c int64) (most int64) {
+		for _, m := range priced {
+			most = max(most, safety.ModelCost(m, p, c))
+		}
+		return most
+	}
+	want := safety.Usage{Tokens: prompt + completion, CostMicros: cost(prompt, completion)}
 	commit, err := g.ledger.Reserve(ti.ID, want, b)
 	if err != nil {
 		return nil, g.refuse(ti.ID, harness.CodeLimit, err)
 	}
-	res, err := g.inner.ModelCall(guard.WithMaxTokens(ctx, completion), ti, req)
-	// What it cost: the model's own count; without one (no usage reported, or the call failed after it started
-	// and the provider may bill what it streamed) the whole reservation, never less.
+	f := guard.FactsFrom(ctx)
+	if f == nil {
+		f = &guard.Facts{}
+		ctx = guard.WithFacts(ctx, f)
+	}
+	res, err := g.inner.ModelCall(guard.WithPriced(guard.WithMaxTokens(ctx, completion), priced), ti, req)
+	// What it cost: the model's own count, at the price of the model that answered (the fallback's after a switch;
+	// the dearest priced one if that isn't known); without a count (no usage reported, or the call failed after it
+	// started and the provider may bill what it streamed) the whole reservation, never less.
 	used := want
 	if err == nil && res != nil && res.Usage.Prompt+res.Usage.Completion > 0 {
 		p, c := int64(res.Usage.Prompt), int64(res.Usage.Completion)
-		used = safety.Usage{Tokens: p + c, CostMicros: safety.ModelCost(req.Model, p, c)}
+		used = safety.Usage{Tokens: p + c, CostMicros: cost(p, c)}
+		if m := f.Data().Model; slices.Contains(priced, m) {
+			used.CostMicros = safety.ModelCost(m, p, c)
+		}
 	}
 	commit(used)
 	g.tripFromGuard(ti.ID, err)

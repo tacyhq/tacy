@@ -102,6 +102,12 @@ func TriggeredStart(f trigger.Fire, firm string, now time.Time) (harness.Start, 
 		Permissions: maps.Clone(perms), Approvers: []string{d.Sponsor}, Agent: AgentScheduled, DefAgent: d.Agent, Digest: f.Digest, Trigger: f.Trigger.ID,
 		Sponsor: d.Sponsor, NotAfter: d.NotAfter, Links: personLinks([]proto.Message{{Role: "user", Content: d.Instructions}}),
 		PageLinks: slices.Contains(web, "web.fetch")}
+	// The run uses the definition's first model; the others it lists (signed by the sponsor, each allowed by the
+	// policy at install) are its fallbacks, in order: an overloaded or slow step switches to the first still allowed,
+	// as a chat run on Auto does (fallback.go). One model: none.
+	if fb := fallbackModels(d.Models[0], d.Models[1:]); len(fb) > 0 {
+		opts.AutoFallback, opts.Fallbacks = true, fb
+	}
 	return s, opts, nil
 }
 

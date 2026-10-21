@@ -127,6 +127,13 @@ type server struct {
 	// sealed results. nil on a firm VM.
 	holders trigger.HolderStore
 	results trigger.ResultStore
+	// memory is schedules' memory across runs (schedule upgrades: trigger/memory.go), on the same side file. nil on a
+	// firm VM.
+	memory trigger.MemoryStore
+	// Run notifications (notify.go): the spaces that turned them on and their marks; nil: none (every call is a no-op).
+	notify *notifier
+	// taskFollows counts each task's open event streams (a prompt in a followed task notifies nobody), under followMu.
+	taskFollows map[string]int
 }
 
 type ticketKey struct{}
@@ -527,6 +534,7 @@ func main() {
 		trigger.Store
 		trigger.HolderStore
 		trigger.ResultStore
+		trigger.MemoryStore
 	}
 	if dir := p.StoragePath(); dir != "" {
 		q, err := queue.OpenSide(filepath.Join(dir, "side.db"))
@@ -535,7 +543,7 @@ func main() {
 		}
 		side = q
 	} else {
-		side = memSide{approval.NewMemStore(), trigger.NewMemStore(), &trigger.MemHolders{}, &trigger.MemResults{}}
+		side = memSide{approval.NewMemStore(), trigger.NewMemStore(), &trigger.MemHolders{}, &trigger.MemResults{}, &trigger.MemMemory{}}
 	}
 	// Schedules (v0.12.0, schedules.go): on the shared chat VM, the directory is who proved they hold a personal
 	// space (recorded at a schedule's install). A firm VM's comes with its key log (later): none, nothing installs.
@@ -543,8 +551,9 @@ func main() {
 	var directory identity.Directory
 	var holders trigger.HolderStore
 	var results trigger.ResultStore
+	var memory trigger.MemoryStore
 	if st.PersonalSpaces() {
-		holders, results = side, side
+		holders, results, memory = side, side, side
 		directory = &trigger.HolderDirectory{Firm: st.Firm(), Store: side}
 	}
 	rg.approvals = &guard.Approvals{Release: rt.Release, Emit: host.Emit, Store: side, IDKey: idKey, OnWait: sg.waiting,
@@ -569,8 +578,22 @@ func main() {
 	}
 	s := &server{platform: p, id: id, agent: rg, rt: rt, rec: rec, token: p.Secret("AGENT_VM_TOKEN"), booted: time.Now().UTC(),
 		sched: newScheduler(lim), lim: lim, quotes: make(chan struct{}, 8), safety: st, gw: gw, safetySlots: make(chan struct{}, 4),
-		host: host, prompts: rg.prompts, dir: directory, approvals: rg.approvals, triggers: engine, holders: holders, results: results}
+		host: host, prompts: rg.prompts, dir: directory, approvals: rg.approvals, triggers: engine, holders: holders, results: results,
+		memory: memory}
 	host.TriggeredDone = s.triggeredDone
+	host.Memory = s.scheduleMemory
+	host.Allows = s.policyAllows
+	// Run notifications (notify.go): off for every space until its holder turns them on.
+	notifyPath := ""
+	if dir := p.StoragePath(); dir != "" {
+		notifyPath = filepath.Join(dir, "notify.json")
+	}
+	if s.notify, err = openNotifier(notifyPath); err != nil {
+		log.Fatalf("notify: %v", err)
+	}
+	host.TaskEnded = s.taskEnded
+	rg.prompts.OnWait = s.onWait(rg.prompts.OnWait, sg.spaceOf)
+	rg.approvals.OnWait = s.onWait(rg.approvals.OnWait, sg.spaceOf)
 	ctx := context.Background()
 	s.resumeTasks(ctx, ids, log.Printf)
 	if d, ok := p.(*dstack); ok { // the first /attest after a cold start then waits for one guest agent call, not two
@@ -620,6 +643,7 @@ func main() {
 	s.searchRoutes(mux, id)
 	s.step7Routes(mux, id)
 	s.scheduleRoutes(mux, id)                      // schedules for personal spaces (schedules.go, SCHEDULES.md)
+	s.notifyRoutes(mux, id)                        // run notifications (notify.go, SCHEDULES.md)
 	mux.HandleFunc("GET /activity", s.activityOut) // sealed activity records, for the relay (docs/24)
 	// Signed policies and stop lists; the signature is the authorization. Only served when the compose pins a key
 	// (stage 2): without one nothing could verify, so there's nothing to take.

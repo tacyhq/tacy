@@ -78,13 +78,21 @@ func TestMaskPIIIBANChecked(t *testing.T) {
 		"DW90F89P0USR",
 		"Samsung QN65S90DAEXZA",
 		"LG OLED65C4PUA 65 inch",
-		"GB00WEST12345698765432", // a GB shape, wrong check digits
-		"DE89WEST12345698765432", // DE's length, wrong check
-		"NL91ABNA041716430",      // one short
 	}
 	for _, q := range keep {
 		if got, kinds := maskPII(q); got != q || kinds != nil {
 			t.Errorf("maskPII(%q) = %q %v, want unchanged", q, got, kinds)
+		}
+	}
+	// IBAN-shaped but not one: not an [iban], but 10+ digits with letters is an account-like identifier, masked
+	// as a number (the identifier rule; model numbers have far fewer digits).
+	for _, q := range []string{
+		"GB00WEST12345698765432", // a GB shape, wrong check digits
+		"DE89WEST12345698765432", // DE's length, wrong check
+		"NL91ABNA041716430",      // one short
+	} {
+		if got, kinds := maskPII(q); got != "[number]" || !slices.Equal(kinds, []string{"number"}) {
+			t.Errorf("maskPII(%q) = %q %v, want [number]", q, got, kinds)
 		}
 	}
 }

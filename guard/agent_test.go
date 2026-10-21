@@ -28,9 +28,10 @@ func TestMaskPII(t *testing.T) {
 		{"1-800-555-0199 support line", "[phone] support line", []string{"phone"}},
 		{"ssn 123-45-6789", "ssn [ssn]", []string{"ssn"}},
 		{"card 4111 1111 1111 1111 declined", "card [card] declined", []string{"card"}},
-		{"account 12345678 balance", "account [number] balance", []string{"number"}},
+		{"account 12345678 balance", "account [account] balance", []string{"account"}},
 		{"IBAN DE89 3704 0044 0532 0130 00", "IBAN [iban]", []string{"iban"}},
-		{"server 10.1.2.3 down", "server [ip] down", []string{"ip"}},
+		{"server 203.0.113.7 down", "server [ip] down", []string{"ip"}},
+		{"router 192.168.1.1 admin login", "router 192.168.1.1 admin login", nil}, // a private address says nothing
 		{"https://bob:hunter2@example.com/x", "[url-credentials]example.com/x", []string{"url-credentials"}},
 		// Must survive: dates, years, versions, small numbers.
 		{"dstack release 2026-10-13", "dstack release 2026-10-13", nil},

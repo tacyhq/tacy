@@ -47,6 +47,9 @@ type AgentDef struct {
 	Version string `json:"version"`
 	// Tools are the tools.go tools the agent may use, in order (also its default set).
 	Tools []string `json:"tools"`
+	// OptTools are tools a request may ask for by name that aren't in its default set: a tab that doesn't know them
+	// (an older chat) never gets them (document_create, documents.go).
+	OptTools []string `json:"opt_tools,omitzero"`
 	// Steps is the most steps (model calls with tools) a task may take; a request may ask for fewer.
 	Steps int `json:"steps"`
 	// Searches and Reads cap the web searches and page reads a task sends out (0: no cap of its own).
@@ -96,8 +99,12 @@ var chatDef = AgentDef{ID: AgentChat, Version: "1", Tools: allTools, Steps: maxS
 // Since v0.13.0 the brief may come with up to 5 of the person's files (review's intake, review.go): read inside the
 // VM through files.* and the quarantined reader as review reads them, at most researchFileParts parts, and never sent
 // out (web.go: a search or page read carrying a passage of them is refused, files_guard.go).
-var researchDef = AgentDef{ID: AgentResearch, Version: "2", Tools: []string{"web_search", "fetch_page", "files_list", "files_read"},
-	Steps: 30, Searches: 20, Reads: 40, Work: 15 * time.Minute, Overall: 60 * time.Minute,
+//
+// Version 3 (agent feature 5): a request may also ask for document_create (OptTools), for a brief that asks for its
+// result as a document (researchDocumentNote).
+var researchDef = AgentDef{ID: AgentResearch, Version: "3", Tools: []string{"web_search", "fetch_page", "files_list", "files_read"},
+	OptTools: []string{documentTool},
+	Steps:    30, Searches: 20, Reads: 40, Work: 15 * time.Minute, Overall: 60 * time.Minute,
 	Run: safety.Limits{Tokens: 8_000_000, ToolCalls: 60, WallSeconds: 15 * 60, CostMicros: 1_000_000},
 	// A gpt-oss-120b answer over a long research conversation costs about a cent; kimi-k3's up to ~$0.25.
 	FinalReserve: 150_000,
@@ -115,7 +122,7 @@ var agentDefs = map[string]*AgentDef{AgentChat: &chatDef, AgentResearch: &resear
 // No site icons or card pictures. Its result is sealed to the space's seal key when it ends and kept 7 days (agentd's
 // schedules.go); the task itself is then forgotten.
 var scheduledDef = AgentDef{ID: AgentScheduled, Version: "1", Tools: []string{"web_search", "fetch_page", "image_search"},
-	Steps: 20, Searches: 10, Reads: 25, Work: 10 * time.Minute,
+	Steps: 20, Searches: 6, Reads: 25, Work: 10 * time.Minute,
 	Run: safety.Limits{Tokens: 4_000_000, ToolCalls: 40, WallSeconds: 10 * 60, CostMicros: 250_000},
 	// Kept for the digest's last answer over a long conversation (a cent or two on the default model).
 	FinalReserve: 30_000, Keep: 7 * 24 * time.Hour}
@@ -298,8 +305,11 @@ func agentStart(d AgentDef, r *proto.RunRequest, s harness.Start, now time.Time,
 	}
 	var actions []string
 	for _, n := range r.Tools {
-		if !slices.Contains(d.Tools, n) {
+		if !slices.Contains(d.Tools, n) && !slices.Contains(d.OptTools, n) {
 			return s, TaskOptions{}, fmt.Errorf("%s doesn't use tool %q", d.ID, n)
+		}
+		if slices.Contains(actions, toolAction(n)) {
+			return s, TaskOptions{}, fmt.Errorf("tool %q is listed twice", n)
 		}
 		actions = append(actions, toolAction(n))
 	}
@@ -376,11 +386,15 @@ func agentInstructions(d AgentDef, actions []string, now time.Time, reader bool)
 		if files {
 			text += researchFilesNote
 		}
+		if slices.Contains(actions, DocumentAction) {
+			text += researchDocumentNote
+		}
 	}
 	return strings.NewReplacer("{{date}}", date, "{{tools}}", strings.Join(tools, ", "),
 		"{{searches}}", fmt.Sprint(d.Searches), "{{reads}}", fmt.Sprint(d.Reads), "{{steps}}", fmt.Sprint(d.Steps),
 		"{{fetch}}", harness.ModelToolName("web.fetch"), "{{read}}", harness.ModelToolName("files.read"),
 		"{{list}}", harness.ModelToolName("files.list"), "{{per}}", fmt.Sprint(maxSectionsPerRead),
+		"{{document}}", harness.ModelToolName(DocumentAction),
 		"{{parts}}", fmt.Sprint(d.FileParts)).Replace(text)
 }
 
@@ -428,6 +442,11 @@ var (
 // researchReaderNote is added when the quarantined reader reads pages and results (as gatewayd always does).
 const researchReaderNote = `- Pages and search results are read for you by Tacy's quarantined reader: you get fields (summary, facts, quotes, wording, source) instead of the text, and each source's number and site, not its address. To read a search result, call {{fetch}} with its number in brackets. An address you write yourself after reading web content isn't opened: only a result's number or a link from the brief.
 - The reader's quotes are exact passages you can't see. Where exact wording matters, write the quote's cite, for example [quote 2], where those words go: the person sees the exact text there. Never write out a source's wording yourself.
+`
+
+// researchDocumentNote is added when the request asked for document_create (documents.go): a brief that asks for its
+// result as a file gets the brief in a document card, its message a short summary.
+const researchDocumentNote = `- Only if the brief asks for the result as a document or a file (a Word document, a PDF, a Markdown or text file, a CSV, "a report I can download"): once the brief is ready, call {{document}} once with the complete brief as its content, every section above but the Sources section (Tacy adds the sources list with their links), cited inline as above, in the format the brief names (docx when it says only "a document" or "a report"). Then your message is two or three sentences saying what the document covers; don't repeat the brief. Never call {{document}} when the brief doesn't ask for a document or file.
 `
 
 // researchFilesNote is added when the research task has the person's files (files.go).

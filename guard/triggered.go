@@ -33,18 +33,56 @@ const MaxTriggeredOpen = 4
 const unattendedNote = `
 This task runs unattended for its sponsor; nobody reads your messages while it runs. Anything that sends or changes something waits for the sponsor's approval in the Tacy app. If an action comes back denied (approval_denied or permission_denied), don't try it another way: finish and say what wasn't done. Your last message is what the sponsor gets: link each source in it by citing its number, like [3], which the app shows as a link to the source. Say only what the sources you read say, nothing from your own knowledge; when a source gave little, write less rather than fill it in.`
 
+// unattendedDocumentNote is added to an unattended task whose definition lists document.create (documents.go).
+const unattendedDocumentNote = `
+Only if the instructions ask for the result as a document or a file (a Word document, a PDF, a CSV, "as a .docx"): call document_create once with the complete result as its content, sources cited as [n] (Tacy adds their links), in the format they name; your last message is then a sentence or two on what it covers.`
+
+func documentNote(docs bool) string {
+	if !docs {
+		return ""
+	}
+	return unattendedDocumentNote
+}
+
+func documentDefs(docs bool) []harness.Tool {
+	if !docs {
+		return nil
+	}
+	return ToolDefs(DocumentAction)
+}
+
 // ErrUnknownTool: a definition names a tool this release doesn't have.
 var ErrUnknownTool = errors.New("the definition names a tool this release doesn't have")
 
-// TriggeredStart makes the start and options of a fired task (StartTriggered).
-func TriggeredStart(f trigger.Fire, firm string, now time.Time) (harness.Start, TaskOptions, error) {
+// searchNote is added to a scheduled run's note when its definition lets it search (schedule upgrades).
+const searchNote = "\n\nYou can search the web (%s): short, generic queries made from the instructions, never personal details; at most %d searches this run. Open a result by its number, like [3]."
+
+// TriggeredStart makes the start and options of a fired task (StartTriggered). mem is its schedule's memory, newest
+// first (trigger.MemoryStore; only for a definition with memory): it goes in the run's first message as data
+// (MemoryNote), and with notify "changes" and an earlier run to compare with, the run may call schedule.no_change.
+func TriggeredStart(f trigger.Fire, firm string, now time.Time, mem []trigger.Remembered) (harness.Start, TaskOptions, error) {
+	return TriggeredStartFor(f, firm, now, mem, nil)
+}
+
+// TriggeredStartFor is TriggeredStart under the space's policy: allows (nil: everything) says whether it allows an
+// action. The tools a run can do without (a result as a document, document.create; "nothing changed",
+// schedule.no_change) are left out of the start when the policy doesn't allow them, with their notes, so a run
+// under a policy signed before their connectors (chat-v3) works as it did before them: its result in the message,
+// and a notify-changes schedule reports every run. Nothing is refused for it.
+func TriggeredStartFor(f trigger.Fire, firm string, now time.Time, mem []trigger.Remembered, allows func(action string) bool) (harness.Start, TaskOptions, error) {
+	if allows == nil {
+		allows = func(string) bool { return true }
+	}
 	d := f.Def
 	var s harness.Start
 	var web, sink []string
+	docs := false
 	for _, t := range d.Tools {
 		switch {
 		case appTool(t) != "":
 			web = append(web, t)
+		case t == DocumentAction: // a result as a document (documents.go): nothing goes out
+			docs = allows(DocumentAction)
 		case t == "sink.post" || t == "sink.put":
 			sink = append(sink, t)
 		default:
@@ -77,10 +115,28 @@ func TriggeredStart(f trigger.Fire, firm string, now time.Time) (harness.Start, 
 	default:
 		return s, TaskOptions{}, errors.New("unknown trigger kind")
 	}
+	if slices.Contains(web, "web.search") && f.Trigger.Kind == trigger.Schedule {
+		note += fmt.Sprintf(searchNote, harness.ModelToolName("web.search"), scheduledDef.Searches)
+	}
+	if !d.Memory {
+		mem = nil
+	}
+	md := d
+	if d.Notify == trigger.NotifyChanges && !allows(NoChangeAction) { // no "nothing changed" under this policy
+		c := *d
+		c.Notify = ""
+		md = &c
+	}
+	note += MemoryNote(md, mem)
+	noChange := md.Memory && md.Notify == trigger.NotifyChanges && len(mem) > 0
+	tools := append(ToolDefs(web...), SinkToolDefs(sink...)...)
+	if noChange {
+		tools = append(tools, noChangeToolDef())
+	}
 	s = harness.Start{Space: d.Space, Attempt: 1,
 		Agent:        harness.AgentRef{ID: d.Agent, Version: strconv.FormatUint(d.Version, 10), Digest: f.Digest},
-		Instructions: strings.TrimSpace(d.Instructions) + "\n" + unattendedNote, Models: d.Models,
-		Tools: append(ToolDefs(web...), SinkToolDefs(sink...)...),
+		Instructions: strings.TrimSpace(d.Instructions) + "\n" + unattendedNote + documentNote(docs), Models: d.Models,
+		Tools: append(tools, documentDefs(docs)...),
 		Input: []harness.Message{{Role: "user", Content: note}},
 		Limits: harness.TaskLimits{MaxSteps: min(d.Steps(), scheduledDef.Steps), MaxModelCalls: min(d.Steps(), scheduledDef.Steps) + 1,
 			Deadline: now.Add(TriggerCap).UTC().Format(time.RFC3339)}}
@@ -101,7 +157,7 @@ func TriggeredStart(f trigger.Fire, firm string, now time.Time) (harness.Start, 
 		Slot: f.Slot, Due: f.Due,
 		Permissions: maps.Clone(perms), Approvers: []string{d.Sponsor}, Agent: AgentScheduled, DefAgent: d.Agent, Digest: f.Digest, Trigger: f.Trigger.ID,
 		Sponsor: d.Sponsor, NotAfter: d.NotAfter, Links: personLinks([]proto.Message{{Role: "user", Content: d.Instructions}}),
-		PageLinks: slices.Contains(web, "web.fetch")}
+		PageLinks: slices.Contains(web, "web.fetch"), Memory: d.Memory, NoChange: noChange}
 	// The run uses the definition's first model; the others it lists (signed by the sponsor, each allowed by the
 	// policy at install) are its fallbacks, in order: an overloaded or slow step switches to the first still allowed,
 	// as a chat run on Auto does (fallback.go). One model: none.
@@ -119,7 +175,18 @@ func ScheduleMember(agent string) string { return "schedule:" + agent }
 // when an event started it. At most MaxTriggeredOpen open tasks per agent (ErrTooMany).
 func (h *Host) StartTriggered(ctx context.Context, f trigger.Fire, firm string) (existed bool, err error) {
 	h.init()
-	start, opts, err := TriggeredStart(f, firm, time.Now())
+	var mem []trigger.Remembered
+	if f.Def.Memory && h.Memory != nil {
+		if mem, err = h.Memory(f.Def.Space, f.Def.Agent); err != nil {
+			return false, err // not started: the next tick tries again (a run without its memory would repeat itself)
+		}
+	}
+	var allows func(string) bool
+	if h.Allows != nil {
+		space := f.Def.Space
+		allows = func(action string) bool { return h.Allows(space, action) }
+	}
+	start, opts, err := TriggeredStartFor(f, firm, time.Now(), mem, allows)
 	if err != nil {
 		return false, err
 	}
@@ -146,8 +213,11 @@ func (h *Host) StartTriggered(ctx context.Context, f trigger.Fire, firm string) 
 	h.live[f.Task] = l
 	h.mu.Unlock()
 	taint := ""
-	if f.Trigger.Kind == trigger.Event {
+	switch {
+	case f.Trigger.Kind == trigger.Event:
 		taint = "event"
+	case len(mem) > 0: // what earlier runs found came from web pages (schedule.go)
+		taint = "memory"
 	}
 	var tools []string
 	for _, t := range start.Tools {

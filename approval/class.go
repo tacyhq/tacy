@@ -34,11 +34,18 @@ var classes = map[string]Class{
 	// nothing leaves, nothing changes.
 	"files.list": Read,
 	"files.read": Read,
-	"sink.post":  Send,
-	"sink.put":   Change,
-	"task.spawn": Read,
-	"task.wait":  Read,
-	"person.ask": Read,
+	// A notify-changes schedule's "nothing changed" (guard/schedule.go): answered in the VM; it only marks the run's
+	// own result quiet.
+	"schedule.no_change": Read,
+	// A document for the person's own conversation (guard/documents.go, agent feature 5): its content goes only into
+	// the run's encrypted result; nothing leaves, nothing changes. Missing here it would be a Send, and every document
+	// would wait for an approval nobody can give on a personal space (the v0.13.0 lesson; approval_test.go).
+	"document.create": Read,
+	"sink.post":       Send,
+	"sink.put":        Change,
+	"task.spawn":      Read,
+	"task.wait":       Read,
+	"person.ask":      Read,
 }
 
 // ClassOf is an action's class. An action the release doesn't know is a Send: unknown means it may send (fail

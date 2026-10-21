@@ -208,12 +208,16 @@ func TestMemStore(t *testing.T) {
 
 // Every action the chat release's ceiling allows has its own class: one missing falls to Send, which needs an
 // approver, and the chat VM has none (v0.13.0's files.list and files.read were missing: every review was refused).
+// v0.15.0 adds document.create (a run's document) and schedule.no_change (a notify-changes run's "nothing changed"):
+// both stay inside the VM, so both are Read. guard's TestCeilingActionsClassified checks the ceiling itself.
 func TestReleaseActionsClassified(t *testing.T) {
 	for _, c := range []struct {
 		action string
 		want   approval.Class
 	}{{"web.search", approval.ReadOut}, {"web.fetch", approval.ReadOut}, {"web.images", approval.ReadOut},
-		{"files.list", approval.Read}, {"files.read", approval.Read}} {
+		{"files.list", approval.Read}, {"files.read", approval.Read},
+		{"document.create", approval.Read}, {"schedule.no_change", approval.Read},
+		{"task.spawn", approval.Read}, {"task.wait", approval.Read}, {"person.ask", approval.Read}} {
 		if got := approval.ClassOf(c.action); got != c.want {
 			t.Errorf("%s: %s, want %s", c.action, got, c.want)
 		}

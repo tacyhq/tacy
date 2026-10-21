@@ -243,6 +243,7 @@ type memSide struct {
 	*triggerMem
 	*trigger.MemHolders
 	*trigger.MemResults
+	*trigger.MemMemory
 }
 
 type (

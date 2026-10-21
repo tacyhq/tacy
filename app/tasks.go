@@ -374,6 +374,8 @@ func (s *server) taskEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer s.followDone(user)
+	s.followTask(ref.Task, 1) // a prompt in a task someone follows notifies nobody (notify.go)
+	defer s.followTask(ref.Task, -1)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(200)

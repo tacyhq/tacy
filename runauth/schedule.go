@@ -27,6 +27,8 @@ const (
 	ResultsLabel       = "tacy/v2/schedule-results"
 	ResultLabel        = "tacy/v2/schedule-result"
 	ResultsDeleteLabel = "tacy/v2/schedule-results-delete"
+	// NotifyLabel: turning run notifications on or off for the space (app/notify.go); own item "on" or "off".
+	NotifyLabel = "tacy/v2/notify-set"
 )
 
 // Where is a schedule call's where and who, as a run request has them (the JSON field names are the run's).

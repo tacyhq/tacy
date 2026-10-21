@@ -28,6 +28,7 @@ var (
 	_ trigger.Store       = (*Side)(nil)
 	_ trigger.HolderStore = (*Side)(nil)
 	_ trigger.ResultStore = (*Side)(nil)
+	_ trigger.MemoryStore = (*Side)(nil)
 )
 
 // sideMigrations are the side file's schema versions (PRAGMA user_version), forward only.
@@ -102,6 +103,58 @@ var sideMigrations = []string{
 	CREATE INDEX results_ended ON results (ended_at);`,
 }
 
+// sideExtras are additive changes made without raising the schema version (v0.15.0 on), so that the release before
+// them still opens the file after a rollback: OpenSide refuses a user_version newer than its own, and v0.12.0-v0.14.0
+// know 2 (a rollback to one of them would stop agentd at its start). Each is idempotent and one an older release
+// ignores: a column with a default that it never names (it names its columns in every insert and select), a table it
+// never reads. Rows it writes meanwhile get the default (a result not quiet); a person's daily schedule, its fired
+// slots and results are untouched either way.
+//
+// Schedule upgrades (v0.15.0): a result's quiet mark (a run that found nothing changed and told nobody), and
+// schedules' memory across runs (trigger/memory.go: the newest 7 runs per schedule, 30 days).
+var sideExtras = []struct {
+	missing string // a query that counts 0 while the change isn't made
+	change  string
+}{
+	{`SELECT count(*) FROM pragma_table_info('results') WHERE name = 'quiet'`,
+		`ALTER TABLE results ADD COLUMN quiet INTEGER NOT NULL DEFAULT 0`},
+	{`SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'memory'`,
+		`CREATE TABLE memory (
+		seq      INTEGER PRIMARY KEY AUTOINCREMENT,
+		task     TEXT NOT NULL UNIQUE,
+		space    TEXT NOT NULL,
+		agent    TEXT NOT NULL,
+		day      TEXT NOT NULL,
+		ended_at INTEGER NOT NULL,
+		quiet    INTEGER NOT NULL,
+		body     BLOB NOT NULL
+	);
+	CREATE INDEX memory_agent ON memory (space, agent, ended_at);
+	CREATE INDEX memory_ended ON memory (ended_at);`},
+}
+
+// applyExtras makes the sideExtras not made yet, each in its own transaction.
+func applyExtras(db *sql.DB) error {
+	for i, x := range sideExtras {
+		tx, err := db.Begin()
+		if err != nil {
+			return err
+		}
+		var n int
+		if err = tx.QueryRow(x.missing).Scan(&n); err == nil && n == 0 {
+			_, err = tx.Exec(x.change)
+		}
+		if err != nil {
+			tx.Rollback()
+			return fmt.Errorf("queue side: extra %d: %w", i+1, err)
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // OpenSide opens (or creates) the side file at path: directory 0700, file 0600.
 func OpenSide(path string) (*Side, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
@@ -148,6 +201,10 @@ func OpenSide(path string) (*Side, error) {
 			db.Close()
 			return nil, err
 		}
+	}
+	if err := applyExtras(db); err != nil {
+		db.Close()
+		return nil, err
 	}
 	return &Side{db: db}, nil
 }
@@ -328,9 +385,9 @@ func (s *Side) Holder(space, id string) (*trigger.Holder, error) {
 
 func (s *Side) PutResult(r trigger.Result) (int64, error) {
 	if _, err := s.db.Exec(`INSERT INTO results (task, space, seal, agent, version, trigger, day, scheduled_at, started_at,
-		ended_at, state, code, enc, ct) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (task) DO NOTHING`,
+		ended_at, state, code, enc, ct, quiet) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (task) DO NOTHING`,
 		r.Task, r.Space, r.Seal, r.Agent, int64(r.Version), r.Trigger, r.Day, ms(r.ScheduledAt), ms(r.StartedAt), ms(r.EndedAt),
-		r.State, r.Code, r.Enc, r.CT); err != nil {
+		r.State, r.Code, r.Enc, r.CT, r.Quiet); err != nil {
 		return 0, err
 	}
 	var seq int64
@@ -338,13 +395,13 @@ func (s *Side) PutResult(r trigger.Result) (int64, error) {
 	return seq, err
 }
 
-const resultCols = `seq, task, space, seal, agent, version, trigger, day, scheduled_at, started_at, ended_at, state, code`
+const resultCols = `seq, task, space, seal, agent, version, trigger, day, scheduled_at, started_at, ended_at, state, code, quiet`
 
 func scanResult(row scanner, extra ...any) (trigger.Result, error) {
 	var r trigger.Result
 	var v, sch, st, en int64
 	if err := row.Scan(append([]any{&r.Seq, &r.Task, &r.Space, &r.Seal, &r.Agent, &v, &r.Trigger, &r.Day, &sch, &st, &en,
-		&r.State, &r.Code}, extra...)...); err != nil {
+		&r.State, &r.Code, &r.Quiet}, extra...)...); err != nil {
 		return r, err
 	}
 	r.Version = uint64(v)
@@ -410,6 +467,105 @@ func (s *Side) DeleteAgentResults(space, agent string) (int, error) {
 
 func (s *Side) PruneResults(t time.Time) error {
 	_, err := s.db.Exec(`DELETE FROM results WHERE ended_at < ?`, ms(t))
+	return err
+}
+
+// memoryBody is a memory row's body: what the run found (trigger.Remembered's text and sources).
+type memoryBody struct {
+	Text    string                     `json:"text,omitzero"`
+	Sources []trigger.RememberedSource `json:"sources,omitzero"`
+}
+
+func (s *Side) PutMemory(m trigger.Remembered) error {
+	m = m.Capped()
+	body, err := json.Marshal(memoryBody{Text: m.Text, Sources: m.Sources})
+	if err != nil {
+		return err
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`INSERT INTO memory (task, space, agent, day, ended_at, quiet, body) VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT (task) DO NOTHING`, m.Task, m.Space, m.Agent, m.Day, ms(m.EndedAt), m.Quiet, body); err != nil {
+		return err
+	}
+	// Only the newest MemoryRuns of the schedule stay.
+	if _, err := tx.Exec(`DELETE FROM memory WHERE space = ? AND agent = ? AND seq NOT IN (SELECT seq FROM memory
+		WHERE space = ? AND agent = ? ORDER BY ended_at DESC, seq DESC LIMIT ?)`, m.Space, m.Agent, m.Space, m.Agent, trigger.MemoryRuns); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Side) Memories(space, agent string, since time.Time) ([]trigger.Remembered, error) {
+	rows, err := s.db.Query(`SELECT task, day, ended_at, quiet, body FROM memory WHERE space = ? AND agent = ? AND ended_at > ?
+		ORDER BY ended_at DESC, seq DESC LIMIT ?`, space, agent, ms(since), trigger.MemoryRuns)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []trigger.Remembered
+	for rows.Next() {
+		m := trigger.Remembered{Space: space, Agent: agent}
+		var ended int64
+		var body []byte
+		if err := rows.Scan(&m.Task, &m.Day, &ended, &m.Quiet, &body); err != nil {
+			return nil, err
+		}
+		var b memoryBody
+		if err := json.Unmarshal(body, &b); err != nil {
+			return nil, err
+		}
+		m.EndedAt, m.Text, m.Sources = time.UnixMilli(ended).UTC(), b.Text, b.Sources
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+func (s *Side) DeleteMemory(space, agent string) (int, error) {
+	res, err := s.db.Exec(`DELETE FROM memory WHERE space = ? AND agent = ?`, space, agent)
+	if err != nil {
+		return 0, err
+	}
+	k, _ := res.RowsAffected()
+	return int(k), nil
+}
+
+func (s *Side) PruneMemoryExcept(keep func(space, agent string) bool) (int, error) {
+	rows, err := s.db.Query(`SELECT DISTINCT space, agent FROM memory`)
+	if err != nil {
+		return 0, err
+	}
+	var gone [][2]string
+	for rows.Next() {
+		var space, agent string
+		if err := rows.Scan(&space, &agent); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		if !keep(space, agent) {
+			gone = append(gone, [2]string{space, agent})
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, g := range gone {
+		k, err := s.DeleteMemory(g[0], g[1])
+		n += k
+		if err != nil {
+			return n, err
+		}
+	}
+	return n, nil
+}
+
+func (s *Side) PruneMemory(t time.Time) error {
+	_, err := s.db.Exec(`DELETE FROM memory WHERE ended_at < ?`, ms(t))
 	return err
 }
 

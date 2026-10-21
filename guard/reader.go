@@ -202,6 +202,26 @@ var sourceKinds = []string{"article", "reference", "docs", "legal", "product", "
 // (the policy's; nil: all). No model allowed: nothing (the reader then shows nothing of the source). ok is false
 // for actions the reader doesn't read.
 func ReaderReserve(action string, allows func(model string) bool) (tokens, cost int64, ok bool) {
+	return ReaderReserveFor("", nil, action, allows)
+}
+
+// ReaderReserveFor is ReaderReserve for a task of agent with files: a files.read of a review whose files are read in
+// one files.read (CrossReserve) also reserves its largest file's cross-check at its largest (the file's characters,
+// crossMaxOut, on the reader's model only: a check has no fallback), so that check runs alongside the parts however
+// many there are, instead of alone in a second files.read (a step of the acting model and a reader round trip more;
+// lab round 8). A review of more parts reserves the section calls only, as before: its checks take the calls a read
+// leaves, so its later reads aren't refused for a check they may not run.
+func ReaderReserveFor(agent string, files []TaskFile, action string, allows func(model string) bool) (tokens, cost int64, ok bool) {
+	tokens, cost, ok = readerReserve(action, allows)
+	if n := CrossReserve(agent, files); ok && action == "files.read" && n > 0 && (allows == nil || allows(DefaultReader.Model)) {
+		p := readerCallMax(n)
+		tokens += p + crossMaxOut
+		cost += safety.ModelCost(DefaultReader.Model, p, crossMaxOut)
+	}
+	return tokens, cost, ok
+}
+
+func readerReserve(action string, allows func(model string) bool) (tokens, cost int64, ok bool) {
 	rc := DefaultReader
 	calls, doc := int64(1), 0
 	switch action {

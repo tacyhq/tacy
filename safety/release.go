@@ -31,6 +31,12 @@ func ChatRelease(firm, tinfoilHost string, models []string, runSeconds int64) *P
 				Fetch: []string{"*"}},
 			// The person's attached files, read inside the VM (a_review): no host, nothing leaves.
 			"files": {Tools: []string{"files.list", "files.read"}, Hosts: []string{}},
+			// Documents in a run's result (guard/documents.go): no host, nothing leaves; the content goes only into
+			// the person's own encrypted conversation.
+			"document": {Tools: []string{"document.create"}, Hosts: []string{}},
+			// A notify-changes schedule's "nothing changed" (guard/schedule.go): no host, nothing sent; it marks
+			// only the run's own result quiet.
+			"schedule": {Tools: []string{"schedule.no_change"}, Hosts: []string{}},
 		},
 		StaleReads: true,
 		Budget: Budgets{

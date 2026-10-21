@@ -1,0 +1,38 @@
+{
+  "format": "tacy-golden-crypto-vectors",
+  "note": "Run notifications' signed VM call (POST /notify/set, poc/05-agent-vm SCHEDULES.md 'Run notifications'): the where and who under tacy/v2/notify-set, own item 'on' or 'off'. Made once from v2-schedule.json's fixed seeds with node:crypto (scripts/gen-golden-v2-notify-vectors.mjs); never regenerate.",
+  "constants": {
+    "labels": {
+      "spaceProof": "tacy/v2/space-proof",
+      "notifySet": "tacy/v2/notify-set"
+    }
+  },
+  "vm_private": "7171717171717171717171717171717171717171717171717171717171717171",
+  "vm_public": "ab4f197998fcc56cc6ed68c1d931af9bb522ec00743e181f7330915df4aa3176",
+  "seal": "x25519:zUjQaB6nPwmgD4OFm9EIgN9WgiAZzaPIg+DRUU41sQY=",
+  "space": "s_aebagbafaydqqcikbmga2dqpca",
+  "proof": "zTb+BtQgYYMbLs86VLweygquYWFPiLcuVOZKLV+y+yw=",
+  "identity": {
+    "seed": "7373737373737373737373737373737373737373737373737373737373737373",
+    "id": "i_cahq4dimbmfascahaycqiaycae",
+    "key": "ed25519:/sFChnP2r+iSZLOAc0SuiyadElpQOFUgJofbWnEoV58="
+  },
+  "requests": [
+    {
+      "name": "turn on",
+      "own": [
+        "on"
+      ],
+      "body": "{\"on\":true,\"space\":\"s_aebagbafaydqqcikbmga2dqpca\",\"space_seal\":\"x25519:zUjQaB6nPwmgD4OFm9EIgN9WgiAZzaPIg+DRUU41sQY=\",\"identity\":\"i_cahq4dimbmfascahaycqiaycae\",\"identity_key\":\"ed25519:/sFChnP2r+iSZLOAc0SuiyadElpQOFUgJofbWnEoV58=\",\"nonce\":\"51515151515151515151515151515151\",\"signed_at\":1792000100,\"space_proof\":\"zTb+BtQgYYMbLs86VLweygquYWFPiLcuVOZKLV+y+yw=\",\"identity_sig\":\"xGcu0gYtsJTlrtIN6Yyhkdzq2/K7HGhPTvZ7b0xqjKAEobMrcQ1FmHjpwi4WWEMMqBlFNa3v3KfyAmlXJJrjCA==\"}",
+      "digest": "e3dd92758d7ddc9caa102b1c49d494fb981c0c0213b024dec1c58231a7490cf2"
+    },
+    {
+      "name": "turn off",
+      "own": [
+        "off"
+      ],
+      "body": "{\"on\":false,\"space\":\"s_aebagbafaydqqcikbmga2dqpca\",\"space_seal\":\"x25519:zUjQaB6nPwmgD4OFm9EIgN9WgiAZzaPIg+DRUU41sQY=\",\"identity\":\"i_cahq4dimbmfascahaycqiaycae\",\"identity_key\":\"ed25519:/sFChnP2r+iSZLOAc0SuiyadElpQOFUgJofbWnEoV58=\",\"nonce\":\"52525252525252525252525252525252\",\"signed_at\":1792000101,\"space_proof\":\"zTb+BtQgYYMbLs86VLweygquYWFPiLcuVOZKLV+y+yw=\",\"identity_sig\":\"+a0/yq6tCZCSMiTsZwe2YXoPrjXYVSgIlirE9MQ+NeF3gqSpwoBlVL4Lns9DhPHF9hyGUDyCVog/uo0M762nCQ==\"}",
+      "digest": "2200ddf6d8f10aed435e9c377b3c1d9e118494ff40ab4184abe533b6ce7535c8"
+    }
+  ]
+}

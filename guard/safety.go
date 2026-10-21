@@ -161,7 +161,12 @@ func withPolicyTransport(c *http.Client) *http.Client {
 }
 
 // ToolAction is the action a chat tool name runs ("" for none).
-func ToolAction(tool string) string { return webAction(tool) }
+func ToolAction(tool string) string {
+	if tool == documentTool {
+		return DocumentAction
+	}
+	return webAction(tool)
+}
 
 // AllTools are the chat's tool names (a request without tools gets them all).
 func AllTools() []string { return slices.Clone(allTools) }

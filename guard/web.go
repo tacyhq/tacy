@@ -55,8 +55,14 @@ func eventName(action string) string {
 // site icons, metrics) under the model tool call the action carries out, and returns what the model sees: done
 // with the tool's JSON; denied when policy refused it (a URL with personal data); failed with the tool's error.
 func (g *Guard) Action(ctx context.Context, ti *harness.TaskInfo, id string, req *harness.Action) (*harness.ActionResult, error) {
+	if IsNoChangeAction(req.Name) { // a notify-changes schedule's "nothing changed" (schedule.go): answered in the VM
+		return g.noChangeAction(ctx, ti, id, req)
+	}
 	if isFilesAction(req.Name) { // the person's files, read in the VM (files.go)
 		return g.filesAction(ctx, ti, id, req)
+	}
+	if isDocumentAction(req.Name) { // a document for the person's own conversation: nothing goes out (documents.go)
+		return g.documentAction(ctx, ti, id, req)
 	}
 	if strings.HasPrefix(req.Name, "sink.") && g.cfg.Sink != nil { // the test-only connector with effects (sink.go)
 		return g.sinkAction(withTask(ctx, ti.ID), ti, id, req)

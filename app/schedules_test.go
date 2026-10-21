@@ -54,6 +54,7 @@ func newSchedEnv(t *testing.T, replies ...string) *schedEnv {
 	s.dir, s.holders, s.results = dir, holders, results
 	s.triggers = trigger.New(trigger.Config{Firm: "f_chat", Dir: dir, Store: e.store, IDKey: []byte("agentd id key"), Trusted: s.safety.OperatorTime})
 	s.tasks().TriggeredDone = s.triggeredDone
+	s.tasks().Allows = s.policyAllows
 	return e
 }
 

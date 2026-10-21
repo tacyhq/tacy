@@ -361,6 +361,16 @@ func (g *safeGateway) waiting(task string, open bool) {
 	}
 }
 
+// spaceOf is the task's space ("" when it isn't running here), for a prompt's waiting notice (notify.go).
+func (g *safeGateway) spaceOf(task string) string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if t := g.tasks[task]; t != nil {
+		return t.space
+	}
+	return ""
+}
+
 // TimedOut says whether watch cancelled the task at its agent's running-time limit (the error people see says
 // the run timed out, as at the deadline).
 func (g *safeGateway) TimedOut(task string) bool {
@@ -442,6 +452,17 @@ func (g *safeGateway) refuse(task, hcode string, err error) error {
 	g.trip(task, err)
 	_, msg := coded(err)
 	return harness.Errf(hcode, "%s", msg)
+}
+
+// taskFiles is the task's files (guard.TaskOptions.Files) for a files.read, else nil.
+func taskFiles(ti *harness.TaskInfo, action string) []guard.TaskFile {
+	var o struct {
+		Files []guard.TaskFile `json:"files"`
+	}
+	if action != "files.read" || ti.Options == nil || json.Unmarshal(ti.Options, &o) != nil {
+		return nil
+	}
+	return o.Files
 }
 
 // images is how many of the person's images the task's model requests carry (guard.TaskOptions.Images).
@@ -577,12 +598,13 @@ func (g *safeGateway) Action(ctx context.Context, ti *harness.TaskInfo, id strin
 	}
 	// The quarantined reader's model call for a page or a search (guard/reader.go) is reserved with the action, at
 	// its largest: an action whose reader the budget can't cover doesn't run (the model never gets raw text instead).
-	reader := readerReserve(req.Name, e)
 	agent := g.agent(ti)
+	reader := readerReserve(agent, taskFiles(ti, req.Name), req.Name, e)
 	b := budget(e, agent)
 	// A built-in agent keeps part of its cost budget for its answer (guard.FinalReserve): a search or read that
-	// would eat into it is refused, and the model told to write its answer now.
-	if keep := guard.FinalReserve(agent); keep > 0 {
+	// would eat into it is refused, and the model told to write its answer now. A document (document.create) and a
+	// "nothing changed" (schedule.no_change) cost nothing and are the answer: they aren't held to the reserve.
+	if keep := guard.FinalReserve(agent); keep > 0 && !guard.IsDocumentAction(req.Name) && !guard.IsNoChangeAction(req.Name) {
 		if left := g.ledger.CostLeft(ti.ID, b); left >= 0 && left-want.CostMicros-reader.CostMicros < keep {
 			return &harness.ActionResult{Status: harness.ActionDenied, Error: safety.CodeBudgetExceeded +
 				": this task's budget for searches and page reads is used up (the rest is kept for the answer); nothing was sent. " +
@@ -607,11 +629,12 @@ func (g *safeGateway) Action(ctx context.Context, ti *harness.TaskInfo, id strin
 	return res, err
 }
 
-// readerReserve is the budget the reader's calls for action may use: every call it may make, on the models the
-// policy allows (zero for actions it doesn't read, or when the policy allows neither of its models: gatewayd then
-// refuses the reader and shows nothing of the source).
-func readerReserve(action string, e *safety.Effective) safety.Usage {
-	tokens, cost, ok := guard.ReaderReserve(action, e.AllowsModel)
+// readerReserve is the budget the reader's calls for an action of a task of agent with files may use: every call it
+// may make (with a review's files.read, its cross-check: guard.ReaderReserveFor), on the models the policy allows
+// (zero for actions it doesn't read, or when the policy allows neither of its models: gatewayd then refuses the
+// reader and shows nothing of the source).
+func readerReserve(agent string, files []guard.TaskFile, action string, e *safety.Effective) safety.Usage {
+	tokens, cost, ok := guard.ReaderReserveFor(agent, files, action, e.AllowsModel)
 	if !ok {
 		return safety.Usage{}
 	}

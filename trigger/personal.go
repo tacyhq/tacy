@@ -97,7 +97,10 @@ type Result struct {
 	EndedAt     time.Time
 	State       string
 	Code        string
-	Enc, CT     []byte // HPKE encapsulated key and ciphertext
+	// Quiet: the run found nothing that changed and told nobody (Definition.Notify): the browser records that it ran
+	// and adds no message.
+	Quiet   bool
+	Enc, CT []byte // HPKE encapsulated key and ciphertext
 }
 
 // ResultKeep is how long a result is kept after its run ended.

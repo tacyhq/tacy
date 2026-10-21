@@ -493,6 +493,8 @@ func TestAgentRetention(t *testing.T) {
 	rid, _ := runAgentTask(t, c, research(researchBrief))
 	chat := proto.RunRequest{Model: proto.DefaultModel, RunSecret: permSecret, Permissions: guard.AllowAll(), Messages: user1("hi")}
 	cid, _ := runAgentTask(t, c, chat)
+	// The stream marks a task delivered after it wrote [DONE], so the client can have the end before the mark is down.
+	waitDelivered(t, ae.s.rt.Store.(harness.DeliveryStore), rid, cid)
 	now := time.Now()
 	if h.Prune(now.Add(5*time.Minute)) != 0 || gone(rid) || gone(cid) {
 		t.Fatal("collected tasks pruned before their 10 minutes")
@@ -516,5 +518,28 @@ func TestAgentRetention(t *testing.T) {
 	}
 	if n := h.Prune(now.Add(24*time.Hour + time.Minute)); n != 2 || !gone(cid) || !gone(rid) {
 		t.Fatalf("after a day: %d pruned, chat gone %v, research gone %v", n, gone(cid), gone(rid))
+	}
+}
+
+// waitDelivered waits until every id is marked delivered (Host.Delivered, after its event stream's end).
+func waitDelivered(t *testing.T, d harness.DeliveryStore, ids ...string) {
+	t.Helper()
+	for end := time.Now().Add(10 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		got, err := d.DeliveredBefore(time.Now().Add(time.Second))
+		if err != nil {
+			t.Fatal(err)
+		}
+		missing := 0
+		for _, id := range ids {
+			if !slices.Contains(got, id) {
+				missing++
+			}
+		}
+		if missing == 0 {
+			return
+		}
+		if time.Now().After(end) {
+			t.Fatalf("%d of %d tasks not marked delivered", missing, len(ids))
+		}
 	}
 }

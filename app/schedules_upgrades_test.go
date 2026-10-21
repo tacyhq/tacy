@@ -295,12 +295,12 @@ func TestScheduleMemoryOfRemovedScheduleGoesAtStart(t *testing.T) {
 			t.Fatalf("install %d %v", code, out)
 		}
 		e.s.triggerTick(context.Background())
-		for id, o := range e.s.tasks().Triggered() {
-			if o.DefAgent == d.Agent {
-				e.waitResult(id)
-			}
+		// Triggered() lists only runs not ended yet, so wait for what the run leaves (stored as it ends) instead.
+		var m []trigger.Remembered
+		for end := time.Now().Add(20 * time.Second); len(m) == 0 && time.Now().Before(end); time.Sleep(20 * time.Millisecond) {
+			m, _ = side.Memories(e.me.Space, d.Agent, time.Time{})
 		}
-		if m, _ := side.Memories(e.me.Space, d.Agent, time.Time{}); len(m) != 1 {
+		if len(m) != 1 {
 			t.Fatalf("memory after the run: %+v", m)
 		}
 		agents = append(agents, d.Agent)

@@ -5,7 +5,7 @@
 // so that spend would look like a gap. A Meter adds up the cost each run already reports in its metrics events (model
 // and reader calls by their tokens at the VM's own prices, safety.ModelCost; searches at safety.SearchCost: the VM's
 // ledger's figures), and Record adds a tool's total to a local ledger by UTC day. The chat's
-// scripts/test-spend.sh push copies each day's total into the relay's usage_global.test_spend (remote D1, with the
+// scripts/test-spend.sh push copies each day's total into the relay's usage_global.test_spend (its database, with the
 // deploy's Cloudflare token), where the alert counts it on the charged side and the admin's Health view shows it as
 // test spend. Numbers only: no prompt, model text or id is kept.
 package testspend

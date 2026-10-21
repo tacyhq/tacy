@@ -817,7 +817,7 @@ func TestTasksOpenEndpoint(t *testing.T) {
 		auth string
 		code int
 		body string
-	}{{"", 401, ""}, {"Bearer nope", 401, ""}, {"Bearer tok", 200, `{"open":0}`}} {
+	}{{"", 401, ""}, {"Bearer nope", 401, ""}, {"Bearer tok", 200, `{"open":0,"schedules":0}`}} {
 		r := httptest.NewRequest("GET", "/tasks/open", nil)
 		if tc.auth != "" {
 			r.Header.Set("Authorization", tc.auth)

@@ -166,7 +166,7 @@ func (s *Server) serve(c net.Conn) {
 		case tMeta, tEnd:
 		case tModel, tAction:
 			if !haveCtx || f.ID == "" || (f.T == tModel) != (f.Model != nil) || (f.T == tAction) != (f.Action != nil) ||
-				f.Grant != nil && f.T != tAction {
+				(f.Grant != nil || f.Approval != nil) && f.T != tAction {
 				return
 			}
 		default:
@@ -231,7 +231,8 @@ func (s *Server) do(ctx context.Context, sess guard.Session, ti *harness.TaskInf
 			c.Tainted = true
 			ti = &c
 		}
-		res.ActionResult, err = s.G.Action(guard.WithGrant(guard.WithFacts(harness.WithRequestID(ctx, f.ID), facts), f.Grant), ti, f.ID, f.Action)
+		res.ActionResult, err = s.G.Action(guard.WithApproval(guard.WithGrant(guard.WithFacts(harness.WithRequestID(ctx, f.ID), facts), f.Grant),
+			f.Approval), ti, f.ID, f.Action)
 	}
 	res.Facts = facts.Ptr()
 	if err != nil {

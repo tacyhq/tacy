@@ -78,6 +78,11 @@ type safeOpts struct {
 	// wrapUp wraps the model upstream (fake slow or overloaded models); slowAfter is the guard's first-token wait.
 	wrapUp    func(guard.Upstream) guard.Upstream
 	slowAfter time.Duration
+	// release edits the release's ceiling policy (the trigger tests add the test-only sink connector); sink and check
+	// are the guard's sink connector and its approval check (gatewayd's side).
+	release func(p *safety.Policy)
+	sink    *guard.Sink
+	check   *guard.ApprovalCheck
 }
 
 func newSafeEnvWith(t *testing.T, o safeOpts, replies ...string) *safeEnv {
@@ -116,6 +121,9 @@ func newSafeEnvWith(t *testing.T, o safeOpts, replies ...string) *safeEnv {
 		e.keylog = fchatGenesis(t, e.admin, e.kit)
 		cfg.Admins, cfg.Genesis, cfg.Carry = nil, keylogHash(e.keylog[0]), o.carry
 	}
+	if o.release != nil {
+		o.release(cfg.Release)
+	}
 	st, err := safety.NewState(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -136,7 +144,7 @@ func newSafeEnvWith(t *testing.T, o safeOpts, replies ...string) *safeEnv {
 	}
 	g := guard.New(guard.Config{Up: up, Search: search, Fetcher: guard.NewFetcher(true),
 		Limits: &lim, CacheSecret: "boot-secret", Now: func() time.Time { return time.Date(2026, 10, 17, 0, 0, 0, 0, time.UTC) },
-		Safety: st, Reader: reader, SlowAfter: o.slowAfter})
+		Safety: st, Reader: reader, SlowAfter: o.slowAfter, Sink: o.sink, Approvals: o.check})
 	sg := newSafeGateway(g, st, &safety.Ledger{})
 	signer, _ := activity.DeriveSigner(bytes.Repeat([]byte{5}, 32), "f_chat")
 	e.rec = &activity.Recorder{Signer: signer, Store: activity.NewMemStore()}

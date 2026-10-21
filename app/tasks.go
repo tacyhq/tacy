@@ -41,8 +41,8 @@ import (
 //	                     person deleted the conversation (docs/30 decision 5); a task still running is cancelled
 //	                     first (billing witness as for cancel) and deleted as soon as it ended. Without a delete an
 //	                     ended task is kept a day, a built-in agent's result up to 7 days (guard.AgentKeep).
-//	GET  /tasks/open     -> {"open": n}: how many tasks are open (not ended), for the relay's idle timer
-//	                     (bearer token; plaintext, a count only).
+//	GET  /tasks/open     -> {"open": n, "schedules": k}: how many tasks are open (not ended) and how many schedules
+//	                     are active (v0.12.0), for the relay's idle timer (bearer token; plaintext, counts only).
 //	POST /tasks/grant    {task, request, kind, decision, value, mac} -> {outcome}: the person's answer to a
 //	                     permission prompt (guard.Prompts) of a /tasks or /run task. The MAC with the run's
 //	                     secret is the authorization (only the tab that started the run has it). 404
@@ -97,7 +97,11 @@ func (s *server) tasksOpen(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	writeJSON(w, 200, map[string]int{"open": s.tasks().Open()})
+	schedules := 0 // the keep-on signal for personal schedules (docs/30 "Scheduled tasks", decision 3): a count only
+	if s.personal() {
+		schedules = s.triggers.Active()
+	}
+	writeJSON(w, 200, map[string]int{"open": s.tasks().Open(), "schedules": schedules})
 }
 
 // Billing witness headers (plaintext, for the relay).

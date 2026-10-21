@@ -5,6 +5,7 @@ package proto
 import (
 	"crypto/sha512"
 	"encoding/json"
+	"time"
 )
 
 // Version names this wire format. It is part of the report_data hash, so a quote for another format can't be
@@ -45,11 +46,27 @@ type Attestation struct {
 	Booted string `json:"booted"`
 }
 
-// Message is one chat message. Only plain text content: earlier tool calls come back as assistant text.
+// Message is one chat message: plain text (earlier tool calls come back as assistant text), and on a person's
+// message the pictures they attached.
 type Message struct {
 	Role    string `json:"role"` // system | user | assistant
 	Content string `json:"content"`
+	// Images are the person's own pictures with this message (releases since v0.12.0; only on a user message of a
+	// chat run): JPEG data URLs ("data:image/jpeg;base64,..."), resized and re-encoded in their browser, which drops
+	// EXIF and GPS. At most MaxRunImages per run, each at most MaxImageBytes decoded. They go to the run's model
+	// when it can see images, and nowhere else: never into a search, a page fetch, an image search or any other
+	// request (guard/images_in.go).
+	Images []string `json:"images,omitempty"`
 }
+
+// The caps on a run's images (Message.Images). The request's encrypted body is capped too (8 MiB, agentd).
+const (
+	MaxRunImages  = 4         // per run, over all its messages
+	MaxImageBytes = 512 << 10 // one image's JPEG bytes (the chat's own cap per image)
+)
+
+// ImageURLPrefix starts every image a run takes: only JPEG, as the chat sends it.
+const ImageURLPrefix = "data:image/jpeg;base64,"
 
 // DefaultModel is the model a run gets when its request names none.
 const DefaultModel = "gpt-oss-120b"
@@ -249,6 +266,29 @@ type Event struct {
 	Fallback string `json:"fallback,omitempty"`
 	From     string `json:"from,omitempty"`
 	To       string `json:"to,omitempty"`
+	// Approval: an effect held for a person's approval (approve before send, docs/27 section 4), or what became of it.
+	Approval *Approval `json:"approval,omitempty"`
+}
+
+// Approval is an effect held for approval: exactly what would happen (Effect, canonical JSON) and its hash, which the
+// approver's passkey signs over (with the other fields) in POST /approvals. State says what became of it. Untrusted
+// model output inside Effect: display only, and the browser recomputes the hash from what it shows.
+type Approval struct {
+	ID         string          `json:"id"` // ap_
+	Task       string          `json:"task"`
+	Request    string          `json:"request"`
+	Action     string          `json:"action"`
+	Firm       string          `json:"firm"`
+	Space      string          `json:"space"`
+	Effect     json.RawMessage `json:"effect,omitempty"`
+	EffectHash string          `json:"effect_hash"`
+	Approvers  []string        `json:"approvers,omitempty"` // i_ ids that may decide
+	ExpiresAt  time.Time       `json:"expires_at"`
+	// Tainted: the task had read outside content when the action was proposed (docs/27 section 5).
+	Tainted bool `json:"tainted,omitempty"`
+	// State: "" (waiting), approved, denied, expired, sent, failed, unknown (may or may not have gone out: never
+	// sent again by the VM), unavailable (nobody here can approve it: denied without asking).
+	State string `json:"state,omitempty"`
 }
 
 // Permission is a permission prompt: before data of a kind leaves the VM, the person allows it once, always (that kind,

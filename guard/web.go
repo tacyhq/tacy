@@ -55,6 +55,9 @@ func eventName(action string) string {
 // site icons, metrics) under the model tool call the action carries out, and returns what the model sees: done
 // with the tool's JSON; denied when policy refused it (a URL with personal data); failed with the tool's error.
 func (g *Guard) Action(ctx context.Context, ti *harness.TaskInfo, id string, req *harness.Action) (*harness.ActionResult, error) {
+	if strings.HasPrefix(req.Name, "sink.") && g.cfg.Sink != nil { // the test-only connector with effects (sink.go)
+		return g.sinkAction(withTask(ctx, ti.ID), ti, id, req)
+	}
 	app := appTool(req.Name)
 	if app == "" {
 		return nil, harness.Errf(harness.CodeNotAllowed, "no connector runs %s", req.Name)
@@ -65,7 +68,7 @@ func (g *Guard) Action(ctx context.Context, ti *harness.TaskInfo, id string, req
 		return nil, err
 	}
 	ctx = withSpace(ctx, t.opts.Space)
-	if err := g.checkSafety(t.opts.Space, req); err != nil {
+	if err := g.checkSafety(t.opts.Space, req); err != nil && !g.approvedRead(ctx, ti, t, id, req) {
 		if d, ok := deniedResult(err); ok {
 			g.record(Egress{Task: ti.ID, Action: id, Op: req.Name, Decision: "denied", Rule: "policy"})
 			return d, nil
@@ -99,7 +102,11 @@ func (g *Guard) Action(ctx context.Context, ti *harness.TaskInfo, id string, req
 	var shown json.RawMessage
 	// The brain's arguments are scanned before anything is sent: a credential pattern, in any encoding, blocks the
 	// action (denied), like a URL with personal data.
-	if ids := outboundLeak(args); ids != nil {
+	if len(t.opts.Images) > 0 && imageInArgs(args, t.opts.Images) {
+		// The person's images go to the model only (images_in.go): an action carrying one sends nothing.
+		g.record(Egress{Task: ti.ID, Action: id, Op: req.Name, Decision: "denied", Rule: "image"})
+		p, shown = pending{out: imageRefused()}, json.RawMessage(args)
+	} else if ids := outboundLeak(args); ids != nil {
 		g.record(Egress{Task: ti.ID, Action: id, Op: req.Name, Decision: "denied", Rule: "leak_scan", Patterns: ids})
 		FactsFrom(ctx).leak(true, ids)
 		provider := ""
@@ -122,6 +129,7 @@ func (g *Guard) Action(ctx context.Context, ti *harness.TaskInfo, id string, req
 	// fields, never the text. A plain chat's search starts each result's picture as soon as that result is read
 	// (cardpics.go prefetchResult), while the reader reads the others: it is shown after the result.
 	if d := g.readerDoc(ctx, ti.ID, id, req.Name, &p); d != nil {
+		d.linked = p.page != nil && t.tools.isLinked(p.page.asked)
 		var onPart func(int, *readerResult)
 		if t.opts.Via == ViaSearch && len(p.results) == len(d.results) {
 			onPart = func(i int, r *readerResult) { g.prefetchResult(t, p.results[i], r.items) }
@@ -156,7 +164,7 @@ func (g *Guard) Action(ctx context.Context, ti *harness.TaskInfo, id string, req
 			URL: im.URL, Type: "image/jpeg", Width: im.Width, Height: im.Height, Data: im.JPEG}})
 	}
 	t.emit(proto.Event{Type: "tool_result", ID: call, Name: app, Args: shown, Masked: out.masked,
-		Result: json.RawMessage(out.content), Citations: out.citations, Quotes: out.quotes})
+		Result: json.RawMessage(out.content), Citations: append(slices.Clone(out.citations), out.links...), Quotes: out.quotes})
 	t.numbering.Unlock()
 	t.icons.add(sourceURLs(out)...)
 	m := toolMetric(app, step, out, ms)

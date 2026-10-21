@@ -27,8 +27,9 @@ type Policy struct {
 	Models []string `json:"models"`
 	// Connectors allowed, by name ("model", "web"); a connector not listed is off, with all its tools.
 	Connectors map[string]Connector `json:"connectors"`
-	// Approve names actions that need a person's approval. Approvals aren't built yet, so listed
-	// actions are refused.
+	// Approve names actions that need a person's approval before each one runs (docs/27 section 4). Sends always
+	// need one whatever this says; a policy can add approvals, never remove them. A release without approvals
+	// refuses listed actions.
 	Approve []string `json:"approve,omitzero"`
 	// StaleReads: when the stop list is stale, reads (model calls, searches, fetches) may go on. Side effects
 	// always stop.
@@ -240,10 +241,20 @@ func (e *Effective) AllowsModel(m string) bool {
 }
 
 // AllowsTool: the action's connector is on and every layer lists the action, and no layer holds it for approval
-// (approvals aren't built: held means refused).
+// (an action a layer holds for approval runs only with a person's approval: AllowsToolApproved).
 func (e *Effective) AllowsTool(action string) bool {
 	conn, _, _ := strings.Cut(action, ".")
 	return !e.NeedsApproval(action) && e.all(func(p *Policy) bool {
+		c, ok := p.Connectors[conn]
+		return ok && slices.Contains(c.Tools, action)
+	})
+}
+
+// AllowsToolApproved: the action's connector is on and every layer lists the action, whatever the layers' approve
+// lists say: for an action that carries a person's verified approval (docs/27 section 4).
+func (e *Effective) AllowsToolApproved(action string) bool {
+	conn, _, _ := strings.Cut(action, ".")
+	return e.all(func(p *Policy) bool {
 		c, ok := p.Connectors[conn]
 		return ok && slices.Contains(c.Tools, action)
 	})

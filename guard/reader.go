@@ -447,10 +447,13 @@ func (rc *ReaderConfig) system() string {
 
 // readerDoc is one item for the reader: a page, or one search's results.
 type readerDoc struct {
-	kind  string // "page" | "search"
-	title string // page
-	url   string // page
-	text  string // page: its text (redacted)
+	kind string // "page" | "search"
+	// linked: a page opened from a numbered link of a page the person named (links.go): one of the items their
+	// question covers, read for what it says itself (linkedNote).
+	linked bool
+	title  string // page
+	url    string // page
+	text   string // page: its text (redacted)
 	// search: each result's title and snippet (redacted), labelled R1, R2, ... in order
 	results []SearchResult
 	// earlier, earlierSkel: the run sets of the sources the task read before this one (taskSources), and, for one
@@ -467,6 +470,9 @@ type readerResult struct {
 	quotes []keptQuote
 	items  []keptItem // checked (checkItems)
 	err    string     // set when nothing is shown (refused, failed): the words the acting model gets
+	// strict: the source tried to instruct an AI (the reader counted an instruction, or code found instruction-like
+	// sentences): its links aren't given (links.go).
+	strict bool
 	// parts: a search read one result per call (ReaderConfig.Split): part i is result i's own checked answer (its
 	// quotes' and items' result 0 is that result), or its failure; out, quotes and items are then unused.
 	parts []*readerResult
@@ -631,6 +637,14 @@ func marked(seg string, si int, spans []span) string {
 	return b.String()
 }
 
+// linkedNote tells the reader that a page opened from a page's numbered link is one of the items the question covers.
+// cmd/digestlab (2026-10-20): given only the digest's instructions ("read the Hacker News front page and send a
+// digest of the top stories"), the reader judged a linked article "not the Hacker News front page, so nothing here
+// bears on the digest" and gave no facts, in 5 of 77 articles read; the digest then said those couldn't be read.
+const linkedNote = "This page was opened from a link on a page the person named: it is one of the items their question " +
+	"covers. Read it for what it says itself (its subject, main points, names, numbers and dates), as if the question were " +
+	"\"what does this page say?\"; don't judge it against the rest of the question."
+
 // prompt is the reader's user message: the person's question (context), what the item is, and the item between
 // marker lines with a random nonce, so the document can't fake its own end. A page's title and address are the
 // page author's text too, so they go inside the markers. With spans (quotes by reference: splitSpans of
@@ -645,6 +659,9 @@ func (d *readerDoc) prompt(question string, spans []span) string {
 		q = "(none given: extract what matters most)"
 	}
 	fmt.Fprintf(&b, "The person's question (context only, not part of the document): %s\n\n", capRunes(q, maxQuestionRunes))
+	if d.linked {
+		b.WriteString(linkedNote + "\n\n")
+	}
 	if d.kind == "page" {
 		b.WriteString("Kind: web page (its title and address are the first lines of the document)\n")
 	} else {
@@ -773,12 +790,30 @@ func (g *Guard) readOne(ctx context.Context, t *task, step int, rc *ReaderConfig
 	// answer that asked for a tool (whatever made it do that is in the document).
 	if res.err != "" && rc.Fallback != "" && rc.Fallback != rc.Model && use.Why != "tool_call" && rctx.Err() == nil {
 		res, _ = g.readModel(rctx, t, step, rc, d, rc.Fallback, rc.FallbackEffort, 0)
+	} else if res.err == "" && blankRead(d, res) && rc.Fallback != "" && rc.Fallback != rc.Model && rctx.Err() == nil {
+		// A blank answer (no summary and no facts) for a page with text to read: the model's structured
+		// output gave up (whitespace in empty arrays), not the page. cmd/digestlab (2026-10-20): 23 of 329 page
+		// reads on deepseek-v4-1-flash, each then reported as "couldn't be read". The fallback reads it once more;
+		// if it gives nothing either, the blank answer stands.
+		if again, _ := g.readModel(rctx, t, step, rc, d, rc.Fallback, rc.FallbackEffort, 0); again.err == "" && !blankRead(d, again) {
+			res = again
+		}
 	}
 	if res.err == "" {
 		t.reads.put(key, res)
 	}
 	return res
 }
+
+// blankRead: a page with at least blankReadRunes of text came back without a summary or a fact (at most an item, a
+// quote or a wording line: nothing to say what the page says).
+func blankRead(d *readerDoc, r *readerResult) bool {
+	return d.kind == "page" && r.out != nil && utf8.RuneCountInString(d.text) >= blankReadRunes && strings.TrimSpace(r.out.Summary) == "" &&
+		len(r.out.Facts) == 0
+}
+
+// blankReadRunes: below this a page may truly have nothing to say (a title and a cookie line).
+const blankReadRunes = 400
 
 // readModel is one reader call on model, at most limit long (0: ctx bounds it): a slot of the VM's reader calls
 // first (readerSlots), then the call; its numbers go to the facts and, as a "reader" metric naming the model, to the
@@ -1020,6 +1055,7 @@ func checkAnswer(rc *ReaderConfig, d *readerDoc, segs []string, spans []span, ou
 	if strict {
 		inj = inj.withLinks()
 	}
+	res.strict = strict
 	// Items: each name and price must be the cited source's own words (they are then given as it writes them).
 	if rc.items() {
 		res.items, use.ItemsDropped = checkItems(d, segs, out.Items, strict)

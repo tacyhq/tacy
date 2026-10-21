@@ -1,6 +1,7 @@
 package runauth
 
 import (
+	"bytes"
 	"crypto/ecdh"
 	"crypto/ed25519"
 	"encoding/base64"
@@ -165,6 +166,17 @@ func makeVectors(t *testing.T) *vectors {
 	r = base
 	r.Agent = "a_research"
 	refuse("an agent added after signing", r)
+	// The person's images (v0.12.0), added after the vectors above: they keep their bytes (a request without images
+	// hashes as before), and these come after them.
+	img1 := proto.ImageURLPrefix + base64.StdEncoding.EncodeToString(append([]byte{0xff, 0xd8, 0xff, 0xe0}, bytes.Repeat([]byte{7}, 60)...))
+	img2 := proto.ImageURLPrefix + base64.StdEncoding.EncodeToString(append([]byte{0xff, 0xd8, 0xff, 0xe0}, bytes.Repeat([]byte{9}, 40)...))
+	add("images", proto.RunRequest{Model: "deepseek-v4-1-flash", RunSecret: strings.Repeat("ef", 32),
+		FallbackModels: []string{"kimi-k3", "gemma4-31b"}, AutoFallback: true,
+		Messages: []proto.Message{{Role: "user", Content: "what is this?", Images: []string{img1}},
+			{Role: "assistant", Content: "A red espresso machine."}, {Role: "user", Content: "where can I buy it?", Images: []string{img2, img1}}}})
+	r = base
+	r.Messages = []proto.Message{{Role: "user", Content: "hi", Images: []string{img1}}}
+	refuse("an image added after signing", r)
 	return v
 }
 

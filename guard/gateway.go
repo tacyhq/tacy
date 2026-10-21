@@ -67,7 +67,9 @@ func (g *Guard) ModelCall(ctx context.Context, ti *harness.TaskInfo, req *harnes
 	}
 	// The request as the old app/agent.go built it.
 	build := func(model, effort string) []byte {
-		body := map[string]any{"model": model, "messages": toModel(req.Messages), "stream": true,
+		msgs := toModel(req.Messages)
+		withImages(msgs, req.Messages, t.opts.Images, SeesImages(model)) // the person's images: to the model only (images_in.go)
+		body := map[string]any{"model": model, "messages": msgs, "stream": true,
 			"stream_options": map[string]any{"include_usage": true}}
 		if secret := cmp.Or(t.opts.CacheSecret, g.cfg.CacheSecret); secret != "" {
 			body["user_cache_secret"] = secret

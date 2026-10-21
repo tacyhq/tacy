@@ -87,6 +87,9 @@ func redactOutcome(out *toolOutcome) []string {
 		str(&out.citations[i].Title)
 		str(&out.citations[i].Snippet)
 	}
+	for i := range out.links {
+		str(&out.links[i].Title)
+	}
 	for i := range out.images {
 		str(&out.images[i].Title)
 	}

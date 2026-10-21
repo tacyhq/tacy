@@ -403,8 +403,11 @@ func (g *safeGateway) Why(task string) (string, string) {
 	return "", ""
 }
 
+// (These read only the field they need from the options: the person's images may be megabytes there.)
 func (g *safeGateway) space(ti *harness.TaskInfo) string {
-	var o guard.TaskOptions
+	var o struct {
+		Space string `json:"space"`
+	}
 	if ti.Options != nil && json.Unmarshal(ti.Options, &o) == nil && o.Space != "" {
 		return o.Space
 	}
@@ -416,7 +419,9 @@ func (g *safeGateway) space(ti *harness.TaskInfo) string {
 
 // agent is the built-in agent a task runs ("": the chat): from its options, or its start's reference.
 func (g *safeGateway) agent(ti *harness.TaskInfo) string {
-	var o guard.TaskOptions
+	var o struct {
+		Agent string `json:"agent"`
+	}
 	if ti.Options != nil && json.Unmarshal(ti.Options, &o) == nil && o.Agent != "" {
 		return o.Agent
 	}
@@ -433,6 +438,21 @@ func (g *safeGateway) refuse(task, hcode string, err error) error {
 	return harness.Errf(hcode, "%s", msg)
 }
 
+// images is how many of the person's images the task's model requests carry (guard.TaskOptions.Images).
+func images(ti *harness.TaskInfo) int {
+	var o struct {
+		Images []struct{} `json:"images"`
+	}
+	if ti.Options != nil && json.Unmarshal(ti.Options, &o) == nil {
+		return len(o.Images)
+	}
+	return 0
+}
+
+// imageTokens is the most one of the person's images costs a model call (Kimi K3 on the chat's 1536 px images: about
+// 2,300; the chat's config), so the budget reserves enough for them.
+const imageTokens = 2600
+
 func (g *safeGateway) ModelCall(ctx context.Context, ti *harness.TaskInfo, req *harness.ModelCall) (*harness.ModelResult, error) {
 	e, err := g.st.Check(g.space(ti), guard.Effect(req))
 	if err != nil {
@@ -448,7 +468,7 @@ func (g *safeGateway) ModelCall(ctx context.Context, ti *harness.TaskInfo, req *
 			n += len(c.Args) + len(c.RawArgs) + 64
 		}
 	}
-	prompt := safety.EstimateTokens(n)
+	prompt := safety.EstimateTokens(n) + int64(images(ti)*imageTokens)
 	agent := g.agent(ti)
 	b := budget(e, agent)
 	// The completion gets what the budget has left, at most CompletionReserve; the guard ends the call if its
@@ -491,10 +511,12 @@ func (g *safeGateway) Action(ctx context.Context, ti *harness.TaskInfo, id strin
 	if err != nil {
 		return nil, g.refuse(ti.ID, harness.CodeNotAllowed, err)
 	}
-	if !e.AllowsTool(req.Name) {
+	// An action a policy layer holds for approval runs only with the person's approval (guard.Approvals put it
+	// in after checking it; gatewayd checks it again).
+	if !e.AllowsTool(req.Name) && !(e.NeedsApproval(req.Name) && guard.ApprovalFrom(ctx) != nil && e.AllowsToolApproved(req.Name)) {
 		why := "isn't allowed by the policy"
-		if e.NeedsApproval(req.Name) {
-			why = "needs approval, which isn't available yet"
+		if e.NeedsApproval(req.Name) && e.AllowsToolApproved(req.Name) {
+			why = "needs a person's approval"
 		}
 		return &harness.ActionResult{Status: harness.ActionDenied, Error: safety.CodePolicyDenied + ": " + req.Name + " " + why}, nil
 	}

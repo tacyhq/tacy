@@ -23,15 +23,16 @@ import (
 const maxPersonLinks = 64
 
 // sourceRefRe is a fetch's url argument naming a source: "[3]".
-var sourceRefRe = regexp.MustCompile(`^\[\s*([0-9]{1,4})\s*\]$`)
+var sourceRefRe = regexp.MustCompile(`^(?:\[\s*([0-9]{1,4})\s*\]|([0-9]{1,4}))$`)
 
-// SourceRef reads a fetch's url argument of the form "[n]".
+// SourceRef reads a fetch's url argument of the form "[n]", or a bare "n" (never an address: cmd/digestlab
+// 2026-10-20 saw models fetch "14" for [14], refused as a composed address, and spend steps finding out).
 func SourceRef(s string) (int, bool) {
 	m := sourceRefRe.FindStringSubmatch(strings.TrimSpace(s))
 	if m == nil {
 		return 0, false
 	}
-	n, err := strconv.Atoi(m[1])
+	n, err := strconv.Atoi(m[1] + m[2])
 	return n, err == nil && n > 0
 }
 

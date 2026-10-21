@@ -122,8 +122,10 @@ type Agent struct {
 
 // Trigger says what started the run.
 type Trigger struct {
-	Kind string `json:"kind"`          // "chat": a person's browser, through the relay
-	Via  string `json:"via,omitempty"` // "relay"
+	// "chat": a person's browser, through the relay; "search": a plain chat's search; "schedule" or "event": an
+	// unattended run its signed definition's trigger started on the VM (via "trigger"; v0.12.0).
+	Kind string `json:"kind"`
+	Via  string `json:"via,omitempty"` // "relay", "trigger", or "resume" (taken up after a restart)
 }
 
 // Controls are the signed controls the run started under (the safety documents' hashes and numbers).
@@ -146,6 +148,9 @@ type Limits struct {
 type Input struct {
 	Messages int `json:"messages"`
 	Bytes    int `json:"bytes"`
+	// Images the person gave the run (v0.12.0): how many and their JPEGs' bytes in all; never what they show.
+	Images     int `json:"images,omitzero"`
+	ImageBytes int `json:"image_bytes,omitzero"`
 }
 
 // Status is how a run ended.

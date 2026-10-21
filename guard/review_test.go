@@ -641,6 +641,59 @@ func TestCrossSlots(t *testing.T) {
 	}
 }
 
+// clauseFile is a file of n parts of about 2,900 characters, one numbered clause each.
+func clauseFile(name string, n int) TaskFile {
+	text := ""
+	for i := 1; i <= n; i++ {
+		text += fmt.Sprintf("%d. Clause.\n%s\n\n", i, strings.Repeat("The parties agree to this term. ", 90))
+	}
+	return TaskFile{Name: name, Text: text}
+}
+
+// A review whose files are read in one files.read reserves, beside the section calls, its largest file's check at
+// its largest; a review of more parts, research, and actions other than files.read reserve the section calls only.
+func TestCrossReserve(t *testing.T) {
+	small, big := clauseFile("nda.txt", 3), clauseFile("msa.txt", 9)
+	if n := len(splitSections(big.Text, reviewPartRunes)); n != 9 {
+		t.Fatalf("%d parts", n)
+	}
+	if got := CrossReserve(AgentReview, []TaskFile{small, big}); got != len(big.Text) {
+		t.Fatalf("12 parts: %d", got)
+	}
+	for _, c := range []struct {
+		agent string
+		files []TaskFile
+	}{{AgentReview, []TaskFile{clauseFile("a.txt", 4), big}}, {AgentReview, []TaskFile{{Name: "one.txt", Text: "1. Short."}}},
+		{AgentResearch, []TaskFile{big}}, {AgentReview, nil}} {
+		if got := CrossReserve(c.agent, c.files); got != 0 {
+			t.Fatalf("%s, %d files: %d", c.agent, len(c.files), got)
+		}
+	}
+	secT, secC, _ := ReaderReserve("files.read", nil)
+	revT, revC, _ := ReaderReserveFor(AgentReview, []TaskFile{small, big}, "files.read", nil)
+	p := readerCallMax(len(big.Text))
+	if revT-secT != p+crossMaxOut || revC-secC != safety.ModelCost(ReaderModel, p, crossMaxOut) {
+		t.Fatalf("review reserves %d/%d, sections %d/%d", revT, revC, secT, secC)
+	}
+	for _, c := range []struct {
+		agent, action string
+		files         []TaskFile
+	}{{AgentReview, "files.read", []TaskFile{clauseFile("a.txt", 4), big}}, {AgentResearch, "files.read", []TaskFile{big}}} {
+		if gotT, gotC, _ := ReaderReserveFor(c.agent, c.files, c.action, nil); gotT != secT || gotC != secC {
+			t.Fatalf("%s %s: %d/%d", c.agent, c.action, gotT, gotC)
+		}
+	}
+	if t1, c1, _ := ReaderReserve("web.fetch", nil); func() bool {
+		t2, c2, _ := ReaderReserveFor(AgentReview, []TaskFile{big}, "web.fetch", nil)
+		return t1 != t2 || c1 != c2
+	}() {
+		t.Fatal("only files.read reserves a check")
+	}
+	if _, c2, _ := ReaderReserveFor(AgentReview, []TaskFile{big}, "files.read", func(m string) bool { return m == ReaderFallbackModel }); c2 >= secC {
+		t.Fatal("a policy without the reader's model reserves no check")
+	}
+}
+
 // crossFile is a file of two parts: Part I and Part II, each about 3,000 characters.
 func crossFile() TaskFile {
 	return TaskFile{Name: "policy.txt", Text: "Part I\n\n1. Rules. " + strings.Repeat("Officers should pre-clear trades. ", 80) +
@@ -716,33 +769,47 @@ func TestReviewCrossCheck(t *testing.T) {
 	}
 }
 
-// A file whose check doesn't fit beside its last parts' reads gets it from the next files.read, alone; the result
-// says so until then.
+// A review read in one files.read reserves its largest file's check beside the section calls (CrossReserve): the
+// first file whose last parts the read reads gets its check in the same read however many parts that is; a second
+// file's check that doesn't fit in the section calls left gets it from the next files.read, alone; the result says so
+// until then. A review of more parts reserves the section calls only: a check that doesn't fit in what a read leaves
+// runs with the next one.
 func TestReviewCrossCheckLater(t *testing.T) {
-	text := ""
-	for i := 1; i <= 9; i++ {
-		text += fmt.Sprintf("%d. Clause.\n%s\n\n", i, strings.Repeat("The parties agree to this term. ", 90))
-	}
-	f := TaskFile{Name: "msa.txt", Text: text}
-	if n := len(splitSections(text, reviewPartRunes)); n != 9 || crossSlots(len(text)) <= maxSectionsPerRead-9 {
-		t.Fatalf("%d parts, %d slots", n, crossSlots(len(text)))
-	}
-	sm := &splitModel{
-		acting: []string{toolCallSSE("c1", "files_read", `{}`), toolCallSSE("c2", "files_read", `{}`), textSSE("## Summary\nDone [quote 1].")},
-		reader: func(prompt string) string { return fileAnswer(t, nil) },
-	}
-	evs := newReviewE2E(t, sm).review(t, reviewReq(f))
-	var outs []filesReadOut
-	for _, e := range evs {
-		if e.Type == "tool_result" && e.Name == "files_read" {
-			var o filesReadOut
-			json.Unmarshal(e.Result, &o)
-			outs = append(outs, o)
+	reads := func(files ...TaskFile) ([]filesReadOut, int) {
+		sm := &splitModel{
+			acting: []string{toolCallSSE("c1", "files_read", `{}`), toolCallSSE("c2", "files_read", `{}`), textSSE("## Summary\nDone [quote 1].")},
+			reader: func(prompt string) string { return fileAnswer(t, nil) },
 		}
+		evs := newReviewE2E(t, sm).review(t, reviewReq(files...))
+		var outs []filesReadOut
+		for _, e := range evs {
+			if e.Type == "tool_result" && e.Name == "files_read" {
+				var o filesReadOut
+				json.Unmarshal(e.Result, &o)
+				outs = append(outs, o)
+			}
+		}
+		return outs, len(sm.readReqs)
 	}
-	if len(outs) != 2 || len(outs[0].Parts) != 9 || len(outs[0].Checks) != 0 || !strings.Contains(outs[0].Next, "1 whole-file check is still to run") ||
-		len(outs[1].Parts) != 0 || len(outs[1].Checks) != 1 || outs[1].Checks[0].Read == nil || len(sm.readReqs) != 10 {
-		t.Fatalf("results %+v, %d reader calls", outs, len(sm.readReqs))
+	f1, f2 := clauseFile("msa.txt", 9), clauseFile("order.txt", 3)
+	if crossSlots(len(f1.Text)) <= maxSectionsPerRead-9 || crossSlots(len(f2.Text)) == 0 {
+		t.Fatalf("slots %d, %d", crossSlots(len(f1.Text)), crossSlots(len(f2.Text)))
+	}
+	outs, calls := reads(f1, f2)
+	if len(outs) != 2 || len(outs[0].Parts) != 12 || len(outs[0].Checks) != 1 || outs[0].Checks[0].File != 1 || outs[0].Checks[0].Read == nil ||
+		!strings.Contains(outs[0].Next, "1 whole-file check is still to run") ||
+		len(outs[1].Parts) != 0 || len(outs[1].Checks) != 1 || outs[1].Checks[0].File != 2 || outs[1].Checks[0].Read == nil || calls != 14 {
+		t.Fatalf("results %+v, %d reader calls", outs, calls)
+	}
+	// 13 parts: the first read has no room for msa.txt's check; the second reads the last part and runs both.
+	f2 = clauseFile("order.txt", 4)
+	if crossSlots(len(f1.Text))+crossSlots(len(f2.Text)) > maxSectionsPerRead-1 {
+		t.Fatal("slots")
+	}
+	outs, calls = reads(f1, f2)
+	if len(outs) != 2 || len(outs[0].Parts) != 12 || len(outs[0].Checks) != 0 || outs[0].Unread != 1 ||
+		len(outs[1].Parts) != 1 || len(outs[1].Checks) != 2 || calls != 15 {
+		t.Fatalf("results %+v, %d reader calls", outs, calls)
 	}
 }
 

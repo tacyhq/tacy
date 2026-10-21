@@ -186,6 +186,11 @@ type TaskOptions struct {
 	// Files are the person's attached files of a review task (review.go): read in the VM by the quarantined reader
 	// through files.*, never shown to the acting model. On the encrypted disk with the task, deleted with it.
 	Files []TaskFile `json:"files,omitzero"`
+	// Memory: an unattended task whose schedule remembers its runs (trigger.Definition.Memory): agentd keeps what it
+	// found when it ends. NoChange: it may call schedule.no_change (a notify-changes schedule with an earlier run to
+	// compare with; schedule.go).
+	Memory   bool `json:"memory,omitzero"`
+	NoChange bool `json:"no_change,omitzero"`
 }
 
 // task is the guard's state for one task: what the old app/agent.go kept per run.
@@ -344,7 +349,9 @@ func ReplaySafe(req any) bool {
 	case *harness.ModelCall:
 		return true
 	case *harness.Action:
-		return appTool(b.Name) != "" || isFilesAction(b.Name) // web.search, web.fetch, web.images; files.* (read only)
+		// web.search, web.fetch, web.images; files.* (read only); schedule.no_change (marks only the run's own result);
+		// document.create (nothing sent or changed)
+		return appTool(b.Name) != "" || isFilesAction(b.Name) || IsNoChangeAction(b.Name) || isDocumentAction(b.Name)
 	}
 	return false
 }
@@ -355,7 +362,8 @@ var _ harness.ReplayGuard = (*Guard)(nil)
 // the brain, the task is tainted (docs/27 section 5). The reader's fields count too: they come from the same text.
 func (g *Guard) Untrusted(_ *harness.TaskInfo, req any) bool { return Untrusted(req) }
 
-// Untrusted is Guard.Untrusted for any gateway (it depends on the request only).
+// Untrusted is Guard.Untrusted for any gateway (it depends on the request only). A document made (document.create)
+// isn't: its result is the guard's own check of what the model wrote, nothing from outside.
 func Untrusted(req any) bool {
 	a, ok := req.(*harness.Action)
 	return ok && (appTool(a.Name) != "" || isFilesAction(a.Name)) // a person's file may carry an injection too
@@ -651,8 +659,14 @@ func startFor(r *proto.RunRequest, now time.Time, reader bool) (harness.Start, T
 	var actions []string
 	for _, n := range r.Tools {
 		a := webAction(n)
+		if n == documentTool { // only when the request names it (a chat that shows documents: documents.go)
+			a = DocumentAction
+		}
 		if a == "" {
 			return s, TaskOptions{}, fmt.Errorf("unknown tool %q", n)
+		}
+		if slices.Contains(actions, a) {
+			return s, TaskOptions{}, fmt.Errorf("tool %q is listed twice", n)
 		}
 		actions = append(actions, a)
 	}
@@ -776,6 +790,9 @@ func chatInstructions(actions []string, now time.Time, reader bool) string {
 `)
 		}
 	}
+	if slices.Contains(actions, DocumentAction) {
+		b.WriteString(chatDocumentLine)
+	}
 	if slices.Contains(actions, "web.images") {
 		img := harness.ModelToolName("web.images")
 		b.WriteString(`- You can show pictures: when the user asks for photos or pictures of real things, posters, artwork or what something looks like, call ` + img + ` (not for drawings, graphs or diagrams the user wants made: draw those yourself). The app shows the images in a gallery under your answer. Never say you can't display or show images, and don't embed images as Markdown or list image URLs.
@@ -784,6 +801,10 @@ func chatInstructions(actions []string, now time.Time, reader bool) string {
 	}
 	return b.String()
 }
+
+// chatDocumentLine is the chat agent's line for document_create (documents.go), when its request asked for it.
+var chatDocumentLine = "- Documents: when the person asks for a file, a document, a download or a format (\"as a Word doc\", \"a PDF\", \"a CSV\"), or for content they'll send or file elsewhere (a drafted letter, email, memo or report longer than a few sentences), call " +
+	harness.ModelToolName(DocumentAction) + " with the complete document (cite sources in it as [n]) and keep your answer to a short lead-in. Never paste the document into your answer instead, and never say you can't make files.\n"
 
 // ToolDefs are the start.tools entries for web connector actions: tools.go's descriptions and schemas under
 // the action names. Unknown names are left out.

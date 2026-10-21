@@ -35,7 +35,7 @@ func TestAgentDefinitions(t *testing.T) {
 		t.Fatal("chat ref")
 	}
 	r := AgentRef(AgentResearch)
-	if r.ID != AgentResearch || r.Version != "2" || len(r.Digest) != 64 || r.Digest == "unsigned" {
+	if r.ID != AgentResearch || r.Version != "3" || len(r.Digest) != 64 || r.Digest == "unsigned" {
 		t.Fatalf("research ref %+v", r)
 	}
 	// The digest covers the definition: changing a limit changes it.

@@ -494,15 +494,15 @@ func TestTriggeredFallbacks(t *testing.T) {
 		return trigger.Fire{Task: "tk_t", Def: &trigger.Definition{Agent: "a_x", Space: testSpace, Models: models, Instructions: "digest"},
 			Trigger: trigger.Trigger{ID: "tr_x", Kind: trigger.Schedule, Daily: "08:00", Zone: "UTC"}, At: time.Now()}
 	}
-	s, o, err := TriggeredStart(fire("deepseek-v4-1-flash", "glm-5-3", "nope", "deepseek-v4-1-flash", "gemma4-31b"), "f_x", time.Now())
+	s, o, err := TriggeredStart(fire("deepseek-v4-1-flash", "glm-5-3", "nope", "deepseek-v4-1-flash", "gemma4-31b"), "f_x", time.Now(), nil)
 	if err == nil {
 		t.Fatal("a definition naming an unknown model started")
 	}
-	s, o, err = TriggeredStart(fire("deepseek-v4-1-flash", "glm-5-3", "deepseek-v4-1-flash", "gemma4-31b"), "f_x", time.Now())
+	s, o, err = TriggeredStart(fire("deepseek-v4-1-flash", "glm-5-3", "deepseek-v4-1-flash", "gemma4-31b"), "f_x", time.Now(), nil)
 	if err != nil || !o.AutoFallback || !slices.Equal(o.Fallbacks, []string{"glm-5-3", "gemma4-31b"}) || s.Models[0] != "deepseek-v4-1-flash" {
 		t.Fatalf("fallbacks %v %v (models %v) %v", o.AutoFallback, o.Fallbacks, s.Models, err)
 	}
-	_, o, err = TriggeredStart(fire("deepseek-v4-1-flash"), "f_x", time.Now())
+	_, o, err = TriggeredStart(fire("deepseek-v4-1-flash"), "f_x", time.Now(), nil)
 	if err != nil || o.AutoFallback || o.Fallbacks != nil {
 		t.Fatalf("one model: %v %v %v", o.AutoFallback, o.Fallbacks, err)
 	}

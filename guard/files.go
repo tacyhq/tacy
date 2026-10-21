@@ -170,22 +170,28 @@ func isFilesAction(action string) bool {
 	return slices.ContainsFunc(filesTools, func(f struct{ action, name string }) bool { return f.action == action })
 }
 
-// toolAction is the action for a tool name (web or files; "" for none).
+// toolAction is the action for a tool name (web, files or documents; "" for none).
 func toolAction(name string) string {
 	for _, f := range filesTools {
 		if f.name == name {
 			return f.action
 		}
 	}
+	if name == documentTool {
+		return DocumentAction
+	}
 	return webAction(name)
 }
 
-// toolName is the tools.go name of an action (web or files; "" for none): its tool definition's key.
+// toolName is the tools.go name of an action (web, files or documents; "" for none): its tool definition's key.
 func toolName(action string) string {
 	for _, f := range filesTools {
 		if f.action == action {
 			return f.name
 		}
+	}
+	if action == DocumentAction {
+		return documentTool
 	}
 	return appTool(action)
 }
@@ -658,6 +664,29 @@ func (s *filesState) checksLeft() int {
 	return n
 }
 
+// CrossReserve is the characters of the largest file of a task of agent with files whose cross-check a files.read
+// reserves beside its section calls (ReaderReserveFor), or 0: a review (an agent with no egress) whose files' parts
+// all fit in one files.read, with a file that gets a check (2 or more parts, at most crossMaxRunes characters:
+// crossDue). agentd (the reservation) and gatewayd (readSections: what a read may run) both decide by it, from the
+// task's options.
+func CrossReserve(agent string, files []TaskFile) int {
+	d, ok := Definition(agent)
+	if !ok || !d.NoEgress || !d.Files {
+		return 0
+	}
+	parts, largest := 0, 0
+	for _, f := range files {
+		n, chars := len(splitSections(f.Text, d.PartRunes)), utf8.RuneCountInString(f.Text)
+		if parts += n; parts > maxSectionsPerRead {
+			return 0
+		}
+		if n >= 2 && chars <= crossMaxRunes {
+			largest = max(largest, chars)
+		}
+	}
+	return largest
+}
+
 // crossSlots is how many of a files.read's maxSectionsPerRead reader calls a file of n characters' cross-check
 // takes: agentd reserves that many section reads at their largest (ReaderReserve), and the check's one call at its
 // largest (on the reader's model; it has no fallback) must fit in what the section calls it replaces would have
@@ -875,14 +904,18 @@ func (g *Guard) readSections(ctx context.Context, t *task, task, id string, refs
 		doc  *readerDoc
 	}
 	var crosses []crossRef
-	slots := maxSectionsPerRead - len(refs)
+	// The read's reservation (ReaderReserveFor): maxSectionsPerRead section calls, of which refs use some, and for a
+	// review read in one files.read, its largest file's check (CrossReserve). A due check takes the section calls
+	// left when they cover it, else that one check's (the first such); one that fits neither runs with the next
+	// files.read.
+	slots, own := maxSectionsPerRead-len(refs), CrossReserve(t.def.ID, t.opts.Files) > 0
 	for fi := range t.files.files {
 		f := &t.files.files[fi]
 		if !rc.Files || !t.files.crossDue(fi, refs) { // a review's files only
 			continue
 		}
 		n := crossSlots(utf8.RuneCountInString(f.text))
-		if n > slots {
+		if n > slots && !own {
 			continue
 		}
 		text, ids := redactForReader(f.text)
@@ -890,7 +923,11 @@ func (g *Guard) readSections(ctx context.Context, t *task, task, id string, refs
 		if len(splitSpans(d.segments(true))) >= maxSpans { // too many lines to number: no check
 			continue
 		}
-		slots -= n
+		if n <= slots {
+			slots -= n
+		} else {
+			own = false
+		}
 		redacted = append(redacted, ids...)
 		f.cross.pending = true
 		crosses = append(crosses, crossRef{fi, f.name, d})

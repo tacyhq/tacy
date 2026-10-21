@@ -327,3 +327,5 @@ func TestChangedScheduleCountsAfresh(t *testing.T) {
 }
 
 func TestMemPersonalStores(t *testing.T) { RunPersonalStoreTests(t, &MemHolders{}, &MemResults{}) }
+
+func TestMemMemoryStore(t *testing.T) { RunMemoryStoreTests(t, &MemMemory{}) }

@@ -17,6 +17,7 @@ import (
 
 	"github.com/tacyhq/tacy/harness"
 	"github.com/tacyhq/tacy/proto"
+	"github.com/tacyhq/tacy/trigger"
 )
 
 // The task model's front (docs/27 section 1, slice 1). A task no longer belongs to the tab that started it: Host
@@ -71,6 +72,15 @@ type Host struct {
 	// TriggeredDone, when set, is told when an unattended task (ViaTrigger) ended, once its last event is in the
 	// queue (agentd seals its result to the space's seal key and forgets the task: schedules.go).
 	TriggeredDone func(id string, opts TaskOptions)
+	// Memory, when set, is a schedule's memory for its next run, newest first (agentd's side file; schedule
+	// upgrades). An error leaves the slot unstarted.
+	Memory func(space, agent string) ([]trigger.Remembered, error)
+	// TaskEnded, when set, is told when a POST /tasks task ended (not one its starter deleted while it ran), once its
+	// last event is in the queue (agentd: a hand-off task nobody follows notifies its person; notify.go).
+	TaskEnded func(id string, opts TaskOptions)
+	// Allows, when set, says whether a space's policy allows an action (agentd: its effective policy). A fired
+	// task's start then leaves out the tools it can do without that the policy doesn't allow (TriggeredStartFor).
+	Allows func(space, action string) bool
 
 	once    sync.Once
 	mu      sync.Mutex
@@ -541,6 +551,9 @@ func (h *Host) close(l *hosted) {
 	}
 	if l.via == ViaTrigger && h.TriggeredDone != nil {
 		h.TriggeredDone(l.id, l.opts)
+	}
+	if l.via == ViaTasks && !deleted && h.TaskEnded != nil {
+		h.TaskEnded(l.id, l.opts)
 	}
 }
 

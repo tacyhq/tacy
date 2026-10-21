@@ -1,0 +1,75 @@
+{
+  "format": "tacy-golden-crypto-vectors",
+  "note": "Schedule upgrades (the VM release after v0.14.0; poc/05-agent-vm/SCHEDULES.md): a definition that searches, remembers and tells only of changes, and one that only remembers; each envelope and its hash, and each install call's where and who. Made once from v2-search.json's fixed seeds with node:crypto (scripts/gen-golden-v2-schedule-upgrades-vectors.mjs); never regenerate once shipped.",
+  "constants": {
+    "labels": {
+      "spaceProof": "tacy/v2/space-proof",
+      "scheduleInstall": "tacy/v2/schedule-install"
+    },
+    "definitionLabel": "tacy-agent/v1",
+    "envelopeHashLabel": "tacy-safety/v1"
+  },
+  "vm_private": "7171717171717171717171717171717171717171717171717171717171717171",
+  "vm_public": "ab4f197998fcc56cc6ed68c1d931af9bb522ec00743e181f7330915df4aa3176",
+  "seal_private": "7272727272727272727272727272727272727272727272727272727272727272",
+  "seal": "x25519:zUjQaB6nPwmgD4OFm9EIgN9WgiAZzaPIg+DRUU41sQY=",
+  "space": "s_aebagbafaydqqcikbmga2dqpca",
+  "proof": "zTb+BtQgYYMbLs86VLweygquYWFPiLcuVOZKLV+y+yw=",
+  "identity": {
+    "seed": "7373737373737373737373737373737373737373737373737373737373737373",
+    "id": "i_cahq4dimbmfascahaycqiaycae",
+    "key": "ed25519:/sFChnP2r+iSZLOAc0SuiyadElpQOFUgJofbWnEoV58="
+  },
+  "definitions": [
+    {
+      "name": "watch",
+      "json": "{\"type\":\"tacy.agent/v1\",\"firm\":\"f_chat\",\"space\":\"s_aebagbafaydqqcikbmga2dqpca\",\"agent\":\"a_aebagbafaydqqcikbmga2dqpcm\",\"version\":1,\"seal\":\"x25519:zUjQaB6nPwmgD4OFm9EIgN9WgiAZzaPIg+DRUU41sQY=\",\"instructions\":\"Search for the latest stable release of the Rust programming language and tell me its version number and release date, with its release notes as [n].\",\"models\":[\"deepseek-v4-1-flash\"],\"tools\":[\"web.fetch\",\"web.search\"],\"max_steps\":20,\"triggers\":[{\"id\":\"tr_cahq4dimbmfascahaycqiaycaq\",\"kind\":\"schedule\",\"daily\":\"08:00\",\"zone\":\"Europe/Lisbon\"}],\"allow\":{\"web.fetch\":\"always\",\"web.search\":\"always\"},\"memory\":true,\"notify\":\"changes\",\"author\":\"i_cahq4dimbmfascahaycqiaycae\",\"sponsor\":\"i_cahq4dimbmfascahaycqiaycae\",\"issued_at\":\"2026-10-21T09:00:00Z\",\"not_after\":\"2027-01-19T09:00:00Z\"}",
+      "envelope": {
+        "kind": "agent",
+        "payload": "eyJ0eXBlIjoidGFjeS5hZ2VudC92MSIsImZpcm0iOiJmX2NoYXQiLCJzcGFjZSI6InNfYWViYWdiYWZheWRxcWNpa2JtZ2EyZHFwY2EiLCJhZ2VudCI6ImFfYWViYWdiYWZheWRxcWNpa2JtZ2EyZHFwY20iLCJ2ZXJzaW9uIjoxLCJzZWFsIjoieDI1NTE5OnpValFhQjZuUHdtZ0Q0T0ZtOUVJZ045V2dpQVp6YVBJZytEUlVVNDFzUVk9IiwiaW5zdHJ1Y3Rpb25zIjoiU2VhcmNoIGZvciB0aGUgbGF0ZXN0IHN0YWJsZSByZWxlYXNlIG9mIHRoZSBSdXN0IHByb2dyYW1taW5nIGxhbmd1YWdlIGFuZCB0ZWxsIG1lIGl0cyB2ZXJzaW9uIG51bWJlciBhbmQgcmVsZWFzZSBkYXRlLCB3aXRoIGl0cyByZWxlYXNlIG5vdGVzIGFzIFtuXS4iLCJtb2RlbHMiOlsiZGVlcHNlZWstdjQtMS1mbGFzaCJdLCJ0b29scyI6WyJ3ZWIuZmV0Y2giLCJ3ZWIuc2VhcmNoIl0sIm1heF9zdGVwcyI6MjAsInRyaWdnZXJzIjpbeyJpZCI6InRyX2NhaHE0ZGltYm1mYXNjYWhheWNxaWF5Y2FxIiwia2luZCI6InNjaGVkdWxlIiwiZGFpbHkiOiIwODowMCIsInpvbmUiOiJFdXJvcGUvTGlzYm9uIn1dLCJhbGxvdyI6eyJ3ZWIuZmV0Y2giOiJhbHdheXMiLCJ3ZWIuc2VhcmNoIjoiYWx3YXlzIn0sIm1lbW9yeSI6dHJ1ZSwibm90aWZ5IjoiY2hhbmdlcyIsImF1dGhvciI6ImlfY2FocTRkaW1ibWZhc2NhaGF5Y3FpYXljYWUiLCJzcG9uc29yIjoiaV9jYWhxNGRpbWJtZmFzY2FoYXljcWlheWNhZSIsImlzc3VlZF9hdCI6IjIwMjYtMTAtMjFUMDk6MDA6MDBaIiwibm90X2FmdGVyIjoiMjAyNy0wMS0xOVQwOTowMDowMFoifQ==",
+        "sigs": [
+          {
+            "key": "ed25519:/sFChnP2r+iSZLOAc0SuiyadElpQOFUgJofbWnEoV58=",
+            "sig": "R86XVjgag59uSA+aDVvbEfpEl/GnEhSNF5/+aNgLOpQJJWSdRtQrSsWyXimZ2mhnBoAYKZNHHDFm6FN6q1auBg=="
+          }
+        ]
+      },
+      "hash": "9bbcbfbff31ee6dd7906f4c501def43a3196d7972118d56f62b26977149b18c0"
+    },
+    {
+      "name": "digest",
+      "json": "{\"type\":\"tacy.agent/v1\",\"firm\":\"f_chat\",\"space\":\"s_aebagbafaydqqcikbmga2dqpca\",\"agent\":\"a_aebagbafaydqqcikbmga2dqpcq\",\"version\":1,\"seal\":\"x25519:zUjQaB6nPwmgD4OFm9EIgN9WgiAZzaPIg+DRUU41sQY=\",\"instructions\":\"Read https://news.ycombinator.com/ and send me a digest of the top 10 stories, each with one line on what it is and its link as [n].\",\"models\":[\"deepseek-v4-1-flash\"],\"tools\":[\"web.fetch\"],\"max_steps\":20,\"triggers\":[{\"id\":\"tr_cahq4dimbmfascahaycqiaycau\",\"kind\":\"schedule\",\"daily\":\"07:00\",\"zone\":\"Europe/Lisbon\"}],\"allow\":{\"web.fetch\":\"always\"},\"memory\":true,\"author\":\"i_cahq4dimbmfascahaycqiaycae\",\"sponsor\":\"i_cahq4dimbmfascahaycqiaycae\",\"issued_at\":\"2026-10-21T09:00:00Z\",\"not_after\":\"2027-01-19T09:00:00Z\"}",
+      "envelope": {
+        "kind": "agent",
+        "payload": "eyJ0eXBlIjoidGFjeS5hZ2VudC92MSIsImZpcm0iOiJmX2NoYXQiLCJzcGFjZSI6InNfYWViYWdiYWZheWRxcWNpa2JtZ2EyZHFwY2EiLCJhZ2VudCI6ImFfYWViYWdiYWZheWRxcWNpa2JtZ2EyZHFwY3EiLCJ2ZXJzaW9uIjoxLCJzZWFsIjoieDI1NTE5OnpValFhQjZuUHdtZ0Q0T0ZtOUVJZ045V2dpQVp6YVBJZytEUlVVNDFzUVk9IiwiaW5zdHJ1Y3Rpb25zIjoiUmVhZCBodHRwczovL25ld3MueWNvbWJpbmF0b3IuY29tLyBhbmQgc2VuZCBtZSBhIGRpZ2VzdCBvZiB0aGUgdG9wIDEwIHN0b3JpZXMsIGVhY2ggd2l0aCBvbmUgbGluZSBvbiB3aGF0IGl0IGlzIGFuZCBpdHMgbGluayBhcyBbbl0uIiwibW9kZWxzIjpbImRlZXBzZWVrLXY0LTEtZmxhc2giXSwidG9vbHMiOlsid2ViLmZldGNoIl0sIm1heF9zdGVwcyI6MjAsInRyaWdnZXJzIjpbeyJpZCI6InRyX2NhaHE0ZGltYm1mYXNjYWhheWNxaWF5Y2F1Iiwia2luZCI6InNjaGVkdWxlIiwiZGFpbHkiOiIwNzowMCIsInpvbmUiOiJFdXJvcGUvTGlzYm9uIn1dLCJhbGxvdyI6eyJ3ZWIuZmV0Y2giOiJhbHdheXMifSwibWVtb3J5Ijp0cnVlLCJhdXRob3IiOiJpX2NhaHE0ZGltYm1mYXNjYWhheWNxaWF5Y2FlIiwic3BvbnNvciI6ImlfY2FocTRkaW1ibWZhc2NhaGF5Y3FpYXljYWUiLCJpc3N1ZWRfYXQiOiIyMDI2LTEwLTIxVDA5OjAwOjAwWiIsIm5vdF9hZnRlciI6IjIwMjctMDEtMTlUMDk6MDA6MDBaIn0=",
+        "sigs": [
+          {
+            "key": "ed25519:/sFChnP2r+iSZLOAc0SuiyadElpQOFUgJofbWnEoV58=",
+            "sig": "RjAAhtX6xyI60qE7/uiIEV9zPjOs//G8GNlNwMmFRXv6qQNvJnJ8bABGMlxR3tYBb6a1dYrIMWvYce9LEv89Cg=="
+          }
+        ]
+      },
+      "hash": "ea0be085c0b5355b6945e04387b3b1f9f05447b5701337250e2cd0887f411a8d"
+    }
+  ],
+  "requests": [
+    {
+      "call": "install",
+      "name": "install the release watch",
+      "own": [
+        "9bbcbfbff31ee6dd7906f4c501def43a3196d7972118d56f62b26977149b18c0"
+      ],
+      "body": "{\"definition\":{\"kind\":\"agent\",\"payload\":\"eyJ0eXBlIjoidGFjeS5hZ2VudC92MSIsImZpcm0iOiJmX2NoYXQiLCJzcGFjZSI6InNfYWViYWdiYWZheWRxcWNpa2JtZ2EyZHFwY2EiLCJhZ2VudCI6ImFfYWViYWdiYWZheWRxcWNpa2JtZ2EyZHFwY20iLCJ2ZXJzaW9uIjoxLCJzZWFsIjoieDI1NTE5OnpValFhQjZuUHdtZ0Q0T0ZtOUVJZ045V2dpQVp6YVBJZytEUlVVNDFzUVk9IiwiaW5zdHJ1Y3Rpb25zIjoiU2VhcmNoIGZvciB0aGUgbGF0ZXN0IHN0YWJsZSByZWxlYXNlIG9mIHRoZSBSdXN0IHByb2dyYW1taW5nIGxhbmd1YWdlIGFuZCB0ZWxsIG1lIGl0cyB2ZXJzaW9uIG51bWJlciBhbmQgcmVsZWFzZSBkYXRlLCB3aXRoIGl0cyByZWxlYXNlIG5vdGVzIGFzIFtuXS4iLCJtb2RlbHMiOlsiZGVlcHNlZWstdjQtMS1mbGFzaCJdLCJ0b29scyI6WyJ3ZWIuZmV0Y2giLCJ3ZWIuc2VhcmNoIl0sIm1heF9zdGVwcyI6MjAsInRyaWdnZXJzIjpbeyJpZCI6InRyX2NhaHE0ZGltYm1mYXNjYWhheWNxaWF5Y2FxIiwia2luZCI6InNjaGVkdWxlIiwiZGFpbHkiOiIwODowMCIsInpvbmUiOiJFdXJvcGUvTGlzYm9uIn1dLCJhbGxvdyI6eyJ3ZWIuZmV0Y2giOiJhbHdheXMiLCJ3ZWIuc2VhcmNoIjoiYWx3YXlzIn0sIm1lbW9yeSI6dHJ1ZSwibm90aWZ5IjoiY2hhbmdlcyIsImF1dGhvciI6ImlfY2FocTRkaW1ibWZhc2NhaGF5Y3FpYXljYWUiLCJzcG9uc29yIjoiaV9jYWhxNGRpbWJtZmFzY2FoYXljcWlheWNhZSIsImlzc3VlZF9hdCI6IjIwMjYtMTAtMjFUMDk6MDA6MDBaIiwibm90X2FmdGVyIjoiMjAyNy0wMS0xOVQwOTowMDowMFoifQ==\",\"sigs\":[{\"key\":\"ed25519:/sFChnP2r+iSZLOAc0SuiyadElpQOFUgJofbWnEoV58=\",\"sig\":\"R86XVjgag59uSA+aDVvbEfpEl/GnEhSNF5/+aNgLOpQJJWSdRtQrSsWyXimZ2mhnBoAYKZNHHDFm6FN6q1auBg==\"}]},\"space\":\"s_aebagbafaydqqcikbmga2dqpca\",\"space_seal\":\"x25519:zUjQaB6nPwmgD4OFm9EIgN9WgiAZzaPIg+DRUU41sQY=\",\"identity\":\"i_cahq4dimbmfascahaycqiaycae\",\"identity_key\":\"ed25519:/sFChnP2r+iSZLOAc0SuiyadElpQOFUgJofbWnEoV58=\",\"nonce\":\"61616161616161616161616161616161\",\"signed_at\":1792000100,\"space_proof\":\"zTb+BtQgYYMbLs86VLweygquYWFPiLcuVOZKLV+y+yw=\",\"identity_sig\":\"coK+JfbUHxMKgaaWcvbyO+WxUXx+1QBHkRVa3fvjb32vc8Y7GL2KxhGhfsMnzBsbg9rkwpquIraUyDFNIBOyDg==\"}",
+      "digest": "60342d8d2a9e44cf946b66bf2997ebf3a83d5d8f77b326e36d0849eaabc1ca5e"
+    },
+    {
+      "call": "install",
+      "name": "install the remembering digest",
+      "own": [
+        "ea0be085c0b5355b6945e04387b3b1f9f05447b5701337250e2cd0887f411a8d"
+      ],
+      "body": "{\"definition\":{\"kind\":\"agent\",\"payload\":\"eyJ0eXBlIjoidGFjeS5hZ2VudC92MSIsImZpcm0iOiJmX2NoYXQiLCJzcGFjZSI6InNfYWViYWdiYWZheWRxcWNpa2JtZ2EyZHFwY2EiLCJhZ2VudCI6ImFfYWViYWdiYWZheWRxcWNpa2JtZ2EyZHFwY3EiLCJ2ZXJzaW9uIjoxLCJzZWFsIjoieDI1NTE5OnpValFhQjZuUHdtZ0Q0T0ZtOUVJZ045V2dpQVp6YVBJZytEUlVVNDFzUVk9IiwiaW5zdHJ1Y3Rpb25zIjoiUmVhZCBodHRwczovL25ld3MueWNvbWJpbmF0b3IuY29tLyBhbmQgc2VuZCBtZSBhIGRpZ2VzdCBvZiB0aGUgdG9wIDEwIHN0b3JpZXMsIGVhY2ggd2l0aCBvbmUgbGluZSBvbiB3aGF0IGl0IGlzIGFuZCBpdHMgbGluayBhcyBbbl0uIiwibW9kZWxzIjpbImRlZXBzZWVrLXY0LTEtZmxhc2giXSwidG9vbHMiOlsid2ViLmZldGNoIl0sIm1heF9zdGVwcyI6MjAsInRyaWdnZXJzIjpbeyJpZCI6InRyX2NhaHE0ZGltYm1mYXNjYWhheWNxaWF5Y2F1Iiwia2luZCI6InNjaGVkdWxlIiwiZGFpbHkiOiIwNzowMCIsInpvbmUiOiJFdXJvcGUvTGlzYm9uIn1dLCJhbGxvdyI6eyJ3ZWIuZmV0Y2giOiJhbHdheXMifSwibWVtb3J5Ijp0cnVlLCJhdXRob3IiOiJpX2NhaHE0ZGltYm1mYXNjYWhheWNxaWF5Y2FlIiwic3BvbnNvciI6ImlfY2FocTRkaW1ibWZhc2NhaGF5Y3FpYXljYWUiLCJpc3N1ZWRfYXQiOiIyMDI2LTEwLTIxVDA5OjAwOjAwWiIsIm5vdF9hZnRlciI6IjIwMjctMDEtMTlUMDk6MDA6MDBaIn0=\",\"sigs\":[{\"key\":\"ed25519:/sFChnP2r+iSZLOAc0SuiyadElpQOFUgJofbWnEoV58=\",\"sig\":\"RjAAhtX6xyI60qE7/uiIEV9zPjOs//G8GNlNwMmFRXv6qQNvJnJ8bABGMlxR3tYBb6a1dYrIMWvYce9LEv89Cg==\"}]},\"space\":\"s_aebagbafaydqqcikbmga2dqpca\",\"space_seal\":\"x25519:zUjQaB6nPwmgD4OFm9EIgN9WgiAZzaPIg+DRUU41sQY=\",\"identity\":\"i_cahq4dimbmfascahaycqiaycae\",\"identity_key\":\"ed25519:/sFChnP2r+iSZLOAc0SuiyadElpQOFUgJofbWnEoV58=\",\"nonce\":\"62626262626262626262626262626262\",\"signed_at\":1792000101,\"space_proof\":\"zTb+BtQgYYMbLs86VLweygquYWFPiLcuVOZKLV+y+yw=\",\"identity_sig\":\"pw9VkGTojPfLf5O8RiDMgl0+CLkIgQgdcNUV3pmlY0nJrgcDyiH8zYY8RR8Zuo/d6PLkXUrXHMDZjoCT91jtAg==\"}",
+      "digest": "32189fc8b7cad2dd67d54137019cdeedf582282c050c3bfc8a684fc0e671773d"
+    }
+  ]
+}

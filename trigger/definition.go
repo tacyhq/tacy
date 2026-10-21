@@ -86,11 +86,20 @@ type Definition struct {
 	Triggers []Trigger `json:"triggers"`
 	// Allow is the sponsor's permission settings for unattended runs, per kind: always or never. Anything else (ask, or
 	// a kind not named) is denied: nobody is there to ask.
-	Allow    map[string]string `json:"allow,omitzero"`
-	Author   string            `json:"author"`  // i_
-	Sponsor  string            `json:"sponsor"` // i_
-	IssuedAt time.Time         `json:"issued_at"`
-	NotAfter time.Time         `json:"not_after"` // the sponsor's authority ends here
+	Allow map[string]string `json:"allow,omitzero"`
+	// Memory (schedule upgrades, the VM release after v0.14.0): the schedule remembers what its runs found, on the
+	// VM only (memory.go: the last MemoryRuns runs, each at most MemoryKeep), and each run sees it, so a digest can
+	// skip what it reported before. Absent: every run starts from nothing, as before. An older VM refuses a
+	// definition with it (strict decoding: unknown member), never runs it without.
+	Memory bool `json:"memory,omitzero"`
+	// Notify is when a run tells the person: "" every run (as before), or NotifyChanges: only when it found something
+	// that changed against what it remembers (it needs Memory); a run that found nothing new ends quiet (no message,
+	// its result marked quiet) through the schedule.no_change tool, never by reading its text.
+	Notify   string    `json:"notify,omitzero"`
+	Author   string    `json:"author"`  // i_
+	Sponsor  string    `json:"sponsor"` // i_
+	IssuedAt time.Time `json:"issued_at"`
+	NotAfter time.Time `json:"not_after"` // the sponsor's authority ends here
 }
 
 // Trigger is one way a definition's tasks start.
@@ -186,6 +195,10 @@ func (d *Definition) check(firm string, now time.Time) error {
 		return errors.New("max_steps must be 0 to 20")
 	case len(d.Triggers) == 0 || len(d.Triggers) > maxTriggers:
 		return errors.New("1 to 8 triggers")
+	case d.Notify != "" && d.Notify != NotifyChanges:
+		return errors.New(`notify must be "changes" or absent`)
+	case d.Notify == NotifyChanges && !d.Memory:
+		return errors.New("notify changes needs memory: a run compares with what the schedule remembers")
 	case d.IssuedAt.IsZero() || d.IssuedAt.After(now.Add(MaxIssuedAhead)):
 		return errors.New("issued_at missing or in the future")
 	case !d.NotAfter.After(now):
@@ -266,8 +279,9 @@ func Personal(d *Definition, space, seal, who string) error {
 		}
 	}
 	for _, t := range d.Tools {
-		if t != "web.fetch" && t != "web.search" && t != "web.images" {
-			return fmt.Errorf("tool %s isn't one a personal schedule may use (web.fetch, web.search, web.images)", t)
+		// document.create: its result as a document in the person's own conversation, nothing sent (guard/documents.go).
+		if t != "web.fetch" && t != "web.search" && t != "web.images" && t != "document.create" {
+			return fmt.Errorf("tool %s isn't one a personal schedule may use (web.fetch, web.search, web.images, document.create)", t)
 		}
 	}
 	return nil

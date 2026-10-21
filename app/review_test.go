@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/tacyhq/tacy/guard"
+	"github.com/tacyhq/tacy/harness"
 	"github.com/tacyhq/tacy/proto"
 	"github.com/tacyhq/tacy/safety"
 )
@@ -112,5 +113,24 @@ func TestReviewNeedsFilesPolicy(t *testing.T) {
 	}
 	if ae.model.n != 0 {
 		t.Fatal("a model call ran")
+	}
+}
+
+// agentd reserves a review's files.read with its largest file's whole-file check when its files are read in one
+// files.read (guard.CrossReserve, from the task's options, as gatewayd decides it); research's as before.
+func TestReviewReaderReserve(t *testing.T) {
+	text := strings.Repeat("1. Term. The parties agree to this term for the period stated. ", 120)
+	e := &safety.Effective{Layers: []*safety.Policy{guard.ReleasePolicy("f_chat", "")}}
+	ti := func(agent string) *harness.TaskInfo {
+		o, _ := json.Marshal(guard.TaskOptions{Agent: agent, Files: []guard.TaskFile{{Name: "msa.txt", Text: text}}})
+		return &harness.TaskInfo{ID: "tk_r", Options: o}
+	}
+	base := readerReserve("", nil, "files.read", e)
+	n := guard.CrossReserve(guard.AgentReview, taskFiles(ti(guard.AgentReview), "files.read"))
+	rev := readerReserve(guard.AgentReview, taskFiles(ti(guard.AgentReview), "files.read"), "files.read", e)
+	res := readerReserve(guard.AgentResearch, taskFiles(ti(guard.AgentResearch), "files.read"), "files.read", e)
+	if n != len(text) || rev.CostMicros <= base.CostMicros || rev.Tokens <= base.Tokens || res != base ||
+		taskFiles(ti(guard.AgentReview), "web.fetch") != nil {
+		t.Fatalf("check %d; review %+v, research %+v, base %+v", n, rev, res, base)
 	}
 }

@@ -105,6 +105,9 @@ type fetched struct {
 	pics               []picCand  // the page's own pictures, from its metadata (pagePictures)
 	links              []pageLink // the page's own links (pageLinks): numbered sources when the task has PageLinks
 	asked              string     // the address asked for (before redirects)
+	// age is the page's date as code found it (sourcedate.go pageAge: its metadata's, else its address's), "" when
+	// none: the model gets it as the page's age, the person in the Sources list.
+	age string
 }
 
 // Tools runs tool calls for one /run request. Citation numbers continue across calls within the run. Exec may
@@ -240,6 +243,10 @@ func (t *Tools) Exec(ctx context.Context, name string, args json.RawMessage) (pe
 			o.fallback, o.status = info.Fallback, info.Status
 			return pending{out: o}, shown
 		}
+		now := time.Now()
+		for i := range rs {
+			rs[i].Age = resultAge(rs[i].Age, rs[i].URL, now) // the provider's date, else its address's (sourcedate.go)
+		}
 		return pending{out: toolOutcome{masked: masked, ran: true, provider: info.Provider, fallback: info.Fallback, wait: gate.wait},
 			query: q, results: rs}, shown
 	case "fetch_page":
@@ -255,19 +262,13 @@ func (t *Tools) Exec(ctx context.Context, name string, args json.RawMessage) (pe
 			}
 			return pending{out: errorOutcome(fmt.Sprintf("there is no source [%d] in this task's results; use a number a search or page gave", n))}, args
 		}
-		// URLs are checked for the unambiguous kinds only: long numbers and IPs are normal in URLs (article ids;
-		// private IPs are refused by the dialer anyway). An address code gave (a source: a search result, a page's
-		// link) isn't: the model didn't write it, so it can't carry the person's data (two Hacker News stories'
-		// message ids read as card numbers, cmd/digestlab 2026-10-20).
+		// URLs are checked for the unambiguous kinds only (urlPersonalData): long numbers and IPs are normal in URLs
+		// (article ids; private IPs are refused by the dialer anyway). An address code gave (a source: a search
+		// result, a page's link) isn't: the model didn't write it, so it can't carry the person's data (two Hacker
+		// News stories' message ids read as card numbers, cmd/digestlab 2026-10-20).
 		var kinds []string
-		var found []string
 		if !t.isSource(a.URL) {
-			_, found = maskPII(a.URL)
-		}
-		for _, k := range found {
-			if k == "email" || k == "ssn" || k == "card" || k == "iban" || k == "url-credentials" {
-				kinds = append(kinds, k)
-			}
+			kinds = urlPersonalData(a.URL)
 		}
 		if len(kinds) > 0 {
 			o := errorOutcome("refused: the URL contains personal data (" + strings.Join(kinds, ", ") + ")")
@@ -434,6 +435,9 @@ func (t *Tools) finish(p pending) toolOutcome {
 		// Its address (after redirects: the page's author chose it) too: the model gets its site and number.
 		n := t.cites
 		head := map[string]any{"note": readerNote, "n": n, "site": siteOf(p.page.final)}
+		if p.page.age != "" {
+			head["age"] = p.page.age // code's (sourcedate.go), like a search result's
+		}
 		if t.pictureFlag(p.page.final, p.page.title, p.page.pics...) {
 			head["picture"] = true // its card gets the page's own picture (cardpics.go)
 		}
@@ -455,16 +459,19 @@ func (t *Tools) finish(p pending) toolOutcome {
 			}
 		}
 		return t.finishRead(p, out, []int{n}, head,
-			[]proto.Citation{{Index: n, Title: p.page.title, URL: p.page.final, Snippet: capRunes(p.page.text, 200)}})
+			[]proto.Citation{{Index: n, Title: p.page.title, URL: p.page.final, Snippet: capRunes(p.page.text, 200), Age: p.page.age}})
 	case p.page != nil:
 		t.cites++
 		res := map[string]any{"note": untrustedNote, "n": t.cites, "url": p.page.final, "title": p.page.title, "text": p.page.text}
+		if p.page.age != "" {
+			res["age"] = p.page.age
+		}
 		if t.pictureFlag(p.page.final, p.page.title, p.page.pics...) {
 			res["picture"] = true
 		}
 		b, _ := json.Marshal(res)
 		out.content = string(b)
-		out.citations = []proto.Citation{{Index: t.cites, Title: p.page.title, URL: p.page.final, Snippet: capRunes(p.page.text, 200)}}
+		out.citations = []proto.Citation{{Index: t.cites, Title: p.page.title, URL: p.page.final, Snippet: capRunes(p.page.text, 200), Age: p.page.age}}
 		return out
 	}
 	type item struct {
@@ -628,13 +635,13 @@ func (t *Tools) fetch(ctx context.Context, raw string) (fetched, error) {
 		if err != nil {
 			return fetched{}, errors.New("fetch failed while reading")
 		}
-		f.title, f.text, f.pics, f.links = htmlPage(string(page), res.Request.URL)
+		f.title, f.text, f.pics, f.links, f.age = htmlPage(string(page), res.Request.URL)
 	case strings.HasPrefix(ct, "text/") || ct == "application/json":
 		body, err := io.ReadAll(io.LimitReader(res.Body, maxPageBytes))
 		if err != nil {
 			return fetched{}, errors.New("fetch failed while reading")
 		}
-		f.text = string(body)
+		f.text, f.age = string(body), urlDate(f.final, time.Now())
 	default:
 		return fetched{}, fmt.Errorf("unsupported content type %s", ct)
 	}

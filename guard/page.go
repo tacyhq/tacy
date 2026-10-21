@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/net/html"
 	"golang.org/x/net/html/atom"
@@ -154,23 +155,23 @@ func HTMLText(src string) (title, text string) { return htmlText(src) }
 // htmlText extracts the title and readable text of an HTML page: its structured facts, then its main content,
 // or the whole page when no content element is found.
 func htmlText(src string) (title, text string) {
-	title, text, _, _ = htmlPage(src, nil)
+	title, text, _, _, _ = htmlPage(src, nil)
 	return title, text
 }
 
-// htmlPage is htmlText plus the page's own pictures as its metadata names them (pagePictures) and its links
-// (pageLinks); none of either without base, the page's address after redirects, which relative addresses resolve
-// against.
-func htmlPage(src string, base *url.URL) (title, text string, pics []picCand, links []pageLink) {
+// htmlPage is htmlText plus the page's own pictures as its metadata names them (pagePictures), its links
+// (pageLinks) and its age (sourcedate.go pageAge: its metadata's dates, else its address's); none of them without
+// base, the page's address after redirects, which relative addresses resolve against.
+func htmlPage(src string, base *url.URL) (title, text string, pics []picCand, links []pageLink, age string) {
 	doc, err := html.Parse(strings.NewReader(src))
 	if err != nil {
-		return "", "", nil, nil
+		return "", "", nil, nil, ""
 	}
 	if base != nil {
-		pics, links = pagePictures(doc, base), pageLinks(doc, base)
+		pics, links, age = pagePictures(doc, base), pageLinks(doc, base), pageAge(doc, base.String(), time.Now())
 	}
 	title, text = htmlDoc(doc)
-	return title, text, pics, links
+	return title, text, pics, links, age
 }
 
 func htmlDoc(doc *html.Node) (title, text string) {

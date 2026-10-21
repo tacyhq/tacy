@@ -45,24 +45,60 @@ func shingleHash(ws []string) uint64 {
 	return h.Sum64()
 }
 
-// passages is every run of fileShingle words of the task's files, but those the brief has too (built once, on the
-// task's first outbound action; about 170,000 entries for 1,000,000 characters).
-func (s *filesState) passages(opts TaskOptions) map[uint64]struct{} {
+// passages builds the set of every run of fileShingle words of the task's files, but those the brief has too (once,
+// on the task's first outbound action; about 170,000 entries for 1,000,000 characters). A stored file's passages join
+// it when the file opens (addPassages): the model can only have its words after that. s.init has run.
+func (s *filesState) passages(opts TaskOptions) {
 	s.guardOnce.Do(func() {
-		set := map[uint64]struct{}{}
-		for _, f := range opts.Files {
-			ws := fileWords(f.Text)
-			for i := 0; i+fileShingle <= len(ws); i++ {
-				set[shingleHash(ws[i:i+fileShingle])] = struct{}{}
-			}
-		}
+		brief := map[uint64]struct{}{}
 		ws := fileWords(opts.Question)
 		for i := 0; i+fileShingle <= len(ws); i++ {
-			delete(set, shingleHash(ws[i:i+fileShingle]))
+			brief[shingleHash(ws[i:i+fileShingle])] = struct{}{}
 		}
-		s.shingles = set
+		// shMu first, then the snapshot: a file that opens meanwhile is either in it or added after (addPassages
+		// waits for shMu and finds the set built).
+		s.shMu.Lock()
+		defer s.shMu.Unlock()
+		s.mu.Lock()
+		var texts []string
+		for _, f := range s.files {
+			if f.opened {
+				texts = append(texts, f.text)
+			}
+		}
+		s.mu.Unlock()
+		s.brief, s.shingles = brief, map[uint64]struct{}{}
+		for _, t := range texts {
+			s.addLocked(t)
+		}
 	})
-	return s.shingles
+}
+
+// addPassages adds an opened stored file's passages, once the set is built (before, building it takes them).
+func (s *filesState) addPassages(text string) {
+	s.shMu.Lock()
+	defer s.shMu.Unlock()
+	if s.shingles != nil {
+		s.addLocked(text)
+	}
+}
+
+func (s *filesState) addLocked(text string) {
+	ws := fileWords(text)
+	for i := 0; i+fileShingle <= len(ws); i++ {
+		h := shingleHash(ws[i : i+fileShingle])
+		if _, ok := s.brief[h]; !ok {
+			s.shingles[h] = struct{}{}
+		}
+	}
+}
+
+// hasPassage: h is a passage of the task's files.
+func (s *filesState) hasPassage(h uint64) bool {
+	s.shMu.Lock()
+	defer s.shMu.Unlock()
+	_, ok := s.shingles[h]
+	return ok
 }
 
 // argStrings is every string in an action's JSON arguments (keys too), each also percent-decoded (as a query and as
@@ -100,17 +136,15 @@ func argStrings(args []byte) []string {
 
 // fileTextInArgs says whether an action's arguments carry a passage of the task's files.
 func (t *task) fileTextInArgs(args []byte) bool {
-	if len(t.opts.Files) == 0 {
+	if !t.opts.HasFiles() {
 		return false
 	}
-	set := t.files.passages(t.opts)
-	if len(set) == 0 {
-		return false
-	}
+	t.files.init(t.opts, t.def)
+	t.files.passages(t.opts)
 	for _, s := range argStrings(args) {
 		ws := fileWords(s)
 		for i := 0; i+fileShingle <= len(ws); i++ {
-			if _, ok := set[shingleHash(ws[i:i+fileShingle])]; ok {
+			if t.files.hasPassage(shingleHash(ws[i : i+fileShingle])) {
 				return true
 			}
 		}

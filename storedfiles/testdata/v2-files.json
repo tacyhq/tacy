@@ -1,0 +1,205 @@
+{
+  "format": "tacy-golden-crypto-vectors",
+  "version": 2,
+  "scheme": "keys-v2-files",
+  "note": "Encrypted file storage (D79): object and tree keys, chunked objects, a node record and a manifest. Fixed fake inputs; generated once and never regenerated.",
+  "constants": {
+    "labels": {
+      "fileChunk": "tacy/v2/file-chunk",
+      "fileNode": "tacy/v2/file-node",
+      "fileManifest": "tacy/v2/file-manifest"
+    },
+    "separator": "\u0000",
+    "format": 2,
+    "alg": 1,
+    "chunkBytes": 1048576,
+    "chunkOverhead": 28,
+    "lengthPrefixBytes": 8,
+    "partChunks": 8,
+    "minPaddedBytes": 65536,
+    "chunkAad": "label ‖ file ‖ object ‖ fmt ‖ alg ‖ epoch ‖ index ‖ last (1 | 0)",
+    "chunk": "IV (12) ‖ AES-256-GCM(object key, IV, AAD) of plaintext[index · 1 MiB, …) + tag (16)",
+    "plaintext": "u64 BE file length ‖ file bytes ‖ zeros to the padded size",
+    "record": "fmt ‖ alg ‖ epoch (u32 BE) ‖ IV (12) ‖ AES-256-GCM(tree key, IV, AAD) of JSON padded with spaces + tag (16)",
+    "nodeAad": "label ‖ space ‖ tree ‖ node ‖ version ‖ fmt ‖ alg ‖ epoch",
+    "manifestAad": "label ‖ space ‖ tree ‖ version ‖ fmt ‖ alg ‖ epoch",
+    "keyWrap": "item key wrap (tacy/v2/item-key ‖ space ‖ gen ‖ item ‖ epoch), item = the ob_ or ft_ id",
+    "paddedSizes": [
+      [
+        0,
+        65536
+      ],
+      [
+        100,
+        65536
+      ],
+      [
+        65528,
+        65536
+      ],
+      [
+        65529,
+        131072
+      ],
+      [
+        200000,
+        262144
+      ],
+      [
+        1048576,
+        2097152
+      ],
+      [
+        1048577,
+        2097152
+      ],
+      [
+        104857600,
+        105906176
+      ]
+    ]
+  },
+  "space": {
+    "id": "s_6eaaaaaaaaaaaaaaaaaaaaaaae",
+    "gen": 1,
+    "keyHex": "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f"
+  },
+  "keys": [
+    {
+      "name": "tree",
+      "space": "s_6eaaaaaaaaaaaaaaaaaaaaaaae",
+      "gen": 1,
+      "item": "ft_6eaaaaaaaaaaaaaaaaaaaaaaam",
+      "epoch": 1,
+      "keyHex": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+      "ivHex": "303132333435363738393a3b",
+      "wrappedHex": "0201303132333435363738393a3bb63107aad418b0713c0fc2740917b6355d7fd0af82417664e4893de0a500d2c302c93f831ef6e0b666c8d7efd521b70f"
+    },
+    {
+      "name": "small",
+      "space": "s_6eaaaaaaaaaaaaaaaaaaaaaaae",
+      "gen": 1,
+      "item": "ob_6eaaaaaaaaaaaaaaaaaaaaaaau",
+      "epoch": 1,
+      "keyHex": "2122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40",
+      "ivHex": "404142434445464748494a4b",
+      "wrappedHex": "0201404142434445464748494a4b24dec9a133816dbeecebe92440b598e07fc250e1062025b0cc996291650c6a83d9852c719ef8bb9f84f160970d072958"
+    },
+    {
+      "name": "two-chunks",
+      "space": "s_6eaaaaaaaaaaaaaaaaaaaaaaae",
+      "gen": 1,
+      "item": "ob_6eaaaaaaaaaaaaaaaaaaaaaaay",
+      "epoch": 1,
+      "keyHex": "22232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f4041",
+      "ivHex": "505152535455565758595a5b",
+      "wrappedHex": "0201505152535455565758595a5b534d1128f1906fb14edec7c25f293b1225b180fb012c1edbb27f2c29f3f3fdd25d28e43f6114477b276ed546d5564f93"
+    }
+  ],
+  "objects": [
+    {
+      "name": "small",
+      "file": "fl_6eaaaaaaaaaaaaaaaaaaaaaaai",
+      "object": "ob_6eaaaaaaaaaaaaaaaaaaaaaaau",
+      "epoch": 1,
+      "size": 100,
+      "seed": 17,
+      "padded": 65536,
+      "storedBytes": 65564,
+      "storedSha256": "f6516a3a9cfa86a102c3b681c872d52163683d51ab7be62c8b8fa7c8b1686def",
+      "chunks": [
+        {
+          "index": 0,
+          "last": true,
+          "plainBytes": 65536,
+          "aadHex": "746163792f76322f66696c652d6368756e6b00666c5f3665616161616161616161616161616161616161616161616169006f625f366561616161616161616161616161616161616161616161617500320031003100300031",
+          "ivHex": "4142434445464748494a4b4c",
+          "sealedSha256": "f6516a3a9cfa86a102c3b681c872d52163683d51ab7be62c8b8fa7c8b1686def",
+          "tagHex": "998fca53ad7cd6b1a55d4a3d826f1f8f"
+        }
+      ]
+    },
+    {
+      "name": "two-chunks",
+      "file": "fl_6eaaaaaaaaaaaaaaaaaaaaaaai",
+      "object": "ob_6eaaaaaaaaaaaaaaaaaaaaaaay",
+      "epoch": 1,
+      "size": 1348576,
+      "seed": 18,
+      "padded": 2097152,
+      "storedBytes": 2097208,
+      "storedSha256": "65af6c4012067f00faff583b1257a7615f0043e4738e62ac81878047f36ada08",
+      "chunks": [
+        {
+          "index": 0,
+          "last": false,
+          "plainBytes": 1048576,
+          "aadHex": "746163792f76322f66696c652d6368756e6b00666c5f3665616161616161616161616161616161616161616161616169006f625f366561616161616161616161616161616161616161616161617900320031003100300030",
+          "ivHex": "5152535455565758595a5b5c",
+          "sealedSha256": "078c554861d7f1b1a39ea9ea885c197e92de9532dadddfdaad62edf474800be7",
+          "tagHex": "459ff27eb15ff8e1eae6d30c2aaf3f62"
+        },
+        {
+          "index": 1,
+          "last": true,
+          "plainBytes": 1048576,
+          "aadHex": "746163792f76322f66696c652d6368756e6b00666c5f3665616161616161616161616161616161616161616161616169006f625f366561616161616161616161616161616161616161616161617900320031003100310031",
+          "ivHex": "52535455565758595a5b5c5d",
+          "sealedSha256": "dc76bbe75173a1283517d68064a4fd0810553ee4eafc6e711a10d933fc0d923c",
+          "tagHex": "2efa63eef3dba02a149b17a191a80ba9"
+        }
+      ]
+    }
+  ],
+  "node": {
+    "tree": "ft_6eaaaaaaaaaaaaaaaaaaaaaaam",
+    "id": "nd_6eaaaaaaaaaaaaaaaaaaaaaaaq",
+    "version": 1,
+    "epoch": 1,
+    "value": {
+      "v": 1,
+      "kind": "file",
+      "name": "Lease 2026.pdf",
+      "parent": null,
+      "file": {
+        "id": "fl_6eaaaaaaaaaaaaaaaaaaaaaaai",
+        "versions": [
+          {
+            "object": "ob_6eaaaaaaaaaaaaaaaaaaaaaaay",
+            "size": 1348576,
+            "type": "application/pdf",
+            "modified": 1760000000000,
+            "epoch": 1,
+            "text": {
+              "object": "ob_6eaaaaaaaaaaaaaaaaaaaaaaau",
+              "size": 100,
+              "epoch": 1
+            }
+          }
+        ]
+      }
+    },
+    "ivHex": "606162636465666768696a6b",
+    "aadHex": "746163792f76322f66696c652d6e6f646500735f36656161616161616161616161616161616161616161616161650066745f366561616161616161616161616161616161616161616161616d006e645f36656161616161616161616161616161616161616161616161710031003200310031",
+    "blobHex": "020100000001606162636465666768696a6b99b6db89c9e15777922d09d83770511f1b6bfe206d2f36a866c29b52ad9dd65c13ce5cb114f1e6d52c18037a1e7802663bac51ddee349716d6669c0578a13356ca2c6805f07c99a94afe4214b3185b879c3951a81cbb1597c3599af580e1af249b6283bd988204894c0cb8219b3265f4e990d9de4a6d5c3f8da83281092187cf2d9e523fdc215e245c69fb5fafeeeaa5d40a0eab2ee6af1576f634be86b7c6da8716df2abf9ad3e8ffd41e339413c10716558ec90d0f66c57acc6c5fcd3259c0770f2793d9b8ea7256a64e6eab92b6524d46d951c7a121c2b37e526a809a7c98148cfdafa7b4f2a58749600fa7317d301571b4b468700b1ef8c9e84e130ec00386349351bb42b62ec2c81386303318641a8bc8cd74eed54e9d69fd00bf17dced5f177713ce89ac879ae59e85ae7909fa7bf7c67adb89fc92864600b704d8074949e36eeca5c995f3dfc4be80e87440c7d2fb124c8787dab35c0c8fa05f1530169f9d48823aac48d46261a81f29f1f08ba500d00836867174298f495184d46336b79d43b5e5401f21bf2a0535914e413594fc74e85c80299023baa416d2679a8a046f83388ea927e960256e8727f240cf6fd8bd4ad0f4a3bbd6b8eabc0b0035d3c16b1987b747cda026be7cef2e9cef5cee4d03f5c3577a0a5394d40a6d32a8e2e7674cb8d3189ddff8c8d7c8be204a8d5b50f4a1bceffa3fc9a14e0da05812f3644c6c80a0b740e655acc9852f3b55bfa0d8521c56b76d3cc013e68a547465e010cacb9bccf73129809b563ab929313c6a44141e8ef42fe8c28eae2682848809f6681858620ffd96c74247bc7b224ef4ed7e33b19aa39096364932f2594e9339d4a30806cc9a6159a447d2ddcf2d10d5f459b68ab780ef4ec4d8d65a0b27fff1733f8d9a97c2c8bb77193418e280a6274a68b82847cedb978fce786ff84f2437c6dbac17722826bc687852afd14ec6ace36fb029969e54c4826de60cb550529fa30ef9ef0133071b9578cd18db1ad89f28232baa45b26a0b178a3bca867577c74db4d85ef0da2437600b9fde15b1c976e98740cc79d6ffc3807df4a106fd5efb8f7395336084f0c9cf8f0a042447959ec57aec3b2272bf003acb61c42f0f68e3912fd1badad9fbb9691b427473591079a8b5136f1e2bb608b4a7beb0dc594ad851f0cc39b5ae5666febebe30094c2a676867ec6c65f7b2de923fb80bf3a78b6f0da7d0c28513a65b16f2207df15a69ede8f4cb12b3ea990b7f6634e895ad09035ddd0dc9e3b37fceff770cdeaef92cc183dfb5b784efc42062ef1d218e31d076ae906a373834c1757a394783b0bd8656e4b89f343408bfeb6c426e7c8a0140ede22d02b80fa20319b62181eda629e415b338f0ca8b8476d675ffb835c3d5305b1c761a0480840712b851737a67e84fdd2807c3b800fee05e12b4a108301a849f131ed6cb715bac3165e46e3720e747e0"
+  },
+  "manifest": {
+    "tree": "ft_6eaaaaaaaaaaaaaaaaaaaaaaam",
+    "version": 1,
+    "epoch": 1,
+    "value": {
+      "v": 1,
+      "space": "s_6eaaaaaaaaaaaaaaaaaaaaaaae",
+      "tree": "ft_6eaaaaaaaaaaaaaaaaaaaaaaam",
+      "version": 1,
+      "live": {
+        "count": 1,
+        "hash": "ce3e5701cea268a51dc9dec52ceb3de227fbb914df75ef901bfa3115b8b98d58"
+      },
+      "trash": []
+    },
+    "ivHex": "707172737475767778797a7b",
+    "aadHex": "746163792f76322f66696c652d6d616e696665737400735f36656161616161616161616161616161616161616161616161650066745f366561616161616161616161616161616161616161616161616d0031003200310031",
+    "blobHex": "020100000001707172737475767778797a7b125c1449ed99eb7c5b6b41230dd03a311b14f6ca6879019ea0800029b50ef87c83fb8e9092b53d0dc77a7c5421a8e2829bc8721b9b41ed012eb99d6c5b3c5ebbe5f91d97066b61fa24d5fd615f8fe14ae69283f34b57c101025282648d55deac3d02f5092a91ebe92b06ac6a7fc925edb51e7e6a4324383fd6a4ed61d9eb345251a3daa930cd5c78a8f60237ffce6f96ae6e94c3544e6c1e73ad3d5569d365052176848c3ce6cf6d8fd28a46445f464cef139d22cbaca8156b1ae75fa6150852ca5339543e829697aae997e095aae0aec89589b9da9c4fc6e1316838a71b6f0c65740ef5e22a944187011dd16380624c3ba52f6dc2818d5f2e64baa381dbf1cee069c3dfb0bcb8cbf39d9c0e615acb61e6e738499a9f5c092c2345b6a425a31808fae1836e520a0a990ec3e33f8c99243b6b6438d55a19d239a4d66f056a47c76b8c8377e0ce98e1539633b98464d2a3fa6ce1a1784a05bf657b3ce6ef2c5106d2b84897602c07ec2ba42e943aafe4eff0dd022235f164f327bd89bd506a3eb4cb5e6fea45f60ebaeef754df742722d63ff55cf6913b60b55e28a4b9d923e0aef49f428ebd20defe4d66e2d688ec5934f1a21db903a5d21787927560611e17ae442187ab887f386598d9bce4fbc52ef5c54586c1253ab2f92a1f16f94c64e4067249b9cc39087a7e8bd8d8280b630b3817b6ea0bad2a34452cd6bd46df0e0405e7bb9e37c58db07f54ce38c01613c82f548ba0aea7b50672d0e036ef72299a5683c28437e2cf7fb3e372c700317c7f2d2118cfb8c39feb3c861e3b7b24d3a29a664b2b7f7f561d25f16588f6bc072e22e2b863b20f936005e15d04d3c1924e1a2443a6c4dd6a08237b1ed38d2846e1f8d37dd516e4b180a6f4410114be170f2e6c3603c65d43440b19df41b9b6e0baacd76eed2160becf9f0dccd697470c74d4fe8f66e09d4e14b5c8969271fd043d1118cddb77ac58034927b8d1368da6f3e96895342123beb498ad12da46bf5df3d1c99277cf3c61496ac0dde21ff496e8b8a4b95fcd0a981c3fa91c03a44291d7977cb3b279b9a1c7e90c8ba61ae11f48b08e821dd3f0fcfe59d32700d0e4a839dfa4f708c7506b9a9687c031168c910e2fa1a2717381218ea559384d2c952292845924741fdfb656d3bd8a2f911a7f8ac41aef266b585f66b62cac14b91b17e8e90c938546a62bf2448c0c6eca3464bdbb13362fc7a71e8d94082cdc126a77e5e936fde814707781ac0ea6a321ab4ea3d0b984c0f82e2c8036ce22c1d9786337de3e44b459370d4045abb9ad8d2666e5555927ae27577b31794f1dc7a123ceeb6cc32f390dbffd732bd66586f1b43b15cabbb065f66b7748de9ce5ae8594e6fcc53124d01449b62f4aaf3c5b7efc1f8812bcd56e97cd1b8bdb32633ee417da37d036eb47ccf30365aea2cf7ef66b3640c503f566cb33bbd964967e6896a4b510a9"
+  }
+}

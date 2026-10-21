@@ -22,7 +22,8 @@ import (
 // agent: the schedule's random id (a_…), so a later stop or remove can name it. daily: one run's expected cost times
 // its recurring runs a week, over 7, rounded up (a daily trigger runs 7 times a week, a weekday trigger on its days).
 // once: its one-time runs' cost together. until: its not_after's UTC date. A run's expected cost is scheduleRunCost:
-// how many runs, which models and whether it may search are folded into the two prices, never sent. A mismatch is 400
+// how many runs, which models, whether it may search and whether it reads stored files are folded into the two
+// prices, never sent. A mismatch is 400
 // charge_mismatch (inside the encrypted answer); a call that matches says so in a plaintext answer header,
 // X-Schedule-Priced: 1 (an older VM never does, and the relay then charges one run a day at the $0.25 cap).
 //
@@ -45,6 +46,12 @@ const (
 	scheduleSearchModel   = 50_000
 	scheduleSearchFixed   = 100_000
 	scheduleRunCap        = 250_000
+	// A definition with stored files (v0.17.0) adds the quarantined reader on its files and the acting model
+	// reading what it found. An estimate from the scheduled run's cap of 24 parts (about 96,000 characters; at most
+	// about $0.08 of reader calls), not yet measured on real scheduled runs: re-measure with cmd/digestlab once a
+	// digest with files runs there.
+	scheduleFilesModel = 10_000
+	scheduleFilesFixed = 40_000
 )
 
 // scheduleWeight is a model's price for a typical step (2,048 prompt and 1,500 completion tokens), in whole units of
@@ -54,11 +61,15 @@ func scheduleWeight(model string) int64 {
 	return 2048*in + 1500*out
 }
 
-// scheduleRunCost is one run's expected cost on model (the dearest the schedule names), µ$, in integers.
-func scheduleRunCost(model string, search bool) int64 {
+// scheduleRunCost is one run's expected cost on model (the dearest the schedule names), µ$, in integers: whether it
+// may search, and whether it reads stored files (files).
+func scheduleRunCost(model string, search, files bool) int64 {
 	share, fixed := int64(scheduleReadModel), int64(scheduleReadFixed)
 	if search {
 		share, fixed = scheduleSearchModel, scheduleSearchFixed
+	}
+	if files {
+		share, fixed = share+scheduleFilesModel, fixed+scheduleFilesFixed
 	}
 	w, base := scheduleWeight(model), scheduleWeight(scheduleMeasuredModel)
 	return min(scheduleRunCap, fixed+(share*w+base-1)/base)
@@ -88,7 +99,7 @@ func scheduleCharge(d *trigger.Definition) string {
 		}
 	}
 	search := slices.Contains(d.Tools, "web.search") && d.Allow["web.search"] == "always"
-	run := scheduleRunCost(model, search)
+	run := scheduleRunCost(model, search, len(d.Files) > 0)
 	return fmt.Sprintf("v1 %s daily=%d once=%d until=%s", d.Agent, (run*week+6)/7, run*once, d.NotAfter.UTC().Format(time.DateOnly))
 }
 

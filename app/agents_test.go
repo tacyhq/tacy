@@ -91,9 +91,14 @@ type agentEnv struct {
 
 // newAgentEnv is agentd with the reader on, the stand-in search and pages, a policy (edit narrows it), permission prompts.
 func newAgentEnv(t *testing.T, edit func(p *safety.Policy), replies ...string) *agentEnv {
+	return newAgentEnvWith(t, nil, edit, replies...)
+}
+
+// newAgentEnvWith is newAgentEnv with the guard reading stored files through stored (nil: none).
+func newAgentEnvWith(t *testing.T, stored *guard.StoredConfig, edit func(p *safety.Policy), replies ...string) *agentEnv {
 	pages := standInPages(t)
 	ps := &pageSearch{base: pages.URL}
-	e := newSafeEnvWith(t, safeOpts{reader: reviewReader, search: ps}, replies...) // readerAnswer, and a review's file sections
+	e := newSafeEnvWith(t, safeOpts{reader: reviewReader, search: ps, stored: stored}, replies...) // readerAnswer, and a review's file sections
 	e.mustPost(e.policy(1, edit), e.heartbeat())
 	host := e.s.tasks()
 	pe := &permEnv{safeEnv: e, asks: make(chan proto.Permission, 16), settled: make(chan proto.Permission, 16)}

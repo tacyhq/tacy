@@ -128,7 +128,9 @@ func TestActivityStaleAndBudgetOnTheRecord(t *testing.T) {
 	if ok != 2 || refused != 2 || runs[1].Usage == nil || runs[1].Usage.ToolCalls != 4 && runs[1].Usage.ToolCalls != 2 {
 		t.Fatalf("budget: %d ok, %d refused, usage %+v", ok, refused, runs[1].Usage)
 	}
-	noContent(t, runs, "matter", "7731")
+	// Phrases with a space: no id, hash or chain value can hold one, so a random chain id can't trip the check
+	// (a bare "7731" matched a random hex id now and then).
+	noContent(t, runs, "matter 7731", "search matter")
 }
 
 func TestActivityRateLimitOnTheRecord(t *testing.T) {

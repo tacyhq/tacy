@@ -495,7 +495,8 @@ func main() {
 		reader := guard.DefaultReader // the quarantined reader, as in gatewayd
 		gw = guard.New(guard.Config{Up: up, Search: search, Fetcher: fetcher, Reader: &reader,
 			Icons:  fetcher, // site icons go through the same guarded client (guard/favicons.go)
-			Limits: &lim, CacheSecret: randomHex(32), Now: func() time.Time { return time.Now().UTC() }, Safety: st})
+			Limits: &lim, CacheSecret: randomHex(32), Now: func() time.Time { return time.Now().UTC() }, Safety: st,
+			Stored: guard.NewStoredConfig()})
 	}
 	sg := newSafeGateway(gw, st, &safety.Ledger{Dir: safetyDir})
 	sg.firstHeard = 20 * time.Second
@@ -571,6 +572,7 @@ func main() {
 		trigger.HolderStore
 		trigger.ResultStore
 		trigger.MemoryStore
+		trigger.CollectStore
 		runauth.PinStore
 	}
 	if dir := p.StoragePath(); dir != "" {
@@ -592,8 +594,9 @@ func main() {
 	var holders trigger.HolderStore
 	var results trigger.ResultStore
 	var memory trigger.MemoryStore
+	var collect trigger.CollectStore
 	if st.PersonalSpaces() {
-		holders, results, memory = side, side, side
+		holders, results, memory, collect = side, side, side, side
 		directory = &trigger.HolderDirectory{Firm: st.Firm(), Store: side}
 	}
 	rg.approvals = &guard.Approvals{Release: rt.Release, Emit: host.Emit, Store: side, IDKey: idKey, OnWait: sg.waiting,
@@ -608,7 +611,8 @@ func main() {
 	} else if len(unknown) > 0 {
 		log.Printf("approvals: %d effects were being sent when the last process stopped: unknown, never sent again", len(unknown))
 	}
-	engine := trigger.New(trigger.Config{Firm: st.Firm(), Dir: directory, Store: side, IDKey: idKey, Trusted: st.OperatorTime})
+	engine := trigger.New(trigger.Config{Firm: st.Firm(), Dir: directory, Store: side, IDKey: idKey, Trusted: st.OperatorTime,
+		Collect: collect})
 	if directory != nil {
 		if n, err := engine.Load(); err != nil {
 			log.Fatalf("triggers: %v", err)

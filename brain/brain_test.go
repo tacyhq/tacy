@@ -235,6 +235,46 @@ func TestEmptyStepAsksOnce(t *testing.T) {
 	}
 }
 
+// An earlier step whose whole reply is a tool call's arguments written as text (gpt-oss does: {"query": ...}) is
+// asked once more, with its tools, its reply and the nudge; the run goes on from the retry's reply. Text that merely
+// holds JSON, or a JSON reply on the last step, ends the run as an answer.
+func TestToolCallAsTextAsksOnce(t *testing.T) {
+	asText := `{"query":"typical NDA term","count":5}`
+	f := harness.NewFake()
+	f.Model = harness.Script(harness.Text(asText), harness.Calls(call("c1", "web.search", `{"query":"a"}`)), harness.Text("the answer [1]"))
+	s := task(3, "web.search")
+	s.Limits.MaxModelCalls = 4
+	o, mcs := run(t, f, s)
+	if o.State != harness.OutcomeSucceeded || o.Done.Text != "the answer [1]" || len(mcs) != 3 {
+		t.Fatalf("outcome %+v, %d model calls", o, len(mcs))
+	}
+	m := mcs[1].Messages
+	if len(mcs[1].Tools) != 1 || m[len(m)-1].Content != asTextNudge || m[len(m)-2].Content != asText {
+		t.Fatalf("retry: tools %v, last messages %+v", mcs[1].Tools, m[len(m)-2:])
+	}
+	for _, m := range mcs[2].Messages {
+		if m.Content == asTextNudge || m.Content == asText {
+			t.Fatal("the nudge or the JSON reply stayed in the conversation")
+		}
+	}
+	if f.ActionRuns("t1", "web.search") != 1 {
+		t.Error("the retry's tool call didn't run")
+	}
+
+	for _, text := range []string{`Here it is: {"a": 1}`, "{not json}", "{}x"} {
+		f = harness.NewFake()
+		f.Model = harness.Script(harness.Text(text))
+		if o, mcs = run(t, f, s); o.Done.Text != text || len(mcs) != 1 {
+			t.Fatalf("%q: outcome %+v, %d model calls", text, o, len(mcs))
+		}
+	}
+	f = harness.NewFake()
+	f.Model = harness.Script(harness.Text(asText))
+	if o, mcs = run(t, f, task(1, "web.search")); o.Done.Text != asText || len(mcs) != 1 {
+		t.Fatalf("last step: outcome %+v, %d model calls", o, len(mcs))
+	}
+}
+
 // Instructions are the system message; the input follows.
 func TestInstructions(t *testing.T) {
 	f := harness.NewFake()

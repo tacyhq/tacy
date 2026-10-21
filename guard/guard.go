@@ -60,6 +60,8 @@ type Config struct {
 	// Approvals checks a person's approval of an effect itself (sink.go, docs/27 section 4); nil: nothing that
 	// needs an approval runs.
 	Approvals *ApprovalCheck
+	// Stored reads the person's stored files (stored.go); nil: a task with stored files can't open them.
+	Stored *StoredConfig
 }
 
 // Guard is a harness.Guard: the runtime's Runtime.Guard. Run serves one chat request on a runtime with it.
@@ -100,6 +102,9 @@ func New(cfg Config) *Guard {
 	}
 	// Every fetch is counted for the activity record (facts.go): host, bytes, policy refusals.
 	cfg.Fetcher, cfg.Icons = recordingClient(cfg.Fetcher), recordingClient(cfg.Icons)
+	if cfg.Stored != nil {
+		cfg.Stored = cfg.Stored.wrapped(cfg.Safety != nil)
+	}
 	g := &Guard{cfg: cfg, tasks: map[string]*task{}, readerSlots: make(chan struct{}, readerCalls)}
 	if cfg.Limits != nil {
 		g.gates = newToolGates(*cfg.Limits)
@@ -186,6 +191,14 @@ type TaskOptions struct {
 	// Files are the person's attached files of a review task (review.go): read in the VM by the quarantined reader
 	// through files.*, never shown to the acting model. On the encrypted disk with the task, deleted with it.
 	Files []TaskFile `json:"files,omitzero"`
+	// Stored are files the person picked from their encrypted storage (proto.StoredFile; stored.go, branch
+	// files-vm-read): numbered after Files, opened (fetched, checked, decrypted) the first time the task reads them,
+	// their text kept in gatewayd's memory only. Their keys and read URLs are never written to the queue
+	// (StoredKeysOff): only the process memory of agentd and gatewayd holds them, so a task resumed after agentd
+	// restarted lists its stored files but can't open them. FilesGrant is a schedule run's read grant (its
+	// definition's), with which the guard asks the chat's Worker for read URLs (storedfiles.URLSource).
+	Stored     []proto.StoredFile `json:"stored,omitzero"`
+	FilesGrant string             `json:"files_grant,omitzero"`
 	// Memory: an unattended task whose schedule remembers its runs (trigger.Definition.Memory): agentd keeps what it
 	// found when it ends. NoChange: it may call schedule.no_change (a notify-changes schedule with an earlier run to
 	// compare with; schedule.go).
@@ -351,7 +364,9 @@ func ReplaySafe(req any) bool {
 	case *harness.Action:
 		// web.search, web.fetch, web.images; files.* (read only); schedule.no_change (marks only the run's own result);
 		// document.create (nothing sent or changed)
-		return appTool(b.Name) != "" || isFilesAction(b.Name) || IsNoChangeAction(b.Name) || isDocumentAction(b.Name)
+		// files.fetch is never a brain's action: the guard's own read of a stored file's ciphertext (stored.go), checked
+		// as a read (it goes on while the stop list is stale, as the files.read that needs it does).
+		return appTool(b.Name) != "" || isFilesAction(b.Name) || IsNoChangeAction(b.Name) || isDocumentAction(b.Name) || b.Name == storedFetchAction
 	}
 	return false
 }
@@ -638,6 +653,9 @@ func startFor(r *proto.RunRequest, now time.Time, reader bool) (harness.Start, T
 	}
 	if r.Messages[len(r.Messages)-1].Role != "user" {
 		return s, TaskOptions{}, fmt.Errorf("the last message must be from the user")
+	}
+	if IsChat(def.ID) && len(r.StoredFiles) > 0 {
+		return s, TaskOptions{}, fmt.Errorf("stored files go only to an agent that reads files (research, review)")
 	}
 	if !IsChat(def.ID) {
 		if len(images) > 0 {

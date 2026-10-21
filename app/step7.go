@@ -216,6 +216,10 @@ func (s *server) runTriggers(ctx context.Context, every time.Duration) {
 // recorded as fired once started, found, or skipped for the agent's cap; an open unattended task whose sponsor was
 // revoked, left the space or whose sponsorship ended is cancelled ("sponsor_gone").
 func (s *server) triggerTick(ctx context.Context) {
+	// Stored files' keys of schedules that reached their end go first (trigger.Engine.ExpireFiles).
+	if err := s.triggers.ExpireFiles(); err != nil {
+		log.Printf("triggers: %v", err)
+	}
 	fires, err := s.triggers.Due()
 	if err != nil && !errors.Is(err, trigger.ErrClock) {
 		log.Printf("triggers: %v", err)

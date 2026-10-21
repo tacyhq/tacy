@@ -83,6 +83,8 @@ type safeOpts struct {
 	release func(p *safety.Policy)
 	sink    *guard.Sink
 	check   *guard.ApprovalCheck
+	// stored is the guard's way to the person's stored files (a stand-in bucket in tests); nil: none.
+	stored *guard.StoredConfig
 }
 
 func newSafeEnvWith(t *testing.T, o safeOpts, replies ...string) *safeEnv {
@@ -144,7 +146,8 @@ func newSafeEnvWith(t *testing.T, o safeOpts, replies ...string) *safeEnv {
 	}
 	g := guard.New(guard.Config{Up: up, Search: search, Fetcher: guard.NewFetcher(true),
 		Limits: &lim, CacheSecret: "boot-secret", Now: func() time.Time { return time.Date(2026, 10, 17, 0, 0, 0, 0, time.UTC) },
-		Safety: st, Reader: reader, SlowAfter: o.slowAfter, OverloadWait: 2 * time.Millisecond, Sink: o.sink, Approvals: o.check})
+		Safety: st, Reader: reader, SlowAfter: o.slowAfter, OverloadWait: 2 * time.Millisecond, Sink: o.sink, Approvals: o.check,
+		Stored: o.stored})
 	sg := newSafeGateway(g, st, &safety.Ledger{})
 	signer, _ := activity.DeriveSigner(bytes.Repeat([]byte{5}, 32), "f_chat")
 	e.rec = &activity.Recorder{Signer: signer, Store: activity.NewMemStore()}

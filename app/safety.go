@@ -152,6 +152,13 @@ func (g *safeGateway) StartFor(r *proto.RunRequest) (harness.Start, guard.TaskOp
 	if len(opts.Files) > 0 && !e.AllowsTool("files.read") {
 		return harness.Start{}, guard.TaskOptions{}, &safety.Error{Code: safety.CodePolicyDenied, Msg: "reading attached files isn't allowed by the policy (it has no files connector)"}
 	}
+	// Stored files (branch files-vm-read) are fetched from the files bucket: under a policy without files.fetch
+	// (chat-v4 and before) the start is refused, before anything is fetched.
+	if len(opts.Stored) > 0 {
+		if err := guard.StoredPolicyError(e); err != nil {
+			return harness.Start{}, guard.TaskOptions{}, err
+		}
+	}
 	if start.Space != space {
 		return start, opts, errors.New("safety: unexpected space")
 	}

@@ -42,7 +42,11 @@ type schedEnv struct {
 }
 
 func newSchedEnv(t *testing.T, replies ...string) *schedEnv {
-	e := &schedEnv{safeEnv: newSafeEnvWith(t, safeOpts{}, replies...), store: trigger.NewMemStore()}
+	return newSchedEnvWith(t, safeOpts{}, replies...)
+}
+
+func newSchedEnvWith(t *testing.T, o safeOpts, replies ...string) *schedEnv {
+	e := &schedEnv{safeEnv: newSafeEnvWith(t, o, replies...), store: trigger.NewMemStore()}
 	e.mustPost(e.policy(1, nil), e.heartbeat())
 	var err error
 	if e.me, err = runauth.NewAsker(); err != nil {
@@ -52,7 +56,8 @@ func newSchedEnv(t *testing.T, replies ...string) *schedEnv {
 	holders, results := &trigger.MemHolders{}, &trigger.MemResults{}
 	dir := &trigger.HolderDirectory{Firm: "f_chat", Store: holders}
 	s.dir, s.holders, s.results = dir, holders, results
-	s.triggers = trigger.New(trigger.Config{Firm: "f_chat", Dir: dir, Store: e.store, IDKey: []byte("agentd id key"), Trusted: s.safety.OperatorTime})
+	s.triggers = trigger.New(trigger.Config{Firm: "f_chat", Dir: dir, Store: e.store, IDKey: []byte("agentd id key"), Trusted: s.safety.OperatorTime,
+		Collect: results})
 	s.tasks().TriggeredDone = s.triggeredDone
 	s.tasks().Allows = s.policyAllows
 	return e

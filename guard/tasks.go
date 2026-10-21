@@ -415,7 +415,9 @@ func (h *Host) Start(ctx context.Context, sr StartRequest) (id string, existed b
 // ended; the caller drops or keeps l (failed).
 func (h *Host) launch(ctx context.Context, l *hosted, model string, tools []string, taint string) (existed bool, err error) {
 	id, start, opts := l.id, l.start, l.opts
-	optsJSON, err := json.Marshal(opts)
+	// The queue keeps the options without the stored files' keys and URLs (StoredKeysOff): only this process and
+	// gatewayd's session hold them, in memory.
+	optsJSON, err := json.Marshal(StoredKeysOff(opts))
 	if err != nil {
 		h.drop(l)
 		return false, err
@@ -1027,6 +1029,7 @@ func EndedOptions(opts jsontext.Value) jsontext.Value {
 		return nil
 	}
 	o.Question, o.Links, o.Images, o.Files, o.CacheSecret = "", nil, nil, nil, ""
+	o.Stored, o.FilesGrant = nil, "" // the stored files' names and sizes too (their keys were never kept)
 	b, err := json.Marshal(o)
 	if err != nil {
 		return nil

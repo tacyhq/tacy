@@ -34,6 +34,9 @@ var classes = map[string]Class{
 	// nothing leaves, nothing changes.
 	"files.list": Read,
 	"files.read": Read,
+	// Fetching the person's stored files' ciphertext for such a task (branch files-vm-read, guard/stored.go): a GET of
+	// objects the person named, decrypted in the VM; nothing of theirs leaves, nothing changes.
+	"files.fetch": Read,
 	// A notify-changes schedule's "nothing changed" (guard/schedule.go): answered in the VM; it only marks the run's
 	// own result quiet.
 	"schedule.no_change": Read,

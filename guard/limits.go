@@ -155,8 +155,16 @@ func (g *toolGates) iconGate() func(context.Context) (func(), error) {
 	return func(ctx context.Context) (func(), error) { return acquireSem(ctx, g.favicons) }
 }
 
-// acquire waits for every cap a tool call needs and returns their release. kind: "search" | "fetch".
+// acquire waits for every cap a tool call needs and returns their release. kind: "search" | "fetch", or
+// "search_more": one more provider request of a search that holds its caps already (a 429's retry, the fallback
+// provider: searchfallback.go), which takes only a token of the provider rate.
 func (g *toolGates) acquire(ctx context.Context, user, kind string) (func(), error) {
+	if kind == searchMoreGate {
+		if err := g.rate.wait(ctx); err != nil {
+			return nil, err
+		}
+		return func() {}, nil
+	}
 	relUser, err := g.user.acquire(ctx, user)
 	if err != nil {
 		return nil, err
@@ -179,6 +187,8 @@ func (g *toolGates) acquire(ctx context.Context, user, kind string) (func(), err
 	}
 	return func() { relGlobal(); relUser() }, nil
 }
+
+const searchMoreGate = "search_more"
 
 // forUser is the gate one run's Tools use.
 func (g *toolGates) forUser(user string) func(context.Context, string) (func(), error) {

@@ -248,6 +248,8 @@ type readerE2E struct {
 	web   *recordingWeb
 	fs    *fakeSearch
 	store *taintStore
+	// lastTask: the id of the task review_test.go's review started last
+	lastTask string
 }
 
 // newReaderE2E runs the reader with quotes copied (the v0.7.0 reader, kept for cmd/readereval's comparison);

@@ -26,7 +26,7 @@ func researchReq(msgs ...proto.Message) *proto.RunRequest {
 }
 
 func TestAgentDefinitions(t *testing.T) {
-	if !slices.Equal(AgentIDs(), []string{AgentChat, AgentResearch}) {
+	if !slices.Equal(AgentIDs(), []string{AgentChat, AgentResearch, AgentReview}) {
 		t.Fatalf("agents %v", AgentIDs())
 	}
 	// The chat's reference is as before agents existed; the research agent's names its definition's digest.
@@ -34,7 +34,7 @@ func TestAgentDefinitions(t *testing.T) {
 		t.Fatal("chat ref")
 	}
 	r := AgentRef(AgentResearch)
-	if r.ID != AgentResearch || r.Version != "1" || len(r.Digest) != 64 || r.Digest == "unsigned" {
+	if r.ID != AgentResearch || r.Version != "2" || len(r.Digest) != 64 || r.Digest == "unsigned" {
 		t.Fatalf("research ref %+v", r)
 	}
 	// The digest covers the definition: changing a limit changes it.
@@ -60,9 +60,6 @@ func TestAgentDefinitions(t *testing.T) {
 	// The release ceiling allows the longest agent's running time; each agent's own narrows it.
 	if p := ReleasePolicy("f_chat", ""); p.Budget.Run.WallSeconds != 900 {
 		t.Fatalf("ceiling %+v", p.Budget.Run)
-	}
-	if _, ok := Definition("a_review"); ok { // slice 3
-		t.Fatal("a_review is in this release")
 	}
 }
 

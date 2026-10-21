@@ -398,6 +398,7 @@ func (g *recGateway) begin(ti *harness.TaskInfo, id, kind, name, connector strin
 		d := f.Data()
 		c.Hosts, c.Blocked, c.Redacted, c.Ms = d.Hosts, d.Blocked, d.Redacted, time.Since(t0).Milliseconds()
 		c.Images = d.Images // web.images: pictures that didn't make it, by reason
+		c.Search = d.Search // web.search: its provider, and why it went to the fallback (guard/searchfallback.go)
 		c.Reader = readerRecord(d.Reader)
 		if kind == "model" && d.Model != "" {
 			c.Name = d.Model // the model it ran on (a fallback after a switch, guard/fallback.go)

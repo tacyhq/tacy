@@ -435,14 +435,20 @@ type resultBody struct {
 
 func resultAAD(space, task string) []byte { return []byte(resultInfo + "\x00" + space + "\x00" + task) }
 
-// resultEvents is what of a run's events the result keeps: text deltas joined per step, no reasoning, metrics or
-// queue positions, at most maxResultEvents (the end and the activity records always kept).
+// resultEvents is what of a run's events the result keeps: text deltas joined per step, no reasoning or queue
+// positions, no metrics but the web searches' (v0.13.0: the browser that saves the result reports them, so a
+// scheduled run's failed searches and fallbacks reach the chat's request_metrics like a run in a tab), at most
+// maxResultEvents (the end and the activity records always kept).
 func resultEvents(evs []proto.Event) []proto.Event {
 	var out []proto.Event
 	for _, e := range evs {
 		switch e.Type {
-		case "reasoning", "metrics", "queue", "meta":
+		case "reasoning", "queue", "meta":
 			continue
+		case "metrics":
+			if e.Metrics == nil || e.Metrics.Kind != "search" {
+				continue
+			}
 		case "text":
 			if n := len(out); n > 0 && out[n-1].Type == "text" && out[n-1].Step == e.Step {
 				out[n-1].Delta += e.Delta

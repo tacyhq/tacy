@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/tacyhq/tacy/guard"
+	"github.com/tacyhq/tacy/harness"
 	"github.com/tacyhq/tacy/proto"
 	"github.com/tacyhq/tacy/safety"
 )
@@ -117,8 +118,15 @@ func TestOverloadedHandPickedCode(t *testing.T) {
 	if end.Status.State != "failed" || end.Status.Code != guard.CodeModelOverloaded || !slices.Equal(runs[0].Models, []string{"glm-5-3"}) {
 		t.Fatalf("records: start models %v, end %+v", runs[0].Models, end.Status)
 	}
-	if len(end.Calls) != 1 || end.Calls[0].Outcome != "overloaded" || end.Calls[0].Code != guard.CodeModelOverloaded {
+	// The call and its three tries after a wait (guard/fallback.go overloadWait): every request on the record, the
+	// last with the run's code.
+	if len(end.Calls) != 4 || end.Calls[3].Code != guard.CodeModelOverloaded {
 		t.Fatalf("calls %+v", end.Calls)
+	}
+	for _, c := range end.Calls {
+		if c.Outcome != "overloaded" || c.Name != "glm-5-3" || c.Prompt+c.Completion != 0 {
+			t.Fatalf("calls %+v", end.Calls)
+		}
 	}
 }
 
@@ -136,4 +144,77 @@ func TestFallbacksNeverRefuseTheRun(t *testing.T) {
 	if !slices.Equal(runs[0].Models, []string{"gpt-oss-120b"}) {
 		t.Fatalf("start models %v", runs[0].Models)
 	}
+}
+
+// A fallback is priced: the call's reservation covers the dearest model it may run on (the asked one and the first
+// allowed fallback on Auto), the guard is told which (guard.WithPriced), and what it used is counted at the price of
+// the model that answered, so a switch to a dearer model can't pass the run's cost budget.
+func TestModelCallPricesTheFallback(t *testing.T) {
+	e := newSafeEnv(t)
+	e.mustPost(e.policy(1, func(p *safety.Policy) { p.Models = []string{"deepseek-v4-1-flash", "kimi-k3", "glm-5-3"} }), e.heartbeat())
+	sg := e.s.agent.(*recGateway).safeGateway
+	for _, c := range []struct {
+		name      string
+		opts      guard.TaskOptions
+		answered  string
+		priced    []string
+		priceWith string
+	}{
+		{"auto, switched", guard.TaskOptions{AutoFallback: true, Fallbacks: []string{"gpt-oss-120b", "kimi-k3", "glm-5-3"}}, "kimi-k3",
+			[]string{"deepseek-v4-1-flash", "kimi-k3"}, "kimi-k3"}, // gpt-oss-120b: not in the policy
+		{"auto, not switched", guard.TaskOptions{AutoFallback: true, Fallbacks: []string{"glm-5-3"}}, "deepseek-v4-1-flash",
+			[]string{"deepseek-v4-1-flash", "glm-5-3"}, "deepseek-v4-1-flash"},
+		{"auto, answer's model unknown", guard.TaskOptions{AutoFallback: true, Fallbacks: []string{"glm-5-3"}}, "",
+			[]string{"deepseek-v4-1-flash", "glm-5-3"}, "glm-5-3"},
+		{"hand-picked", guard.TaskOptions{Fallbacks: []string{"kimi-k3"}}, "",
+			[]string{"deepseek-v4-1-flash"}, "deepseek-v4-1-flash"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			stub := &pricedStub{answered: c.answered}
+			l := &safety.Ledger{}
+			g := &safeGateway{inner: stub, st: sg.st, ledger: l}
+			c.opts.Space, c.opts.Agent = testSpace, guard.AgentResearch
+			raw, _ := json.Marshal(c.opts)
+			l.Begin("tk_p", testSpace, "")
+			ti := &harness.TaskInfo{ID: "tk_p", Options: raw, Start: &harness.Start{Space: testSpace}}
+			if _, err := g.ModelCall(context.Background(), ti, &harness.ModelCall{Model: "deepseek-v4-1-flash",
+				Messages: []harness.Message{{Role: "user", Content: "q"}}}); err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(stub.priced, c.priced) {
+				t.Fatalf("priced %v, want %v", stub.priced, c.priced)
+			}
+			// The output cap is what the dearest priced model's cost left can pay for (a_research's $1).
+			dear := c.priced[len(c.priced)-1]
+			if c.name == "auto, switched" && stub.maxTokens != min(int64(safety.CompletionReserve), safety.CompletionFor(dear, stub.prompt, 1_000_000)) {
+				t.Fatalf("output cap %d", stub.maxTokens)
+			}
+			used, _ := l.Used("tk_p")
+			if want := safety.ModelCost(c.priceWith, 1000, 500); used.CostMicros != want {
+				t.Fatalf("counted %d micro-USD, want %d (%s's price)", used.CostMicros, want, c.priceWith)
+			}
+		})
+	}
+}
+
+// pricedStub is gatewayd for TestModelCallPricesTheFallback: it notes what agentd sent and answers on `answered`.
+type pricedStub struct {
+	guard.Gateway
+	answered  string
+	priced    []string
+	maxTokens int64
+	prompt    int64
+}
+
+func (p *pricedStub) ModelCall(ctx context.Context, ti *harness.TaskInfo, req *harness.ModelCall) (*harness.ModelResult, error) {
+	p.priced, p.maxTokens = guard.PricedFrom(ctx), guard.MaxTokensFrom(ctx)
+	n := 0
+	for _, m := range req.Messages {
+		n += len(m.Content) + 64
+	}
+	p.prompt = safety.EstimateTokens(n)
+	if p.answered != "" {
+		guard.FactsFrom(ctx).Merge(guard.FactsData{Model: p.answered})
+	}
+	return &harness.ModelResult{Message: harness.Message{Role: "assistant", Content: "a"}, Usage: harness.Usage{Prompt: 1000, Completion: 500}}, nil
 }

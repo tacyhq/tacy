@@ -40,6 +40,21 @@ func MaxTokensFrom(ctx context.Context) int64 {
 	return n
 }
 
+type pricedKey struct{}
+
+// WithPriced names the models agentd reserved a model call's budget for (the model asked for, and the fallback it
+// may switch to): the guard sends the call to no other (fallback.go route), so a switch never costs more than the
+// reservation covers.
+func WithPriced(ctx context.Context, models []string) context.Context {
+	return context.WithValue(ctx, pricedKey{}, slices.Clone(models))
+}
+
+// PricedFrom is ctx's priced models (nil: not said; in-process tests without agentd).
+func PricedFrom(ctx context.Context) []string {
+	m, _ := ctx.Value(pricedKey{}).([]string)
+	return m
+}
+
 type spaceKey struct{}
 
 func withSpace(ctx context.Context, space string) context.Context {

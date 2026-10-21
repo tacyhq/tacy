@@ -67,8 +67,10 @@ type frame struct {
 	ID    string             `json:"id,omitzero"` // the harness request id (journal, vault lease records)
 	Model *harness.ModelCall `json:"model,omitzero"`
 	// model: the output cap agentd reserved budget for (guard.WithMaxTokens; 0: none)
-	MaxTokens int64           `json:"max_tokens,omitzero"`
-	Action    *harness.Action `json:"action,omitzero"`
+	MaxTokens int64 `json:"max_tokens,omitzero"`
+	// model: the models agentd reserved budget for (guard.WithPriced; none: not said)
+	Priced []string        `json:"priced,omitzero"`
+	Action *harness.Action `json:"action,omitzero"`
 	// action: the person's answer to its permission prompt, which gatewayd checks itself before anything
 	// is sent (guard.Grant); none for a kind the person always allows.
 	Grant *guard.Grant `json:"grant,omitzero"`

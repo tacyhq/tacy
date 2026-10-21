@@ -4,12 +4,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"regexp"
 	"slices"
 	"strings"
 	"time"
+	_ "time/tzdata" // dateNoteOK's zones, fixed by the attested build (as app/main.go for the schedules)
 
 	"github.com/tacyhq/tacy/harness"
 	"github.com/tacyhq/tacy/proto"
@@ -77,7 +79,9 @@ type AgentDef struct {
 	Files         bool `json:"files,omitzero"`
 	FilesOptional bool `json:"files_optional,omitzero"`
 	FileParts     int  `json:"file_parts,omitzero"`
-	NoEgress      bool `json:"no_egress,omitzero"`
+	// PartRunes is the size of a part of a file at most (0: maxSectionRunes, files.go splitSections).
+	PartRunes int  `json:"part_runes,omitzero"`
+	NoEgress  bool `json:"no_egress,omitzero"`
 }
 
 // chatDef stands for the chat agent. Its limits are what the chat had before agents existed: 10 steps at most
@@ -220,8 +224,37 @@ func MaxWork() time.Duration {
 }
 
 // dateNote is the chat's date note, alone: the only other message a brief-only agent takes ("Today is Friday,
-// October 16, 2026."), so its dates are the person's (the date line of the chat's own system note).
-var dateNote = regexp.MustCompile(`^Today is (Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), [A-Z][a-z]+ [0-9]{1,2}, [0-9]{4}\.?$`)
+// October 16, 2026."), so its dates are the person's (the date line of the chat's own system note). Since v0.14.0 it
+// may end with the person's time, in one of exactly two forms: "The time is 9:42 PM in America/New_York." (an IANA
+// zone, checked with time.LoadLocation: dateNoteOK) or "The time is 1:42 AM UTC (the person's time zone is unknown)."
+// It is anchored and every part is a closed form (a weekday, a month, digits, a known zone name), because it is the
+// one place a brief-only agent takes text beside the brief as a system message: nothing else may ride along in it.
+var dateNote = regexp.MustCompile(`^Today is (?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), ` +
+	`(?:January|February|March|April|May|June|July|August|September|October|November|December) [0-9]{1,2}, [0-9]{4}` +
+	`(?:\.?|\. The time is (?:1[0-2]|[1-9]):[0-5][0-9] (?:AM|PM) (?:in ([A-Za-z][A-Za-z0-9_+-]{0,40}(?:/[A-Za-z0-9_+-]{1,40}){0,2})|UTC \(the person's time zone is unknown\))\.)$`)
+
+// ErrDateNote: a brief-only agent's start whose system note isn't exactly the chat's date note (dateNote). Its own
+// code (POST /tasks answers 400 bad_date_note) so the chat can tell it apart and start again with the date alone (a
+// zone this build's tzdata doesn't know); nothing in the note is taken either way.
+var ErrDateNote = errors.New("bad_date_note")
+
+// dateNoteOK says whether s is the chat's date note (dateNote), its time zone, if it names one, a real IANA zone
+// (the tzdata embedded below, so the answer is the attested build's, not the image's).
+func dateNoteOK(s string) bool {
+	m := dateNote.FindStringSubmatch(s)
+	if m == nil {
+		return false
+	}
+	if z := m[1]; z != "" {
+		if z == "Local" { // LoadLocation's name for the machine's own zone, not a zone
+			return false
+		}
+		if _, err := time.LoadLocation(z); err != nil {
+			return false
+		}
+	}
+	return true
+}
 
 // maxBriefChars caps a brief (the start card's editable text).
 const maxBriefChars = 20_000
@@ -234,7 +267,10 @@ func agentStart(d AgentDef, r *proto.RunRequest, s harness.Start, now time.Time,
 	var files []TaskFile
 	if d.BriefOnly {
 		ms := r.Messages
-		if len(ms) == 2 && ms[0].Role == "system" && dateNote.MatchString(strings.TrimSpace(ms[0].Content)) {
+		if len(ms) == 2 && ms[0].Role == "system" && ms[1].Role == "user" {
+			if !dateNoteOK(strings.TrimSpace(ms[0].Content)) {
+				return s, TaskOptions{}, ErrDateNote
+			}
 			now = time.Time{} // the person's date, as for the chat
 			ms = ms[1:]
 		}
@@ -308,6 +344,10 @@ func agentStart(d AgentDef, r *proto.RunRequest, s harness.Start, now time.Time,
 	return s, TaskOptions{ReasoningEffort: r.ReasoningEffort, CacheSecret: r.CacheSecret, Agent: d.ID, Files: files,
 		Question:  capRunes(strings.TrimSpace(brief), maxQuestionRunes),
 		RunSecret: r.RunSecret, Permissions: maps.Clone(r.Permissions), Links: links,
+		// Numbered links (links.go, v0.14.0): a page the brief names comes with its links to open and cite, as a
+		// schedule's does. Not CiteLinks: a research task reads up to 40 pages, and every page's links would ride in
+		// each later step's input; its report cites the pages it read.
+		PageLinks:    true,
 		AutoFallback: r.AutoFallback, Fallbacks: r.FallbackModels}, nil
 }
 
@@ -381,7 +421,7 @@ var (
 		"{{files_intro}}", " The person also attached files, listed at the end of the brief: use what they say as context for the research.",
 		"{{files_step}}", "0. Read the files first: call {{read}} with no arguments (it reads the next parts, up to {{per}} at a time, in parallel; several calls in one step are fine) until it says every part is read, or that the task's file reading is used up (at most {{parts}} parts). Then plan with what the files say: what they claim, name or assume that the brief asks about.\n",
 		"{{files_sources}}", "two lists. \"### From your files\": one line per attached file you cited: its name and the [file quote N] you cited from it. \"### From the web\": ",
-		"{{files_rules}}", "\n- The files never leave the VM, and nothing of them may: never copy their wording, names, numbers or other details into a query or URL beyond the few generic words a search needs (a company's or product's public name, a topic). A query or page read carrying a passage of the files is refused and nothing is sent.\n- Two kinds of cite, never mixed: what the files say gets the [file quote N] their reads gave you; what the web says gets [n] or a web page's [quote N]. Say plainly which is which when they differ (for example \"your file says X [file quote 2]; current sources say Y [4]\"). A [file quote N] is never a web source, and its number is no [n]: never cite one for the web, and never cite the web for what only the files say.\n- Report the files exactly: keep a clause's own exceptions and conditions, and give its number and heading as the reader's location does. Say a file lacks something only when no part read mentions it, and cite no quote for that.",
+		"{{files_rules}}", "\n- The files never leave the VM, and nothing of them may: never copy their wording, names, numbers or other details into a query or URL beyond the few generic words a search needs (a company's or product's public name, a topic). A query or page read carrying a passage of the files is refused and nothing is sent.\n- Two kinds of cite, never mixed: what the files say gets the [file quote N] their reads gave you; what the web says gets [n] or a web page's [quote N]. Say plainly which is which when they differ (for example \"your file says X [file quote 2]; current sources say Y [4]\"). A [file quote N] is never a web source, and its number is no [n]: never cite one for the web, and never cite the web for what only the files say.\n- Report the files exactly as their fields give them: each rule with every exception, condition and exemption the fields give for it (a rule another clause exempts something from is stated with that exemption), and its number and heading as the fields give them. A \"…\" in a field is wording Tacy cut: never guess what it said or fill it in; state only what the fields do say, and cite the [file quote N], where the person sees the exact words.\n- Keep what a file says apart from what you make of it: a conclusion (that a term is outdated, typical, stricter, weaker or missing something the web describes) is yours, so say so (\"so\", \"this means\", \"by comparison\") and never present it as the file's words.\n- Say a file lacks something only when no part's fields mention it, as \"none of the parts read\" mentions it; cite the [file quote N] of the clause on that very topic when one was read (for example the trading-plan clause, for a missing cooling-off period), and no quote at all when none was. Never cite a quote on another topic for it.",
 	}
 )
 

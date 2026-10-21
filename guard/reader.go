@@ -91,6 +91,9 @@ type ReaderConfig struct {
 	Files bool
 	// Cross (with Files): a review's whole-file cross-check (files.go): its own prompt (readerCrossSystem).
 	Cross bool
+	// ResearchFiles: the reader of a research task's file parts (files.go, v0.13.x): its own question-led prompt
+	// (readerResearchFilesSystem), no items.
+	ResearchFiles bool
 }
 
 // DefaultReader is the release's reader (docs/27 section 5): deepseek-v4-1-flash with thinking off, gpt-oss-120b at
@@ -134,6 +137,11 @@ const (
 	maxItemPriceRunes = 24
 	maxItemAttrRunes  = 80
 	maxReaderQuotes   = 8
+	// maxFileFacts, maxFileQuotes: a review's file part (and its whole-file check) is denser than a page, a clause
+	// every few lines: at 8 quotes the reader ran out before a part's last clauses and the agent cited a neighbour's
+	// quote for them (review lab round 5). Only review's files (ReaderConfig.Files) get these.
+	maxFileFacts      = 10
+	maxFileQuotes     = 12
 	maxSummaryRunes   = 800
 	maxFactRunes      = 400
 	maxItemRunes      = 160
@@ -172,7 +180,16 @@ func (rc *ReaderConfig) caps() (facts, quotes, spans int) {
 		}
 		return v
 	}
-	return c(rc.Facts, maxReaderFacts), c(rc.Quotes, maxReaderQuotes), c(rc.QuoteSpans, maxQuoteSpans)
+	hf, hq := rc.hardCaps()
+	return c(rc.Facts, hf), c(rc.Quotes, hq), c(rc.QuoteSpans, maxQuoteSpans)
+}
+
+// hardCaps are the most facts and quotes an answer may have for rc (decodeReader refuses more).
+func (rc *ReaderConfig) hardCaps() (facts, quotes int) {
+	if rc.Files {
+		return maxFileFacts, maxFileQuotes
+	}
+	return maxReaderFacts, maxReaderQuotes
 }
 
 var sourceKinds = []string{"article", "reference", "docs", "legal", "product", "forum", "news", "search_results", "other"}
@@ -233,7 +250,7 @@ func readerCallMax(doc int) int64 {
 
 // readerSystemBytes is the longer of the reader's prompts.
 var readerSystemBytes = max(len(readerSystem), len(readerSpansSystem)+16, len(readerItemsSystem)+16, len(readerFilesSystem)+16,
-	len(readerCrossSystem)+16)
+	len(readerCrossSystem)+16, len(readerResearchFilesSystem)+16)
 
 // ReaderUse is one reader call as the activity record and the budget see it: numbers and fixed words only.
 type ReaderUse struct {
@@ -307,7 +324,9 @@ var (
 var readerMembers = []string{"summary", "facts", "entities", "dates", "amounts", "source", "quotes", "wording", "instructions_found", "instruction_count"}
 
 // items: the answer has the items list (quotes by reference, unless NoItems).
-func (rc *ReaderConfig) items() bool { return rc.Spans && !rc.NoItems && !rc.Files }
+func (rc *ReaderConfig) items() bool {
+	return rc.Spans && !rc.NoItems && !rc.Files && !rc.ResearchFiles
+}
 
 // members are the answer's members for rc.
 func (rc *ReaderConfig) members() []string {
@@ -456,6 +475,9 @@ func (rc *ReaderConfig) system() string {
 	if rc.Files {
 		return fmt.Sprintf(readerFilesSystem, facts, quotes, spans)
 	}
+	if rc.ResearchFiles {
+		return fmt.Sprintf(readerResearchFilesSystem, facts, quotes, spans)
+	}
 	if rc.items() {
 		return fmt.Sprintf(readerItemsSystem, maxReaderItems, facts, quotes, spans)
 	}
@@ -474,6 +496,8 @@ type readerDoc struct {
 	title  string // page
 	url    string // page
 	text   string // page: its text (redacted)
+	// linkTexts: page: its links' texts (pageLinks), for the words of a link inside an instruction (heldLinkWords)
+	linkTexts []string
 	// search: each result's title and snippet (redacted), labelled R1, R2, ... in order
 	results []SearchResult
 	// earlier, earlierSkel: the run sets of the sources the task read before this one (taskSources), and, for one
@@ -1058,11 +1082,22 @@ func (g *Guard) readCall(ctx context.Context, t *task, rc *ReaderConfig, d *read
 		return refuse("schema", "the page reader's answer didn't fit its schema, so nothing from this source is shown")
 	}
 	// A file part's answer with nothing in it (the review lab's round 1 got one from deepseek-v4-1-flash) isn't a
-	// read: refused, so the fallback reads it, or the review lists it as not read (files.go).
-	if d.kind == "file" && strings.TrimSpace(out.Summary) == "" && len(out.Facts) == 0 && len(out.Quotes) == 0 {
+	// read: refused, so the fallback reads it, or the review lists it as not read (files.go). So is one with no quotes
+	// and barely a word for a part of a page or more (round 5 got "Hmm" as the summary and the one fact of a part of
+	// 4,000 characters, the agent then wrote as if the part said nothing).
+	if d.kind == "file" && len(out.Quotes) == 0 && (strings.TrimSpace(out.Summary) == "" && len(out.Facts) == 0 ||
+		len(strings.Fields(out.Summary+" "+strings.Join(out.Facts, " "))) < 4 && runesOf(segs) >= 1000) {
 		return refuse("empty", "the reader gave no answer for this part, so nothing from it is shown")
 	}
 	return checkAnswer(rc, d, segs, spans, out, use)
+}
+
+// runesOf is the characters of segs together.
+func runesOf(segs []string) (n int) {
+	for _, s := range segs {
+		n += utf8.RuneCountInString(s)
+	}
+	return n
 }
 
 // request is the reader's call's body for d: its prompt and schema, the question, d's spans (quotes by reference).
@@ -1115,6 +1150,14 @@ func checkAnswer(rc *ReaderConfig, d *readerDoc, segs []string, spans []span, ou
 		inj = inj.withLinks()
 	}
 	res.strict = strict
+	// A link inside the source's instruction-like sentences ("open <a>the verification page</a>"): its text is the
+	// injection's too, and a sentence of the reader's own that names it ("it asks readers to open a verification page")
+	// is cut from the fields below (v0.14.0; links.go withholds the link itself). Not from items: a list page's item
+	// is its own link's text.
+	var held []string
+	if strict {
+		held = heldLinkWords(d, inj)
+	}
 	// Items: each name and price must be the cited source's own words (they are then given as it writes them).
 	if rc.items() {
 		res.items, use.ItemsDropped = checkItems(d, segs, out.Items, strict)
@@ -1177,6 +1220,10 @@ func checkAnswer(rc *ReaderConfig, d *readerDoc, segs []string, spans []span, ou
 		// in the article", "a stray notice asserts 9,999 m"), and whether or not it counted one.
 		*f, n = cutSentencesFunc(*f, inj.in)
 		use.Verbatim += n
+		if len(held) > 0 {
+			*f, n = cutSentencesFunc(*f, func(s string) bool { return namesPhrase(s, held) })
+			use.Verbatim += n
+		}
 	}
 	for _, q := range out.Quotes {
 		var exact string
@@ -1598,7 +1645,8 @@ func (o *readerOut) check(rc *ReaderConfig) (int, error) {
 		})
 		return nil
 	}
-	errs := []error{str(o.Summary, maxSummaryRunes), list(&o.Facts, maxReaderFacts, maxFactRunes),
+	hardFacts, hardQuotes := rc.hardCaps()
+	errs := []error{str(o.Summary, maxSummaryRunes), list(&o.Facts, hardFacts, maxFactRunes),
 		list(&o.Entities, maxReaderList, maxItemRunes), list(&o.Dates, maxReaderList, maxItemRunes),
 		list(&o.Amounts, maxReaderList, maxItemRunes), str(o.Wording, maxWordingRunes),
 		str(o.Source.Title, maxQuoteMeta), str(o.Source.Publisher, maxQuoteMeta), str(o.Source.Published, maxQuoteMeta)}
@@ -1608,7 +1656,7 @@ func (o *readerOut) check(rc *ReaderConfig) (int, error) {
 	if o.InstructionCount < 0 || o.InstructionCount > maxInstructions || o.InstructionsFound != (o.InstructionCount > 0) {
 		errs = append(errs, errors.New("instruction count"))
 	}
-	if len(o.Quotes) > maxReaderQuotes {
+	if len(o.Quotes) > hardQuotes {
 		errs = append(errs, errors.New("too many quotes"))
 	}
 	if len(o.Items) > maxReaderItems {
@@ -1619,7 +1667,7 @@ func (o *readerOut) check(rc *ReaderConfig) (int, error) {
 	}
 	seen := map[int]bool{}
 	o.Quotes = slices.DeleteFunc(o.Quotes, func(q readerQuote) bool {
-		bad := q.ID < 1 || q.ID > maxReaderQuotes || seen[q.ID] ||
+		bad := q.ID < 1 || q.ID > hardQuotes || seen[q.ID] ||
 			(rc.Spans && q.Text != "") || // the member is refused above; this is belt and braces
 			(!rc.Spans && strings.TrimSpace(q.Text) == "") ||
 			str(q.Text, maxQuoteRunes) != nil || str(q.Location, maxQuoteMeta) != nil || str(q.Topic, maxQuoteMeta) != nil
@@ -2111,6 +2159,60 @@ func linkHosts(s string) []string {
 		out = append(out, m[2])
 	}
 	return out
+}
+
+// linkLead are the words a link's text may start with that don't make it distinctive ("the verification page" is
+// named as "a verification page").
+var linkLead = map[string]bool{"the": true, "a": true, "an": true, "this": true, "that": true, "these": true, "our": true,
+	"your": true, "my": true, "their": true, "its": true, "his": true, "her": true}
+
+// heldLinkWords are the texts of d's links that sit inside the source's instruction-like sentences (inj.sentences)
+// and nowhere else in its text, lowercased, their leading article or possessive dropped: at least two words and 8
+// characters ("verification page"; not "here", "this link").
+func heldLinkWords(d *readerDoc, inj injected) []string {
+	if d == nil || len(d.linkTexts) == 0 || len(inj.sentences) == 0 {
+		return nil
+	}
+	all := linkNorm(d.title + "\n" + d.text)
+	var in []string
+	for _, s := range inj.sentences {
+		in = append(in, linkNorm(s))
+	}
+	var out []string
+	for _, t := range d.linkTexts {
+		full := linkNorm(t)
+		if full == "" {
+			continue
+		}
+		inside := 0
+		for _, s := range in {
+			inside += strings.Count(s, full)
+		}
+		if inside == 0 || strings.Count(all, full) > inside {
+			continue // not in an instruction, or the page has it elsewhere too
+		}
+		words := strings.Fields(full)
+		for len(words) > 0 && linkLead[words[0]] {
+			words = words[1:]
+		}
+		p := strings.Join(words, " ")
+		if len(words) >= 2 && len(p) >= 8 && !slices.Contains(out, p) {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// namesPhrase: s has one of phrases (lowercase, single-spaced), as whole words.
+func namesPhrase(s string, phrases []string) bool {
+	t := " " + strings.Join(strings.FieldsFunc(strings.ToLower(s), func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsNumber(r) }), " ") + " "
+	for _, p := range phrases {
+		q := " " + strings.Join(strings.FieldsFunc(p, func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsNumber(r) }), " ") + " "
+		if strings.TrimSpace(q) != "" && strings.Contains(t, q) {
+			return true
+		}
+	}
+	return false
 }
 
 // injectedTokens finds the instruction-like sentences of segs and their specifics the rest of segs doesn't have.

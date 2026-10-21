@@ -86,12 +86,12 @@ func (e *exa) Search(ctx context.Context, query string, count int) ([]SearchResu
 	req.Header.Set("x-api-key", string(key.Bytes()))
 	res, err := e.http.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("search provider unreachable")
+		return nil, transportFailure(err)
 	}
 	defer res.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(res.Body, 2<<20))
 	if err != nil {
-		return nil, err
+		return nil, transportFailure(err)
 	}
 	raw = exactRedact(raw, []*vault.Secret{key}) // an echoed key never reaches the brain
 	if res.StatusCode != 200 {
@@ -100,9 +100,10 @@ func (e *exa) Search(ctx context.Context, query string, count int) ([]SearchResu
 			Tag string `json:"tag"`
 		}
 		if json.Unmarshal(raw, &er) == nil && er.Tag == "CONTENT_FILTER_ERROR" {
+			// A refusal of the query, not a failure: never retried elsewhere (searchfallback.go).
 			return nil, fmt.Errorf("the search provider's safety filter refused this query")
 		}
-		return nil, fmt.Errorf("search provider returned %d", res.StatusCode)
+		return nil, httpFailure(res)
 	}
 	return parseExa(raw, count)
 }
@@ -120,7 +121,7 @@ func parseExa(raw []byte, count int) ([]SearchResult, error) {
 		} `json:"results"`
 	}
 	if err := json.Unmarshal(raw, &out); err != nil {
-		return nil, fmt.Errorf("search provider: bad response")
+		return nil, badResponse()
 	}
 	var rs []SearchResult
 	for _, r := range out.Results {

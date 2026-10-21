@@ -354,7 +354,7 @@ func toolMetric(name string, step int, out toolOutcome, ms int64) *proto.Metric 
 	}
 	switch name {
 	case "web_search":
-		m.Kind, m.Provider = "search", out.provider
+		m.Kind, m.Provider, m.Fallback, m.Status = "search", out.provider, out.fallback, out.status
 		if out.failed == "" {
 			m.Results = len(out.citations)
 		}

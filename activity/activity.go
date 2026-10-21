@@ -195,6 +195,26 @@ type Call struct {
 	Edited     bool   `json:"edited,omitzero"`
 	// Images (web.images): the pictures shown, and those that didn't make it by reason. Fixed words and counts only.
 	Images *Images `json:"images,omitzero"`
+	// Search (web.search, v0.13.0): the provider that ran it and, when it went to the fallback, why. Hosts lists every
+	// provider it reached.
+	Search *Search `json:"search,omitzero"`
+}
+
+// Search is how a web search went: the provider whose results it got (or that failed last), and Fallback, when the
+// primary provider failed on its side and the search went to the fallback: the failure's class (http_402, http_5xx,
+// timeout, ...) or breaker_open (the primary skipped after failures in a row). Fixed words only.
+type Search struct {
+	Provider string `json:"provider"`
+	Fallback string `json:"fallback,omitzero"`
+}
+
+// Clone is a copy (nil for nil).
+func (s *Search) Clone() *Search {
+	if s == nil {
+		return nil
+	}
+	c := *s
+	return &c
 }
 
 // Images counts pictures: those shown (Shown, since v0.8.7: an image search's, or the card pictures taken from the

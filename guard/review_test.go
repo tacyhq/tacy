@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"encoding/json/jsontext"
 	"fmt"
+	"github.com/tacyhq/tacy/approval"
 	"net/http"
 	"slices"
 	"strings"
@@ -755,6 +756,19 @@ func TestResearchFilesNoCrossCheck(t *testing.T) {
 	for _, r := range sm.readReqs {
 		if p := r["messages"].([]any)[1].(map[string]any)["content"].(string); strings.Contains(p, headingsAboveLabel) || isCross(p) {
 			t.Fatalf("research prompt %q", p)
+		}
+	}
+}
+
+// The release ceiling's every connector action has a class in the approval table, never the unknown default (a
+// send): the chat VM has no approvers, so an unclassified action is refused for every task.
+func TestCeilingActionsClassified(t *testing.T) {
+	rel := ReleasePolicy("f_chat", "")
+	for name, c := range rel.Connectors {
+		for _, a := range c.Tools {
+			if approval.ClassOf(a) == approval.Send {
+				t.Errorf("connector %s: %s has no approval class (falls to send)", name, a)
+			}
 		}
 	}
 }

@@ -117,4 +117,21 @@ func RunMemoryStoreTests(t *testing.T, ms MemoryStore) {
 	if got, _ := ms.Memories("s_1", "a_1", time.Time{}); len(got) != 0 {
 		t.Fatal("deleted memory read back")
 	}
+	// Schedules that are gone lose their memory; the others keep theirs.
+	for _, m := range []Remembered{mk("tk_k1", "s_1", "a_keep", 40), mk("tk_k2", "s_1", "a_keep", 41), mk("tk_g1", "s_1", "a_gone", 40),
+		mk("tk_g2", "s_2", "a_keep", 40)} {
+		ms.PutMemory(m)
+	}
+	n, err := ms.PruneMemoryExcept(func(space, agent string) bool { return space == "s_1" && agent == "a_keep" })
+	if err != nil || n != 2 {
+		t.Fatalf("prune except: %d %v", n, err)
+	}
+	if got, _ := ms.Memories("s_1", "a_keep", time.Time{}); len(got) != 2 {
+		t.Fatalf("a kept schedule's memory: %+v", got)
+	}
+	for _, sa := range [][2]string{{"s_1", "a_gone"}, {"s_2", "a_keep"}} {
+		if got, _ := ms.Memories(sa[0], sa[1], time.Time{}); len(got) != 0 {
+			t.Fatalf("a gone schedule's memory stayed: %v %+v", sa, got)
+		}
+	}
 }

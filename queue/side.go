@@ -533,6 +533,37 @@ func (s *Side) DeleteMemory(space, agent string) (int, error) {
 	return int(k), nil
 }
 
+func (s *Side) PruneMemoryExcept(keep func(space, agent string) bool) (int, error) {
+	rows, err := s.db.Query(`SELECT DISTINCT space, agent FROM memory`)
+	if err != nil {
+		return 0, err
+	}
+	var gone [][2]string
+	for rows.Next() {
+		var space, agent string
+		if err := rows.Scan(&space, &agent); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		if !keep(space, agent) {
+			gone = append(gone, [2]string{space, agent})
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, g := range gone {
+		k, err := s.DeleteMemory(g[0], g[1])
+		n += k
+		if err != nil {
+			return n, err
+		}
+	}
+	return n, nil
+}
+
 func (s *Side) PruneMemory(t time.Time) error {
 	_, err := s.db.Exec(`DELETE FROM memory WHERE ended_at < ?`, ms(t))
 	return err

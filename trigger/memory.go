@@ -63,6 +63,10 @@ type MemoryStore interface {
 	DeleteMemory(space, agent string) (int, error)
 	// PruneMemory deletes memories of runs that ended before t.
 	PruneMemory(t time.Time) error
+	// PruneMemoryExcept deletes the memory of every schedule (space and agent) keep says is gone; it returns how
+	// many runs' memories went. agentd: a schedule removed, or replaced by a version without memory, while a
+	// release that never reads memory ran (a rollback to v0.14.0) loses its memory when this release is back.
+	PruneMemoryExcept(keep func(space, agent string) bool) (int, error)
 }
 
 // Capped is m within the limits: text and note cut, at most MaxMemorySources sources (each title and address
@@ -183,6 +187,12 @@ func (m *MemMemory) DeleteMemory(space, agent string) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.del(func(x Remembered) bool { return !(x.Space == space && x.Agent == agent) }), nil
+}
+
+func (m *MemMemory) PruneMemoryExcept(keep func(space, agent string) bool) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.del(func(x Remembered) bool { return keep(x.Space, x.Agent) }), nil
 }
 
 func (m *MemMemory) PruneMemory(t time.Time) error {

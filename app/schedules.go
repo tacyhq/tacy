@@ -620,6 +620,27 @@ func (s *server) policyAllows(space, action string) bool {
 	return err == nil && e.AllowsTool(action)
 }
 
+// pruneMemory drops memories past their keep (30 days) and every memory of a schedule that isn't installed in its
+// space with memory on: one removed, or replaced by a version without memory, while a release that never reads
+// memory ran (a rollback to v0.14.0, whose remove deletes the definition and results but not this table).
+func (s *server) pruneMemory() {
+	if s.memory == nil || s.triggers == nil {
+		return
+	}
+	if err := s.memory.PruneMemory(time.Now().Add(-trigger.MemoryKeep)); err != nil {
+		log.Printf("schedules: %v", err)
+	}
+	n, err := s.memory.PruneMemoryExcept(func(space, agent string) bool {
+		in := s.triggers.Get(agent)
+		return in != nil && in.Def.Space == space && in.Def.Memory
+	})
+	if err != nil {
+		log.Printf("schedules: %v", err)
+	} else if n > 0 {
+		log.Printf("schedules: %d memories of schedules no longer installed deleted", n) // no ids
+	}
+}
+
 func (s *server) scheduleMemory(space, agent string) ([]trigger.Remembered, error) {
 	if s.memory == nil {
 		return nil, nil
@@ -627,17 +648,14 @@ func (s *server) scheduleMemory(space, agent string) ([]trigger.Remembered, erro
 	return s.memory.Memories(space, agent, time.Now().Add(-trigger.MemoryKeep))
 }
 
-// pruneResults drops results past their keep, and memories past theirs, every hour, until ctx ends.
+// pruneResults drops results past their keep and prunes memories (pruneMemory), at once (agentd's start: main loads
+// the definitions first) and then every hour, until ctx ends.
 func (s *server) pruneResults(ctx context.Context) {
 	for {
 		if err := s.results.PruneResults(time.Now().Add(-trigger.ResultKeep)); err != nil {
 			log.Printf("schedules: %v", err)
 		}
-		if s.memory != nil {
-			if err := s.memory.PruneMemory(time.Now().Add(-trigger.MemoryKeep)); err != nil {
-				log.Printf("schedules: %v", err)
-			}
-		}
+		s.pruneMemory()
 		select {
 		case <-ctx.Done():
 			return

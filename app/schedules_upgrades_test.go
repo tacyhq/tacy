@@ -9,6 +9,7 @@ import (
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -19,6 +20,7 @@ import (
 	"github.com/tacyhq/tacy/guard"
 	"github.com/tacyhq/tacy/harness"
 	"github.com/tacyhq/tacy/identity"
+	"github.com/tacyhq/tacy/queue"
 	"github.com/tacyhq/tacy/runauth"
 	"github.com/tacyhq/tacy/safety"
 	"github.com/tacyhq/tacy/trigger"
@@ -261,6 +263,73 @@ func TestScheduleUpgradesUnderOlderPolicy(t *testing.T) {
 	if b := e.modelBody(3); !offered(b, guard.NoChangeTool) || !offered(b, "document_create") {
 		t.Fatalf("run 3 under chat-v4 wasn't offered its tools: %s", b)
 	}
+}
+
+// A schedule removed while a release that never reads memory ran (a rollback to v0.14.0: its remove stops the
+// definition and deletes the results, not the memory table) loses its memory as soon as this release is back: at
+// agentd's start (pruneMemory, after the definitions load) and on each hourly pass. Another schedule's memory stays.
+// On a real side file, closed and opened again between the steps as the releases would.
+func TestScheduleMemoryOfRemovedScheduleGoesAtStart(t *testing.T) {
+	e := newSchedEnv(t, pText("Top stories: A [1]."), pText("Top stories: B [1]."))
+	path := filepath.Join(t.TempDir(), "side.db")
+	open := func() *queue.Side {
+		side, err := queue.OpenSide(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dir := &trigger.HolderDirectory{Firm: "f_chat", Store: side}
+		e.s.dir, e.s.holders, e.s.results, e.s.memory, e.store = dir, side, side, side, nil
+		e.s.tasks().Memory = e.s.scheduleMemory
+		e.s.triggers = trigger.New(trigger.Config{Firm: "f_chat", Dir: dir, Store: side, IDKey: []byte("agentd id key"), Trusted: e.s.safety.OperatorTime})
+		if _, err := e.s.triggers.Load(); err != nil {
+			t.Fatal(err)
+		}
+		return side
+	}
+	// v0.15.0: two schedules with memory each run once and are remembered.
+	side := open()
+	var agents []string
+	for range 2 {
+		d := e.daily(e.me, func(d *trigger.Definition) { d.Memory = true })
+		if code, out := e.install(e.me, e.sign(d, e.me.Key)); code != 200 {
+			t.Fatalf("install %d %v", code, out)
+		}
+		e.s.triggerTick(context.Background())
+		for id, o := range e.s.tasks().Triggered() {
+			if o.DefAgent == d.Agent {
+				e.waitResult(id)
+			}
+		}
+		if m, _ := side.Memories(e.me.Space, d.Agent, time.Time{}); len(m) != 1 {
+			t.Fatalf("memory after the run: %+v", m)
+		}
+		agents = append(agents, d.Agent)
+	}
+	side.Close()
+
+	// v0.14.0 (rolled back): removing the first schedule stops it and deletes its results, nothing else.
+	side = open()
+	if _, err := e.s.triggers.Stop(agents[0], true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := side.DeleteAgentResults(e.me.Space, agents[0]); err != nil {
+		t.Fatal(err)
+	}
+	if m, _ := side.Memories(e.me.Space, agents[0], time.Time{}); len(m) != 1 {
+		t.Fatal("the setup: v0.14.0's remove left the memory")
+	}
+	side.Close()
+
+	// v0.15.0 again: its start prunes.
+	side = open()
+	e.s.pruneMemory()
+	if m, _ := side.Memories(e.me.Space, agents[0], time.Time{}); len(m) != 0 {
+		t.Fatalf("a removed schedule's memory stayed: %+v", m)
+	}
+	if m, _ := side.Memories(e.me.Space, agents[1], time.Time{}); len(m) != 1 {
+		t.Fatalf("an installed schedule's memory went: %+v", m)
+	}
+	side.Close()
 }
 
 // agentd checks schedule.no_change against the space's policy like any other action (its connector is "schedule"

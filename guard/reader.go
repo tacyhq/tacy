@@ -134,6 +134,11 @@ const (
 	maxItemPriceRunes = 24
 	maxItemAttrRunes  = 80
 	maxReaderQuotes   = 8
+	// maxFileFacts, maxFileQuotes: a review's file part (and its whole-file check) is denser than a page, a clause
+	// every few lines: at 8 quotes the reader ran out before a part's last clauses and the agent cited a neighbour's
+	// quote for them (review lab round 5). Only review's files (ReaderConfig.Files) get these.
+	maxFileFacts      = 10
+	maxFileQuotes     = 12
 	maxSummaryRunes   = 800
 	maxFactRunes      = 400
 	maxItemRunes      = 160
@@ -172,7 +177,16 @@ func (rc *ReaderConfig) caps() (facts, quotes, spans int) {
 		}
 		return v
 	}
-	return c(rc.Facts, maxReaderFacts), c(rc.Quotes, maxReaderQuotes), c(rc.QuoteSpans, maxQuoteSpans)
+	hf, hq := rc.hardCaps()
+	return c(rc.Facts, hf), c(rc.Quotes, hq), c(rc.QuoteSpans, maxQuoteSpans)
+}
+
+// hardCaps are the most facts and quotes an answer may have for rc (decodeReader refuses more).
+func (rc *ReaderConfig) hardCaps() (facts, quotes int) {
+	if rc.Files {
+		return maxFileFacts, maxFileQuotes
+	}
+	return maxReaderFacts, maxReaderQuotes
 }
 
 var sourceKinds = []string{"article", "reference", "docs", "legal", "product", "forum", "news", "search_results", "other"}
@@ -1058,11 +1072,22 @@ func (g *Guard) readCall(ctx context.Context, t *task, rc *ReaderConfig, d *read
 		return refuse("schema", "the page reader's answer didn't fit its schema, so nothing from this source is shown")
 	}
 	// A file part's answer with nothing in it (the review lab's round 1 got one from deepseek-v4-1-flash) isn't a
-	// read: refused, so the fallback reads it, or the review lists it as not read (files.go).
-	if d.kind == "file" && strings.TrimSpace(out.Summary) == "" && len(out.Facts) == 0 && len(out.Quotes) == 0 {
+	// read: refused, so the fallback reads it, or the review lists it as not read (files.go). So is one with no quotes
+	// and barely a word for a part of a page or more (round 5 got "Hmm" as the summary and the one fact of a part of
+	// 4,000 characters, the agent then wrote as if the part said nothing).
+	if d.kind == "file" && len(out.Quotes) == 0 && (strings.TrimSpace(out.Summary) == "" && len(out.Facts) == 0 ||
+		len(strings.Fields(out.Summary+" "+strings.Join(out.Facts, " "))) < 4 && runesOf(segs) >= 1000) {
 		return refuse("empty", "the reader gave no answer for this part, so nothing from it is shown")
 	}
 	return checkAnswer(rc, d, segs, spans, out, use)
+}
+
+// runesOf is the characters of segs together.
+func runesOf(segs []string) (n int) {
+	for _, s := range segs {
+		n += utf8.RuneCountInString(s)
+	}
+	return n
 }
 
 // request is the reader's call's body for d: its prompt and schema, the question, d's spans (quotes by reference).
@@ -1598,7 +1623,8 @@ func (o *readerOut) check(rc *ReaderConfig) (int, error) {
 		})
 		return nil
 	}
-	errs := []error{str(o.Summary, maxSummaryRunes), list(&o.Facts, maxReaderFacts, maxFactRunes),
+	hardFacts, hardQuotes := rc.hardCaps()
+	errs := []error{str(o.Summary, maxSummaryRunes), list(&o.Facts, hardFacts, maxFactRunes),
 		list(&o.Entities, maxReaderList, maxItemRunes), list(&o.Dates, maxReaderList, maxItemRunes),
 		list(&o.Amounts, maxReaderList, maxItemRunes), str(o.Wording, maxWordingRunes),
 		str(o.Source.Title, maxQuoteMeta), str(o.Source.Publisher, maxQuoteMeta), str(o.Source.Published, maxQuoteMeta)}
@@ -1608,7 +1634,7 @@ func (o *readerOut) check(rc *ReaderConfig) (int, error) {
 	if o.InstructionCount < 0 || o.InstructionCount > maxInstructions || o.InstructionsFound != (o.InstructionCount > 0) {
 		errs = append(errs, errors.New("instruction count"))
 	}
-	if len(o.Quotes) > maxReaderQuotes {
+	if len(o.Quotes) > hardQuotes {
 		errs = append(errs, errors.New("too many quotes"))
 	}
 	if len(o.Items) > maxReaderItems {
@@ -1619,7 +1645,7 @@ func (o *readerOut) check(rc *ReaderConfig) (int, error) {
 	}
 	seen := map[int]bool{}
 	o.Quotes = slices.DeleteFunc(o.Quotes, func(q readerQuote) bool {
-		bad := q.ID < 1 || q.ID > maxReaderQuotes || seen[q.ID] ||
+		bad := q.ID < 1 || q.ID > hardQuotes || seen[q.ID] ||
 			(rc.Spans && q.Text != "") || // the member is refused above; this is belt and braces
 			(!rc.Spans && strings.TrimSpace(q.Text) == "") ||
 			str(q.Text, maxQuoteRunes) != nil || str(q.Location, maxQuoteMeta) != nil || str(q.Topic, maxQuoteMeta) != nil

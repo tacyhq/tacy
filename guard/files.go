@@ -35,9 +35,10 @@ const (
 	// maxSectionsPerRead is how many sections one files.read reads at once (agentd reserves the reader's budget for
 	// that many: ReaderReserve).
 	maxSectionsPerRead = 12
-	// maxSectionRunes is a section's size at most; sections are packed up to it from whole clauses where the text
-	// has them. About a page of a contract: one reader call covers it in its 8 facts and 8 quotes (the scorecard's
-	// round 1 at 6,000 lost cross-references and wording differences in a policy's long sections).
+	// maxSectionRunes is a section's size at most (an agent's own may be smaller: AgentDef.PartRunes); sections are
+	// packed up to it from whole clauses where the text has them. About a page of a contract: one reader call covers
+	// it in its 8 facts and 8 quotes (the scorecard's round 1 at 6,000 lost cross-references and wording differences
+	// in a policy's long sections).
 	maxSectionRunes = 4000
 	// maxSectionTries: a section whose read failed is tried again once by a later files.read.
 	maxSectionTries = 2
@@ -213,10 +214,13 @@ func headingLine(l string) bool {
 	return letters >= 3
 }
 
-// splitSections cuts a file's text into sections: blocks that start at heading lines, a block longer than
-// maxSectionRunes cut at its last blank line, line break or space before the cap, then consecutive blocks packed
-// together up to maxSectionRunes. Sections cover the whole text in order; ones with only whitespace are left out.
-func splitSections(text string) []fileSection {
+// splitSections cuts a file's text into sections: blocks that start at heading lines, a block longer than size
+// (at most maxSectionRunes) cut at its last blank line, line break or space before the cap, then consecutive blocks
+// packed together up to size. Sections cover the whole text in order; ones with only whitespace are left out.
+func splitSections(text string, size int) []fileSection {
+	if size <= 0 || size > maxSectionRunes {
+		size = maxSectionRunes
+	}
 	// Blocks at heading lines.
 	var cuts []int
 	for at := 0; at < len(text); {
@@ -233,7 +237,7 @@ func splitSections(text string) []fileSection {
 	var blocks []fileSection
 	prev := 0
 	for _, c := range append(cuts, len(text)) {
-		blocks = append(blocks, cutBig(text, prev, c)...)
+		blocks = append(blocks, cutBig(text, prev, c, size)...)
 		prev = c
 	}
 	// Packed.
@@ -241,7 +245,7 @@ func splitSections(text string) []fileSection {
 	cur, curRunes := fileSection{}, -1
 	for _, b := range blocks {
 		n := utf8.RuneCountInString(text[b.start:b.end])
-		if curRunes >= 0 && curRunes+n <= maxSectionRunes {
+		if curRunes >= 0 && curRunes+n <= size {
 			cur.end, curRunes = b.end, curRunes+n
 			continue
 		}
@@ -348,14 +352,14 @@ func (f *reviewFile) headingsAbove(sec int) []string {
 	return out
 }
 
-// cutBig cuts text[start:end] into pieces of at most maxSectionRunes: at the last blank line before the cap, else
+// cutBig cuts text[start:end] into pieces of at most size characters: at the last blank line before the cap, else
 // the last line break, else the last space, else at the cap.
-func cutBig(text string, start, end int) []fileSection {
+func cutBig(text string, start, end, size int) []fileSection {
 	var out []fileSection
 	for start < end {
 		capAt, n := end, 0
 		for i := range text[start:end] {
-			if n == maxSectionRunes {
+			if n == size {
 				capAt = start + i
 				break
 			}
@@ -446,10 +450,10 @@ type filesState struct {
 	shingles  map[uint64]struct{}
 }
 
-func (s *filesState) init(opts TaskOptions) {
+func (s *filesState) init(opts TaskOptions, d AgentDef) {
 	s.once.Do(func() {
 		for _, f := range opts.Files {
-			secs := splitSections(f.Text)
+			secs := splitSections(f.Text, d.PartRunes)
 			s.files = append(s.files, reviewFile{name: f.Name, text: f.Text, secs: secs, state: make([]secState, len(secs))})
 		}
 	})
@@ -677,7 +681,7 @@ func (g *Guard) filesAction(ctx context.Context, ti *harness.TaskInfo, id string
 		}
 		return nil, err
 	}
-	t.files.init(t.opts)
+	t.files.init(t.opts, t.def)
 	name := harness.ModelToolName(req.Name)
 	args := json.RawMessage(req.Args)
 	if !json.Valid(args) {
@@ -759,7 +763,7 @@ func (g *Guard) fileReader(review bool) *ReaderConfig {
 	rc := *g.cfg.Reader
 	rc.Files, rc.NoItems, rc.Split = review, true, false
 	rc.Timeout, rc.ModelTimeout = fileReadTimeout, fileModelTimeout
-	rc.Facts, rc.Quotes = 0, 0 // the hard caps: 8 facts, 8 quotes
+	rc.Facts, rc.Quotes = 0, 0 // the hard caps: 8 facts and 8 quotes, a review's 10 and 12 (hardCaps)
 	return &rc
 }
 
@@ -961,7 +965,7 @@ func locSuffix(loc string) string {
 // restore takes up a files.read's journaled result after a restart (rebuild.go): which sections were read or
 // failed. It returns the highest quote number in it.
 func (s *filesState) restore(t *task, output []byte) int {
-	s.init(t.opts)
+	s.init(t.opts, t.def)
 	var o filesReadOut
 	if json.Unmarshal(output, &o) != nil {
 		return 0
@@ -1009,7 +1013,7 @@ func (t *task) coverageText() string {
 		return ""
 	}
 	s := &t.files
-	s.init(t.opts)
+	s.init(t.opts, t.def)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var lines, injected []string
@@ -1126,7 +1130,7 @@ Fields:
 The part's number ("part 3 of 7") is Tacy's cut of the file, not the document's own numbering: never use it as a location; name clauses by the document's own numbers and headings. A part may start in the middle of a clause: the "Continues under" line after the title, when there is one, gives the file's headings above where the part starts (its Part, Article or clause), so name clauses with them.
 
 - summary: what this part provides, in your own words, at most 500 characters: its clauses by the document's numbers or headings and what each does.
-- facts: up to %d points a careful reviewer of this part needs, most important first, in your own words, each at most 300 characters, each naming its clause (number or heading) and pointing to its quote as [Q1]. Cover, where the part has them: each party's obligations and rights; payment, fees, amounts and deadlines; term, renewal and termination; limits of liability, exclusions, indemnities and warranties; confidentiality, data, intellectual property, non-compete, non-solicit or exclusivity; assignment and changes to the terms; governing law, venue and disputes. Say plainly when a term is one-sided (which party it favours), unusual, vague, uncapped or open-ended, or conflicts with another clause here. Note cross-references (which section a clause points to, and what it says is there), defined terms, who exactly a clause covers, and the strength of each obligation (must, shall, should, may). Give numbers, periods, percentages and names exactly. Don't copy sentences: exact wording belongs in quotes.
+- facts: up to %d points a careful reviewer of this part needs, most important first, in your own words, each at most 300 characters, each naming its clause (number or heading) and pointing to that clause's own quote as [Q1] (a quote of each clause it names), never to a quote of another clause. Cover, where the part has them: each party's obligations and rights; payment, fees, amounts and deadlines; term, renewal and termination; limits of liability, exclusions, indemnities and warranties; confidentiality, data, intellectual property, non-compete, non-solicit or exclusivity; assignment and changes to the terms; governing law, venue and disputes. Say plainly when a term is one-sided (which party it favours), unusual, vague, uncapped or open-ended, or conflicts with another clause here. Measure each clause against what an expert in this kind of document expects today (the law's and regulators' current rules, market terms, good practice) and say plainly where it falls short: a safeguard or condition such documents usually have that it lacks, a period, limit or standard weaker than usual, a person or body that approves its own or its members' actions, a time, period or condition that can be read two ways. Note cross-references (which section a clause points to, and what it says is there), defined terms, who exactly a clause covers, and the strength of each obligation (must, shall, should, may). Give numbers, periods, percentages and names exactly. Don't copy sentences: exact wording belongs in quotes.
 - entities: the parties and the other people, organizations and places named (up to 12, short).
 - dates: dates and periods with what they are for, e.g. "30 days: notice to terminate" (up to 12, short).
 - amounts: amounts, fees, caps and percentages with what they are for (up to 12, short).

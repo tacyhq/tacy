@@ -77,7 +77,9 @@ type AgentDef struct {
 	Files         bool `json:"files,omitzero"`
 	FilesOptional bool `json:"files_optional,omitzero"`
 	FileParts     int  `json:"file_parts,omitzero"`
-	NoEgress      bool `json:"no_egress,omitzero"`
+	// PartRunes is the size of a part of a file at most (0: maxSectionRunes, files.go splitSections).
+	PartRunes int  `json:"part_runes,omitzero"`
+	NoEgress  bool `json:"no_egress,omitzero"`
 }
 
 // chatDef stands for the chat agent. Its limits are what the chat had before agents existed: 10 steps at most

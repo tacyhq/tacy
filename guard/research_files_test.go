@@ -287,7 +287,7 @@ func TestResearchFilePartsCap(t *testing.T) {
 		fmt.Fprintf(&big, "%d. Clause %d\n%s\n\n", i+1, i+1, strings.Repeat(fmt.Sprintf("Clause %d text runs on. ", i+1), 150))
 	}
 	file := TaskFile{Name: "big.txt", Text: big.String()}
-	n := len(splitSections(file.Text))
+	n := len(splitSections(file.Text, researchDef.PartRunes))
 	if n <= researchFileParts {
 		t.Fatalf("only %d parts", n)
 	}

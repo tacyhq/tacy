@@ -99,10 +99,13 @@ type Trigger struct {
 	Kind string `json:"kind"`
 	// Schedule: a slot every Every (a Go duration, whole minutes, 15m to 744h), counted from Anchor; or one a day at
 	// Daily ("HH:MM", 24 h) wall-clock time in Zone (an IANA zone name), following its DST changes (docs/30
-	// "Scheduled tasks", decision 1).
+	// "Scheduled tasks", decision 1), only on Days when it names some ("mon" … "sun", 1 to 6 of them in week order;
+	// absent: every day); or once, at At ("YYYY-MM-DDTHH:MM") wall-clock time in Zone (v0.14.0, daily.go).
 	Every  string    `json:"every,omitzero"`
 	Anchor time.Time `json:"anchor,omitzero"`
 	Daily  string    `json:"daily,omitzero"`
+	Days   []string  `json:"days,omitzero"`
+	At     string    `json:"at,omitzero"`
 	Zone   string    `json:"zone,omitzero"`
 	// Event: the sender's Ed25519 key ("ed25519:<base64>"): only events it signs start a task.
 	Sender string `json:"sender,omitzero"`
@@ -125,11 +128,23 @@ func (t *Trigger) check() error {
 		if t.Sender != "" {
 			return fmt.Errorf("schedule %s: no sender", t.ID)
 		}
-		if t.Daily != "" || t.Zone != "" {
+		if t.Daily != "" || t.Zone != "" || t.Days != nil || t.At != "" {
 			if t.Every != "" || !t.Anchor.IsZero() {
-				return fmt.Errorf("schedule %s: daily or every, not both", t.ID)
+				return fmt.Errorf("schedule %s: daily, at or every, only one", t.ID)
+			}
+			if t.At != "" {
+				if t.Daily != "" || t.Days != nil {
+					return fmt.Errorf("schedule %s: at is one run: no daily or days with it", t.ID)
+				}
+				if _, _, err := t.once(); err != nil {
+					return fmt.Errorf("schedule %s: %w", t.ID, err)
+				}
+				return nil
 			}
 			if _, _, _, err := t.daily(); err != nil {
+				return fmt.Errorf("schedule %s: %w", t.ID, err)
+			}
+			if _, err := t.weekdays(); err != nil {
 				return fmt.Errorf("schedule %s: %w", t.ID, err)
 			}
 			return nil
@@ -139,7 +154,8 @@ func (t *Trigger) check() error {
 			return fmt.Errorf("schedule %s: every must be whole minutes from %v to %v, with an anchor", t.ID, MinEvery, MaxEvery)
 		}
 	case Event:
-		if _, err := identity.ParseKey(t.Sender); err != nil || t.Every != "" || !t.Anchor.IsZero() || t.Daily != "" || t.Zone != "" {
+		if _, err := identity.ParseKey(t.Sender); err != nil || t.Every != "" || !t.Anchor.IsZero() || t.Daily != "" || t.Zone != "" ||
+			t.Days != nil || t.At != "" {
 			return fmt.Errorf("event %s: needs the sender's ed25519 key and nothing else", t.ID)
 		}
 	default:
@@ -203,6 +219,14 @@ func (d *Definition) check(firm string, now time.Time) error {
 		if a := d.Triggers[i].Anchor; !a.IsZero() && (a.Sub(d.IssuedAt) > MaxSponsorship || d.IssuedAt.Sub(a) > MaxSponsorship) {
 			return errors.New("a schedule's anchor must be within a year of issued_at")
 		}
+		if d.Triggers[i].IsOnce() { // its one run is within the sponsorship: not before issued_at, before not_after
+			switch _, at, _ := d.Triggers[i].once(); {
+			case at.Before(d.IssuedAt):
+				return errors.New("the time of a one-time schedule has already passed (it is before issued_at)")
+			case !at.Before(d.NotAfter):
+				return errors.New("a one-time schedule's at must be before not_after")
+			}
+		}
 		if seen[d.Triggers[i].ID] {
 			return errors.New("a trigger id is used twice")
 		}
@@ -227,7 +251,7 @@ func validSeal(s string) bool {
 
 // Personal checks a definition installed in a person's own space on the shared chat VM (docs/30 "Scheduled
 // tasks"): it is for the space and seal key the request proved, its author and sponsor are the identity that
-// signed the request, its triggers are daily schedules and its tools web reads only (nothing that sends or
+// signed the request, its triggers are daily (or chosen days) or one-time schedules and its tools web reads only (nothing that sends or
 // changes something: approvals don't exist for personal spaces yet).
 func Personal(d *Definition, space, seal, who string) error {
 	switch {
@@ -237,8 +261,8 @@ func Personal(d *Definition, space, seal, who string) error {
 		return errors.New("author and sponsor must be the identity that signed the request")
 	}
 	for _, t := range d.Triggers {
-		if t.Kind != Schedule || t.Daily == "" {
-			return errors.New("personal spaces take daily schedules only")
+		if t.Kind != Schedule || (t.Daily == "" && t.At == "") {
+			return errors.New("personal spaces take daily, weekday or one-time schedules only")
 		}
 	}
 	for _, t := range d.Tools {

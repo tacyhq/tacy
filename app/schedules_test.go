@@ -186,7 +186,7 @@ func TestScheduleInstallRefusals(t *testing.T) {
 			t.Errorf("%s: %d %v, want %d %s", name, code, out, c.code, c.err)
 		}
 	}
-	if n := e.s.triggers.SpaceCount(e.me.Space); n != 0 {
+	if _, n := e.s.triggers.SpaceCount(e.me.Space); n != 0 {
 		t.Fatalf("%d installed after refusals", n)
 	}
 	// The holder's install; the very same request again is a replay; the same definition in a new request is fine.

@@ -23,8 +23,9 @@ import (
 // text or a tool call) within SlowThreshold, or that the provider answers 503, 429 or "overloaded", is slow: people
 // see model_slow. On Auto (RunRequest.AutoFallback) the call is given up and the step runs again, once, on the
 // first fallback the policy and this guard allow (model_switched); the run's later steps go straight to it. A
-// hand-picked model is waited for when slow, and ends the run with CodeModelOverloaded when overloaded. Billing is
-// unchanged: the relay charges the run's X-Agent-Model whatever model answered.
+// hand-picked model is waited for when slow, and ends the run with CodeModelOverloaded when overloaded. Billing: the
+// relay charges the run at the dearest model it may call (X-Agent-Price-Model, v0.16.0; charge.go), and a fallback
+// dearer than what it was charged at is dropped (a tab without the header is charged at X-Agent-Model).
 //
 // Overloaded calls are made again first (v0.14.0, 2026-10-21): Tinfoil's "overloaded" is mostly its per-key request
 // rate ("429 Rate limit reached for requests. Retry after 7 seconds."), which passes in seconds. Before giving a

@@ -57,7 +57,8 @@ type Store interface {
 	// Definitions returns every stored definition that isn't removed, with its state.
 	Definitions() ([]Stored, error)
 	// SetState stops or removes the agent's stored definition at version (StateStopped, StateRemoved); ErrStale when
-	// the stored one isn't that version. Removing keeps the version floor.
+	// the stored one isn't that version. Removing keeps the version floor (the agent id and version) and nothing else:
+	// the definition's envelope (its instructions, in plaintext) goes.
 	SetState(agent string, version uint64, state string) error
 	// LastFired is the highest slot recorded for a schedule trigger (ok false: none yet).
 	LastFired(trigger string) (slot int64, ok bool, err error)

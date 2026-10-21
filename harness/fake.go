@@ -18,6 +18,8 @@ type MemStore struct {
 	order  map[string][]string // request ids per task, in the order begun
 	cps    map[string]*Checkpoint
 	events map[string][]StoredEvent
+	// delivered: when an ended task's result reached its starter (DeliveryStore)
+	delivered map[string]time.Time
 	// Now is the clock for created and ended times; nil: time.Now.
 	Now func() time.Time
 }
@@ -29,8 +31,10 @@ type memTask struct {
 
 func NewMemStore() *MemStore {
 	return &MemStore{tasks: map[string]*memTask{}, recs: map[string]*Record{}, order: map[string][]string{},
-		cps: map[string]*Checkpoint{}, events: map[string][]StoredEvent{}}
+		cps: map[string]*Checkpoint{}, events: map[string][]StoredEvent{}, delivered: map[string]time.Time{}}
 }
+
+var _ DeliveryStore = (*MemStore)(nil)
 
 func (m *MemStore) now() time.Time {
 	if m.Now != nil {
@@ -150,7 +154,48 @@ func (m *MemStore) DeleteTask(id string) error {
 	delete(m.order, id)
 	delete(m.cps, id)
 	delete(m.events, id)
+	delete(m.delivered, id)
 	return nil
+}
+
+func (m *MemStore) Scrub(id string, opts jsontext.Value) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t := m.tasks[id]
+	if t == nil || !t.ended {
+		return nil
+	}
+	t.st.Start, t.st.Options, t.st.Steers = jsontext.Value(`{}`), opts.Clone(), nil
+	for _, rid := range m.order[id] {
+		if r := m.recs[id+"\x00"+rid]; r != nil {
+			r.Req, r.Body, r.Err = nil, nil, nil
+		}
+	}
+	delete(m.cps, id)
+	return nil
+}
+
+func (m *MemStore) MarkDelivered(id string, at time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if t := m.tasks[id]; t != nil && t.ended {
+		if _, ok := m.delivered[id]; !ok {
+			m.delivered[id] = at.UTC()
+		}
+	}
+	return nil
+}
+
+func (m *MemStore) DeliveredBefore(before time.Time) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []string
+	for _, id := range m.torder {
+		if at, ok := m.delivered[id]; ok && at.Before(before) {
+			out = append(out, id)
+		}
+	}
+	return out, nil
 }
 
 func (m *MemStore) Begin(task, id, kind string, hash [32]byte, req jsontext.Value) (Record, bool, error) {
@@ -160,9 +205,13 @@ func (m *MemStore) Begin(task, id, kind string, hash [32]byte, req jsontext.Valu
 		return *r, false, nil
 	}
 	r := &Record{ID: id, Kind: kind, Hash: hash, Req: req.Clone()}
+	out := *r
+	if t := m.tasks[task]; t != nil && t.ended { // a late request of an ended task keeps no body (Scrub)
+		r.Req = nil
+	}
 	m.recs[task+"\x00"+id] = r
 	m.order[task] = append(m.order[task], id)
-	return *r, true, nil
+	return out, true, nil
 }
 
 func (m *MemStore) Hold(task, id, sub string) error {
@@ -189,6 +238,9 @@ func (m *MemStore) Finish(task, id string, body jsontext.Value, e *Error) error 
 	defer m.mu.Unlock()
 	if r := m.recs[task+"\x00"+id]; r != nil {
 		r.Done, r.Body, r.Err = true, body.Clone(), e
+		if t := m.tasks[task]; t != nil && t.ended { // finished after its task ended: no result kept (Scrub)
+			r.Body, r.Err = nil, nil
+		}
 	}
 	return nil
 }
@@ -196,6 +248,9 @@ func (m *MemStore) Finish(task, id string, body jsontext.Value, e *Error) error 
 func (m *MemStore) SaveCheckpoint(task string, cp *Checkpoint) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if t := m.tasks[task]; t != nil && t.ended { // none for an ended task (Scrub)
+		return nil
+	}
 	c := *cp
 	c.State = append([]byte(nil), cp.State...)
 	m.cps[task] = &c

@@ -3,6 +3,9 @@ package runauth
 import (
 	"crypto/ecdh"
 	"crypto/ed25519"
+	"encoding/base64"
+	"errors"
+	"sync"
 	"time"
 )
 
@@ -74,4 +77,117 @@ func (a *Asker) Call(label string, vmPub []byte, items ...string) (Where, error)
 		Nonce: f.Nonce, SignedAt: f.SignedAt}
 	w.IdentitySig = SignCall(a.Key, label, &w, vmPub, items...)
 	return w, nil
+}
+
+// ---- personal spaces: the seal key pinned per space ---------------------------------------------------------
+
+// On the shared chat VM a personal space has no signed policy or space log here: a request proves it holds *a* seal
+// key for the space it names, and nothing else ties that key to the space. So each personal space is pinned to the
+// first seal key proven for it (trust on first use; agentd also seeds the pins from the holders its schedules
+// recorded before v0.16.0), and every run, search, pictures request or call naming the space with another seal key
+// is refused: someone who knows a space's id can't spend its budget, or fill, change or remove its schedules, with a
+// key of their own.
+//
+// A rotation (a new seal key generation for the space) moves the pin with a reseal call (POST /spaces/reseal) that
+// proves both keys: the new one as any call's where and who, the old one with its own space proof against this boot's
+// key (an X25519 key can't sign; the proof is how it shows itself). The identity's signature covers both:
+//
+//	reseal:  "tacy/v2/space-reseal",  old_seal, base64(old_proof)
+//
+// The pin moves only from the key it holds now: a stale or a third key is refused.
+const ResealLabel = "tacy/v2/space-reseal"
+
+// ErrSealPinned: the request's seal key isn't the one pinned for its space.
+var ErrSealPinned = errors.New("runauth: the space's seal key isn't the one this VM pinned for it")
+
+// PinStore keeps each personal space's pinned seal key (agentd's side file; MemPins in memory).
+type PinStore interface {
+	// PinSeal pins seal for space when the space has no pin yet, and returns the space's pin (seal, or the earlier one).
+	PinSeal(space, seal string, at time.Time) (pinned string, err error)
+	// RepinSeal moves space's pin from old to seal; ErrSealPinned when the pin isn't old. A space without a pin gets
+	// seal.
+	RepinSeal(space, old, seal string, at time.Time) error
+}
+
+// CheckPin pins who's seal key for its space on first use and refuses another one (ErrSealPinned).
+func CheckPin(p PinStore, who Who, now time.Time) error {
+	pinned, err := p.PinSeal(who.Space, who.Seal, now)
+	if err != nil {
+		return err
+	}
+	if pinned != who.Seal {
+		return ErrSealPinned
+	}
+	return nil
+}
+
+// ResealItems are a reseal call's own items: the old seal key and its proof.
+func ResealItems(oldSeal string, oldProof []byte) []string {
+	return []string{oldSeal, base64.StdEncoding.EncodeToString(oldProof)}
+}
+
+// CheckReseal verifies a reseal call against this boot's key vm: w proves the new seal key and carries the
+// identity's signature over the old key and its proof (ResealItems), and oldProof proves the old key for the same
+// space. The nonce is the caller's to claim, and moving the pin (PinStore.RepinSeal) too.
+func CheckReseal(vm *ecdh.PrivateKey, w *Where, oldSeal string, oldProof []byte, now time.Time) (Who, error) {
+	who, err := CheckCall(vm, ResealLabel, w, now, ResealItems(oldSeal, oldProof)...)
+	if err != nil {
+		return Who{}, err
+	}
+	if oldSeal == who.Seal {
+		return Who{}, errors.New("runauth: the new seal key is the old one")
+	}
+	if err := CheckSpaceProof(vm, who.Space, oldSeal, oldProof); err != nil {
+		return Who{}, err
+	}
+	return who, nil
+}
+
+// Reseal makes a reseal call moving a's space from its seal key to next, for the VM key vmPub (tests, and what a
+// browser that rotates a space's seal key would do). a keeps its old key; the caller switches to next afterwards.
+func (a *Asker) Reseal(next *ecdh.PrivateKey, vmPub []byte) (w Where, oldSeal string, oldProof []byte, err error) {
+	peer, err := ecdh.X25519().NewPublicKey(vmPub)
+	if err != nil {
+		return Where{}, "", nil, err
+	}
+	oldSeal = a.SealString()
+	if oldProof, err = SpaceProof(a.Seal, peer, a.Space, oldSeal, vmPub); err != nil {
+		return Where{}, "", nil, err
+	}
+	nextAsker := *a
+	nextAsker.Seal = next
+	w, err = nextAsker.Call(ResealLabel, vmPub, ResealItems(oldSeal, oldProof)...)
+	return w, oldSeal, oldProof, err
+}
+
+// MemPins is an in-memory PinStore.
+type MemPins struct {
+	mu sync.Mutex
+	m  map[string]string
+}
+
+func (m *MemPins) PinSeal(space, seal string, _ time.Time) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.m == nil {
+		m.m = map[string]string{}
+	}
+	if p, ok := m.m[space]; ok {
+		return p, nil
+	}
+	m.m[space] = seal
+	return seal, nil
+}
+
+func (m *MemPins) RepinSeal(space, old, seal string, _ time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.m == nil {
+		m.m = map[string]string{}
+	}
+	if p, ok := m.m[space]; ok && p != old {
+		return ErrSealPinned
+	}
+	m.m[space] = seal
+	return nil
 }

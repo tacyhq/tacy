@@ -60,6 +60,9 @@ type Conn struct {
 	User string
 	// Model, when set, is sent as X-Agent-Model instead of the request's model (tests: the VM must refuse it).
 	Model string
+	// Kind and PriceModel, when set, are sent as X-Agent-Kind and X-Agent-Price-Model with a run or a task start: what
+	// the relay prices it at (v0.16.0; guard/charge.go). The VM refuses a start whose body doesn't match them.
+	Kind, PriceModel string
 	// Asker fills each request's space and identity (keys v2 slice 6; runauth) unless the request names a space
 	// already (tests that send their own). New makes a fresh one: a personal space and identity of this connection.
 	Asker *runauth.Asker
@@ -158,6 +161,7 @@ func (c *Conn) Run(ctx context.Context, req proto.RunRequest, on func(proto.Even
 	if c.Model != "" {
 		r.Header.Set("X-Agent-Model", c.Model)
 	}
+	c.chargeHeaders(r)
 	if c.User != "" {
 		r.Header.Set("X-Agent-User", c.User)
 	}
@@ -170,6 +174,7 @@ func (c *Conn) Run(ctx context.Context, req proto.RunRequest, on func(proto.Even
 		b, _ := io.ReadAll(io.LimitReader(res.Body, 2000))
 		return fmt.Errorf("run: HTTP %d: %s", res.StatusCode, strings.TrimSpace(string(b)))
 	}
+	on = observed("", on)
 	sc := bufio.NewScanner(res.Body)
 	sc.Buffer(make([]byte, 0, 64<<10), 8<<20)
 	for sc.Scan() {
@@ -231,6 +236,7 @@ func (c *Conn) stream(ctx context.Context, path string, req any, on func(proto.E
 		b, _ := io.ReadAll(io.LimitReader(res.Body, 2000))
 		return fmt.Errorf("%s: HTTP %d: %s", strings.TrimPrefix(path, "/"), res.StatusCode, strings.TrimSpace(string(b)))
 	}
+	on = observed("", on)
 	sc := bufio.NewScanner(res.Body)
 	sc.Buffer(make([]byte, 0, 64<<10), 8<<20)
 	for sc.Scan() {
@@ -275,6 +281,36 @@ type TaskBilling struct {
 	Bill       string
 	Start      string
 	Refundable bool
+	// Priced: the start's answer says the VM checked the pricing headers (X-Agent-Priced: 1, v0.16.0).
+	Priced bool
+}
+
+// chargeHeaders adds what the relay prices a start at (Kind, PriceModel), when set.
+func (c *Conn) chargeHeaders(r *http.Request) {
+	if c.Kind != "" {
+		r.Header.Set("X-Agent-Kind", c.Kind)
+	}
+	if c.PriceModel != "" {
+		r.Header.Set("X-Agent-Price-Model", c.PriceModel)
+	}
+}
+
+// Observe, when set, sees every event a run, a search, a pictures request or a task's event stream delivers, before
+// the caller's callback: task and seq name a task's event (a task followed again from an earlier seq repeats them),
+// "" and 0 anything else. Test tools that spend production inference set it to count what they spent
+// (internal/testspend); set it before the first request.
+var Observe func(task string, seq int, e proto.Event)
+
+// observed wraps on with Observe (as it is now) for a stream that isn't a task's.
+func observed(task string, on func(proto.Event)) func(proto.Event) {
+	obs := Observe
+	if obs == nil {
+		return on
+	}
+	return func(e proto.Event) {
+		obs(task, 0, e)
+		on(e)
+	}
 }
 
 // post sends one EHBP-encrypted task call and returns the decrypted response.
@@ -285,6 +321,7 @@ func (c *Conn) post(ctx context.Context, path, model string, v any) (*http.Respo
 	r.Header.Set("Authorization", "Bearer "+c.Token)
 	if model != "" {
 		r.Header.Set("X-Agent-Model", model)
+		c.chargeHeaders(r) // a start: what the relay prices it at
 	}
 	if c.User != "" {
 		r.Header.Set("X-Agent-User", c.User)
@@ -312,7 +349,7 @@ func (c *Conn) taskCall(ctx context.Context, path, model string, v any) (*Task, 
 		return nil, err
 	}
 	t.Billing = TaskBilling{Bill: res.Header.Get("X-Agent-Bill"), Start: res.Header.Get("X-Agent-Task"),
-		Refundable: res.Header.Get("X-Agent-Refundable") == "1"}
+		Refundable: res.Header.Get("X-Agent-Refundable") == "1", Priced: res.Header.Get("X-Agent-Priced") == "1"}
 	return &t, nil
 }
 
@@ -399,6 +436,13 @@ func (c *Conn) FollowTask(ctx context.Context, id string, after int, on func(seq
 	sc := bufio.NewScanner(res.Body)
 	sc.Buffer(make([]byte, 0, 64<<10), 8<<20)
 	seq := 0
+	if obs := Observe; obs != nil {
+		inner := on
+		on = func(seq int, e proto.Event) {
+			obs(id, seq, e)
+			inner(seq, e)
+		}
+	}
 	for sc.Scan() {
 		line := sc.Text()
 		if v, ok := strings.CutPrefix(line, "id: "); ok {

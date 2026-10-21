@@ -122,6 +122,11 @@ type RunRequest struct {
 	// (guard/agents.go); a request only picks one, and an unknown one is refused. Covered by the run signature
 	// (runauth) when set. A non-chat agent starts only through POST /tasks and takes one message: the brief.
 	Agent string `json:"agent,omitempty"`
+	// ChargedModel is the model the relay charged the run at (v0.16.0): its X-Agent-Price-Model header (checked to be
+	// the dearest model the run may call, guard.CheckCharge), or X-Agent-Model when there is none (a tab before it). A
+	// fallback dearer than it is dropped, so a run never switches to a model it wasn't charged for. Set by agentd
+	// from the headers, never read from or written to the wire; "": nothing dropped (in-process tests, scheduled runs).
+	ChargedModel string `json:"-"`
 }
 
 // SearchRequest is POST /search's body: the plain chat's one web search the person allowed in their tab (docs/29;

@@ -43,7 +43,7 @@ var reviewDef = AgentDef{ID: AgentReview, Version: "1", Tools: []string{"files_l
 	Steps: reviewSteps, Work: 10 * time.Minute, Overall: 60 * time.Minute,
 	Run:          safety.Limits{Tokens: 4_000_000, ToolCalls: 40, WallSeconds: 10 * 60, CostMicros: 500_000},
 	FinalReserve: reviewFinalKeep, PartRunes: reviewPartRunes,
-	BriefOnly: true, Keep: 7 * 24 * time.Hour, Instructions: reviewInstructions, Files: true, NoEgress: true}
+	BriefOnly: true, Instructions: reviewInstructions, Files: true, NoEgress: true}
 
 // TaskFile is one file of a review task: its name as the person attached it and its text.
 type TaskFile struct {

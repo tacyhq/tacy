@@ -51,6 +51,9 @@ func (m *MemStore) SetState(agent string, version uint64, state string) error {
 		return ErrStale
 	}
 	m.state[agent] = state
+	if state == StateRemoved { // only the agent id and version stay (the floor)
+		m.defs[agent] = nil
+	}
 	return nil
 }
 

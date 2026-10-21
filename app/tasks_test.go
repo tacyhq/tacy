@@ -47,6 +47,15 @@ func (d *deadQueue) w() error {
 	}
 	return nil
 }
+func (d *deadQueue) Scrub(id string, o jsontext.Value) error {
+	return cmpErr(d.w(), func() error { return d.Store.Scrub(id, o) })
+}
+func (d *deadQueue) MarkDelivered(id string, at time.Time) error {
+	return cmpErr(d.w(), func() error { return d.Store.(harness.DeliveryStore).MarkDelivered(id, at) })
+}
+func (d *deadQueue) DeliveredBefore(at time.Time) ([]string, error) {
+	return d.Store.(harness.DeliveryStore).DeliveredBefore(at)
+}
 func (d *deadQueue) AddTask(id string, s, o jsontext.Value) error {
 	return cmpErr(d.w(), func() error { return d.Store.AddTask(id, s, o) })
 }
@@ -497,9 +506,10 @@ func TestTasksCancelDuringHeldRequest(t *testing.T) {
 	if len(fs.queries) != 0 || m.calls.Load() != 1 {
 		t.Fatalf("searches %v, model calls %d", fs.queries, m.calls.Load())
 	}
+	// The task ended: its journal keeps the held search's id and done mark only (harness.Store.Scrub), so it can't run.
 	recs, _ := p2.q.Journal(tk.Task)
 	for _, r := range recs {
-		if r.Kind == harness.TypeAction && (!r.Done || r.Err == nil || r.Err.Code != harness.CodeCancelled || r.Held != harness.WaitApproval) {
+		if r.Kind == harness.TypeAction && (!r.Done || r.Req != nil || r.Body != nil || r.Held != harness.WaitApproval) {
 			t.Fatalf("the held search's journal entry: %+v", r)
 		}
 	}

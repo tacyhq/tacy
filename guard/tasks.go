@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
@@ -58,10 +59,13 @@ type Host struct {
 	// key gets tk_ + HMAC(IDKey, space, user, key), so a repeated start finds the first task instead of making a
 	// second. nil: starts with a key are refused.
 	IDKey []byte
-	// Keep is how long an ended task's events and journal stay for its followers; 0: a day (docs/27 section 1). A
-	// built-in agent's task may say longer (guard.AgentKeep: a_research's result stays until the browser collected
-	// it, POST /tasks/delete, at most 7 days; docs/30 decision 5).
+	// Keep is how long an ended task's result (its events) stays for its starter when nobody collects it; 0:
+	// DefaultKeep. A built-in agent's own keep (guard.AgentKeep) is capped by it. A result its starter collected goes
+	// DeliveredKeep after that (Delivered), and POST /tasks/delete deletes it at once.
 	Keep time.Duration
+	// DeliveredKeep is how long a task stays after its starter's event stream handed on its end (Delivered); 0:
+	// DefaultDeliveredKeep.
+	DeliveredKeep time.Duration
 	// FlushEvery is how long events wait before they are written to the queue together; 0: 100 ms. A process that
 	// dies loses at most that much of a stream; the task's outcome and its journal are written as they happen.
 	FlushEvery time.Duration
@@ -177,17 +181,37 @@ func (h *Host) Open() int {
 // may be refunded by the relay).
 func modelOutput(t string) bool { return t == "reasoning" || t == "text" || t == "tool_call" }
 
+// DefaultKeep is how long an ended task's result waits for its starter to collect it (Host.Keep): a day. Its
+// content is plaintext on the VM's encrypted disk meanwhile, so it's kept no longer than the person needs to come
+// back to a result they handed off: the run's end notifies them (notify.go), the chat collects it the next time it's
+// open, and its task list already treats a task not collected within a day as gone (the chat's agent/task-center.ts).
+// A scheduled run's result doesn't wait here: it's sealed to the space's key as it ends (agentd's schedules.go).
+const DefaultKeep = 24 * time.Hour
+
+// DefaultDeliveredKeep is how long a task stays once its starter's event stream handed on its end (Host.Delivered):
+// long enough for the tab to save the result (and to follow it again from its first event after a reload or a
+// failed save), short enough that a collected result doesn't sit on the disk.
+const DefaultDeliveredKeep = 10 * time.Minute
+
 func (h *Host) keep() time.Duration {
 	if h.Keep > 0 {
 		return h.Keep
 	}
-	return 24 * time.Hour
+	return DefaultKeep
 }
 
-// keepFor is how long an ended task of agent is kept: its agent's keep (guard.AgentKeep), else Keep.
+func (h *Host) deliveredKeep() time.Duration {
+	if h.DeliveredKeep > 0 {
+		return h.DeliveredKeep
+	}
+	return DefaultDeliveredKeep
+}
+
+// keepFor is how long an ended task of agent is kept: its agent's keep (guard.AgentKeep), else Keep; never more
+// than Keep.
 func (h *Host) keepFor(agent string) time.Duration {
 	if k := AgentKeep(agent); k > 0 {
-		return k
+		return min(k, h.keep())
 	}
 	return h.keep()
 }
@@ -924,14 +948,24 @@ func (h *Host) Resume(ids []string) (resumed, abandoned int) {
 }
 
 // Prune deletes the tasks that ended more than their keep ago (their start, journal and events: Keep, or their
-// agent's, guard.AgentKeep), and forgets the ended ones this process no longer needs to serve. Run it now and then.
+// agent's, guard.AgentKeep) and those delivered more than DeliveredKeep ago (Delivered), and forgets the ended ones
+// this process no longer needs to serve. Run it now and then (agentd: at its start and every hour).
 func (h *Host) Prune(now time.Time) int {
 	h.init()
+	n := 0
+	if d, ok := h.RT.Store.(harness.DeliveryStore); ok {
+		if ids, err := d.DeliveredBefore(now.Add(-h.deliveredKeep())); err == nil {
+			for _, id := range ids {
+				if h.prune(id) {
+					n++
+				}
+			}
+		}
+	}
 	ids, err := h.RT.Store.EndedBefore(now.Add(-min(h.keep(), h.minAgentKeep())))
 	if err != nil {
-		return 0
+		return n
 	}
-	n := 0
 	for _, id := range ids {
 		if st, err := h.RT.Store.Task(id); err == nil && st != nil {
 			var o TaskOptions
@@ -940,15 +974,83 @@ func (h *Host) Prune(now time.Time) int {
 				continue // its agent keeps it longer
 			}
 		}
-		if h.RT.Forget(id) == nil {
+		if h.prune(id) {
 			n++
-			if h.Forgotten != nil {
-				h.Forgotten(id)
-			}
 		}
-		h.mu.Lock()
-		delete(h.live, id)
-		h.mu.Unlock()
+	}
+	return n
+}
+
+// prune deletes an ended task (Prune, Delivered's timer) and forgets it here; true when it was deleted.
+func (h *Host) prune(id string) bool {
+	ok := h.RT.Forget(id) == nil
+	if ok && h.Forgotten != nil {
+		h.Forgotten(id)
+	}
+	h.mu.Lock()
+	delete(h.live, id)
+	h.mu.Unlock()
+	return ok
+}
+
+// Delivered: the starter's event stream handed on the whole of an ended task (its end, then [DONE]), so the result
+// reached the tab. The task is then deleted DeliveredKeep later (also after a restart: the queue keeps the mark)
+// instead of after its keep. A task that hasn't ended, or one this person can't see, is left alone.
+func (h *Host) Delivered(id, user string) {
+	h.init()
+	if h.owned(id, user) != nil {
+		return
+	}
+	d, ok := h.RT.Store.(harness.DeliveryStore)
+	if !ok {
+		return
+	}
+	if st, err := h.RT.Status(id); err != nil || !harness.Terminal(st.State) {
+		return
+	}
+	if d.MarkDelivered(id, time.Now()) != nil {
+		return
+	}
+	time.AfterFunc(h.deliveredKeep()+time.Second, func() { h.Prune(time.Now()) })
+}
+
+// EndedOptions is what of a task's options the queue keeps once the task ended (harness.Runtime.KeepOptions): the
+// content goes (the person's question and links, their images and files, the prompt cache's secret); what the
+// starter's calls are checked with (via, user, run secret), its agent (its keep) and the other ids stay. Options that
+// don't parse are dropped whole.
+func EndedOptions(opts jsontext.Value) jsontext.Value {
+	if len(opts) == 0 {
+		return opts
+	}
+	var o TaskOptions
+	if json.Unmarshal(opts, &o) != nil {
+		return nil
+	}
+	o.Question, o.Links, o.Images, o.Files, o.CacheSecret = "", nil, nil, nil, ""
+	b, err := json.Marshal(o)
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
+// ScrubEnded scrubs every ended task still kept (harness.Store.Scrub with EndedOptions): what a process that stopped
+// between a task's end and its scrub, or a release before scrubs (a rollback), left. agentd runs it at its start.
+// Returns how many it scrubbed.
+func (h *Host) ScrubEnded() int {
+	ids, err := h.RT.Store.EndedBefore(time.Now().Add(time.Hour))
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, id := range ids {
+		st, err := h.RT.Store.Task(id)
+		if err != nil || st == nil || st.Ended.IsZero() {
+			continue
+		}
+		if h.RT.Store.Scrub(id, EndedOptions(st.Options)) == nil {
+			n++
+		}
 	}
 	return n
 }

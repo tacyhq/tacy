@@ -17,6 +17,7 @@ import (
 	"github.com/tacyhq/tacy/guard"
 	"github.com/tacyhq/tacy/identity"
 	"github.com/tacyhq/tacy/proto"
+	"github.com/tacyhq/tacy/runauth"
 	"github.com/tacyhq/tacy/safety"
 	"github.com/tacyhq/tacy/trigger"
 )
@@ -244,6 +245,7 @@ type memSide struct {
 	*trigger.MemHolders
 	*trigger.MemResults
 	*trigger.MemMemory
+	*runauth.MemPins
 }
 
 type (

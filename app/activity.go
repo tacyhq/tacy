@@ -45,6 +45,10 @@ type recGateway struct {
 	vmKey *ecdh.PrivateKey
 	// nonces this boot took (Verify): a request runs at most once.
 	nonces *runauth.Nonces
+	// pins: each personal space's seal key, pinned the first time one is proven for it (v0.16.0; runauth.PinStore):
+	// on the shared chat VM a request naming a space with another seal key is refused (Verify, and the schedule
+	// calls' callWho). agentd keeps them in the side file; in memory until it's set.
+	pins runauth.PinStore
 
 	mu    sync.Mutex
 	bg    map[string]guard.FactsData // site icons' egress per task, from the session's End
@@ -67,7 +71,8 @@ var (
 )
 
 func newRecGateway(sg *safeGateway, rec *activity.Recorder, vmKey *ecdh.PrivateKey) *recGateway {
-	return &recGateway{safeGateway: sg, rec: rec, vmKey: vmKey, bg: map[string]guard.FactsData{}, nonces: &runauth.Nonces{}}
+	return &recGateway{safeGateway: sg, rec: rec, vmKey: vmKey, bg: map[string]guard.FactsData{}, nonces: &runauth.Nonces{},
+		pins: &runauth.MemPins{}}
 }
 
 // Verify checks a request's where and who once, when it arrives (keys v2 slice 6, docs/26 section 6; package
@@ -76,8 +81,10 @@ func newRecGateway(sg *safeGateway, rec *activity.Recorder, vmKey *ecdh.PrivateK
 // nonce, claimed here (so it runs at most once on this one). On a firm's VM the seal key must be the one the space's
 // own signed policy names and the identity must be current in the firm key log with that key: the identity is then
 // whose member budget the run uses. On the shared chat VM (State.PersonalSpaces) people's personal spaces have no
-// signed policy: the seal key is the one the request proves, and the member budget is the relay's daily per-user tag
-// user (accounts are free to make; only the relay knows who is who). Errors are plain (400): nothing was recorded.
+// signed policy: the seal key is the one the request proves, pinned to the space the first time one is (v0.16.0;
+// runauth.CheckPin: a request with another seal key for the space is refused), and the member budget is the relay's
+// daily per-user tag user (accounts are free to make; only the relay knows who is who). Errors are plain (400):
+// nothing was recorded.
 func (g *recGateway) Verify(r *proto.RunRequest, user string) error {
 	v, err := g.verify(func(vm *ecdh.PrivateKey) (runauth.Who, error) { return runauth.Check(vm, r, time.Now()) }, r.Nonce, r.SignedAt, user)
 	if err == nil {
@@ -129,11 +136,25 @@ func (g *recGateway) verify(check func(vm *ecdh.PrivateKey) (runauth.Who, error)
 			return nil, &safety.Error{Code: safety.CodePolicyDenied, Msg: "the identity isn't current in the firm key log"}
 		}
 		v.Member = who.Identity
+	} else if err := g.checkPin(who); err != nil {
+		return nil, err
 	}
 	if err := g.nonces.Claim(nonce, signedAt); err != nil {
 		return nil, err
 	}
 	return v, nil
+}
+
+// checkPin is runauth.CheckPin on the shared chat VM's personal spaces: a seal key other than the space's pinned one
+// is a policy refusal (403), as a firm space's seal key that isn't its policy's.
+func (g *recGateway) checkPin(who runauth.Who) error {
+	switch err := runauth.CheckPin(g.pins, who, time.Now()); {
+	case errors.Is(err, runauth.ErrSealPinned):
+		return &safety.Error{Code: safety.CodePolicyDenied, Msg: "the space's seal key isn't the one this VM pinned for it"}
+	case err != nil:
+		return errors.New("the space's seal key couldn't be checked")
+	}
+	return nil
 }
 
 // StartFor: the safety checks, then the recipient of the run's record (the space's seal key) into its options.

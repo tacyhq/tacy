@@ -68,8 +68,9 @@ type AgentDef struct {
 	// BriefOnly: the task takes one message, the brief (optionally after the chat's date note): no conversation
 	// history, so the agent gets only what the start card showed (docs/30 principles).
 	BriefOnly bool `json:"brief_only,omitzero"`
-	// Keep is how long an ended task's result stays on the VM for the browser to collect (POST /tasks/delete once it
-	// saved it; decision 5); 0: the host's default (Host.Keep).
+	// Keep is how long an ended task's result stays on the VM for the browser to collect, when its event stream
+	// didn't hand it on (Host.Delivered) and nobody deleted it (POST /tasks/delete); 0: the host's default (Host.Keep),
+	// which also caps it. None of the built-in agents has its own since v0.16.0 (a day for all: guard.DefaultKeep).
 	Keep time.Duration `json:"keep,omitzero"`
 	// Extras: site icons and card pictures (fetches the chat's display needs, not the agent's work).
 	Extras bool `json:"extras,omitzero"`
@@ -108,7 +109,7 @@ var researchDef = AgentDef{ID: AgentResearch, Version: "3", Tools: []string{"web
 	Run: safety.Limits{Tokens: 8_000_000, ToolCalls: 60, WallSeconds: 15 * 60, CostMicros: 1_000_000},
 	// A gpt-oss-120b answer over a long research conversation costs about a cent; kimi-k3's up to ~$0.25.
 	FinalReserve: 150_000,
-	BriefOnly:    true, Keep: 7 * 24 * time.Hour, Instructions: researchInstructions,
+	BriefOnly:    true, Instructions: researchInstructions,
 	Files: true, FilesOptional: true, FileParts: researchFileParts}
 
 // researchFileParts is the most parts of the person's files a research task reads (about 240,000 characters, about
@@ -120,12 +121,12 @@ var agentDefs = map[string]*AgentDef{AgentChat: &chatDef, AgentResearch: &resear
 // scheduledDef is AgentScheduled (docs/30 "Scheduled tasks", decision 8): at most 20 steps and $0.25 per run (the
 // definition's max_steps may ask for fewer), 10 page reads and 5 searches per step budget's worth, 10 minutes of work.
 // No site icons or card pictures. Its result is sealed to the space's seal key when it ends and kept 7 days (agentd's
-// schedules.go); the task itself is then forgotten.
+// schedules.go); the task itself (its plaintext) is then forgotten at once.
 var scheduledDef = AgentDef{ID: AgentScheduled, Version: "1", Tools: []string{"web_search", "fetch_page", "image_search"},
 	Steps: 20, Searches: 6, Reads: 25, Work: 10 * time.Minute,
 	Run: safety.Limits{Tokens: 4_000_000, ToolCalls: 40, WallSeconds: 10 * 60, CostMicros: 250_000},
 	// Kept for the digest's last answer over a long conversation (a cent or two on the default model).
-	FinalReserve: 30_000, Keep: 7 * 24 * time.Hour}
+	FinalReserve: 30_000}
 
 // internalDefs are definitions a request can't name (Startable is false): only the VM starts their tasks.
 var internalDefs = map[string]*AgentDef{AgentScheduled: &scheduledDef}
@@ -323,7 +324,7 @@ func agentStart(d AgentDef, r *proto.RunRequest, s harness.Start, now time.Time,
 		return s, TaskOptions{}, fmt.Errorf("max_steps must be 1 to %d for %s", d.Steps, d.ID)
 	}
 	if r.AutoFallback {
-		r.FallbackModels = fallbackModels(r.Model, r.FallbackModels)
+		r.FallbackModels = chargedFallbacks(r) // none dearer than the run was charged at (charge.go)
 	} else {
 		r.FallbackModels = nil
 	}

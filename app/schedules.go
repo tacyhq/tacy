@@ -49,6 +49,10 @@ import (
 //	POST /schedules/results         {where and who, after} -> {results, more}
 //	POST /schedules/result          {where and who, task} -> {…, sealed: {enc, ct}}
 //	POST /schedules/results/delete  {where and who, tasks} -> {deleted}
+//	POST /spaces/reseal             {where and who (the new seal key), old_seal, old_proof} -> {space, seal}
+//
+// Every call's seal key must be the one pinned for its space (v0.16.0, runauth.CheckPin; 403 seal_mismatch
+// otherwise); POST /spaces/reseal moves the pin to a new seal key, proving the old one too (runauth.CheckReseal).
 
 // Limits.
 const (
@@ -70,6 +74,7 @@ func (s *server) scheduleRoutes(mux *http.ServeMux, id *ehbpidentity.Identity) {
 	} {
 		mux.Handle("POST /schedules/"+path, s.taskGuard(false, false, id.Middleware()(h)))
 	}
+	mux.Handle("POST /spaces/reseal", s.taskGuard(false, false, id.Middleware()(http.HandlerFunc(s.spaceReseal))))
 }
 
 func failDetail(w http.ResponseWriter, status int, code, detail string) {
@@ -94,6 +99,20 @@ func (s *server) callWho(w http.ResponseWriter, label string, where *runauth.Whe
 		failDetail(w, 403, "bad_proof", err.Error())
 		return runauth.Who{}, false
 	}
+	// The space's pinned seal key (v0.16.0): another key proven for the space changes nothing in it.
+	switch err := runauth.CheckPin(rg.pins, who, time.Now()); {
+	case errors.Is(err, runauth.ErrSealPinned):
+		failDetail(w, 403, "seal_mismatch", err.Error())
+		return runauth.Who{}, false
+	case err != nil:
+		fail(w, 500, "store_unavailable")
+		return runauth.Who{}, false
+	}
+	return s.claimNonce(w, rg, who, where)
+}
+
+// claimNonce claims a checked call's nonce; it writes the error itself (false).
+func (s *server) claimNonce(w http.ResponseWriter, rg *recGateway, who runauth.Who, where *runauth.Where) (runauth.Who, bool) {
 	switch err := rg.nonces.Claim(where.Nonce, where.SignedAt); {
 	case errors.Is(err, runauth.ErrReplay):
 		fail(w, 409, "replayed")
@@ -116,6 +135,44 @@ func readCall(w http.ResponseWriter, r *http.Request, max int64, v any) bool {
 		return false
 	}
 	return true
+}
+
+type resealRequest struct {
+	runauth.Where
+	OldSeal  string `json:"old_seal"`
+	OldProof []byte `json:"old_proof"`
+}
+
+// spaceReseal moves a personal space's pinned seal key to a new one (a rotation): the call proves the new key as any
+// call does and the old one with its own space proof, and the pin moves only from the key it holds now.
+func (s *server) spaceReseal(w http.ResponseWriter, r *http.Request) {
+	var req resealRequest
+	if !readCall(w, r, 8<<10, &req) {
+		return
+	}
+	rg, _ := s.agent.(*recGateway)
+	if !s.personal() || rg == nil || rg.vmKey == nil {
+		fail(w, 503, "identity_unavailable")
+		return
+	}
+	who, err := runauth.CheckReseal(rg.vmKey, &req.Where, req.OldSeal, req.OldProof, time.Now())
+	if err != nil {
+		failDetail(w, 403, "bad_proof", err.Error())
+		return
+	}
+	if _, ok := s.claimNonce(w, rg, who, &req.Where); !ok {
+		return
+	}
+	switch err := rg.pins.RepinSeal(who.Space, req.OldSeal, who.Seal, time.Now()); {
+	case errors.Is(err, runauth.ErrSealPinned):
+		failDetail(w, 403, "seal_mismatch", "the old seal key isn't the one pinned for the space")
+		return
+	case err != nil:
+		fail(w, 500, "store_unavailable")
+		return
+	}
+	log.Printf("spaces: a personal space's seal key was rotated") // no ids
+	writeJSON(w, 200, map[string]string{"space": who.Space, "seal": who.Seal})
 }
 
 type installRequest struct {
@@ -176,7 +233,14 @@ func (s *server) scheduleInstall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var d trigger.Definition
-	if err := jsonv2.Unmarshal(req.Definition.Payload, &d); err == nil {
+	decodeErr := jsonv2.Unmarshal(req.Definition.Payload, &d)
+	// What the relay charges for it (v0.16.0, schedule_charge.go), checked against the signed definition first.
+	charged, ok := checkScheduleCharge(r, &d, decodeErr == nil)
+	if !ok {
+		failDetail(w, 400, "charge_mismatch", "the X-Schedule-Charge header doesn't match the schedule's definition")
+		return
+	}
+	if err := decodeErr; err == nil {
 		if d.Space != who.Space || d.Author != who.Identity || d.Sponsor != who.Identity {
 			failDetail(w, 403, "not_holder", "a personal schedule's space, author and sponsor are the request's own")
 			return
@@ -219,6 +283,9 @@ func (s *server) scheduleInstall(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("schedules: installed (version %d, %d triggers)", in.Def.Version, len(in.Def.Triggers)) // no ids or times
 	state := s.triggers.StateOf(in)
+	if charged {
+		w.Header().Set(schedulePricedHeader, "1")
+	}
 	writeJSON(w, 200, map[string]any{"agent": in.Def.Agent, "version": in.Def.Version, "digest": in.Digest, "state": state,
 		"not_after": in.Def.NotAfter.UTC(), "triggers": s.triggerViews(in, state, false)})
 }
@@ -295,10 +362,19 @@ func (s *server) stopSchedule(w http.ResponseWriter, r *http.Request, remove boo
 	if !ok {
 		return
 	}
+	// The schedule the relay stops charging (v0.16.0, schedule_charge.go): the one this signed call names.
+	named := r.Header.Get(scheduleAgentHeader)
+	if named != "" && named != req.Agent {
+		failDetail(w, 400, "agent_mismatch", "the X-Schedule-Agent header doesn't name the call's schedule")
+		return
+	}
 	in := s.triggers.Get(req.Agent)
 	if in == nil || in.Def.Space != who.Space || in.Def.Seal != who.Seal {
 		fail(w, 404, "no_such_schedule")
 		return
+	}
+	if named != "" {
+		w.Header().Set(schedulePricedHeader, "1")
 	}
 	out, err := s.triggers.Stop(req.Agent, remove)
 	if err != nil {

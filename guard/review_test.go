@@ -51,7 +51,7 @@ func reviewReq(files ...TaskFile) *proto.RunRequest {
 func TestReviewDefinition(t *testing.T) {
 	d, ok := Definition(AgentReview)
 	if !ok || !slices.Equal(d.Tools, []string{"files_list", "files_read"}) || !d.NoEgress || !d.Files || !d.BriefOnly || d.Extras ||
-		d.Steps != 12 || d.Work != 10*time.Minute || d.Overall != time.Hour || d.Run.CostMicros != 500_000 || d.Keep != 7*24*time.Hour ||
+		d.Steps != 12 || d.Work != 10*time.Minute || d.Overall != time.Hour || d.Run.CostMicros != 500_000 || d.Keep != 0 ||
 		d.Searches != 0 || d.Reads != 0 {
 		t.Fatalf("review %+v", d)
 	}

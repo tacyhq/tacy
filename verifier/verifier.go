@@ -63,6 +63,10 @@ var PreLaunchScripts = map[string]string{
 	"982181610f70be9087b1c69b36b719b47b82d37fcef8acc9289ed3bb3095ffe8": "Phala pre-launch script v0.0.20",
 }
 
+// AppComposeCheck is the check of app-compose.json's other settings. The chat names a failure by its "app-compose:"
+// prefix (the chat's verifier-core.ts), so the rest of the name may grow.
+const AppComposeCheck = "app-compose: reviewed pre-launch script, no init script, docker-compose runner, expected env names only, container logs not public"
+
 // Envs are the only environment variable names the CVM may receive from the deployer (encrypted env).
 var Envs = []string{"TINFOIL_API_KEY", "BRAVE_SEARCH_API_KEY", "TAVILY_API_KEY", "EXA_API_KEY", "SEARCH_PROVIDER", "AGENT_VM_TOKEN"}
 
@@ -331,12 +335,17 @@ func Verify(ctx context.Context, att *proto.Attestation, nonce []byte, p Policy)
 			err = fmt.Errorf("deployer may set env %s", e)
 		}
 	}
-	if !r.add("app-compose: reviewed pre-launch script, no init script, docker-compose runner, expected env names only", err,
-		fmt.Sprintf("%s; envs %v", preName, ac.AllowedEnvs)) {
+	// public_logs publishes the containers' stdout and stderr on the host's dashboard and log API: an error message
+	// or a stray print could carry what a person sent. Ours log no content, but nothing here could prove that of
+	// every line, so a CVM with public logs fails (v0.16.0; before, it was only recorded as a fact).
+	if err == nil && ac.PublicLogs {
+		err = errors.New("app-compose has public_logs on (the containers' logs are published)")
+	}
+	r.Facts["public logs"] = fmt.Sprint(ac.PublicLogs) // also when the check fails: what it saw
+	r.Facts["pre-launch script"] = preName
+	if !r.add(AppComposeCheck, err, fmt.Sprintf("%s; envs %v; public logs %v", preName, ac.AllowedEnvs, ac.PublicLogs)) {
 		return failed()
 	}
-	r.Facts["public logs"] = fmt.Sprint(ac.PublicLogs)
-	r.Facts["pre-launch script"] = preName
 	pin := ""
 	if m := binaryPin.FindStringSubmatch(ac.DockerComposeFile); m != nil {
 		pin = m[1]

@@ -160,6 +160,85 @@ func Run(t *testing.T, open func(t *testing.T) harness.Store, reopen func(t *tes
 			t.Errorf("journal of an unknown task: %+v", recs)
 		}
 	})
+	t.Run("scrub", func(t *testing.T) {
+		s := open(t)
+		start, opts := jsontext.Value(`{"input":"the person's words"}`), jsontext.Value(`{"question":"the person's words","user":"u"}`)
+		must(t, s.AddTask("t1", start, opts))
+		must(t, s.AddTask("t2", start, opts))
+		for _, id := range []string{"t1", "t2"} {
+			must(t, s.AddSteer(id, harness.Steer{N: 1, Text: "steer"}))
+			_, _, err := s.Begin(id, "m1", harness.TypeModelCall, [32]byte{7}, jsontext.Value(`{"messages":"secret"}`))
+			must(t, err)
+			must(t, s.Finish(id, "m1", jsontext.Value(`{"text":"secret"}`), harness.Errf(harness.CodeInternal, "secret")))
+			must(t, s.SaveCheckpoint(id, &harness.Checkpoint{Seq: 1, State: []byte("secret")}))
+			must(t, s.AddEvents(id, []harness.StoredEvent{{Seq: 1, Data: []byte(`{"type":"done"}`)}}))
+		}
+		// t2 hasn't ended: a scrub leaves it as it was.
+		must(t, s.Scrub("t2", jsontext.Value(`{}`)))
+		must(t, s.EndTask("t1", harness.Outcome{State: harness.OutcomeSucceeded}))
+		must(t, s.Scrub("t1", jsontext.Value(`{"user":"u"}`)))
+		must(t, s.Scrub("t9", nil)) // unknown: nothing
+		// Late writes (a request that was still running when the task ended) keep no content either.
+		_, _, err := s.Begin("t1", "a9", harness.TypeAction, [32]byte{9}, jsontext.Value(`{"late":"secret"}`))
+		must(t, err)
+		must(t, s.Finish("t1", "a9", jsontext.Value(`{"late":"secret"}`), nil))
+		must(t, s.SaveCheckpoint("t1", &harness.Checkpoint{Seq: 9, State: []byte("secret")}))
+		if reopen != nil {
+			s = reopen(t, s)
+		}
+		if recs, _ := s.Journal("t1"); len(recs) != 2 || recs[1].ID != "a9" || !recs[1].Done || recs[1].Req != nil || recs[1].Body != nil {
+			t.Fatalf("a late request of an ended task: %+v", recs)
+		}
+		t1, _ := s.Task("t1")
+		if t1 == nil || string(t1.Start) != `{}` || string(t1.Options) != `{"user":"u"}` || t1.Outcome != harness.OutcomeSucceeded {
+			t.Fatalf("t1 after its scrub: %+v", t1)
+		}
+		recs, _ := s.Journal("t1")
+		recs = recs[:min(1, len(recs))]
+		if len(recs) != 1 || recs[0].ID != "m1" || recs[0].Hash != ([32]byte{7}) || !recs[0].Done || recs[0].Req != nil ||
+			recs[0].Body != nil || recs[0].Err != nil {
+			t.Fatalf("t1's journal after its scrub: %+v", recs)
+		}
+		if rec, fresh, _ := s.Begin("t1", "m1", harness.TypeModelCall, [32]byte{7}, nil); fresh || !rec.Done {
+			t.Fatalf("a scrubbed request id could run again: %+v %v", rec, fresh)
+		}
+		if cp, _ := s.Checkpoint("t1"); cp != nil {
+			t.Fatalf("t1's checkpoint after its scrub: %+v", cp)
+		}
+		if evs, _ := s.Events("t1", 0, 10); len(evs) != 1 {
+			t.Fatalf("t1's events (its result) went with the scrub: %d", len(evs))
+		}
+		open, _ := s.OpenTasks()
+		if len(open) != 1 || open[0].ID != "t2" || string(open[0].Start) != string(start) || string(open[0].Options) != string(opts) ||
+			len(open[0].Steers) != 1 {
+			t.Fatalf("t2 (open) after a scrub: %+v", open)
+		}
+		if recs, _ := s.Journal("t2"); len(recs) != 1 || recs[0].Req == nil || recs[0].Body == nil {
+			t.Fatalf("t2's journal after a scrub: %+v", recs)
+		}
+		if cp, _ := s.Checkpoint("t2"); cp == nil {
+			t.Fatal("t2's checkpoint went")
+		}
+		// Delivery marks (optional): only an ended task's, the first time counts, gone with the task.
+		d, ok := s.(harness.DeliveryStore)
+		if !ok {
+			return
+		}
+		at := time.Now().Add(-time.Minute)
+		must(t, d.MarkDelivered("t1", at))
+		must(t, d.MarkDelivered("t1", at.Add(time.Hour)))
+		must(t, d.MarkDelivered("t2", at)) // not ended: not marked
+		if ids, _ := d.DeliveredBefore(at); len(ids) != 0 {
+			t.Fatalf("delivered before the mark: %v", ids)
+		}
+		if ids, _ := d.DeliveredBefore(at.Add(time.Second)); len(ids) != 1 || ids[0] != "t1" {
+			t.Fatalf("delivered: %v", ids)
+		}
+		must(t, s.DeleteTask("t1"))
+		if ids, _ := d.DeliveredBefore(time.Now().Add(time.Hour)); len(ids) != 0 {
+			t.Fatalf("a deleted task's mark: %v", ids)
+		}
+	})
 	t.Run("delete", func(t *testing.T) {
 		s := open(t)
 		must(t, s.AddTask("t1", jsontext.Value(`{}`), nil))

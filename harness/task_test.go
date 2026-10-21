@@ -305,8 +305,10 @@ func TestCancelWhileHeld(t *testing.T) {
 	if p.f.ActionRuns("t1", "mail.send") != 0 {
 		t.Fatal("the held mail ran")
 	}
+	// The task ended, so its journal keeps only each request's id, hash and done mark (Store.Scrub): the held one is
+	// done (it can't run any more), its body and error gone with the rest of the run's content.
 	recs, _ := mem.Journal("t1")
-	if len(recs) != 2 || !recs[1].Done || recs[1].Err == nil || recs[1].Err.Code != CodeCancelled || recs[1].Held != WaitApproval {
+	if len(recs) != 2 || !recs[1].Done || recs[1].Held != WaitApproval || recs[1].Err != nil || recs[0].Req != nil || recs[0].Body != nil {
 		t.Fatalf("journal %+v", recs)
 	}
 	if st, _ := p.f.Status("t1"); st.State != StateCancelled || len(st.Held) != 0 {

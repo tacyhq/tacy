@@ -17,6 +17,7 @@ import (
 	"github.com/tacyhq/tacy/agentclient"
 	"github.com/tacyhq/tacy/approval"
 	"github.com/tacyhq/tacy/guard"
+	"github.com/tacyhq/tacy/harness"
 	"github.com/tacyhq/tacy/proto"
 	"github.com/tacyhq/tacy/runauth"
 	"github.com/tacyhq/tacy/safety"
@@ -484,24 +485,61 @@ func TestTaskDelete(t *testing.T) {
 // Retention (decision 5): an ended research task's result stays until collected, at most 7 days; a chat task's for
 // the host's day, as before.
 func TestAgentRetention(t *testing.T) {
-	ae := newAgentEnv(t, nil, pText(researchAnswer), pText("chat answer"))
+	ae := newAgentEnv(t, nil, pText(researchAnswer), pText("chat answer"), pText(researchAnswer), pText("chat answer"))
 	c := ae.conn(t, tasksUser)
+	h := ae.s.tasks()
+	gone := func(id string) bool { st, _ := ae.s.rt.Store.Task(id); return st == nil }
+	// Collected: each followed to its end, so it goes DeliveredKeep after that, the research one too.
 	rid, _ := runAgentTask(t, c, research(researchBrief))
 	chat := proto.RunRequest{Model: proto.DefaultModel, RunSecret: permSecret, Permissions: guard.AllowAll(), Messages: user1("hi")}
 	cid, _ := runAgentTask(t, c, chat)
-	h := ae.s.tasks()
-	gone := func(id string) bool { st, _ := ae.s.rt.Store.Task(id); return st == nil }
+	// The stream marks a task delivered after it wrote [DONE], so the client can have the end before the mark is down.
+	waitDelivered(t, ae.s.rt.Store.(harness.DeliveryStore), rid, cid)
 	now := time.Now()
-	if h.Prune(now.Add(time.Hour)) != 0 || gone(rid) || gone(cid) {
-		t.Fatal("pruned within the hour")
+	if h.Prune(now.Add(5*time.Minute)) != 0 || gone(rid) || gone(cid) {
+		t.Fatal("collected tasks pruned before their 10 minutes")
 	}
-	if n := h.Prune(now.Add(2 * 24 * time.Hour)); n != 1 || !gone(cid) || gone(rid) {
-		t.Fatalf("after 2 days: %d pruned, chat gone %v, research gone %v", n, gone(cid), gone(rid))
+	if n := h.Prune(now.Add(11 * time.Minute)); n != 2 || !gone(cid) || !gone(rid) {
+		t.Fatalf("collected tasks after 11 minutes: %d pruned, chat gone %v, research gone %v", n, gone(cid), gone(rid))
 	}
-	if n := h.Prune(now.Add(6 * 24 * time.Hour)); n != 0 || gone(rid) {
-		t.Fatal("research pruned before 7 days")
+	// Not collected (nobody followed them to the end): a day for each, research included (7 days before v0.16.0).
+	start := func(req proto.RunRequest) string {
+		tk, err := c.StartTask(context.Background(), req, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		waitTask(t, c, tk.Task, func(s *agentclient.Task) bool { return harness.Terminal(s.State) })
+		return tk.Task
 	}
-	if n := h.Prune(now.Add(7*24*time.Hour + time.Minute)); n != 1 || !gone(rid) {
-		t.Fatalf("after 7 days: %d pruned, research gone %v", n, gone(rid))
+	rid, cid = start(research(researchBrief)), start(chat)
+	now = time.Now()
+	if h.Prune(now.Add(time.Hour)) != 0 || h.Prune(now.Add(23*time.Hour)) != 0 || gone(rid) || gone(cid) {
+		t.Fatal("results not collected were pruned within the day")
+	}
+	if n := h.Prune(now.Add(24*time.Hour + time.Minute)); n != 2 || !gone(cid) || !gone(rid) {
+		t.Fatalf("after a day: %d pruned, chat gone %v, research gone %v", n, gone(cid), gone(rid))
+	}
+}
+
+// waitDelivered waits until every id is marked delivered (Host.Delivered, after its event stream's end).
+func waitDelivered(t *testing.T, d harness.DeliveryStore, ids ...string) {
+	t.Helper()
+	for end := time.Now().Add(10 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		got, err := d.DeliveredBefore(time.Now().Add(time.Second))
+		if err != nil {
+			t.Fatal(err)
+		}
+		missing := 0
+		for _, id := range ids {
+			if !slices.Contains(got, id) {
+				missing++
+			}
+		}
+		if missing == 0 {
+			return
+		}
+		if time.Now().After(end) {
+			t.Fatalf("%d of %d tasks not marked delivered", missing, len(ids))
+		}
 	}
 }

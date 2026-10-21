@@ -35,7 +35,8 @@
 // The HPKE private key is generated at boot and lives only in memory; requests and responses are never logged. A
 // /run's task (its input, options, journal and events) is in the queue on the VM's encrypted disk only while it
 // runs and is deleted when it ends; /run tasks a previous process left open are ended at boot (nobody can see their
-// answer). A POST /tasks task is kept until it ends plus a day, and goes on after a restart.
+// answer). A POST /tasks task goes on after a restart; once it ends only its result (its events) and ids stay,
+// for 10 minutes after its event stream handed the result on, else a day.
 // compose.yaml embeds this source (cmd/compose), and the CVM runs binaries whose SHA-256 are pinned in the
 // compose, so the attested compose hash covers the exact code.
 package main
@@ -83,6 +84,7 @@ import (
 	"github.com/tacyhq/tacy/internal/tinfoil"
 	"github.com/tacyhq/tacy/proto"
 	"github.com/tacyhq/tacy/queue"
+	"github.com/tacyhq/tacy/runauth"
 	"github.com/tacyhq/tacy/runner"
 	"github.com/tacyhq/tacy/safety"
 	"github.com/tacyhq/tacy/trigger"
@@ -130,6 +132,9 @@ type server struct {
 	// memory is schedules' memory across runs (schedule upgrades: trigger/memory.go), on the same side file. nil on a
 	// firm VM.
 	memory trigger.MemoryStore
+	// ledger is the safety budgets' ledger (the safe gateway's): GET /tasks/open reads scheduled runs' cost from it.
+	// nil: none.
+	ledger *safety.Ledger
 	// Run notifications (notify.go): the spaces that turned them on and their marks; nil: none (every call is a no-op).
 	notify *notifier
 	// taskFollows counts each task's open event streams (a prompt in a followed task notifies nobody), under followMu.
@@ -141,7 +146,29 @@ type ticketKey struct{}
 // ModelHeader carries the run's model in plaintext (checked against the encrypted body).
 const ModelHeader = "X-Agent-Model"
 
+// What the relay prices a run at (v0.16.0, guard/charge.go), both optional and checked against the encrypted body:
+// the built-in agent (X-Agent-Kind) and the dearest model the run may call (X-Agent-Price-Model). pricedHeader is
+// this VM's plaintext witness on a task start's answer that it checked them: a relay that priced a start lower on
+// their word charges the rest when the witness is missing (a release before them doesn't check).
+const (
+	KindHeader       = "X-Agent-Kind"
+	PriceModelHeader = "X-Agent-Price-Model"
+	pricedHeader     = "X-Agent-Priced"
+)
+
 func knownModel(m string) bool { return guard.KnownModel(m) }
+
+// chargeHeadersError is why the pricing headers are refused at the door ("": they're fine): a kind or a model this
+// release doesn't have. That they match the body is checked after decryption (guard.CheckCharge).
+func chargeHeadersError(r *http.Request) string {
+	if k := r.Header.Get(KindHeader); k != "" && !guard.KnownKind(k) {
+		return "kind_unknown"
+	}
+	if m := r.Header.Get(PriceModelHeader); m != "" && !knownModel(m) {
+		return "model_unknown"
+	}
+	return ""
+}
 
 // brainWait is how long a run waits for a brain to be connected before it gives up (a brain restarts in about a
 // second; this covers the first boot, when the brain's container starts right after this one listens).
@@ -222,6 +249,10 @@ func (s *server) guard(next http.Handler) http.Handler {
 			fail(w, 400, "model_unknown")
 			return
 		}
+		if msg := chargeHeadersError(r); msg != "" {
+			fail(w, 400, msg)
+			return
+		}
 		user := r.Header.Get("X-Agent-User")
 		if user != "" && !userTagRe.MatchString(user) {
 			fail(w, 400, "bad_user_tag")
@@ -255,6 +286,11 @@ func (s *server) run(w http.ResponseWriter, r *http.Request) {
 	// anything runs or is recorded (this response is encrypted, so the reason only reaches the browser).
 	if h := r.Header.Get(ModelHeader); h != cmp.Or(req.Model, proto.DefaultModel) {
 		fail(w, 400, "model_mismatch: the X-Agent-Model header doesn't match the run's model")
+		return
+	}
+	// The same for what it priced: the run's kind and the dearest model it may call (v0.16.0).
+	if err := guard.CheckCharge(&req, r.Header.Get(ModelHeader), r.Header.Get(KindHeader), r.Header.Get(PriceModelHeader)); err != nil {
+		fail(w, 400, err.Error())
 		return
 	}
 	// Where and who (keys v2 slice 6): checked once, here; StartFor then uses what was verified.
@@ -535,6 +571,7 @@ func main() {
 		trigger.HolderStore
 		trigger.ResultStore
 		trigger.MemoryStore
+		runauth.PinStore
 	}
 	if dir := p.StoragePath(); dir != "" {
 		q, err := queue.OpenSide(filepath.Join(dir, "side.db"))
@@ -543,8 +580,11 @@ func main() {
 		}
 		side = q
 	} else {
-		side = memSide{approval.NewMemStore(), trigger.NewMemStore(), &trigger.MemHolders{}, &trigger.MemResults{}, &trigger.MemMemory{}}
+		side = memSide{approval.NewMemStore(), trigger.NewMemStore(), &trigger.MemHolders{}, &trigger.MemResults{}, &trigger.MemMemory{},
+			&runauth.MemPins{}}
 	}
+	// Personal spaces' seal keys pinned on first use (v0.16.0; runauth.PinStore), kept with the side file's holders.
+	rg.pins = side
 	// Schedules (v0.12.0, schedules.go): on the shared chat VM, the directory is who proved they hold a personal
 	// space (recorded at a schedule's install). A firm VM's comes with its key log (later): none, nothing installs.
 	// Approvals keep no directory either way: no definition a personal space can install sends or changes anything.
@@ -579,7 +619,7 @@ func main() {
 	s := &server{platform: p, id: id, agent: rg, rt: rt, rec: rec, token: p.Secret("AGENT_VM_TOKEN"), booted: time.Now().UTC(),
 		sched: newScheduler(lim), lim: lim, quotes: make(chan struct{}, 8), safety: st, gw: gw, safetySlots: make(chan struct{}, 4),
 		host: host, prompts: rg.prompts, dir: directory, approvals: rg.approvals, triggers: engine, holders: holders, results: results,
-		memory: memory}
+		memory: memory, ledger: sg.ledger}
 	host.TriggeredDone = s.triggeredDone
 	host.Memory = s.scheduleMemory
 	host.Allows = s.policyAllows
@@ -704,7 +744,9 @@ func (s *server) stats(w http.ResponseWriter, r *http.Request) {
 func newRuntime(g harness.Guard, store harness.Store, lim Limits) *harness.Runtime {
 	return &harness.Runtime{Guard: g, Store: store, Info: harness.Info{Name: "tacy-runtime", Version: "0.1"},
 		Limits:   harness.Limits{MaxTasks: lim.MaxRuns, MaxInflight: max(1, lim.RunTools)},
-		OnReject: func(err error) { log.Printf("brain frame refused: %v", err) }}
+		OnReject: func(err error) { log.Printf("brain frame refused: %v", err) },
+		// An ended task's options keep no content (v0.16.0): its run's input, files and model calls go as it ends.
+		KeepOptions: guard.EndedOptions}
 }
 
 // listenSocket listens on a unix socket at path (a stale one is removed): group gid and mode 0660, so the one

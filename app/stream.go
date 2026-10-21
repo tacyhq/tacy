@@ -86,18 +86,22 @@ func (s *eventStream) emit(e proto.Event) error {
 }
 
 // done ends the stream with [DONE]; nothing is written after it.
-func (s *eventStream) done() {
+// done ends the stream with [DONE]; an error says it couldn't be written (the reader is gone).
+func (s *eventStream) done() error {
 	s.stop()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
-		return
+		return io.ErrClosedPipe
 	}
 	s.closed = true
-	io.WriteString(s.w, "data: [DONE]\n\n")
+	if _, err := io.WriteString(s.w, "data: [DONE]\n\n"); err != nil {
+		return err
+	}
 	if s.flusher != nil {
 		s.flusher.Flush()
 	}
+	return nil
 }
 
 // stop ends the keepalives and waits for them to stop writing (the handler must not write after it returns).

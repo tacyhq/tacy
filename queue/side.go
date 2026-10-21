@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/tacyhq/tacy/approval"
+	"github.com/tacyhq/tacy/runauth"
 	"github.com/tacyhq/tacy/trigger"
 )
 
@@ -131,6 +132,24 @@ var sideExtras = []struct {
 	);
 	CREATE INDEX memory_agent ON memory (space, agent, ended_at);
 	CREATE INDEX memory_ended ON memory (ended_at);`},
+	// v0.16.0: each personal space's pinned seal key (runauth.PinStore). Ids and public keys only.
+	{`SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'space_seals'`,
+		`CREATE TABLE space_seals (
+		space TEXT PRIMARY KEY,
+		seal  TEXT NOT NULL,
+		at    INTEGER NOT NULL
+	);`},
+}
+
+// seedPins pins each personal space that has none yet to the seal key of its earliest holder record (the schedules
+// installed before pins existed, or while a release without them ran after a rollback): the key that space's holder
+// proved first, rather than whichever key asks next. Idempotent.
+func seedPins(db *sql.DB) error {
+	_, err := db.Exec(`INSERT INTO space_seals (space, seal, at)
+		SELECT h.space, h.seal, h.at FROM holders h
+		WHERE h.at = (SELECT min(at) FROM holders WHERE space = h.space) ORDER BY h.space, h.identity
+		ON CONFLICT (space) DO NOTHING`)
+	return err
 }
 
 // applyExtras makes the sideExtras not made yet, each in its own transaction.
@@ -205,6 +224,14 @@ func OpenSide(path string) (*Side, error) {
 	if err := applyExtras(db); err != nil {
 		db.Close()
 		return nil, err
+	}
+	if err := seedPins(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("queue side: seal pins: %w", err)
+	}
+	if err := purgeRemoved(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("queue side: removed definitions: %w", err)
 	}
 	return &Side{db: db}, nil
 }
@@ -349,15 +376,79 @@ func (s *Side) Definitions() ([]trigger.Stored, error) {
 	return out, rows.Err()
 }
 
+// removedEnv is a removed definition's envelope: none (the column can't be NULL). Its agent id, version and state
+// stay, the version floor that refuses a replay of an older definition (SaveDefinition); its instructions don't.
+var removedEnv = []byte{}
+
 func (s *Side) SetState(agent string, version uint64, state string) error {
-	res, err := s.db.Exec(`UPDATE definitions SET state = ? WHERE agent = ? AND version = ?`, state, agent, int64(version))
+	res, err := s.db.Exec(`UPDATE definitions SET state = ?, env = CASE WHEN ? = ? THEN ? ELSE env END WHERE agent = ? AND version = ?`,
+		state, state, trigger.StateRemoved, removedEnv, agent, int64(version))
 	if err != nil {
 		return err
 	}
 	if n, _ := res.RowsAffected(); n != 1 {
 		return trigger.ErrStale
 	}
+	if state == trigger.StateRemoved {
+		s.truncateWAL()
+	}
 	return nil
+}
+
+// purgeRemoved empties the envelopes of definitions removed before removals did (v0.12.0-v0.15.0, or while one of
+// them ran after a rollback). Idempotent.
+func purgeRemoved(db *sql.DB) error {
+	res, err := db.Exec(`UPDATE definitions SET env = ? WHERE state = ? AND length(env) > 0`, removedEnv, trigger.StateRemoved)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`)
+	}
+	return nil
+}
+
+// truncateWAL empties the write-ahead log after a purge, as the queue's (Store.truncateWAL).
+func (s *Side) truncateWAL() {
+	s.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`)
+}
+
+// ---- personal spaces: pinned seal keys (runauth.PinStore) ----------------------------------------------------
+
+var _ runauth.PinStore = (*Side)(nil)
+
+func (s *Side) PinSeal(space, seal string, at time.Time) (string, error) {
+	if _, err := s.db.Exec(`INSERT INTO space_seals (space, seal, at) VALUES (?, ?, ?) ON CONFLICT (space) DO NOTHING`,
+		space, seal, ms(at)); err != nil {
+		return "", err
+	}
+	var pinned string
+	err := s.db.QueryRow(`SELECT seal FROM space_seals WHERE space = ?`, space).Scan(&pinned)
+	return pinned, err
+}
+
+func (s *Side) RepinSeal(space, old, seal string, at time.Time) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var pinned string
+	switch err := tx.QueryRow(`SELECT seal FROM space_seals WHERE space = ?`, space).Scan(&pinned); {
+	case errors.Is(err, sql.ErrNoRows):
+		if _, err := tx.Exec(`INSERT INTO space_seals (space, seal, at) VALUES (?, ?, ?)`, space, seal, ms(at)); err != nil {
+			return err
+		}
+	case err != nil:
+		return err
+	case pinned != old:
+		return runauth.ErrSealPinned
+	default:
+		if _, err := tx.Exec(`UPDATE space_seals SET seal = ?, at = ? WHERE space = ?`, seal, ms(at), space); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // ---- personal spaces: holders and results ---------------------------------------------------------------------

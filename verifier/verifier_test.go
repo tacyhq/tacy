@@ -188,6 +188,40 @@ func TestInitScriptRefused(t *testing.T) {
 	}
 }
 
+// public_logs on is a failure (v0.16.0): the containers' logs would be published, and a log line could carry content.
+// As for init_script, the quote is made consistent with the edited app-compose.json, so only this rule can fail. The
+// recordings (and the live CVM) have it off and still pass every check before the images rule.
+func TestPublicLogsRefused(t *testing.T) {
+	a, nonce, compose := load061(t)
+	appCompose := withAppCompose(t, a, func(ac map[string]any) { ac["public_logs"] = true })
+	p := offline
+	p.Compose = compose
+	rtmr3 := recompose(t, a, appCompose)
+	p.VerifyQuote = changeQuote(func(q *tdx.Quote) { q.Rtmrs[3] = rtmr3 })
+	res, err := Verify(context.Background(), a, nonce, p)
+	if err == nil || !strings.HasPrefix(err.Error(), AppComposeCheck+": ") || !strings.Contains(err.Error(), "public_logs") ||
+		res.HPKEPublicKey != nil {
+		t.Fatalf("public logs: %v", err)
+	}
+	if last := res.Checks[len(res.Checks)-1]; last.Name != AppComposeCheck || last.OK {
+		t.Fatalf("last check %+v", last)
+	}
+	// Off, as recorded: this check passes and records it.
+	a, nonce, compose = load061(t)
+	p = offline
+	p.Compose = compose
+	res, err = Verify(context.Background(), a, nonce, p)
+	onlyImagesFailed(t, res, err)
+	for _, c := range res.Checks {
+		if c.Name == AppComposeCheck && (!c.OK || !strings.Contains(c.Detail, "public logs false")) {
+			t.Fatalf("app-compose check %+v", c)
+		}
+	}
+	if res.Facts["public logs"] != "false" {
+		t.Fatalf("facts %v", res.Facts)
+	}
+}
+
 // recompose sets a's compose-hash event to sha256(appCompose) and returns the RTMR3 the edited log replays to.
 func recompose(t *testing.T, a *proto.Attestation, appCompose []byte) []byte {
 	t.Helper()

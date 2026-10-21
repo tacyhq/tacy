@@ -48,7 +48,7 @@ func TestAgentDefinitions(t *testing.T) {
 	}
 	// docs/30's limits.
 	if d, _ := Definition(AgentResearch); d.Steps != 30 || d.Searches != 20 || d.Reads != 40 || d.Work != 15*time.Minute ||
-		d.Overall != time.Hour || d.Run.CostMicros != 1_000_000 || !d.BriefOnly || d.Keep != 7*24*time.Hour || d.Extras ||
+		d.Overall != time.Hour || d.Run.CostMicros != 1_000_000 || !d.BriefOnly || d.Keep != 0 || d.Extras ||
 		slices.Contains(d.Tools, "image_search") {
 		t.Fatalf("research %+v", d)
 	}

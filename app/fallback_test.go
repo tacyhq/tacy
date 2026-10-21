@@ -81,7 +81,9 @@ func TestFallbackPolicyRecordAndMetrics(t *testing.T) {
 	if len(runs) != 2 {
 		t.Fatalf("%d records", len(runs))
 	}
-	if want := []string{"deepseek-v4-1-flash", "gpt-oss-120b", "glm-5-3"}; !slices.Equal(runs[0].Models, want) {
+	// glm-5-3 is dropped too (v0.16.0): dearer than what the run was charged at, its X-Agent-Model (no
+	// X-Agent-Price-Model, as a tab before it sends: guard/charge.go).
+	if want := []string{"deepseek-v4-1-flash", "gpt-oss-120b"}; !slices.Equal(runs[0].Models, want) {
 		t.Fatalf("start record's models %v, want %v", runs[0].Models, want)
 	}
 	calls := runs[1].Calls

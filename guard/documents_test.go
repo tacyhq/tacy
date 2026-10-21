@@ -158,7 +158,7 @@ func TestDocumentToolOptIn(t *testing.T) {
 		t.Fatalf("chat default: %v %v", s.Tools, err)
 	}
 	chat.Tools = []string{"web_search", "fetch_page", "image_search", "document_create"}
-	if s, _, err = startFor(chat, now, true); err != nil || s.Tools[len(s.Tools)-1].Name != DocumentAction || !strings.Contains(s.Instructions, "call document_create with the complete document") {
+	if s, _, err = startFor(chat, now, true); err != nil || s.Tools[len(s.Tools)-1].Name != DocumentAction || !strings.Contains(s.Instructions, "made with document_create") || !strings.Contains(s.Instructions, "Drafted content") {
 		t.Fatalf("chat with documents: %v %v", s.Tools, err)
 	}
 	r := researchReq()

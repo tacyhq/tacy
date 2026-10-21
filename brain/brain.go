@@ -29,8 +29,11 @@ import (
 	"github.com/tacyhq/tacy/harness"
 )
 
-// finalNudge asks for the answer when the last step's reply was only a tool call (see loop).
+// finalNudge asks for the answer when the last step's reply had no text (only a tool call, or nothing: see loop).
 const finalNudge = "You can't call any more tools. Answer my question now from the tool results above, citing them as [n]."
+
+// emptyNudge asks once more when an earlier step's reply had neither text nor a tool call (see loop).
+const emptyNudge = "Your last reply was empty. Continue: call the tools you need, or answer my question."
 
 // Version names this brain in hello (logs only).
 const Version = "0.1"
@@ -70,6 +73,9 @@ func Run(ctx context.Context, conn net.Conn) error {
 type state struct {
 	Step     int               `json:"step"`
 	Messages []harness.Message `json:"messages"`
+	// Retried: an earlier step's empty reply was asked again (emptyNudge), which happens once per task, so the
+	// steps' own calls stay within max_model_calls (max_steps + 1).
+	Retried bool `json:"retried,omitempty"`
 }
 
 // maxState is the most checkpoint state the runtime takes: its max_checkpoint, and little enough that the
@@ -152,12 +158,24 @@ func loop(ctx context.Context, t *harness.Task, parallel, maxState int) (harness
 		if err != nil {
 			return ended(t, err)
 		}
-		if last && len(res.Message.ToolCalls) > 0 && strings.TrimSpace(res.Message.Content) == "" {
+		empty := strings.TrimSpace(res.Message.Content) == ""
+		if last && empty {
 			// No tools were offered, yet some models (gpt-oss-120b) still ask for one and write nothing, which ended
-			// the run without an answer (8 of 11 live runs of a shopping question, 2026-10-16). Ask once more for
-			// the answer, without the unanswerable call. Its own request id, so a resumed brain replays it.
+			// the run without an answer (8 of 11 live runs of a shopping question, 2026-10-16); or they write nothing
+			// at all, wanting a tool they no longer have (a document, agent-documents scorecard 2026-10-21). Ask once
+			// more for the answer, without the unanswerable call. Its own request id, so a resumed brain replays it.
 			retry := harness.ModelCall{Model: t.Start.Models[0], Messages: append(slices.Clone(st.Messages), harness.Message{Role: "user", Content: finalNudge})}
 			if r2, err := t.ModelCall(rctx, fmt.Sprintf("s%d.m2", st.Step), retry); err == nil && strings.TrimSpace(r2.Message.Content) != "" {
+				res = r2
+			}
+		} else if !last && empty && len(res.Message.ToolCalls) == 0 && !st.Retried {
+			// Neither text nor a tool call before the last step (gpt-oss-120b's reasoning ends "Let's search." and
+			// nothing follows), which ended the run with an empty answer. Ask once more, tools offered, once per task.
+			st.Retried = true
+			retry := mc
+			retry.Messages = append(slices.Clone(st.Messages), harness.Message{Role: "user", Content: emptyNudge})
+			if r2, err := t.ModelCall(rctx, fmt.Sprintf("s%d.m2", st.Step), retry); err == nil &&
+				(strings.TrimSpace(r2.Message.Content) != "" || len(r2.Message.ToolCalls) > 0) {
 				res = r2
 			}
 		}

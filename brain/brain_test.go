@@ -187,6 +187,54 @@ func TestLastStepToolCallAsksForTheAnswer(t *testing.T) {
 	}
 }
 
+// A last step that writes nothing at all (no text, no tool call: gpt-oss wanting a tool it no longer has) gets the
+// same one more call asking for the answer.
+func TestLastStepEmptyAsksForTheAnswer(t *testing.T) {
+	f := harness.NewFake()
+	f.Model = harness.Script(harness.Calls(call("c1", "web.search", `{"query":"a"}`)), harness.Text(""), harness.Text("the answer [1]"))
+	s := task(2, "web.search")
+	s.Limits.MaxModelCalls = 3
+	o, mcs := run(t, f, s)
+	if o.State != harness.OutcomeSucceeded || o.Done.Text != "the answer [1]" || len(mcs) != 3 {
+		t.Fatalf("outcome %+v, %d model calls", o, len(mcs))
+	}
+	if m := mcs[2].Messages; len(mcs[2].Tools) != 0 || m[len(m)-1].Content != finalNudge {
+		t.Fatalf("retry: tools %v, last message %+v", mcs[2].Tools, m[len(m)-1])
+	}
+}
+
+// An earlier step with neither text nor a tool call is asked once more, with its tools, the run going on from the
+// retry's reply; a second empty step isn't (the task's model calls stay within max_steps + 1).
+func TestEmptyStepAsksOnce(t *testing.T) {
+	f := harness.NewFake()
+	f.Model = harness.Script(harness.Text(""), harness.Calls(call("c1", "web.search", `{"query":"a"}`)), harness.Text("the answer [1]"))
+	s := task(3, "web.search")
+	s.Limits.MaxModelCalls = 4
+	o, mcs := run(t, f, s)
+	if o.State != harness.OutcomeSucceeded || o.Done.Text != "the answer [1]" || len(mcs) != 3 {
+		t.Fatalf("outcome %+v, %d model calls", o, len(mcs))
+	}
+	if m := mcs[1].Messages; len(mcs[1].Tools) != 1 || m[len(m)-1].Content != emptyNudge {
+		t.Fatalf("retry: tools %v, last message %+v", mcs[1].Tools, m[len(m)-1])
+	}
+	for _, m := range mcs[2].Messages {
+		if m.Content == emptyNudge {
+			t.Fatal("the nudge stayed in the conversation")
+		}
+	}
+	if f.ActionRuns("t1", "web.search") != 1 {
+		t.Error("the retry's tool call didn't run")
+	}
+
+	// Empty again after the retry, and on a later step: the run ends there, with one retry only.
+	f = harness.NewFake()
+	f.Model = harness.Script(harness.Text(""), harness.Text(""), harness.Text(""))
+	o, mcs = run(t, f, s)
+	if o.State != harness.OutcomeSucceeded || len(mcs) != 2 {
+		t.Fatalf("outcome %+v, %d model calls (want 2: the step and one retry)", o, len(mcs))
+	}
+}
+
 // Instructions are the system message; the input follows.
 func TestInstructions(t *testing.T) {
 	f := harness.NewFake()

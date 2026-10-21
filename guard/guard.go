@@ -803,8 +803,22 @@ func chatInstructions(actions []string, now time.Time, reader bool) string {
 }
 
 // chatDocumentLine is the chat agent's line for document_create (documents.go), when its request asked for it.
-var chatDocumentLine = "- Documents: when the person asks for a file, a document, a download or a format (\"as a Word doc\", \"a PDF\", \"a CSV\"), or for content they'll send or file elsewhere (a drafted letter, email, memo or report longer than a few sentences), call " +
-	harness.ModelToolName(DocumentAction) + " with the complete document (cite sources in it as [n]) and keep your answer to a short lead-in. Never paste the document into your answer instead, and never say you can't make files.\n"
+//
+// Agent-documents scorecard (the chat's agent-docs scorecard, 2026-10-21): with the line before ("when the person
+// asks for a file, a document, a download or a format ... call document_create"), gpt-oss-120b made the file in 64 of
+// 80 runs of 20 file requests: it took "a CSV of …", "an HTML page" and "a README.md" for content to write out
+// ("they didn't ask for a document format, just a README.md text"), or planned the call and then wrote the file into
+// its message as a code block (the live e2e check's two failures). Naming the formats as file requests, saying a
+// code block isn't a file (an HTML page or CSV made for them included), and calling before any text: 78 of 80, with
+// the 11 requests that must not make one still 44 of 44 and the e2e check's message 8 of 8 (5 of 8 before). Moving
+// the line up to the tools list made no difference. Drafted emails and letters still stayed in the message: the next change puts
+// them in a card too, and naming them as their own kind ("even when they don't mention a file", with what stays in
+// the message) took the 8 drafts from 13 of 32 to 30 of 32, files 80 of 80, the 11 no-document requests 44 of 44
+// and short rewrites and summaries 16 of 16.
+var chatDocumentLine = "- Documents: two kinds of reply go in a document card, made with " + harness.ModelToolName(DocumentAction) + " (the only way they get something to copy whole or download; content written in your message, even in a code block, is not a file):\n" +
+	"  1. A file or format they ask for (\"a CSV of …\", \"as a Word doc\", \"a PDF\", \"a README.md\", \"an HTML page\", \"a text file\"). An HTML page, a CSV or a README you make for them is a file even though it's code or data: it goes in the card, not in a code block.\n" +
+	"  2. Drafted content they'll take elsewhere, even when they don't mention a file: an email, a letter, a cover letter, a post (LinkedIn, a blog), a README, a memo, a report, or a rewrite of a paragraph or more (\"rewrite this more formally\" on more than a couple of sentences).\n" +
+	"  Call it with the complete content (cite sources in it as [n]) as soon as you have what goes in it (after any searches), before you write any text, then write only a short lead-in. Answers, explanations, summaries, lists of ideas and rewrites of one or two sentences stay in your message, and so does a question about files or formats (how to export a CSV, which format to send). Never paste a document into your answer instead, and never say you can't make files.\n"
 
 // ToolDefs are the start.tools entries for web connector actions: tools.go's descriptions and schemas under
 // the action names. Unknown names are left out.

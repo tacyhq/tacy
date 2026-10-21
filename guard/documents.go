@@ -68,7 +68,8 @@ var documentAliases = map[string]string{
 func init() {
 	toolDefs[documentTool] = def(documentTool,
 		"Put a document in your result as a card the person can copy or download as a file (Word, PDF, Markdown, text, CSV or HTML; their browser builds it). "+
-			"Use it only when the brief or instructions ask for a file, a document, a download or a format (\"as a Word doc\", \"a PDF report\", \"give me a CSV\"); otherwise answer in your message. "+
+			"It is the only way to give a file: text in your message can't be downloaded, even in a code block. "+
+			"Use it whenever the person, the brief or the instructions ask for a file, a document, a download or a format (\"as a Word doc\", \"a PDF report\", \"a CSV of …\", \"an HTML page\", \"a README.md\"), and in a chat for drafted content the person will take elsewhere (an email, a letter, a post, a memo, a README, a rewrite longer than a couple of sentences); otherwise answer in your message. "+
 			"Make the document complete and ready to use: the whole report, not a summary of it. Write Markdown (# headings, - lists, 1. numbered lists, **bold**, | tables |) for docx, pdf and md; plain text for txt; a header row and rows for csv; a complete HTML document for html. "+
 			"Cite sources inside it as [n] with the numbers the tool results gave, as in an answer (in a CSV or HTML table, put [n] where a source's link goes: Tacy writes its address there); don't write a list of sources or links: Tacy adds the sources list with their links. "+
 			fmt.Sprintf("At most %d documents per task and %s characters each. ", MaxDocuments, "50,000")+

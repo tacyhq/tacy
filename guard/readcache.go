@@ -68,7 +68,7 @@ func (d *readerDoc) key(rc *ReaderConfig, question string) [32]byte {
 	put(rc.Fallback + "/" + rc.FallbackEffort)
 	put(strconv.FormatBool(rc.Spans) + "/" + strconv.Itoa(facts) + "/" + strconv.Itoa(quotes) + "/" + strconv.Itoa(spans))
 	put(question)
-	put(d.kind)
+	put(d.kind + "/" + strconv.FormatBool(rc.Files) + "/" + strconv.FormatBool(rc.Cross) + "/" + strconv.FormatBool(d.whole))
 	put(d.url)
 	put(d.title)
 	put(d.text)

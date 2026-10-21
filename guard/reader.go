@@ -89,6 +89,8 @@ type ReaderConfig struct {
 	NoItems bool
 	// Files: the reader of a review's file sections (files.go): its own prompt (readerFilesSystem), no items.
 	Files bool
+	// Cross (with Files): a review's whole-file cross-check (files.go): its own prompt (readerCrossSystem).
+	Cross bool
 }
 
 // DefaultReader is the release's reader (docs/27 section 5): deepseek-v4-1-flash with thinking off, gpt-oss-120b at
@@ -210,16 +212,17 @@ func ReaderReserve(action string, allows func(model string) bool) (tokens, cost 
 }
 
 // ReaderCallMax is the most one reader call for action may use (its prompt and completion tokens at their caps):
-// what a call that reached the model without counts is counted at.
+// what a call that reached the model without counts is counted at. A files.read's calls are counted as its largest,
+// a whole file's cross-check (files.go crossMaxRunes).
 func ReaderCallMax(action string) (prompt, completion int64) {
-	doc := maxPageChars
+	doc, completion := maxPageChars, DefaultReader.MaxOut
 	switch action {
 	case "web.search":
 		doc = maxSearchDocRunes
 	case "files.read":
-		doc = maxSectionRunes
+		doc, completion = crossMaxRunes, crossMaxOut
 	}
-	return readerCallMax(doc), DefaultReader.MaxOut
+	return readerCallMax(doc), completion
 }
 
 // readerCallMax is a reader call's prompt tokens at most for a document of doc characters at most.
@@ -229,7 +232,8 @@ func readerCallMax(doc int) int64 {
 }
 
 // readerSystemBytes is the longer of the reader's prompts.
-var readerSystemBytes = max(len(readerSystem), len(readerSpansSystem)+16, len(readerItemsSystem)+16, len(readerFilesSystem)+16)
+var readerSystemBytes = max(len(readerSystem), len(readerSpansSystem)+16, len(readerItemsSystem)+16, len(readerFilesSystem)+16,
+	len(readerCrossSystem)+16)
 
 // ReaderUse is one reader call as the activity record and the budget see it: numbers and fixed words only.
 type ReaderUse struct {
@@ -446,6 +450,9 @@ func (rc *ReaderConfig) system() string {
 		return readerSystem
 	}
 	facts, quotes, spans := rc.caps()
+	if rc.Files && rc.Cross {
+		return fmt.Sprintf(readerCrossSystem, facts, quotes, spans)
+	}
 	if rc.Files {
 		return fmt.Sprintf(readerFilesSystem, facts, quotes, spans)
 	}
@@ -460,6 +467,7 @@ type readerDoc struct {
 	kind string // "page" | "search" | "file" (a section of a review's file: title is its file and section)
 	// research: a file section of a research task (read with the release's question-led prompt, not review's)
 	research bool
+	whole    bool   // file: a review's whole file, for its cross-check (files.go readerCrossSystem)
 	title    string // page
 	url      string // page
 	text     string // page: its text (redacted)
@@ -535,7 +543,12 @@ var sentenceBreak = regexp.MustCompile(`[.!?]["'”’)\]]*\s+`)
 // letter isn't one: "e.g. this"); a piece longer than maxSpanRunes is cut at a space; a piece shorter than
 // minSpanRunes joins the next one in its segment. Spans hold no leading or trailing whitespace and are numbered in
 // order from 1 (the slice index plus one). At most maxSpans: past that the rest of a document joins the last span.
-func splitSpans(segs []string) []span {
+func splitSpans(segs []string) []span { return splitSpansFor(segs, false) }
+
+// splitSpansFor is splitSpans; with tail (a review's file), a short piece that ends its line joins the piece before
+// it on that line instead of the next line's: a clause's closing "See Appendix B." stays with its clause, not with
+// the next clause's first sentence (the review scorecard's round 3 cited the next clause for it).
+func splitSpansFor(segs []string, tail bool) []span {
 	var out []span
 	for si, s := range segs {
 		var pieces [][2]int
@@ -591,8 +604,15 @@ func splitSpans(segs []string) []span {
 		}
 		// join short pieces to the next one in the segment
 		var merged [][2]int
-		for _, p := range pieces {
-			if n := len(merged); n > 0 && utf8.RuneCountInString(s[merged[n-1][0]:merged[n-1][1]]) < minSpanRunes {
+		short := func(p [2]int) bool { return utf8.RuneCountInString(s[p[0]:p[1]]) < minSpanRunes }
+		for i, p := range pieces {
+			n := len(merged)
+			if n > 0 && short(merged[n-1]) {
+				merged[n-1][1] = p[1]
+				continue
+			}
+			if tail && n > 0 && short(p) && !strings.Contains(s[merged[n-1][1]:p[0]], "\n") &&
+				(i+1 == len(pieces) || strings.Contains(s[p[1]:pieces[i+1][0]], "\n")) {
 				merged[n-1][1] = p[1]
 				continue
 			}
@@ -661,10 +681,13 @@ func (d *readerDoc) prompt(question string, spans []span) string {
 	case "page":
 		b.WriteString("Kind: web page (its title and address are the first lines of the document)\n")
 	case "file":
-		if d.research {
+		switch {
+		case d.research:
 			b.WriteString("Kind: one part of a file the person attached to their research brief (the file's name and the part are the first line of the document; the part is Tacy's cut of the file, not one of its own sections)\n")
-		} else {
-			b.WriteString("Kind: one part of a file the person attached for review (the file's name and the part are the first line of the document)\n")
+		case d.whole:
+			b.WriteString("Kind: a whole file the person attached for review (the file's name is the first line of the document)\n")
+		default:
+			b.WriteString("Kind: one part of a file the person attached for review (the file's name and the part are the first line of the document; a \"Continues under\" line after it, when there is one, gives the file's headings above where the part starts)\n")
 		}
 	default:
 		fmt.Fprintf(&b, "Kind: search results (%d), labelled R1, R2, ...\n", len(d.results))
@@ -939,7 +962,7 @@ func (g *Guard) readCall(ctx context.Context, t *task, rc *ReaderConfig, d *read
 	segs := d.segments(rc.Spans)
 	var spans []span
 	if rc.Spans {
-		spans = splitSpans(segs)
+		spans = splitSpansFor(segs, rc.Files) // a review's file part or whole file
 	}
 	raw := rc.request(d, t.opts.Question, spans, cmp.Or(t.opts.CacheSecret, g.cfg.CacheSecret))
 	stream, err := g.cfg.Up.Stream(ctx, raw)
@@ -1119,6 +1142,10 @@ func checkAnswer(rc *ReaderConfig, d *readerDoc, segs []string, spans []span, ou
 	for _, q := range out.Quotes {
 		var exact string
 		var seg int
+		if rc.Spans && rc.Files { // a review's file part or whole file
+			_, _, most := rc.caps()
+			q.From, q.To = alignClause(q.Location, q.From, q.To, segs, spans, most)
+		}
 		if rc.Spans {
 			// Code fills in the text: from the first span's start to the last one's end, as the source has it.
 			first, last := spans[q.From-1], spans[q.To-1]
@@ -1141,6 +1168,53 @@ func checkAnswer(rc *ReaderConfig, d *readerDoc, segs []string, spans []span, ou
 	}
 	use.Quotes, use.Instructions, use.Items = len(res.quotes), out.InstructionCount, len(res.items)
 	return res
+}
+
+var (
+	// locClauseRe is the clause number a quote's location starts with ("10.4 attorneys' fees", "Part III 3(b)": 3,
+	// "Section 5.2"); passageClauseRe the one a passage starts with ("10.5 Entire Agreement.", "26. Prohibited").
+	locClauseRe     = regexp.MustCompile(`^(?:(?i:part|article)\s+(?:[0-9]{1,2}|[IVXLC]{1,6})[,.]?\s+)?(?:(?i:section|clause)\s+|§\s*)?([0-9]{1,2}(?:\.[0-9]{1,2}){0,2})(?:[.\s(]|$)`)
+	passageClauseRe = regexp.MustCompile(`^[^\pL\pN]{0,4}([0-9]{1,2}(?:\.[0-9]{1,2}){0,2})\.?(?:\s|$)`)
+)
+
+// alignClause moves a file quote whose passage starts with another clause's number than its location names (the
+// reader named spans one clause off: round 3's "10.4 Attorneys' Fees" quote held 10.5) to the nearest span, within
+// 3 of it, that starts with the location's number, keeping its length (within its segment, at most most spans).
+// Anything else is left as the reader gave it. Only which exact passage of the file is shown changes.
+func alignClause(loc string, from, to int, segs []string, spans []span, most int) (int, int) {
+	lm := locClauseRe.FindStringSubmatch(strings.TrimSpace(loc))
+	if lm == nil || from < 1 || to > len(spans) {
+		return from, to
+	}
+	startsWith := func(i int) string {
+		sp := spans[i-1]
+		if m := passageClauseRe.FindStringSubmatch(segs[sp.seg][sp.start:sp.end]); m != nil {
+			return m[1]
+		}
+		return ""
+	}
+	have := startsWith(from)
+	if have == "" || have == lm[1] {
+		return from, to
+	}
+	for i := from; i <= to; i++ {
+		if startsWith(i) == lm[1] {
+			return from, to // the clause is in it
+		}
+	}
+	for d := 1; d <= 3; d++ {
+		for _, p := range []int{from - d, from + d} {
+			if p < 1 || p > len(spans) || spans[p-1].seg != spans[from-1].seg || startsWith(p) != lm[1] {
+				continue
+			}
+			end := min(p+(to-from), len(spans), p+most-1)
+			for end > p && spans[end-1].seg != spans[p-1].seg {
+				end--
+			}
+			return p, end
+		}
+	}
+	return from, to
 }
 
 // sources is how many sources a document has for items to name: its search results, or 1 (a page).

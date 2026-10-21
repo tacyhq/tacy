@@ -14,6 +14,7 @@ import (
 
 	"github.com/tacyhq/tacy/harness"
 	"github.com/tacyhq/tacy/proto"
+	"github.com/tacyhq/tacy/safety"
 )
 
 // a_review (docs/30 slice 3): the person's files in the brief's message, read only inside the VM through files.*
@@ -512,5 +513,248 @@ func TestReviewEmptyRead(t *testing.T) {
 	text := eventText(newReviewE2E(t, sm).review(t, reviewReq()))
 	if !strings.Contains(text, "- nda.txt: part 1 of 1, from “MUTUAL NON-DISCLOSURE AGREEMENT” (the reader couldn't read it)") {
 		t.Fatalf("an empty read counted: %q", text)
+	}
+}
+
+// A part names the headings it continues under (its Part, its clause), so a document that numbers its clauses again
+// in each Part is cited right; the title block isn't one of them, and indentation nests (Markdown lists).
+func TestHeadingsAbove(t *testing.T) {
+	text := "EXHIBIT 19\n\nInsider Trading Policy\n\nPart II\n\n3. Definitions\n\na. Material. " + strings.Repeat("Words about materiality. ", 10) +
+		"\n\nmore of (a) after a page break.\n\nPart III\n\n3. Pre-clearance\n\nb. No trade without approval.\n\n" +
+		"5. Prohibited\n    1. Mutual.\n        a. Each party.\n        b. Second item.\n"
+	f := reviewFile{text: text}
+	at := func(s string) int { return strings.Index(text, s) }
+	for _, c := range []struct {
+		from string
+		want []string
+	}{
+		{"Part II", nil}, // the title block is above it: no headings
+		{"more of (a)", []string{"Part II", "3. Definitions", string([]rune("a. Material. " + strings.Repeat("Words about materiality. ", 3))[:79]) + "…"}},
+		{"3. Pre-clearance", []string{"Part III"}},             // starts with its own heading: only what is above it
+		{"No trade", []string{"Part III", "3. Pre-clearance"}}, // "b. " alone before it isn't a heading
+		{"        b. Second", []string{"Part III", "5. Prohibited", "1. Mutual."}},
+	} {
+		f.secs = []fileSection{{0, at(c.from)}, {at(c.from), len(text)}}
+		if got := f.headingsAbove(1); !slices.Equal(got, c.want) {
+			t.Errorf("from %q: %q, want %q", c.from, got, c.want)
+		}
+	}
+	if (&reviewFile{text: text, secs: []fileSection{{0, len(text)}}}).headingsAbove(0) != nil {
+		t.Error("the first part has headings above it")
+	}
+}
+
+// A reader quote whose passage starts with the next clause's number while its location names this one is moved to
+// the clause its location names; anything else stays as the reader gave it.
+func TestAlignClause(t *testing.T) {
+	text := "10.3 Governing Law. Delaware law governs this agreement.\n10.4 Attorneys' Fees. Consultant pays Client's fees.\n10.5 Entire Agreement. This is the whole agreement.\nSigned by the parties below."
+	segs := []string{"title", text}
+	spans := splitSpansFor(segs, true)
+	num := func(prefix string) int {
+		for i, sp := range spans {
+			if strings.HasPrefix(segs[sp.seg][sp.start:sp.end], prefix) {
+				return i + 1
+			}
+		}
+		t.Fatalf("no span %q", prefix)
+		return 0
+	}
+	s104, s105 := num("10.4"), num("10.5")
+	for _, c := range []struct {
+		loc           string
+		from, to      int
+		wantF, wantTo int
+	}{
+		{"10.4 attorneys' fees", s105, s105, s104, s104},
+		{"10.4 attorneys' fees", s104, s104, s104, s104}, // right already
+		{"10.4 attorneys' fees", s104, s105, s104, s105}, // holds it
+		{"Signature block", s105, s105, s105, s105},      // no number
+		{"Part X 9.9 nothing", s105, s105, s105, s105},   // no such clause near
+		{"Section 10.3 governing law", s104, s104, num("10.3"), num("10.3")},
+	} {
+		if f, to := alignClause(c.loc, c.from, c.to, segs, spans, 6); f != c.wantF || to != c.wantTo {
+			t.Errorf("%q %d-%d: %d-%d, want %d-%d", c.loc, c.from, c.to, f, to, c.wantF, c.wantTo)
+		}
+	}
+}
+
+// In a file, a clause's short closing sentence stays with its clause, not the next clause's first sentence.
+func TestSplitSpansTail(t *testing.T) {
+	segs := []string{"t", "c. The Committee shall record the date of each request. See Appendix B.\n\nd. Any member must get the written permission of another."}
+	texts := func(tail bool) []string {
+		var out []string
+		for _, sp := range splitSpansFor(segs, tail) {
+			out = append(out, segs[sp.seg][sp.start:sp.end])
+		}
+		return out
+	}
+	if got := texts(true); len(got) != 3 || !strings.HasSuffix(got[1], "request. See Appendix B.") || !strings.HasPrefix(got[2], "d. Any") {
+		t.Fatalf("file spans %q", got)
+	}
+	if got := texts(false); len(got) != 3 || !strings.HasPrefix(got[2], "See Appendix B.") {
+		t.Fatalf("page spans %q", got)
+	}
+}
+
+// A cross-check takes no more of agentd's reservation for a files.read than the section reads it replaces: its call
+// at its largest fits in its slots' section calls, and the largest file that gets one fits in a read.
+func TestCrossSlots(t *testing.T) {
+	sec := readerCallMax(maxSectionRunes)
+	for _, n := range []int{100, maxSectionRunes, 12_000, 23_000, crossMaxRunes} {
+		k := int64(crossSlots(n))
+		cross := readerCallMax(n)
+		if k*(sec+DefaultReader.MaxOut) < cross+crossMaxOut ||
+			k*safety.ModelCost(ReaderModel, sec, DefaultReader.MaxOut) < safety.ModelCost(ReaderModel, cross, crossMaxOut) {
+			t.Fatalf("%d characters: %d slots don't cover the check", n, k)
+		}
+	}
+	if crossSlots(crossMaxRunes) > maxSectionsPerRead {
+		t.Fatalf("the largest check takes %d slots", crossSlots(crossMaxRunes))
+	}
+	if p, c := ReaderCallMax("files.read"); p < readerCallMax(crossMaxRunes) || c < crossMaxOut {
+		t.Fatal("a files.read call without counts is counted below a check's largest")
+	}
+}
+
+// crossFile is a file of two parts: Part I and Part II, each about 3,000 characters.
+func crossFile() TaskFile {
+	return TaskFile{Name: "policy.txt", Text: "Part I\n\n1. Rules. " + strings.Repeat("Officers should pre-clear trades. ", 90) +
+		"\n\nPart II\n\n1. Pre-clearance. " + strings.Repeat("Officers must pre-clear every trade. ", 85)}
+}
+
+func isCross(prompt string) bool { return strings.Contains(prompt, "Kind: a whole file") }
+
+// Once every part of a file is read, the reader reads it whole once more (its own prompt, thinking on, no schema, no
+// fallback), alongside the parts; the acting model gets the check's fields and quotes like a part's, the person
+// the quotes with "whole file". A check whose file has a part not read isn't shown.
+func TestReviewCrossCheck(t *testing.T) {
+	review := "## Summary\nA policy [quote 1].\n\n## Issues\n| # | Severity | Party | Clause | Issue | Cite |\n|---|---|---|---|---|---|\n| 1 | High | Company | Part I 1; Part II 1 | Should against must. | [quote 3] |"
+	sm := &splitModel{
+		acting: []string{toolCallSSE("c1", "files_read", `{}`), textSSE(review)},
+		reader: func(prompt string) string {
+			if isCross(prompt) {
+				return fileAnswer(t, func(m map[string]any) {
+					m["summary"] = "Two Parts, numbered again in each [Q1]."
+					m["facts"] = []string{"Part I 1 says officers should pre-clear, Part II 1 that they must [Q1]."}
+					m["quotes"] = []map[string]any{{"id": 1, "from": 3, "to": 3, "location": "Part II 1 pre-clearance", "topic": "must pre-clear"}}
+				})
+			}
+			return fileAnswer(t, nil)
+		},
+	}
+	evs := newReviewE2E(t, sm).review(t, reviewReq(crossFile()))
+	var res *proto.Event
+	for i := range evs {
+		if evs[i].Type == "tool_result" && evs[i].Name == "files_read" {
+			res = &evs[i]
+		}
+	}
+	var out filesReadOut
+	if res == nil || json.Unmarshal(res.Result, &out) != nil || len(out.Parts) != 2 || len(out.Checks) != 1 || out.Checks[0].Read == nil ||
+		out.Checks[0].Read.Quotes[0].Cite != "[quote 3]" || !strings.Contains(out.Checks[0].Read.Facts[0], "[quote 3]") || out.Next != "Every part of every file is read: write the review now." {
+		t.Fatalf("result %s", res.Result)
+	}
+	if len(res.Quotes) != 3 || res.Quotes[2].Location != "policy.txt, whole file: Part II 1 pre-clearance" {
+		t.Fatalf("quotes %+v", res.Quotes)
+	}
+	var cross map[string]any
+	for _, r := range sm.readReqs {
+		if isCross(r["messages"].([]any)[1].(map[string]any)["content"].(string)) {
+			cross = r
+		}
+	}
+	if len(sm.readReqs) != 3 || cross == nil || cross["reasoning_effort"] != crossEffort || cross["max_tokens"] != float64(crossMaxOut) || cross["response_format"] != nil ||
+		!strings.Contains(cross["messages"].([]any)[0].(map[string]any)["content"].(string), "Your job is only the cross-check") {
+		t.Fatalf("%d reader calls; the check's %v", len(sm.readReqs), cross)
+	}
+	if !strings.Contains(eventText(evs), "None: all 2 parts of the 1 file were read.") {
+		t.Fatalf("text %q", eventText(evs))
+	}
+	// Part 2 not read: the check ran but isn't shown.
+	sm = &splitModel{
+		acting: []string{toolCallSSE("c1", "files_read", `{}`), textSSE("## Summary\nPart of it.")},
+		reader: func(prompt string) string {
+			if strings.Contains(prompt, "part 2 of 2") {
+				return "not json"
+			}
+			return fileAnswer(t, nil)
+		},
+	}
+	evs = newReviewE2E(t, sm).review(t, reviewReq(crossFile()))
+	for _, e := range evs {
+		if e.Type == "tool_result" && e.Name == "files_read" {
+			var out filesReadOut
+			if json.Unmarshal(e.Result, &out) != nil || len(out.Checks) != 1 || out.Checks[0].Read != nil || out.Checks[0].Error != "not shown: a part of this file couldn't be read" || len(e.Quotes) != 1 {
+				t.Fatalf("result %s, %d quotes", e.Result, len(e.Quotes))
+			}
+		}
+	}
+}
+
+// A file whose check doesn't fit beside its last parts' reads gets it from the next files.read, alone; the result
+// says so until then.
+func TestReviewCrossCheckLater(t *testing.T) {
+	text := ""
+	for i := 1; i <= 9; i++ {
+		text += fmt.Sprintf("%d. Clause.\n%s\n\n", i, strings.Repeat("The parties agree to this term. ", 115))
+	}
+	f := TaskFile{Name: "msa.txt", Text: text}
+	if n := len(splitSections(text)); n != 9 || crossSlots(len(text)) <= maxSectionsPerRead-9 {
+		t.Fatalf("%d parts, %d slots", n, crossSlots(len(text)))
+	}
+	sm := &splitModel{
+		acting: []string{toolCallSSE("c1", "files_read", `{}`), toolCallSSE("c2", "files_read", `{}`), textSSE("## Summary\nDone [quote 1].")},
+		reader: func(prompt string) string { return fileAnswer(t, nil) },
+	}
+	evs := newReviewE2E(t, sm).review(t, reviewReq(f))
+	var outs []filesReadOut
+	for _, e := range evs {
+		if e.Type == "tool_result" && e.Name == "files_read" {
+			var o filesReadOut
+			json.Unmarshal(e.Result, &o)
+			outs = append(outs, o)
+		}
+	}
+	if len(outs) != 2 || len(outs[0].Parts) != 9 || len(outs[0].Checks) != 0 || !strings.Contains(outs[0].Next, "1 whole-file check is still to run") ||
+		len(outs[1].Parts) != 0 || len(outs[1].Checks) != 1 || outs[1].Checks[0].Read == nil || len(sm.readReqs) != 10 {
+		t.Fatalf("results %+v, %d reader calls", outs, len(sm.readReqs))
+	}
+}
+
+// After a restart, a check already shown counts as done and its quote numbers as given.
+func TestReviewRebuildCross(t *testing.T) {
+	out, _ := json.Marshal(filesReadOut{Parts: []fileSectionOut{{File: 1, Part: 1, Of: 2, Read: &readView{Quotes: []quoteRef{{ID: 2}}}}, {File: 1, Part: 2, Of: 2, Read: &readView{}}},
+		Checks: []fileCheckOut{{File: 1, Read: &readView{Quotes: []quoteRef{{ID: 7}}}}}})
+	req, _ := json.Marshal(harness.Action{Name: "files.read", Args: jsontext.Value(`{}`)})
+	body, _ := json.Marshal(harness.ActionResult{Status: harness.ActionDone, Output: jsontext.Value(out)})
+	journal := []harness.Record{{ID: "r1", Kind: harness.TypeAction, Req: req, Done: true, Body: body}}
+	opts, _ := json.Marshal(TaskOptions{Agent: AgentReview, Files: []TaskFile{crossFile()}})
+	g := New(Config{Up: nil, Search: &fakeSearch{}})
+	tk := g.task(&harness.TaskInfo{ID: "tk_rc", Start: &harness.Start{}, Options: opts, Journal: func() ([]harness.Record, error) { return journal, nil }})
+	if tk.tools.quotes != 7 || tk.files.unread() != 0 || tk.files.checksLeft() != 0 {
+		t.Fatalf("rebuilt: quotes %d unread %d checks left %d", tk.tools.quotes, tk.files.unread(), tk.files.checksLeft())
+	}
+}
+
+// A research task's files get neither the cross-check nor the headings line: both are review's.
+func TestResearchFilesNoCrossCheck(t *testing.T) {
+	f := crossFile()
+	sm := &splitModel{
+		acting: []string{toolCallSSE("c1", "files_read", `{}`), textSSE("## Summary\nDone.")},
+		reader: func(prompt string) string { return answerJSON(t, nil) },
+	}
+	evs := newReviewE2E(t, sm).review(t, researchFilesReq(f))
+	for _, e := range evs {
+		if e.Type == "tool_result" && e.Name == "files_read" && (strings.Contains(string(e.Result), `"checks"`) || strings.Contains(string(e.Result), "whole-file")) {
+			t.Fatalf("result %s", e.Result)
+		}
+	}
+	if len(sm.readReqs) != 2 {
+		t.Fatalf("%d reader calls", len(sm.readReqs))
+	}
+	for _, r := range sm.readReqs {
+		if p := r["messages"].([]any)[1].(map[string]any)["content"].(string); strings.Contains(p, headingsAboveLabel) || isCross(p) {
+			t.Fatalf("research prompt %q", p)
+		}
 	}
 }

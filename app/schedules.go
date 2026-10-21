@@ -47,11 +47,13 @@ import (
 // Limits.
 const (
 	maxSpaceSchedules = 8
-	resultsPage       = 50
-	maxResultEvents   = 2000
-	maxResultBytes    = 1 << 20
-	resultInfo        = "tacy/v2/schedule-result"
-	resultType        = "tacy.schedule.result/v1"
+	// maxSpaceStored also counts ended one-time schedules (the chat removes each once its result is saved).
+	maxSpaceStored  = 64
+	resultsPage     = 50
+	maxResultEvents = 2000
+	maxResultBytes  = 1 << 20
+	resultInfo      = "tacy/v2/schedule-result"
+	resultType      = "tacy.schedule.result/v1"
 )
 
 // scheduleRoutes serves the routes on mux behind EHBP with id.
@@ -118,6 +120,8 @@ type installRequest struct {
 type triggerView struct {
 	ID          string     `json:"id"`
 	Daily       string     `json:"daily,omitzero"`
+	Days        []string   `json:"days,omitzero"`
+	At          string     `json:"at,omitzero"`
 	Zone        string     `json:"zone,omitzero"`
 	NextRun     *time.Time `json:"next_run,omitzero"`
 	LastDay     string     `json:"last_day,omitzero"`
@@ -129,14 +133,14 @@ func (s *server) triggerViews(in *trigger.Installed, state string, full bool) []
 	var out []triggerView
 	now := time.Now()
 	for _, t := range in.Def.Triggers {
-		v := triggerView{ID: t.ID, Daily: t.Daily, Zone: t.Zone}
+		v := triggerView{ID: t.ID, Daily: t.Daily, Days: t.Days, At: t.At, Zone: t.Zone}
 		if state == trigger.StateActive {
 			if n := t.NextRun(now); !n.IsZero() && n.Before(in.Def.NotAfter) {
 				n = n.UTC()
 				v.NextRun = &n
 			}
 		}
-		if full && t.IsDaily() {
+		if full && (t.IsDaily() || t.IsOnce()) {
 			ran, skipped := s.triggers.LastRan(&t)
 			if ran >= 0 {
 				v.LastDay, v.LastTask = trigger.DayOf(ran), s.triggers.TaskFor(in.Def, &t, ran)
@@ -171,9 +175,11 @@ func (s *server) scheduleInstall(w http.ResponseWriter, r *http.Request) {
 			failDetail(w, 403, "not_holder", "a personal schedule's space, author and sponsor are the request's own")
 			return
 		}
-		if old := s.triggers.Get(d.Agent); (old == nil || old.Def.Space != who.Space) && s.triggers.SpaceCount(who.Space) >= maxSpaceSchedules {
-			fail(w, 429, "too_many_schedules")
-			return
+		if old := s.triggers.Get(d.Agent); old == nil || old.Def.Space != who.Space {
+			if live, all := s.triggers.SpaceCount(who.Space); live >= maxSpaceSchedules || all >= maxSpaceStored {
+				fail(w, 429, "too_many_schedules")
+				return
+			}
 		}
 	}
 	in, err := s.triggers.InstallChecked(req.Definition, func(d *trigger.Definition) error {

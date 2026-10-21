@@ -155,3 +155,96 @@ func TestScheduleGoldenVectors(t *testing.T) {
 }
 
 func jsonNum(n int64) string { b, _ := json.Marshal(n); return string(b) }
+
+// The chat's golden vectors for the v0.13.0 trigger kinds (the chat's test/golden/v2-schedule-kinds.json, made with
+// node:crypto from the same fixed seeds): a weekly (chosen weekdays) and a one-time definition verify with their hash
+// and the identity's signature, pass the personal rules, carry the trigger the chat meant, and their install requests
+// decode strictly and check under the install label against the VM key.
+func TestScheduleKindsGoldenVectors(t *testing.T) {
+	b, err := os.ReadFile("../runauth/testdata/v2-schedule-kinds.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var v struct {
+		VMPrivate   string `json:"vm_private"`
+		Seal, Space string
+		Identity    struct{ Seed, ID, Key string }
+		Definitions []struct {
+			Name     string
+			JSON     string          `json:"json"`
+			Envelope safety.Envelope `json:"envelope"`
+			Hash     string          `json:"hash"`
+		}
+		Requests []struct {
+			Call, Name, Body, Digest string
+			Own                      []string
+		}
+	}
+	if err := json.Unmarshal(b, &v); err != nil {
+		t.Fatal(err)
+	}
+	unhex := func(s string) []byte { x, _ := hex.DecodeString(s); return x }
+	vm, _ := ecdh.X25519().NewPrivateKey(unhex(v.VMPrivate))
+	idKey := ed25519.NewKeyFromSeed(unhex(v.Identity.Seed))
+	if identity.KeyString(idKey.Public().(ed25519.PublicKey)) != v.Identity.Key {
+		t.Fatal("identity key")
+	}
+	var dir identity.Static
+	dir.Add("f_chat", v.Identity.ID, idKey.Public().(ed25519.PublicKey), v.Space)
+	hashes := map[string]bool{}
+	seen := map[string]bool{}
+	for _, x := range v.Definitions {
+		env := x.Envelope
+		if string(env.Payload) != x.JSON || env.Hash() != x.Hash {
+			t.Fatalf("%s: envelope payload or hash", x.Name)
+		}
+		var d trigger.Definition
+		jsonv2.Unmarshal(env.Payload, &d)
+		got, err := trigger.VerifyDefinition(&env, &dir, "f_chat", d.IssuedAt)
+		if err != nil {
+			t.Fatalf("%s: %v", x.Name, err)
+		}
+		if err := trigger.Personal(got, v.Space, v.Seal, v.Identity.ID); err != nil {
+			t.Fatalf("%s: personal rules: %v", x.Name, err)
+		}
+		if len(got.Triggers) != 1 {
+			t.Fatalf("%s: %d triggers", x.Name, len(got.Triggers))
+		}
+		tr := got.Triggers[0]
+		switch {
+		case tr.IsOnce():
+			if tr.At == "" || tr.Daily != "" || tr.Days != nil || !tr.NextRun(got.IssuedAt).After(got.IssuedAt) {
+				t.Fatalf("%s: once trigger %+v", x.Name, tr)
+			}
+			seen["once"] = true
+		case tr.IsDaily() && tr.Days != nil:
+			seen["weekly"] = true
+		default:
+			t.Fatalf("%s: trigger %+v", x.Name, tr)
+		}
+		hashes[x.Hash] = true
+	}
+	if !seen["once"] || !seen["weekly"] {
+		t.Fatalf("the vectors have %v", seen)
+	}
+	for _, r := range v.Requests {
+		if r.Call != "install" {
+			t.Fatalf("%s: call %s", r.Name, r.Call)
+		}
+		var x installRequest
+		if err := jsonv2.Unmarshal([]byte(r.Body), &x, jsonv2.RejectUnknownMembers(true)); err != nil {
+			t.Fatalf("%s: body: %v", r.Name, err)
+		}
+		own := []string{x.Definition.Hash()}
+		if !hashes[own[0]] || strings.Join(own, "|") != strings.Join(r.Own, "|") {
+			t.Fatalf("%s: own items %q, the vectors say %q", r.Name, own, r.Own)
+		}
+		dg := runauth.CallDigest(runauth.InstallLabel, vm.PublicKey().Bytes(), &x.Where, own...)
+		if hex.EncodeToString(dg[:]) != r.Digest {
+			t.Fatalf("%s: digest %x", r.Name, dg)
+		}
+		if _, err := runauth.CheckCall(vm, runauth.InstallLabel, &x.Where, time.Unix(x.SignedAt, 0), own...); err != nil {
+			t.Fatalf("%s: %v", r.Name, err)
+		}
+	}
+}

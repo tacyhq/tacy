@@ -269,7 +269,7 @@ func TestStopAndRemove(t *testing.T) {
 	w, d := dailyWorld(t, "07:00", "Europe/Lisbon", issued)
 	env, _ := SignDefinition(d, w.sponsorK)
 	in, err := w.e.Stop(w.agent, false)
-	if err != nil || in.State != StateStopped || w.e.Active() != 0 || w.e.SpaceCount(w.space) != 1 {
+	if live, all := w.e.SpaceCount(w.space); err != nil || in.State != StateStopped || w.e.Active() != 0 || live != 1 || all != 1 {
 		t.Fatalf("stop: %+v %v", in, err)
 	}
 	if f := w.tick(time.Date(2026, 10, 22, 7, 0, 30, 0, lis)); len(f) != 0 {
@@ -285,7 +285,7 @@ func TestStopAndRemove(t *testing.T) {
 	if n, _ := e2.Load(); n != 1 || e2.Get(w.agent).State != StateStopped {
 		t.Fatal("stopped state lost at restart")
 	}
-	if _, err := w.e.Stop(w.agent, true); err != nil || w.e.Get(w.agent) != nil || w.e.SpaceCount(w.space) != 0 {
+	if _, err := w.e.Stop(w.agent, true); err != nil || w.e.Get(w.agent) != nil || func() bool { _, all := w.e.SpaceCount(w.space); return all != 0 }() {
 		t.Fatalf("remove: %v", err)
 	}
 	if _, err := w.e.Stop(w.agent, true); !errors.Is(err, ErrNoAgent) {

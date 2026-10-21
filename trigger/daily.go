@@ -3,6 +3,7 @@ package trigger
 import (
 	"errors"
 	"regexp"
+	"slices"
 	"strconv"
 	"time"
 )
@@ -13,6 +14,10 @@ import (
 //   - a time the spring-forward change skips (02:30 when clocks jump from 02:00 to 03:00) fires at the change
 //     (03:00 local), as cron does;
 //   - a time the fall-back change repeats (01:30 twice) fires at its first occurrence, once.
+//
+// A daily trigger with Days fires only on those weekdays (of the slot's local date). A one-time trigger (At) has one
+// slot, its local date, at the same rules' instant; once it has run or been skipped (more than 3 h late) its schedule
+// has ended (Engine.StateOf).
 //
 // The zones come from the Go release's tzdata, embedded in agentd (import time/tzdata), so the VM image needs no
 // zoneinfo files and the rules are fixed by the attested build.
@@ -37,8 +42,79 @@ func (t *Trigger) daily() (hh, mm int, loc *time.Location, err error) {
 	return hh, mm, loc, nil
 }
 
-// IsDaily: a daily schedule trigger.
+// IsDaily: a daily schedule trigger (every day, or only on its Days).
 func (t *Trigger) IsDaily() bool { return t.Kind == Schedule && t.Daily != "" }
+
+// IsOnce: a one-time schedule trigger.
+func (t *Trigger) IsOnce() bool { return t.Kind == Schedule && t.At != "" }
+
+// weekdayNames, in the one order Days takes them (Monday first).
+var weekdayNames = []string{"mon", "tue", "wed", "thu", "fri", "sat", "sun"}
+
+// weekdays parses Days: nil (every day), or 1 to 6 distinct names in week order (all seven is written as no days).
+func (t *Trigger) weekdays() (map[time.Weekday]bool, error) {
+	if t.Days == nil {
+		return nil, nil
+	}
+	if len(t.Days) == 0 || len(t.Days) > 6 {
+		return nil, errors.New("days must name 1 to 6 weekdays (every day: no days)")
+	}
+	out := map[time.Weekday]bool{}
+	last := -1
+	for _, d := range t.Days {
+		i := slices.Index(weekdayNames, d)
+		if i <= last { // unknown, repeated or out of order
+			return nil, errors.New("days must be mon, tue, wed, thu, fri, sat or sun, each once, in that order")
+		}
+		last = i
+		out[time.Weekday((i+1)%7)] = true
+	}
+	return out, nil
+}
+
+// onDay: a daily trigger fires on the slot's local date (always, without Days).
+func (t *Trigger) onDay(slot int64) bool {
+	days, err := t.weekdays()
+	if err != nil {
+		return false
+	}
+	return days == nil || days[time.Unix(slot*86400, 0).UTC().Weekday()]
+}
+
+var atRe = regexp.MustCompile(`^([0-9]{4})-([0-9]{2})-([0-9]{2})T([01][0-9]|2[0-3]):([0-5][0-9])$`)
+
+// once parses a one-time trigger: its slot (the local date's day number) and its instant.
+func (t *Trigger) once() (int64, time.Time, error) {
+	m := atRe.FindStringSubmatch(t.At)
+	if m == nil {
+		return -1, time.Time{}, errors.New("at must be YYYY-MM-DDTHH:MM")
+	}
+	y, _ := strconv.Atoi(m[1])
+	mo, _ := strconv.Atoi(m[2])
+	d, _ := strconv.Atoi(m[3])
+	if day := time.Date(y, time.Month(mo), d, 12, 0, 0, 0, time.UTC); day.Year() != y || int(day.Month()) != mo || day.Day() != d {
+		return -1, time.Time{}, errors.New("at must be a real date")
+	}
+	_, _, loc, err := (&Trigger{Daily: m[4] + ":" + m[5], Zone: t.Zone}).daily()
+	if err != nil {
+		return -1, time.Time{}, err
+	}
+	hh, _ := strconv.Atoi(m[4])
+	mm, _ := strconv.Atoi(m[5])
+	return dayNumber(y, time.Month(mo), d), dailyAt(hh, mm, loc, y, time.Month(mo), d), nil
+}
+
+// OnceSlot is a one-time trigger's slot and instant (-1 for other triggers).
+func (t *Trigger) OnceSlot() (int64, time.Time) {
+	if !t.IsOnce() {
+		return -1, time.Time{}
+	}
+	slot, at, err := t.once()
+	if err != nil {
+		return -1, time.Time{}
+	}
+	return slot, at
+}
 
 // dayNumber is a civil date's days since 1970-01-01.
 func dayNumber(y int, m time.Month, d int) int64 {
@@ -106,23 +182,38 @@ func (t *Trigger) DailySlot(at time.Time) (int64, time.Time) {
 	return dayNumber(n.Date()), inst
 }
 
-// NextRun is the next instant after t a daily trigger fires at (zero for other triggers).
+// NextRun is the next instant after t a daily or one-time trigger fires at (zero for other triggers, and for a
+// one-time one whose time has come).
 func (t *Trigger) NextRun(at time.Time) time.Time {
+	if t.IsOnce() {
+		if _, inst := t.OnceSlot(); inst.After(at) {
+			return inst
+		}
+		return time.Time{}
+	}
 	hh, mm, loc, err := t.daily()
 	if err != nil {
 		return time.Time{}
 	}
 	y, m, d := at.In(loc).Date()
-	for i := 0; i < 3; i++ {
-		if inst := dailyAt(hh, mm, loc, y, m, d+i); inst.After(at) {
+	for i := 0; i < 9; i++ {
+		inst := dailyAt(hh, mm, loc, y, m, d+i)
+		n := time.Date(y, m, d+i, 12, 0, 0, 0, time.UTC)
+		if inst.After(at) && t.onDay(dayNumber(n.Date())) {
 			return inst
 		}
 	}
 	return time.Time{}
 }
 
-// SlotAt is a daily slot's instant (the slot's local date at the trigger's time).
+// SlotAt is a daily or one-time slot's instant (the slot's local date at the trigger's time).
 func (t *Trigger) SlotAt(slot int64) time.Time {
+	if t.IsOnce() {
+		if s, inst := t.OnceSlot(); s == slot {
+			return inst
+		}
+		return time.Time{}
+	}
 	hh, mm, loc, err := t.daily()
 	if err != nil {
 		return time.Time{}

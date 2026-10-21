@@ -30,6 +30,10 @@ var classes = map[string]Class{
 	"web.search": ReadOut,
 	"web.fetch":  ReadOut,
 	"web.images": ReadOut,
+	// The person's attached files of a review or research task, read inside the VM (v0.13.0, guard/files.go):
+	// nothing leaves, nothing changes.
+	"files.list": Read,
+	"files.read": Read,
 	"sink.post":  Send,
 	"sink.put":   Change,
 	"task.spawn": Read,

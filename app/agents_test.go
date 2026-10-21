@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/tacyhq/tacy/agentclient"
+	"github.com/tacyhq/tacy/approval"
 	"github.com/tacyhq/tacy/guard"
 	"github.com/tacyhq/tacy/proto"
 	"github.com/tacyhq/tacy/runauth"
@@ -107,6 +108,17 @@ func newAgentEnv(t *testing.T, edit func(p *safety.Policy), replies ...string) *
 		}}
 	e.s.agent.(*recGateway).prompts = pe.prompts
 	e.s.prompts = pe.prompts
+	// Approve before send as main() wires it on the chat VM (v0.12.0): the side store, no approver directory, the
+	// policy's approve list. An action the release's approval table doesn't know is a send and is refused here (no
+	// approver): the built-in agents' every tool must be known (v0.13.0 shipped files.* unknown and was rolled back).
+	rg := e.s.agent.(*recGateway)
+	e.s.approvals = &guard.Approvals{Release: e.s.rt.Release, Store: approval.NewMemStore(), IDKey: []byte("agentd id key"),
+		OnWait: rg.waiting, Emit: host.Emit, Check: approval.Config{RP: ReleaseRP},
+		Listed: func(space, action string) bool {
+			p, err := e.s.safety.Policy(space)
+			return err == nil && p.NeedsApproval(action)
+		}}
+	rg.approvals = e.s.approvals
 	seal, _ := recipientKey(t)
 	return &agentEnv{permEnv: pe, pages: pages, search: ps, seal: seal}
 }

@@ -2,6 +2,7 @@ package guard
 
 import (
 	"net/url"
+	"regexp"
 	"strings"
 	"unicode/utf8"
 
@@ -48,6 +49,23 @@ const (
 	// 2026-10-21).
 	minMainLinks = 20
 )
+
+// fewLinks is a page read's links on a chat turn that doesn't ask for links, a list or sources (TaskOptions.LinksCap):
+// the first ones in page order. A Wikipedia article's 160 were 31% of the turn's input.
+const fewLinks = 30
+
+// asksForLinks: a message that asks for links, addresses, sources or a list ("list today's top 10 HN stories, one
+// line each with its link").
+var asksForLinks = regexp.MustCompile(`(?i)\b(links?|linked|hyperlinks?|urls?|addresses|sources?|lists?|listing)\b`)
+
+// linksCapFor is a chat turn's TaskOptions.LinksCap: all of a page's links (maxPageLinks) when the person's message
+// asks for links, a list or sources; fewLinks otherwise.
+func linksCapFor(message string) int {
+	if asksForLinks.MatchString(message) {
+		return maxPageLinks
+	}
+	return fewLinks
+}
 
 // linksNote is added to a page's note when it comes with links.
 // cmd/digestlab (2026-10-20): told only "cite it as [n]", the model wrote a story's site as its link in 2 of 8

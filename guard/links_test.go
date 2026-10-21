@@ -436,3 +436,23 @@ func TestHeldLinkWords(t *testing.T) {
 		t.Fatalf("summary without links %q", res.out.Summary)
 	}
 }
+
+// A chat turn that doesn't ask for links gets a page's first fewLinks; one that asks for links, a list or sources
+// gets them all (link lab 2026-10-21: a page's links were 18% of an ordinary turn's input).
+func TestLinksCapFor(t *testing.T) {
+	for msg, want := range map[string]int{
+		"list today's top 10 HN stories, one line each with its link":            maxPageLinks,
+		"What are the top 5 trending repos? Link each one.":                      maxPageLinks,
+		"Summarize https://en.wikipedia.org/wiki/Espresso_machine, with sources": maxPageLinks,
+		"Summarize https://en.wikipedia.org/wiki/Espresso_machine":               fewLinks,
+		"What's the best espresso machine under $500?":                           fewLinks,
+	} {
+		if got := linksCapFor(msg); got != want {
+			t.Errorf("%q: %d, want %d", msg, got, want)
+		}
+	}
+	now := time.Date(2026, 10, 20, 0, 0, 0, 0, time.UTC)
+	if _, o, _ := startFor(&proto.RunRequest{Space: testSpace, Messages: user("What's new in Python 3.14?")}, now, true); o.LinksCap != fewLinks {
+		t.Fatalf("cap %d", o.LinksCap)
+	}
+}

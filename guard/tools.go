@@ -129,6 +129,8 @@ type Tools struct {
 	// (TaskOptions.CiteLinks); citeOnly are their numbers (never sources: a fetch of one is refused). Guarded by mu.
 	citeLinks bool
 	citeOnly  map[int]bool
+	// linksCap: at most this many links a page read (TaskOptions.LinksCap; 0: all it has, up to maxPageLinks).
+	linksCap int
 	// linked: the linkKeys of the page links handed out as numbered sources (a page opened from one is read as one
 	// of the items the question covers: readerDoc.linked). Guarded by mu.
 	linked      map[string]bool
@@ -654,6 +656,9 @@ func (t *Tools) pageLinks(pg *fetched, r *readerResult) (kept []pageLink, withhe
 	before := t.strictPages[k]
 	t.mu.Unlock()
 	kept, strict, withheld := keptLinks(pg, r, personal || citeOnly, before)
+	if t.linksCap > 0 && len(kept) > t.linksCap {
+		kept = kept[:t.linksCap]
+	}
 	if strict {
 		t.mu.Lock()
 		if t.strictPages == nil {

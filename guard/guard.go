@@ -139,6 +139,10 @@ type TaskOptions struct {
 	// page's link, comes with its links numbered for citing only (links.go): people see the ones the answer cites, and
 	// none of them can be opened.
 	CiteLinks bool `json:"cite_links,omitzero"`
+	// LinksCap: at most this many of a page read's links (links.go; 0: maxPageLinks). The chat's turn that doesn't ask
+	// for links, a list or sources gets fewLinks: a page's links were 18% of such turns' input, a Wikipedia article's 31%
+	// (link lab, 2026-10-21).
+	LinksCap int `json:"links_cap,omitzero"`
 	// AutoFallback: on Auto (proto.RunRequest.AutoFallback) a slow or overloaded step switches to the first allowed
 	// of Fallbacks (fallback.go). Fallbacks are the run's fallback models as the guard kept them (startFor), in the
 	// chat's order; the guard checks each against the policy again before it switches.
@@ -379,7 +383,7 @@ func (g *Guard) open(id string, opts TaskOptions, out func(proto.Event) error) *
 	}
 	t.tools = &Tools{search: g.cfg.Search, fetcher: g.cfg.Fetcher, reader: g.cfg.Reader != nil, plain: opts.Via == ViaSearch, noPics: !t.def.Extras,
 		links: g.cfg.Reader != nil && (g.cfg.PageLinks == "on" || opts.PageLinks && g.cfg.PageLinks != "off"), personal: opts.Links,
-		citeLinks: g.cfg.Reader != nil && opts.CiteLinks && g.cfg.PageLinks != "off"}
+		citeLinks: g.cfg.Reader != nil && opts.CiteLinks && g.cfg.PageLinks != "off", linksCap: opts.LinksCap}
 	if g.gates != nil {
 		t.tools.gate = g.gates.forUser(opts.User)
 		t.tools.decodes = g.gates.decodes
@@ -674,7 +678,7 @@ func startFor(r *proto.RunRequest, now time.Time, reader bool) (harness.Start, T
 		RunSecret: r.RunSecret, Permissions: maps.Clone(r.Permissions), Links: personLinks(r.Messages),
 		// Numbered links (links.go, v0.14.0): a page the person named comes with its links to open and cite, as a
 		// schedule's does; any other page read with its links to cite only.
-		PageLinks: true, CiteLinks: true,
+		PageLinks: true, CiteLinks: true, LinksCap: linksCapFor(r.Messages[len(r.Messages)-1].Content),
 		AutoFallback: r.AutoFallback, Fallbacks: fallbacks, Images: images}, nil
 }
 

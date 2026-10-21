@@ -64,9 +64,9 @@ func TestReviewDefinition(t *testing.T) {
 	if string(a) == string(b) || !strings.Contains(string(a), `"no_egress":true`) {
 		t.Fatal("digest input ignores no_egress")
 	}
-	// research's definition (and so its digest) is as v0.11.0 has it: the new fields are left out when off.
-	if r, _ := json.Marshal(researchDef); strings.Contains(string(r), "no_egress") || strings.Contains(string(r), `"files"`) {
-		t.Fatalf("research's definition changed: %s", r)
+	// research (version 2 since v0.13.0) takes files too, optionally, and sends out: no no_egress in its definition.
+	if r, _ := json.Marshal(researchDef); strings.Contains(string(r), "no_egress") || !strings.Contains(string(r), `"files":true,"files_optional":true,"file_parts":60`) {
+		t.Fatalf("research's definition: %s", r)
 	}
 	// The release ceiling allows the files connector's two tools (a signed policy must list them too).
 	if p := ReleasePolicy("f_chat", ""); !slices.Equal(p.Connectors["files"].Tools, []string{"files.list", "files.read"}) || len(p.Connectors["files"].Hosts) != 0 {
@@ -320,11 +320,11 @@ func TestFilesReadPick(t *testing.T) {
 	f := TaskFile{Name: "big.txt", Text: strings.Repeat(strings.Repeat("word ", 700)+"\n\n", 15)} // 15 sections
 	s.init(TaskOptions{Files: []TaskFile{f, {Name: "small.txt", Text: "Small."}}})
 	n := len(s.files[0].secs)
-	first, err := s.pick(0, nil)
+	first, err := s.pick(0, nil, maxSectionsPerRead)
 	if err != nil || len(first) != maxSectionsPerRead || first[0] != (secRef{0, 0}) {
 		t.Fatalf("first %v %v", first, err)
 	}
-	second, _ := s.pick(0, nil) // pending ones aren't taken twice (two calls in one step)
+	second, _ := s.pick(0, nil, maxSectionsPerRead) // pending ones aren't taken twice (two calls in one step)
 	if len(second) != n-maxSectionsPerRead+1 || second[0] != (secRef{0, maxSectionsPerRead}) || second[len(second)-1] != (secRef{1, 0}) {
 		t.Fatalf("second %v (n %d)", second, n)
 	}
@@ -334,18 +334,18 @@ func TestFilesReadPick(t *testing.T) {
 	for _, r := range second {
 		s.done(r, true, 0)
 	}
-	if again, _ := s.pick(0, nil); len(again) != 1 || again[0] != (secRef{0, 3}) { // the failed one, once more
+	if again, _ := s.pick(0, nil, maxSectionsPerRead); len(again) != 1 || again[0] != (secRef{0, 3}) { // the failed one, once more
 		t.Fatalf("retry %v", again)
 	}
 	s.done(secRef{0, 3}, false, 0)
-	if none, _ := s.pick(0, nil); len(none) != 0 || s.unread() != 0 {
+	if none, _ := s.pick(0, nil, maxSectionsPerRead); len(none) != 0 || s.unread() != 0 {
 		t.Fatalf("after two tries %v", none)
 	}
-	if got, err := s.pick(2, []int{1}); err != nil || len(got) != 1 || got[0] != (secRef{1, 0}) {
+	if got, err := s.pick(2, []int{1}, maxSectionsPerRead); err != nil || len(got) != 1 || got[0] != (secRef{1, 0}) {
 		t.Fatalf("named %v %v", got, err)
 	}
 	for _, bad := range [][2]any{{3, []int(nil)}, {1, []int{0}}, {1, []int{n + 1}}, {0, []int{1}}} {
-		if _, err := s.pick(bad[0].(int), bad[1].([]int)); err == nil {
+		if _, err := s.pick(bad[0].(int), bad[1].([]int), maxSectionsPerRead); err == nil {
 			t.Errorf("pick %v: no error", bad)
 		}
 	}

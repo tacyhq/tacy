@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"regexp"
 	"slices"
@@ -100,19 +101,16 @@ func TestReviewTask(t *testing.T) {
 	}
 }
 
-// Under a policy without the files connector (signed before a_review) every files action is policy_denied: the review
-// still ends, and the VM says it read nothing.
+// Under a policy without the files connector (signed before a_review) a task with files is refused at its start
+// (policy_denied): nothing runs that couldn't read what it was given. Research without files still starts.
 func TestReviewNeedsFilesPolicy(t *testing.T) {
-	ae := reviewEnv(t, func(p *safety.Policy) { delete(p.Connectors, "files") },
-		pCalls([3]string{"c1", "files_read", `{}`}), pText("## Summary\nI couldn't read the file."))
-	_, evs := runAgentTask(t, ae.conn(t, tasksUser), review())
-	denied := false
-	for _, e := range evs {
-		if e.Type == "tool_result" && strings.Contains(string(e.Result), safety.CodePolicyDenied) {
-			denied = true
-		}
+	ae := reviewEnv(t, func(p *safety.Policy) { delete(p.Connectors, "files") }, pText("## Summary\nUnused."))
+	c := ae.conn(t, tasksUser)
+	if _, err := c.StartTask(context.Background(), review(), ""); err == nil || !strings.Contains(err.Error(), safety.CodePolicyDenied) ||
+		!strings.Contains(err.Error(), "files connector") {
+		t.Fatalf("start: %v", err)
 	}
-	if !denied || !strings.Contains(answerText(evs), "- nda.txt: part 1 of 1, from “MUTUAL NON-DISCLOSURE AGREEMENT” (not read") {
-		t.Fatalf("denied %v, text %q", denied, answerText(evs))
+	if ae.model.n != 0 {
+		t.Fatal("a model call ran")
 	}
 }

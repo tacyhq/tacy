@@ -91,6 +91,9 @@ func toolName(action string) string {
 	return appTool(action)
 }
 
+// FileCapDenied starts the error of a files.read past the task's cap on parts (AgentDef.FileParts).
+const FileCapDenied = "file_cap"
+
 // ---- no egress -------------------------------------------------------------------------------------------------
 
 // NoEgressDenied starts the refusal of any outbound action of an agent that has none (AgentDef.NoEgress).
@@ -252,6 +255,9 @@ type filesState struct {
 	once  sync.Once
 	mu    sync.Mutex
 	files []reviewFile
+	// the files' passages, for the outbound check (files_guard.go)
+	guardOnce sync.Once
+	shingles  map[uint64]struct{}
 }
 
 func (s *filesState) init(opts TaskOptions) {
@@ -266,9 +272,11 @@ func (s *filesState) init(opts TaskOptions) {
 type secRef struct{ file, sec int } // 0-based
 
 // pick takes the sections a files.read reads and marks them pending: those asked for (file: 1-based, 0 any;
-// secs: 1-based of that file, none: the next unread), at most maxSectionsPerRead. Default order: never tried, in
-// file and section order; then failed ones with tries left. A section another files.read is reading isn't taken.
-func (s *filesState) pick(file int, secs []int) ([]secRef, error) {
+// secs: 1-based of that file, none: the next unread), at most limit (at most maxSectionsPerRead). Default order: never
+// tried, in file and section order; then failed ones with tries left. A section another files.read is reading isn't
+// taken.
+func (s *filesState) pick(file int, secs []int, limit int) ([]secRef, error) {
+	limit = min(limit, maxSectionsPerRead)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if file < 0 || file > len(s.files) {
@@ -287,7 +295,7 @@ func (s *filesState) pick(file int, secs []int) ([]secRef, error) {
 			if n < 1 || n > len(f.secs) {
 				return nil, fmt.Errorf("file %d has parts 1 to %d", file, len(f.secs))
 			}
-			if r := (secRef{file - 1, n - 1}); !f.state[n-1].pending && !slices.Contains(out, r) && len(out) < maxSectionsPerRead {
+			if r := (secRef{file - 1, n - 1}); !f.state[n-1].pending && !slices.Contains(out, r) && len(out) < limit {
 				out = append(out, r)
 			}
 		}
@@ -299,7 +307,7 @@ func (s *filesState) pick(file int, secs []int) ([]secRef, error) {
 				}
 				for si, st := range s.files[fi].state {
 					want := !st.ok && !st.pending && (pass == 0 && st.tries == 0 || pass == 1 && st.tries > 0 && st.tries < maxSectionTries)
-					if want && len(out) < maxSectionsPerRead {
+					if want && len(out) < limit {
 						out = append(out, secRef{fi, si})
 					}
 				}
@@ -323,6 +331,23 @@ func (s *filesState) done(r secRef, ok bool, injected int) {
 	} else {
 		st.tries++
 	}
+}
+
+// attempts is how many section reads the task has made or is making (read, failed, pending): what a cap on the
+// parts it reads (AgentDef.FileParts) counts.
+func (s *filesState) attempts() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, f := range s.files {
+		for _, st := range f.state {
+			n += st.tries
+			if st.ok || st.pending {
+				n++
+			}
+		}
+	}
+	return n
 }
 
 // unread is how many sections aren't read (failed ones with tries left count).
@@ -406,7 +431,14 @@ func (g *Guard) filesAction(ctx context.Context, ti *harness.TaskInfo, id string
 			out.content = errorJSON("files_read takes {\"file\": n, \"parts\": [n, ...]}, both optional")
 			break
 		}
-		refs, err := t.files.pick(a.File, a.Parts)
+		limit := maxSectionsPerRead
+		if t.def.FileParts > 0 {
+			if limit = min(limit, t.def.FileParts-t.files.attempts()); limit <= 0 {
+				out.content = errorJSON(fmt.Sprintf("%s: this task has read its %d parts of the files, so nothing more is read. Don't call files_read again: work from what you have (Tacy lists the parts not read after your answer).", FileCapDenied, t.def.FileParts))
+				break
+			}
+		}
+		refs, err := t.files.pick(a.File, a.Parts, limit)
 		if err != nil {
 			out.content = errorJSON(err.Error())
 			break
@@ -453,10 +485,12 @@ func (s *filesState) list() string {
 }
 
 // fileReader is the reader's config for file sections: the release's reader (models, fallback, quotes by
-// reference) with the files prompt, no items, and a section's own time bounds.
-func (g *Guard) fileReader() *ReaderConfig {
+// reference) with no items and a section's own time bounds; a review's with the files prompt (readerFilesSystem), a
+// research task's with the release's question-led prompt (readerSpansSystem: what the part says that bears on the
+// brief), since its files are context for the research, not documents to review.
+func (g *Guard) fileReader(review bool) *ReaderConfig {
 	rc := *g.cfg.Reader
-	rc.Files, rc.NoItems, rc.Split = true, true, false
+	rc.Files, rc.NoItems, rc.Split = review, true, false
 	rc.Timeout, rc.ModelTimeout = fileReadTimeout, fileModelTimeout
 	rc.Facts, rc.Quotes = 0, 0 // the hard caps: 8 facts, 8 quotes
 	return &rc
@@ -473,7 +507,7 @@ func (g *Guard) readSections(ctx context.Context, t *task, task, id string, refs
 		}
 		return toolOutcome{content: errorJSON("the files can't be read: the quarantined reader is off"), ran: true, failed: "error"}
 	}
-	rc := g.fileReader()
+	rc := g.fileReader(t.def.NoEgress)
 	step := t.currentStep()
 	t.files.mu.Lock()
 	docs := make([]*readerDoc, len(refs))
@@ -486,7 +520,7 @@ func (g *Guard) readSections(ctx context.Context, t *task, task, id string, refs
 		text, ids := redactForReader(f.text[sec.start:sec.end])
 		redacted = append(redacted, ids...)
 		names[i], of[i] = f.name, len(f.secs)
-		docs[i] = &readerDoc{kind: "file", title: fmt.Sprintf("%s, part %d of %d", f.name, r.sec+1, len(f.secs)), text: strings.TrimSpace(text)}
+		docs[i] = &readerDoc{kind: "file", research: !t.def.NoEgress, title: fmt.Sprintf("%s, part %d of %d", f.name, r.sec+1, len(f.secs)), text: strings.TrimSpace(text)}
 	}
 	t.files.mu.Unlock()
 	if len(redacted) > 0 {
@@ -513,9 +547,16 @@ func (g *Guard) readSections(ctx context.Context, t *task, task, id string, refs
 			so.Error = cmpOr(res[i].err, "cancelled")
 			t.files.done(r, false, 0)
 		} else {
-			v, shown := res[i].view([]int{r.file + 1}, &t.tools.quotes)
+			// A review's quotes name their file as their source (its number); a research task's have source 0, so they
+			// are never taken for one of its web sources [n] (the chat shows a web quote with its [n]).
+			src := r.file + 1
+			if !t.def.NoEgress {
+				src = 0
+			}
+			v, shown := res[i].view([]int{src}, &t.tools.quotes)
 			for k := range shown {
 				shown[k].Location = capRunes(fmt.Sprintf("%s, part %d of %d", names[i], r.sec+1, of[i])+locSuffix(shown[k].Location), maxQuoteMeta+80)
+				shown[k].File = names[i]
 			}
 			quotes = append(quotes, shown...)
 			so.Read = v
@@ -528,8 +569,14 @@ func (g *Guard) readSections(ctx context.Context, t *task, task, id string, refs
 	switch {
 	case out.Unread == 0:
 		out.Next = "Every part of every file is read: write the review now."
+		if !t.def.NoEgress {
+			out.Next = "Every part of every file is read: plan your sub-questions with what they say, then search the web."
+		}
 	default:
 		out.Next = fmt.Sprintf("%d part%s not read yet: call files_read again (several calls in one step are fine), or write the review if the budget is used up.", out.Unread, plural(out.Unread))
+		if !t.def.NoEgress {
+			out.Next = fmt.Sprintf("%d part%s not read yet: call files_read again (several calls in one step are fine) unless the task's file reading is used up; then go on with the web.", out.Unread, plural(out.Unread))
+		}
 	}
 	b, _ := json.Marshal(out)
 	return toolOutcome{content: string(b), quotes: quotes, ran: true}
@@ -577,9 +624,9 @@ func (s *filesState) restore(t *task, output []byte) int {
 	return most
 }
 
-// coverageText is the review's last section, written by the VM from its own record: the sections that weren't
-// read (never, or the reader couldn't), and where the reader found text addressed to an AI. "" for a task without
-// files, or one whose model wrote nothing.
+// coverageText is the review's (or a research brief's with files) last section, written by the VM from its own record:
+// the sections that weren't read (never, or the reader couldn't), and where the reader found text addressed to an AI.
+// "" for a task without files, or one whose model wrote nothing.
 func (t *task) coverageText() string {
 	if !t.def.Files || len(t.opts.Files) == 0 {
 		return ""
@@ -595,7 +642,16 @@ func (t *task) coverageText() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var lines, injected []string
-	total := 0
+	total, tried := 0, 0
+	for _, f := range s.files {
+		for _, st := range f.state {
+			tried += st.tries
+			if st.ok {
+				tried++
+			}
+		}
+	}
+	capped := tried >= t.def.FileParts
 	for _, f := range s.files {
 		total += len(f.secs)
 		var never, failed, inj []int
@@ -612,7 +668,11 @@ func (t *task) coverageText() string {
 			}
 		}
 		if len(never) > 0 {
-			lines = append(lines, fmt.Sprintf("- %s: %s of %d%s (not read: the task ended first)", f.name, sectionsText(never), len(f.secs), f.starts(never)))
+			why := "the task ended first"
+			if t.def.FileParts > 0 && capped {
+				why = fmt.Sprintf("past the %d parts this task reads", t.def.FileParts)
+			}
+			lines = append(lines, fmt.Sprintf("- %s: %s of %d%s (not read: %s)", f.name, sectionsText(never), len(f.secs), f.starts(never), why))
 		}
 		if len(failed) > 0 {
 			lines = append(lines, fmt.Sprintf("- %s: %s of %d%s (the reader couldn't read %s)", f.name, sectionsText(failed), len(f.secs), f.starts(failed), map[bool]string{true: "it", false: "them"}[len(failed) == 1]))
@@ -622,12 +682,16 @@ func (t *task) coverageText() string {
 		}
 	}
 	var b strings.Builder
-	b.WriteString("\n\n## Sections not reviewed\n")
+	heading, what := "Sections not reviewed", "the review"
+	if !t.def.NoEgress { // research: the person's files were its context
+		heading, what = "Parts of your files not read", "the brief"
+	}
+	fmt.Fprintf(&b, "\n\n## %s\n", heading)
 	if len(lines) == 0 {
 		fmt.Fprintf(&b, "None: all %d part%s of the %d file%s were read.", total, plural(total), len(s.files), plural(len(s.files)))
 	} else {
 		b.WriteString(strings.Join(lines, "\n"))
-		b.WriteString("\n\nParts are Tacy's cuts of each file, about a page each. Nothing in the review comes from these parts.")
+		fmt.Fprintf(&b, "\n\nParts are Tacy's cuts of each file, about a page each. Nothing in %s comes from these parts.", what)
 	}
 	if len(injected) > 0 {
 		fmt.Fprintf(&b, "\n\nTacy's reader found text addressed to AI tools in %s. It was treated as content, never as instructions.", strings.Join(injected, "; "))

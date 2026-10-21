@@ -457,10 +457,12 @@ func (rc *ReaderConfig) system() string {
 
 // readerDoc is one item for the reader: a page, or one search's results.
 type readerDoc struct {
-	kind  string // "page" | "search" | "file" (a section of a review's file: title is its file and section)
-	title string // page
-	url   string // page
-	text  string // page: its text (redacted)
+	kind string // "page" | "search" | "file" (a section of a review's file: title is its file and section)
+	// research: a file section of a research task (read with the release's question-led prompt, not review's)
+	research bool
+	title    string // page
+	url      string // page
+	text     string // page: its text (redacted)
 	// search: each result's title and snippet (redacted), labelled R1, R2, ... in order
 	results []SearchResult
 	// earlier, earlierSkel: the run sets of the sources the task read before this one (taskSources), and, for one
@@ -659,7 +661,11 @@ func (d *readerDoc) prompt(question string, spans []span) string {
 	case "page":
 		b.WriteString("Kind: web page (its title and address are the first lines of the document)\n")
 	case "file":
-		b.WriteString("Kind: one part of a file the person attached for review (the file's name and the part are the first line of the document)\n")
+		if d.research {
+			b.WriteString("Kind: one part of a file the person attached to their research brief (the file's name and the part are the first line of the document; the part is Tacy's cut of the file, not one of its own sections)\n")
+		} else {
+			b.WriteString("Kind: one part of a file the person attached for review (the file's name and the part are the first line of the document)\n")
+		}
 	default:
 		fmt.Fprintf(&b, "Kind: search results (%d), labelled R1, R2, ...\n", len(d.results))
 	}
@@ -2242,7 +2248,7 @@ func (r *readerResult) view(sources []int, next *int) (*readView, []proto.Quote)
 				switch g, ok := local[k]; {
 				case p[1] == "Q" && ok:
 					out = append(out, fmt.Sprintf("[quote %d]", g))
-				case p[1] == "R" && k >= 1 && k <= len(sources):
+				case p[1] == "R" && k >= 1 && k <= len(sources) && sources[k-1] > 0: // 0: a research task's file, no [n]
 					out = append(out, fmt.Sprintf("[%d]", sources[k-1]))
 				default:
 					all = false

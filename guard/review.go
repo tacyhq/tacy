@@ -53,61 +53,71 @@ const (
 	attachClose = "\n</attachment>"
 )
 
-// reviewIntake splits a review's message into its files and the brief: the message starts with 1 to 5 attachment
-// blocks exactly as the chat writes them (`<attachment name="NAME">\nTEXT\n</attachment>`, NAME with &, ", < and >
-// escaped, TEXT with "</attachment>" written as "<\/attachment>"), separated by a blank line, then the brief.
-// Anything else is refused, as are more than 5 files, an empty file, and more than 1,000,000 characters (or 4 MiB)
-// of text in all.
+// reviewIntake is fileIntake for a_review.
 func reviewIntake(msg string) (brief string, files []TaskFile, err error) {
+	return fileIntake(reviewDef, msg)
+}
+
+// fileIntake splits the brief's message of an agent that takes files (AgentDef.Files) into its files and the brief:
+// the message starts with up to 5 attachment blocks exactly as the chat writes them (`<attachment name="NAME">\nTEXT\n
+// </attachment>`, NAME with &, ", < and > escaped, TEXT with "</attachment>" written as "<\/attachment>"), separated
+// by a blank line, then the brief. Anything else is refused, as are more than 5 files, an empty file, and more than
+// 1,000,000 characters (or 4 MiB) of text in all. a_review needs at least one file; a_research takes none too
+// (AgentDef.FilesOptional: then the whole message is the brief).
+func fileIntake(d AgentDef, msg string) (brief string, files []TaskFile, err error) {
 	rest := msg
 	chars, bytes := 0, 0
 	for strings.HasPrefix(rest, attachOpen) {
 		if len(files) == maxReviewFiles {
-			return "", nil, fmt.Errorf("a_review takes at most %d files", maxReviewFiles)
+			return "", nil, fmt.Errorf("%s takes at most %d files", d.ID, maxReviewFiles)
 		}
 		rest = rest[len(attachOpen):]
 		q := strings.Index(rest, attachHead)
 		if q < 0 || strings.ContainsAny(rest[:q], "\"\n<>") {
-			return "", nil, fmt.Errorf("a_review: a file's block is malformed")
+			return "", nil, fmt.Errorf("%s: a file's block is malformed", d.ID)
 		}
 		name := strings.NewReplacer("&quot;", `"`, "&lt;", "<", "&gt;", ">", "&amp;", "&").Replace(rest[:q])
 		rest = rest[q+len(attachHead):]
 		end := strings.Index(rest, attachClose)
 		if end < 0 {
-			return "", nil, fmt.Errorf("a_review: a file's block isn't closed")
+			return "", nil, fmt.Errorf("%s: a file's block isn't closed", d.ID)
 		}
 		text := strings.ReplaceAll(rest[:end], `<\/attachment>`, "</attachment>")
 		rest = strings.TrimPrefix(rest[end+len(attachClose):], "\n\n")
 		if !label(name, 4*maxFileNameRunes) || utf8.RuneCountInString(name) > maxFileNameRunes || !utf8.ValidString(name) {
-			return "", nil, fmt.Errorf("a_review: a file's name must be 1 to %d characters, no control characters", maxFileNameRunes)
+			return "", nil, fmt.Errorf("%s: a file's name must be 1 to %d characters, no control characters", d.ID, maxFileNameRunes)
 		}
 		if strings.TrimSpace(text) == "" {
-			return "", nil, fmt.Errorf("a_review: %s has no text", name)
+			return "", nil, fmt.Errorf("%s: %s has no text", d.ID, name)
 		}
 		if !utf8.ValidString(text) {
-			return "", nil, fmt.Errorf("a_review: %s isn't UTF-8 text", name)
+			return "", nil, fmt.Errorf("%s: %s isn't UTF-8 text", d.ID, name)
 		}
 		chars += utf8.RuneCountInString(text)
 		bytes += len(text)
 		if chars > maxReviewChars || bytes > maxReviewBytes {
-			return "", nil, fmt.Errorf("a_review: the files' text is over %d characters", maxReviewChars)
+			return "", nil, fmt.Errorf("%s: the files' text is over %d characters", d.ID, maxReviewChars)
 		}
 		files = append(files, TaskFile{Name: name, Text: text})
 	}
-	if len(files) == 0 {
-		return "", nil, fmt.Errorf("a_review takes 1 to %d files, as attachment blocks before the brief", maxReviewFiles)
+	if len(files) == 0 && !d.FilesOptional {
+		return "", nil, fmt.Errorf("%s takes 1 to %d files, as attachment blocks before the brief", d.ID, maxReviewFiles)
 	}
 	if strings.Contains(rest, attachOpen) {
-		return "", nil, fmt.Errorf("a_review: the files must all come before the brief")
+		return "", nil, fmt.Errorf("%s: the files must all come before the brief", d.ID)
 	}
 	return rest, files, nil
 }
 
 // fileList is what the acting model learns of the files, after the brief: each file's number, name, size and
 // sections (code's numbers; the text never goes to it).
-func fileList(files []TaskFile) string {
+func fileList(d AgentDef, files []TaskFile) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "\n\nFiles attached for review (you never see their text: read them with %s):", "files_read")
+	what := "Files attached for review"
+	if !d.NoEgress {
+		what = "Files the person attached"
+	}
+	fmt.Fprintf(&b, "\n\n%s (you never see their text: read them with %s):", what, "files_read")
 	for i, f := range files {
 		n := len(splitSections(f.Text))
 		fmt.Fprintf(&b, "\n%d. %s: %s characters, %d part%s", i+1, f.Name, thousands(utf8.RuneCountInString(f.Text)), n, plural(n))

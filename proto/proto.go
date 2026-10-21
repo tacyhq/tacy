@@ -285,6 +285,9 @@ type Quote struct {
 	Location string `json:"location"` // where in the source (the reader's words)
 	Topic    string `json:"topic"`    // what it is about (the reader's words)
 	Text     string `json:"text"`
+	// File is the name of the person's file a quote is from (a_review's and a_research's files.read, v0.13.0); ""
+	// for a web source's. A research task's file quotes have Index 0: they are no web source's.
+	File string `json:"file,omitempty"`
 }
 
 // Image is one picture image_search shows: a JPEG the VM decoded, scaled to at most 1024 px and re-encoded from

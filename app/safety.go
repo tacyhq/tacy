@@ -146,6 +146,11 @@ func (g *safeGateway) StartFor(r *proto.RunRequest) (harness.Start, guard.TaskOp
 	if err != nil {
 		return start, opts, err
 	}
+	// A task with the person's files (a_review, a_research) reads them through the files connector: under a policy
+	// without it (signed before v0.13.0) the start is refused, so nothing runs that couldn't read what it was given.
+	if len(opts.Files) > 0 && !e.AllowsTool("files.read") {
+		return harness.Start{}, guard.TaskOptions{}, &safety.Error{Code: safety.CodePolicyDenied, Msg: "reading attached files isn't allowed by the policy (it has no files connector)"}
+	}
 	if start.Space != space {
 		return start, opts, errors.New("safety: unexpected space")
 	}

@@ -70,6 +70,12 @@ func (g *Guard) Action(ctx context.Context, ti *harness.TaskInfo, id string, req
 		g.record(Egress{Task: ti.ID, Action: id, Op: req.Name, Decision: "denied", Rule: NoEgressDenied})
 		return noEgressDenial(req.Name), nil
 	}
+	// The person's files never leave the VM (files_guard.go): a search or page read whose arguments carry a passage
+	// of them is refused before the person is asked and before anything is sent.
+	if t.fileTextInArgs(req.Args) {
+		g.record(Egress{Task: ti.ID, Action: id, Op: req.Name, Decision: "denied", Rule: FileTextDenied})
+		return fileTextDenial(req.Name), nil
+	}
 	if err := t.searchOnly(req); err != nil { // a plain chat's search task: its one search only (searchtask.go)
 		return nil, err
 	}

@@ -40,9 +40,14 @@ import (
 //	                     start, journal and events: the result), as the browser asks once it saved the result or the
 //	                     person deleted the conversation (docs/30 decision 5); a task still running is cancelled
 //	                     first (billing witness as for cancel) and deleted as soon as it ended. Without a delete an
-//	                     ended task is kept a day, a built-in agent's result up to 7 days (guard.AgentKeep).
-//	GET  /tasks/open     -> {"open": n, "schedules": k}: how many tasks are open (not ended) and how many schedules
-//	                     are active (v0.12.0), for the relay's idle timer (bearer token; plaintext, counts only).
+//	                     ended task is kept 10 minutes once its events stream handed on its end and [DONE] (the
+//	                     result reached the tab: guard.Host.Delivered), else a day (guard.DefaultKeep; v0.16.0, before
+//	                     it a built-in agent's result was kept up to 7 days). What only its run needed (its input, the
+//	                     person's files, model calls, checkpoints) goes as it ends (harness.Store.Scrub).
+//	GET  /tasks/open     -> {"open": n, "schedules": k, "scheduled_spend_micros": {day: µ$}}: how many tasks are open
+//	                     (not ended) and how many schedules are active (v0.12.0), for the relay's idle timer, and
+//	                     (v0.16.0) what scheduled runs cost today and yesterday, all accounts together (bearer token;
+//	                     plaintext, counts and one sum a day only).
 //	POST /tasks/grant    {task, request, kind, decision, value, mac} -> {outcome}: the person's answer to a
 //	                     permission prompt (guard.Prompts) of a /tasks or /run task. The MAC with the run's
 //	                     secret is the authorization (only the tab that started the run has it). 404
@@ -52,6 +57,8 @@ import (
 // X-Agent-Task: new | existing (a repeated once-only key found the first task: nothing new runs, so the relay
 // gives that charge back) and X-Agent-Bill: the task's opaque bill id (guard.Host.Bill); a cancel says the same
 // bill id and X-Agent-Refundable: 1 when it was the task's first cancel, before any model output (guard.Host.Cancel).
+// Since v0.16.0 a start also says X-Agent-Priced: 1: it checked the relay's pricing headers (X-Agent-Kind,
+// X-Agent-Price-Model; guard/charge.go), so the relay may keep the price it set on their word.
 // The relay refunds only on that witness and its own clock, never on the browser's word.
 //
 // POST /run stays as a shim over this (guard.Host.Run) for one more release after the chat moved to /tasks
@@ -101,7 +108,25 @@ func (s *server) tasksOpen(w http.ResponseWriter, r *http.Request) {
 	if s.personal() {
 		schedules = s.triggers.Active()
 	}
-	writeJSON(w, 200, map[string]int{"open": s.tasks().Open(), "schedules": schedules})
+	writeJSON(w, 200, tasksOpenAnswer{Open: s.tasks().Open(), Schedules: schedules, ScheduledSpend: s.scheduledSpend()})
+}
+
+// tasksOpenAnswer is GET /tasks/open's body. ScheduledSpend (v0.16.0) is what the VM's own schedules cost today and
+// yesterday (UTC), in micro-USD, all accounts together: one number a day, no ids or times. No relay charges these
+// runs (they fire on the VM's clock), so the relay's hourly cron adds the number to its daily totals, which its
+// billing alert compares with Tinfoil's bill (the chat's agent.ts recordScheduledSpend).
+type tasksOpenAnswer struct {
+	Open           int              `json:"open"`
+	Schedules      int              `json:"schedules"`
+	ScheduledSpend map[string]int64 `json:"scheduled_spend_micros,omitzero"`
+}
+
+// scheduledSpend is the ledger's cost of scheduled runs by UTC day (safety.Ledger.MembersCost); nil without a ledger.
+func (s *server) scheduledSpend() map[string]int64 {
+	if s.ledger == nil {
+		return nil
+	}
+	return s.ledger.MembersCost(guard.ScheduleMember(""))
 }
 
 // Billing witness headers (plaintext, for the relay).
@@ -175,6 +200,10 @@ func (s *server) taskGuard(start, needTag bool, next http.Handler) http.Handler 
 				fail(w, 400, "model_unknown")
 				return
 			}
+			if msg := chargeHeadersError(r); msg != "" {
+				fail(w, 400, msg)
+				return
+			}
 		}
 		user := r.Header.Get("X-Agent-User")
 		if user != "" && !userTagRe.MatchString(user) || user == "" && needTag {
@@ -219,6 +248,11 @@ func (s *server) taskStart(w http.ResponseWriter, r *http.Request) {
 	}
 	if h := r.Header.Get(ModelHeader); h != cmp.Or(req.Model, proto.DefaultModel) {
 		fail(w, 400, "model_mismatch: the X-Agent-Model header doesn't match the task's model")
+		return
+	}
+	// What the relay priced (v0.16.0): the task's kind and the dearest model it may call, or refused before it starts.
+	if err := guard.CheckCharge(&req.RunRequest, r.Header.Get(ModelHeader), r.Header.Get(KindHeader), r.Header.Get(PriceModelHeader)); err != nil {
+		fail(w, 400, err.Error())
 		return
 	}
 	// Where and who (keys v2 slice 6): checked once, here; the task is made from what was verified.
@@ -269,6 +303,7 @@ func (s *server) taskStart(w http.ResponseWriter, r *http.Request) {
 	st.Existing = existed
 	w.Header().Set(billHeader, s.tasks().Bill(id))
 	w.Header().Set(taskStartHeader, map[bool]string{true: "existing", false: "new"}[existed])
+	w.Header().Set(pricedHeader, "1") // the pricing headers were checked (CheckCharge above)
 	writeJSON(w, 200, st)
 }
 
@@ -384,8 +419,8 @@ func (s *server) taskEvents(w http.ResponseWriter, r *http.Request) {
 	err := h.Follow(r.Context(), ref.Task, user, ref.After, func(e guard.Event) error {
 		return out.write(fmt.Sprintf("id: %d\ndata: %s\n\n", e.Seq, e.Data))
 	})
-	if err == nil {
-		out.done()
+	if err == nil && out.done() == nil {
+		h.Delivered(ref.Task, user) // the whole result reached the tab: deleted soon (v0.16.0)
 	}
 }
 
@@ -415,9 +450,13 @@ func (s *server) followDone(user string) {
 }
 
 // resumeTasks takes up the tasks a previous process left in the queue (POST /tasks ones go on; /run ones are
-// abandoned, as before) and prunes ended ones past their keep, now and every hour.
+// abandoned, as before), scrubs the ended ones it left (guard.Host.ScrubEnded: a process that stopped before it
+// could, or a release before scrubs) and prunes ended ones past their keep, now and every hour.
 func (s *server) resumeTasks(ctx context.Context, ids []string, logf func(string, ...any)) {
 	h := s.tasks()
+	if n := h.ScrubEnded(); n > 0 {
+		logf("tasks: %d ended tasks kept only their results", n)
+	}
 	if resumed, abandoned := h.Resume(ids); resumed+abandoned > 0 {
 		logf("tasks: resumed %d, ended %d runs a previous process left open", resumed, abandoned)
 	}

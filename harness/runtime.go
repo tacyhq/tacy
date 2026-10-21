@@ -116,6 +116,11 @@ type Store interface {
 	EndedBefore(t time.Time) ([]string, error)
 	// DeleteTask removes a task and everything recorded for it: steering, journal, checkpoints, events.
 	DeleteTask(id string) error
+	// Scrub drops what only an ended task's run needed, as soon as it ended: its start (kept as {}), its steering,
+	// its checkpoints and the request and result bodies in its journal (each record's id, type, hash and done mark
+	// stay, so a request id still can't run twice), and replaces its options with opts. Its state, outcome, times
+	// and events (the result its starter collects) stay until DeleteTask. A task that hasn't ended is left alone.
+	Scrub(id string, opts jsontext.Value) error
 
 	// Begin records a request (its type, hash and body) as pending before it runs. If (task, id) was recorded
 	// before, it records nothing and returns that record with fresh false.
@@ -210,6 +215,10 @@ type Runtime struct {
 	OnReject func(error)
 	// Observe, when set, sees every frame read from (in) or written to the brain: tests, a dev transcript.
 	Observe func(in bool, e *Envelope)
+	// KeepOptions, when set, is what of a task's options the Store keeps once the task ended (Store.Scrub): the
+	// guard's side drops their content (the person's question, files, images) and keeps the ids its starter's calls
+	// are checked with. nil: the options stay as they are.
+	KeepOptions func(opts jsontext.Value) jsontext.Value
 
 	once  sync.Once
 	mu    sync.Mutex
@@ -467,6 +476,7 @@ func (r *Runtime) Restore() ([]string, error) {
 		var s Start
 		if r.tasks[st.ID] != nil || json.Unmarshal(st.Start, &s) != nil || s.validate() != nil {
 			r.Store.EndTask(st.ID, Outcome{State: OutcomeFailed, Done: &Done{Outcome: OutcomeFailed, Error: "task unreadable"}})
+			r.Store.Scrub(st.ID, r.keptOptions(st.Options))
 			continue
 		}
 		var held map[string]string
@@ -498,6 +508,24 @@ func (r *Runtime) Restore() ([]string, error) {
 	}
 	r.dispatchLocked()
 	return ids, nil
+}
+
+// keptOptions is what of opts the Store keeps once the task ended (KeepOptions).
+func (r *Runtime) keptOptions(opts jsontext.Value) jsontext.Value {
+	if r.KeepOptions == nil {
+		return opts
+	}
+	return r.KeepOptions(opts)
+}
+
+// DeliveryStore is a Store that also remembers when an ended task's result reached its starter (guard.Host.Delivered),
+// so the task is deleted soon after that instead of after its keep, also across a restart. Optional: a Store
+// without it keeps a delivered task until its keep. DeleteTask forgets the mark with the task.
+type DeliveryStore interface {
+	// MarkDelivered records that the ended task id was delivered at at (the first time counts).
+	MarkDelivered(id string, at time.Time) error
+	// DeliveredBefore returns the tasks delivered before t.
+	DeliveredBefore(t time.Time) ([]string, error)
 }
 
 // Forget deletes an ended task from the Store: its start, options, steering, journal, checkpoints and events. A
@@ -709,6 +737,8 @@ func (r *Runtime) endLocked(t *task, o Outcome) {
 	t.lc = Lifecycle{State: EndState(o.State)}
 	t.outcome, t.sess = o, nil
 	r.Store.EndTask(t.id, o) // best effort: a task the store still has open is restored and resumed once more
+	// What only the run needed goes now (best effort too: guard.Host.ScrubEnded repeats it at a start).
+	r.Store.Scrub(t.id, r.keptOptions(t.info.Options))
 	t.stop()
 	close(t.finished)
 	r.order = slices.DeleteFunc(r.order, func(x *task) bool { return x == t })

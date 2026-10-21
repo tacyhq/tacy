@@ -4,6 +4,7 @@ import (
 	"encoding/json/v2"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -397,6 +398,25 @@ func (l *Ledger) End(task string) {
 	l.save()
 }
 
+// MembersCost is the cost (micro-USD) that every member whose name starts with prefix used today and yesterday (UTC),
+// all together, by day: one number a day, never a member, run or time. Scheduled runs' members are "schedule:<agent>"
+// (guard.ScheduleMember), so MembersCost("schedule:") is what the VM's own schedules spent, which no relay charged:
+// the relay's hourly cron adds it to its daily totals (agentd's GET /tasks/open).
+func (l *Ledger) MembersCost(prefix string) map[string]int64 {
+	l.init()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.Now().UTC()
+	out := map[string]int64{now.Format(time.DateOnly): 0, now.Add(-24 * time.Hour).Format(time.DateOnly): 0}
+	for k, d := range l.days {
+		scope, day, ok := strings.Cut(k, "|")
+		if _, want := out[day]; ok && want && strings.HasPrefix(scope, memberScope(prefix)) {
+			out[day] += d.Used.CostMicros
+		}
+	}
+	return out
+}
+
 // save writes today's and yesterday's counters (older days are dropped).
 func (l *Ledger) save() error {
 	if l.Dir == "" {
@@ -438,6 +458,28 @@ var modelPrices = map[string][2]int64{
 
 // unknownPrice is used for a model without a price: the dearest one, so an estimate never runs low.
 var unknownPrice = [2]int64{4_000_000, 20_000_000}
+
+// PriceRank orders models by price: input plus output price per million tokens (a model without a price ranks as the
+// dearest). The relay charges a run at the dearest model it may call (X-Agent-Price-Model, which agentd checks
+// against the run's signed fallback list); the chat ranks them the same way (the chat's plans.ts dearestModel; a unit
+// test there compares this table with prices.ts).
+func PriceRank(model string) int64 {
+	p, ok := modelPrices[model]
+	if !ok {
+		p = unknownPrice
+	}
+	return p[0] + p[1]
+}
+
+// PricePerM is model's input and output price in millionths of a USD per million tokens (an unknown model: the
+// dearest).
+func PricePerM(model string) (input, output int64) {
+	p, ok := modelPrices[model]
+	if !ok {
+		p = unknownPrice
+	}
+	return p[0], p[1]
+}
 
 // ModelCost estimates a model call's cost in millionths of a USD.
 func ModelCost(model string, prompt, completion int64) int64 {

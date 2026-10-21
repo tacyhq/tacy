@@ -87,6 +87,47 @@ var migrations = []string{
 // SchemaVersion is the version Open migrates to.
 var SchemaVersion = len(migrations)
 
+// queueExtras are additive changes made without raising the schema version (v0.16.0 on), as the side file's
+// sideExtras: a release before them still opens the file after a rollback (migrate refuses a newer user_version, which
+// would stop agentd). Each is idempotent and one an older release ignores: a table it never reads.
+//
+// delivered (v0.16.0): when an ended task's result reached its starter (harness.DeliveryStore), so it's deleted
+// soon after instead of after its keep. Ids and times only. An older release never deletes these rows with their task;
+// Open drops the ones whose task is gone.
+var queueExtras = []struct {
+	missing string // a query that counts 0 while the change isn't made
+	change  string
+}{
+	{`SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'delivered'`,
+		`CREATE TABLE delivered (
+		task TEXT PRIMARY KEY,
+		at   INTEGER NOT NULL
+	);
+	CREATE INDEX delivered_at ON delivered (at);`},
+}
+
+// applyQueueExtras makes the queueExtras not made yet, each in its own transaction.
+func applyQueueExtras(db *sql.DB) error {
+	for i, x := range queueExtras {
+		tx, err := db.Begin()
+		if err != nil {
+			return err
+		}
+		var n int
+		if err = tx.QueryRow(x.missing).Scan(&n); err == nil && n == 0 {
+			_, err = tx.Exec(x.change)
+		}
+		if err != nil {
+			tx.Rollback()
+			return fmt.Errorf("extra %d: %w", i+1, err)
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // migrate brings the database to SchemaVersion, one step per transaction. A database newer than this code is
 // refused (a rollback after a migration needs the newer release back, not a guess).
 func migrate(db *sql.DB) error {
@@ -147,6 +188,10 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("queue: %w", err)
 	}
+	if err := applyQueueExtras(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("queue: %w", err)
+	}
 	if err := tidyAfterOlder(db); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("queue: %w", err)
@@ -164,8 +209,18 @@ func tidyAfterOlder(db *sql.DB) error {
 		harness.OutcomeSucceeded, harness.StateDone, harness.OutcomeCancelled, harness.StateCancelled, harness.StateFailed, ms(time.Now())); err != nil {
 		return err
 	}
-	_, err := db.Exec(`DELETE FROM events WHERE task NOT IN (SELECT id FROM tasks)`)
+	if _, err := db.Exec(`DELETE FROM events WHERE task NOT IN (SELECT id FROM tasks)`); err != nil {
+		return err
+	}
+	_, err := db.Exec(`DELETE FROM delivered WHERE task NOT IN (SELECT id FROM tasks)`) // an older release deleted the task
 	return err
+}
+
+// truncateWAL copies the write-ahead log into the database and empties it, so what a delete or a scrub removed
+// (zeroed in the database by secure_delete) isn't left in the log's older frames either. Best effort: a busy log is
+// emptied by a later call.
+func (s *Store) truncateWAL() {
+	s.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`)
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -309,12 +364,71 @@ func (s *Store) DeleteTask(id string) error {
 	}
 	defer tx.Rollback()
 	for _, q := range []string{`DELETE FROM tasks WHERE id = ?`, `DELETE FROM steers WHERE task = ?`,
-		`DELETE FROM journal WHERE task = ?`, `DELETE FROM checkpoints WHERE task = ?`, `DELETE FROM events WHERE task = ?`} {
+		`DELETE FROM journal WHERE task = ?`, `DELETE FROM checkpoints WHERE task = ?`, `DELETE FROM events WHERE task = ?`,
+		`DELETE FROM delivered WHERE task = ?`} {
 		if _, err := tx.Exec(q, id); err != nil {
 			return err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.truncateWAL()
+	return nil
+}
+
+// emptyStart is what an ended task's start becomes (Scrub): the column can't be NULL.
+var emptyStart = []byte(`{}`)
+
+func (s *Store) Scrub(id string, opts jsontext.Value) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`UPDATE tasks SET start = ?, options = ? WHERE id = ? AND ended = 1`, emptyStart, nullable(opts), id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return nil // unknown, or not ended: nothing to scrub
+	}
+	for _, q := range []string{`DELETE FROM steers WHERE task = ?`, `DELETE FROM checkpoints WHERE task = ?`,
+		`UPDATE journal SET req = NULL, body = NULL, err = NULL WHERE task = ?`} {
+		if _, err := tx.Exec(q, id); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.truncateWAL()
+	return nil
+}
+
+var _ harness.DeliveryStore = (*Store)(nil)
+
+func (s *Store) MarkDelivered(id string, at time.Time) error {
+	_, err := s.db.Exec(`INSERT INTO delivered (task, at) SELECT id, ? FROM tasks WHERE id = ? AND ended = 1
+		ON CONFLICT (task) DO NOTHING`, ms(at), id)
+	return err
+}
+
+func (s *Store) DeliveredBefore(before time.Time) ([]string, error) {
+	rows, err := s.db.Query(`SELECT task FROM delivered WHERE at < ? ORDER BY at`, ms(before))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) AddEvents(task string, evs []harness.StoredEvent) error {
@@ -359,8 +473,9 @@ func (s *Store) Begin(task, id, kind string, hash [32]byte, req jsontext.Value) 
 		return harness.Record{}, false, err
 	}
 	defer tx.Rollback()
-	res, err := tx.Exec(`INSERT INTO journal (task, id, kind, hash, req) VALUES (?, ?, ?, ?, ?) ON CONFLICT (task, id) DO NOTHING`,
-		task, id, kind, hash[:], nullable(req))
+	// An ended task's request (a late one) keeps no body: Scrub has run or will.
+	res, err := tx.Exec(`INSERT INTO journal (task, id, kind, hash, req) VALUES (?, ?, ?, ?, CASE WHEN `+endedTask+` THEN NULL ELSE ? END)
+		ON CONFLICT (task, id) DO NOTHING`, task, id, kind, hash[:], task, nullable(req))
 	if err != nil {
 		return harness.Record{}, false, err
 	}
@@ -412,9 +527,14 @@ func (s *Store) Finish(task, id string, body jsontext.Value, e *harness.Error) e
 			return err
 		}
 	}
-	_, err := s.db.Exec(`UPDATE journal SET done = 1, body = ?, err = ? WHERE task = ? AND id = ?`, nullable(body), nullable(errb), task, id)
+	// A request that finishes after its task ended (Scrub) is marked done without its result.
+	_, err := s.db.Exec(`UPDATE journal SET done = 1, body = CASE WHEN `+endedTask+` THEN NULL ELSE ? END,
+		err = CASE WHEN `+endedTask+` THEN NULL ELSE ? END WHERE task = ? AND id = ?`, task, nullable(body), task, nullable(errb), task, id)
 	return err
 }
+
+// endedTask is an SQL condition: the task (one parameter, its id) has ended.
+const endedTask = `EXISTS (SELECT 1 FROM tasks WHERE id = ? AND ended = 1)`
 
 func (s *Store) Journal(task string) ([]harness.Record, error) {
 	rows, err := s.db.Query(`SELECT `+recCols+` FROM journal WHERE task = ? ORDER BY seq`, task)
@@ -434,9 +554,10 @@ func (s *Store) Journal(task string) ([]harness.Record, error) {
 }
 
 func (s *Store) SaveCheckpoint(task string, cp *harness.Checkpoint) error {
-	_, err := s.db.Exec(`INSERT INTO checkpoints (task, seq, steer_applied, state) VALUES (?, ?, ?, ?)
+	// None for an ended task (a late one): Scrub dropped its checkpoints.
+	_, err := s.db.Exec(`INSERT INTO checkpoints (task, seq, steer_applied, state) SELECT ?, ?, ?, ? WHERE NOT `+endedTask+`
 		ON CONFLICT (task) DO UPDATE SET seq = excluded.seq, steer_applied = excluded.steer_applied, state = excluded.state`,
-		task, cp.Seq, cp.SteerApplied, []byte(cp.State))
+		task, cp.Seq, cp.SteerApplied, []byte(cp.State), task)
 	return err
 }
 

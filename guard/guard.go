@@ -695,7 +695,7 @@ func startFor(r *proto.RunRequest, now time.Time, reader bool) (harness.Start, T
 	// what the start record lists as the models the run may call. Without Auto there are none.
 	var fallbacks []string
 	if r.AutoFallback {
-		fallbacks = fallbackModels(r.Model, r.FallbackModels)
+		fallbacks = chargedFallbacks(r) // none dearer than the run was charged at (charge.go)
 	}
 	if len(images) > 0 && SeesImages(r.Model) { // a step moved to another model keeps seeing the person's images
 		fallbacks = slices.DeleteFunc(fallbacks, func(m string) bool { return !SeesImages(m) })

@@ -384,7 +384,7 @@ func TestScheduledRunRecordedAndSealed(t *testing.T) {
 		t.Fatalf("another's fetch: %d", code)
 	}
 	spoof := &runauth.Asker{Space: e.me.Space, Seal: other.Seal, Identity: other.Identity, Key: other.Key}
-	if code, _ := e.openResult(spoof, task); code != 404 {
+	if code, _ := e.openResult(spoof, task); code != 403 { // refused at the door: the space's seal key is pinned (v0.16.0)
 		t.Fatalf("this space named with another seal key: %d", code)
 	}
 	// Sealed to the seal key, bound to its space and task: it doesn't open as another task's.

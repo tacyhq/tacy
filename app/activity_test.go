@@ -15,6 +15,7 @@ import (
 
 	"github.com/tacyhq/tacy/activity"
 	"github.com/tacyhq/tacy/proto"
+	"github.com/tacyhq/tacy/runauth"
 	"github.com/tacyhq/tacy/safety"
 )
 
@@ -156,10 +157,22 @@ func testActivityChain(t *testing.T, behindRunner bool) {
 	all = append(all, runs...)
 	e.mustPost(e.stop(safety.IssuerFirm, 2, nil, e.admin))
 
-	// 4. Every run is recorded (keys v2 slice 6): one with another seal key goes to that key's chain, never this one.
+	// 4. Every run is recorded (keys v2 slice 6): one in another space, with its own seal key, goes to that key's chain,
+	// never this one. This space's seal key is pinned to priv now (v0.16.0): naming it with another key is refused at
+	// the door, and nothing runs or is recorded.
+	pinned := proto.RunRequest{Model: proto.DefaultModel, Permissions: guard.AllowAll(), Messages: user1("hi")}
+	authorizeFor(t, e.s, &pinned) // testSpace with testAsker's seal key
+	if code, body := postRun(e.s, pinned, ""); code != 403 && !strings.Contains(body, "pinned") || strings.Contains(body, `"activity"`) {
+		t.Fatalf("this space with another seal key: %d %s", code, body)
+	}
 	e.model.replies = append(e.model.replies, pText("elsewhere"))
-	evs = runParity(t, e.s, proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("hi")})
-	if m := metaOf(evs); !strings.Contains(types(evs), "activity") || m.Activity == nil || m.Activity.Chain != activity.ChainID(testSpace, testAsker.SealString()) {
+	elsewhere := proto.RunRequest{Model: proto.DefaultModel, Permissions: guard.AllowAll(), Messages: user1("hi")}
+	other := &runauth.Asker{Space: runauth.NewID("s"), Seal: testAsker.Seal, Identity: testAsker.Identity, Key: testAsker.Key}
+	if err := other.Authorize(&elsewhere, e.vmKey.PublicKey().Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	evs = runParity(t, e.s, elsewhere)
+	if m := metaOf(evs); !strings.Contains(types(evs), "activity") || m.Activity == nil || m.Activity.Chain != activity.ChainID(other.Space, testAsker.SealString()) {
 		t.Fatalf("a run in another chain: %s", types(evs))
 	}
 

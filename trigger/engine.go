@@ -439,6 +439,73 @@ func (e *Engine) Active() int {
 	return n
 }
 
+// NextRun is the earliest instant a schedule run is due that hasn't started yet, over every definition Active counts,
+// floored to the minute; zero when none is ahead. It lets the Worker stop the VM between runs and start it a little
+// before the next one (docs/30 "Scheduled tasks", decision 3 as revised 2026-10-23), so it errs early: a run due now
+// that hasn't fired (the VM just booted, its clock not trusted yet) is reported at its own, past instant until it
+// fires or Due skips it (MaxLate), and a slot whose record can't be read counts as not fired. One time for all
+// definitions together: no ids, no counts per schedule.
+func (e *Engine) NextRun() time.Time {
+	now := e.cfg.Now()
+	var next time.Time
+	for _, in := range e.Installed() {
+		if e.StateOf(in) != StateActive {
+			continue
+		}
+		for _, tr := range in.Def.Triggers {
+			if tr.Kind != Schedule {
+				continue
+			}
+			at := e.nextOf(in.Def, &tr, now)
+			if at.IsZero() || !at.Before(in.Def.NotAfter) { // past not_after it never fires (sponsorOK)
+				continue
+			}
+			if next.IsZero() || at.Before(next) {
+				next = at
+			}
+		}
+	}
+	if next.IsZero() {
+		return next
+	}
+	return next.UTC().Truncate(time.Minute)
+}
+
+// nextOf is a schedule trigger's next run as Due will see it: its current slot's instant while that slot is still to
+// fire, else the next slot's (zero: none).
+func (e *Engine) nextOf(d *Definition, tr *Trigger, now time.Time) time.Time {
+	unfired := func(slot int64) bool {
+		last, ok, err := e.cfg.Store.LastFired(slotKey(tr))
+		return err != nil || !ok || last < slot
+	}
+	switch {
+	case tr.IsDaily():
+		if slot, at := tr.DailySlot(now); slot >= 0 && !at.Before(d.IssuedAt) && tr.onDay(slot) && now.Sub(at) <= MaxLate && unfired(slot) {
+			return at
+		}
+		return tr.NextRun(now)
+	case tr.IsOnce():
+		slot, at := tr.OnceSlot()
+		if slot < 0 || at.Before(d.IssuedAt) || now.Sub(at) > MaxLate || !unfired(slot) {
+			return time.Time{}
+		}
+		return at
+	default:
+		p := tr.Period()
+		if p <= 0 {
+			return time.Time{}
+		}
+		slot := Slot(tr, now)
+		if slot < 0 {
+			return tr.Anchor
+		}
+		if unfired(slot) {
+			return tr.Anchor.Add(time.Duration(slot) * p)
+		}
+		return tr.Anchor.Add(time.Duration(slot+1) * p)
+	}
+}
+
 // SpaceCount is how many definitions (active or stopped, not removed) are in space: live leaves out the ended ones,
 // all counts them.
 func (e *Engine) SpaceCount(space string) (live, all int) {

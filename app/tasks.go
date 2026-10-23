@@ -44,10 +44,11 @@ import (
 //	                     result reached the tab: guard.Host.Delivered), else a day (guard.DefaultKeep; v0.16.0, before
 //	                     it a built-in agent's result was kept up to 7 days). What only its run needed (its input, the
 //	                     person's files, model calls, checkpoints) goes as it ends (harness.Store.Scrub).
-//	GET  /tasks/open     -> {"open": n, "schedules": k, "scheduled_spend_micros": {day: µ$}}: how many tasks are open
-//	                     (not ended) and how many schedules are active (v0.12.0), for the relay's idle timer, and
-//	                     (v0.16.0) what scheduled runs cost today and yesterday, all accounts together (bearer token;
-//	                     plaintext, counts and one sum a day only).
+//	GET  /tasks/open     -> {"open": n, "schedules": k, "next_run": t, "scheduled_spend_micros": {day: µ$}}: how many
+//	                     tasks are open (not ended) and how many schedules are active (v0.12.0), for the relay's idle
+//	                     timer; (v0.16.0) what scheduled runs cost today and yesterday, all accounts together; and (the
+//	                     release after v0.17.0) when the next scheduled run is due, one UTC time to the minute for all
+//	                     schedules together, or null (bearer token; plaintext, counts, one time and one sum a day only).
 //	POST /tasks/grant    {task, request, kind, decision, value, mac} -> {outcome}: the person's answer to a
 //	                     permission prompt (guard.Prompts) of a /tasks or /run task. The MAC with the run's
 //	                     secret is the authorization (only the tab that started the run has it). 404
@@ -105,19 +106,30 @@ func (s *server) tasksOpen(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	schedules := 0 // the keep-on signal for personal schedules (docs/30 "Scheduled tasks", decision 3): a count only
+	var next *time.Time
 	if s.personal() {
 		schedules = s.triggers.Active()
+		if n := s.triggers.NextRun(); !n.IsZero() {
+			next = &n
+		}
 	}
-	writeJSON(w, 200, tasksOpenAnswer{Open: s.tasks().Open(), Schedules: schedules, ScheduledSpend: s.scheduledSpend()})
+	writeJSON(w, 200, tasksOpenAnswer{Open: s.tasks().Open(), Schedules: schedules, NextRun: next, ScheduledSpend: s.scheduledSpend()})
 }
 
 // tasksOpenAnswer is GET /tasks/open's body. ScheduledSpend (v0.16.0) is what the VM's own schedules cost today and
 // yesterday (UTC), in micro-USD, all accounts together: one number a day, no ids or times. No relay charges these
 // runs (they fire on the VM's clock), so the relay's hourly cron adds the number to its daily totals, which its
 // billing alert compares with Tinfoil's bill (the chat's agent.ts recordScheduledSpend).
+//
+// NextRun (the release after v0.17.0) is the earliest scheduled run still to start (trigger.Engine.NextRun: floored
+// to the minute; a run due now that hasn't fired yet keeps its own, past time), so the relay can let the VM stop
+// between runs and start it a few minutes before the next one instead of keeping it on all day. One time for all
+// schedules together, never which schedule or whose. Always present: null says there's none, while an older VM
+// sends no field at all (the relay then keeps the VM on while any schedule is active, as before).
 type tasksOpenAnswer struct {
 	Open           int              `json:"open"`
 	Schedules      int              `json:"schedules"`
+	NextRun        *time.Time       `json:"next_run"`
 	ScheduledSpend map[string]int64 `json:"scheduled_spend_micros,omitzero"`
 }
 

@@ -449,22 +449,31 @@ func TestScheduleCountStopRemove(t *testing.T) {
 		r := httptest.NewRequest("GET", "/tasks/open", nil)
 		r.Header.Set("Authorization", "Bearer tok")
 		e.s.tasksOpen(w, r)
-		var out map[string]int
-		if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil || len(out) != 2 {
+		var out map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil || len(out) != 3 {
 			t.Fatalf("GET /tasks/open: %s", w.Body)
 		}
-		return out
+		if _, ok := out["next_run"].(string); !ok && out["next_run"] != nil {
+			t.Fatalf("next_run %s", w.Body)
+		}
+		o, _ := e.openNext()
+		return o
 	}
-	if o := open(); o["schedules"] != 0 {
-		t.Fatalf("%v", o)
+	if o, next := e.openNext(); o["schedules"] != 0 || next != nil {
+		t.Fatalf("%v %v", o, next)
 	}
+	runAt := time.Now().UTC().Add(3 * time.Hour).Truncate(time.Minute)
 	d := e.daily(e.me, func(d *trigger.Definition) {
-		d.Triggers[0].Daily = time.Now().UTC().Add(3 * time.Hour).Format("15:04") // later today: no run in this test
+		d.Triggers[0].Daily = runAt.Format("15:04") // later today: no run in this test
 	})
 	env := e.sign(d, e.me.Key)
 	e.install(e.me, env)
 	if o := open(); o["schedules"] != 1 || o["open"] != 0 {
 		t.Fatalf("%v", o)
+	}
+	// The next run's time, to the minute, for the relay's wake-up: one time, no ids.
+	if _, next := e.openNext(); next == nil || !next.Equal(runAt) {
+		t.Fatalf("next run %v, want %s", next, runAt)
 	}
 	// Only the holder stops it.
 	other, _ := runauth.NewAsker()

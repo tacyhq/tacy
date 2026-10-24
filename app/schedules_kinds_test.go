@@ -27,13 +27,26 @@ func (e *schedEnv) shiftedEngine() *atomic.Int64 {
 }
 
 func (e *schedEnv) open() map[string]int {
+	o, _ := e.openNext()
+	return o
+}
+
+// openNext is GET /tasks/open's counts and its next_run (the release after v0.17.0; nil when null). The field is
+// always there on this VM: an older VM's missing field means "keep the VM on" to the relay.
+func (e *schedEnv) openNext() (map[string]int, *time.Time) {
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest("GET", "/tasks/open", nil)
 	r.Header.Set("Authorization", "Bearer tok")
 	e.s.tasksOpen(w, r)
-	var out map[string]int
-	json.Unmarshal(w.Body.Bytes(), &out)
-	return out
+	var raw map[string]json.RawMessage
+	var out struct {
+		Open, Schedules int
+		NextRun         *time.Time `json:"next_run"`
+	}
+	if json.Unmarshal(w.Body.Bytes(), &raw) != nil || json.Unmarshal(w.Body.Bytes(), &out) != nil || raw["next_run"] == nil {
+		e.t.Fatalf("GET /tasks/open: %s", w.Body)
+	}
+	return map[string]int{"open": out.Open, "schedules": out.Schedules}, out.NextRun
 }
 
 func (e *schedEnv) listed(a *runauth.Asker) []map[string]any {
@@ -66,8 +79,8 @@ func TestScheduleOnceRunsThenEnds(t *testing.T) {
 	if tr["at"] != d.Triggers[0].At || tr["daily"] != nil || tr["days"] != nil || tr["next_run"] != at.Format(time.RFC3339) {
 		t.Fatalf("install's trigger %v", tr)
 	}
-	if o := e.open(); o["schedules"] != 1 {
-		t.Fatalf("before its run: %v", o)
+	if o, next := e.openNext(); o["schedules"] != 1 || next == nil || !next.Equal(at) {
+		t.Fatalf("before its run: %v, next run %v", o, next)
 	}
 	e.s.triggerTick(context.Background()) // not yet
 	if n := len(e.s.tasks().Triggered()); n != 0 {
@@ -98,8 +111,8 @@ func TestScheduleOnceRunsThenEnds(t *testing.T) {
 	if tr["next_run"] != nil || tr["last_task"] != task || tr["last_day"] != at.Format(time.DateOnly) || tr["at"] != d.Triggers[0].At {
 		t.Fatalf("listed trigger %v", tr)
 	}
-	if o := e.open(); o["schedules"] != 0 {
-		t.Fatalf("an ended schedule keeps the VM on: %v", o)
+	if o, next := e.openNext(); o["schedules"] != 0 || next != nil {
+		t.Fatalf("an ended schedule keeps the VM on: %v, next run %v", o, next)
 	}
 	if _, body := e.openResult(e.me, task); body == nil || body.Day != r.Day {
 		t.Fatalf("sealed result %+v", body)

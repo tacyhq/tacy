@@ -773,6 +773,12 @@ func personDated(ms []proto.Message) bool {
 // chatInstructions is the chat agent's system prompt (from the old app/agent.go systemPrompt; the tools as the model sees
 // them, harness.ModelToolName). The runtime writes today's date in when it makes the task, so a resumed brain
 // gets the same prompt and its model call replays under the same id.
+//
+// The lines on how current a source is, stating only what a cited source says, and keeping signs, units and
+// attributions (v0.17.2): the search scorecard's re-measure of v0.17.1 (core 15, two rounds, Opus judge) found 3.2%
+// of claims wrong: stale prices from undated roundups or 2024 launches, older news called the latest, invented ranks
+// and comparisons, a sign and an attribution changed. With these lines and the reader's exactness rule (reader.go):
+// 1.2% (7 of 570), unsupported 25.6% (29.2% before).
 func chatInstructions(actions []string, now time.Time, reader bool) string {
 	var tools []string
 	for _, a := range actions {
@@ -796,6 +802,9 @@ func chatInstructions(actions []string, now time.Time, reader bool) string {
 - Cite the sources you use inline as plain [n] (for example [2]), with the numbers given in the tool results. One number per bracket: write [2][5], never [2, 5]. Only cite a number a search result or a page you read gave you (an image search's pictures aren't sources); don't invent sources or numbers.
 - Cite inline only: don't end the answer with a list of sources, references or links. The app shows the sources under the answer.
 - Check dates against today's date; a page date without a year is probably recent, not years old.
+- How current a source is: a result's or page's age is its date. For a price, a version, a standing or status, or the latest or most recent news, prefer the maker's, seller's or official source (its own product or store page, newsroom, release notes, statement or scoreboard) and the newest dated sources over roundups, reviews and resellers. A price from a roundup with no date, or from a source more than about three months old, isn't a current price: leave it out, or say whose it is and when (for example "$129.99 at its 2024 launch"). For "latest" or "most recent", compare the dates the sources give and name the newest item with its date; never call something the latest when a source shows a newer one, and say how old the newest one is when none is from the last few days.
+- State only what a source you cite says: no rank or position ("the top story", "third in the division", "the highest"), comparison ("cheaper", "twice the battery"), description or detail (a play, a score by period, who did what) that none of them gives. Something you work out yourself (a difference, a ratio, which is largest) you say is yours and show the numbers, after checking every item.
+- Keep signs, units and attributions as the sources give them: a change given without + or - or a direction isn't "up" or "down"; "designed with X" isn't "made by X"; a price, rank or date belongs only to the item the source gives it for.
 - If the tools don't give an answer, say so briefly.
 - Tacy asks the person before a search or a page fetch leaves its sealed hardware. If a tool call comes back denied (permission_denied), don't try it again another way: answer from what you know, and say plainly that you didn't check the web for it.
 `)

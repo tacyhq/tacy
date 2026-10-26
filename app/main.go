@@ -139,6 +139,8 @@ type server struct {
 	notify *notifier
 	// taskFollows counts each task's open event streams (a prompt in a followed task notifies nobody), under followMu.
 	taskFollows map[string]int
+	// handed: the results the relay said it stored (POST /schedules/handoff, handoff.go), memory only.
+	handed handedSet
 }
 
 type ticketKey struct{}
@@ -686,9 +688,10 @@ func main() {
 	// The plain chat's web search (search.go, docs/29).
 	s.searchRoutes(mux, id)
 	s.step7Routes(mux, id)
-	s.scheduleRoutes(mux, id)                      // schedules for personal spaces (schedules.go, SCHEDULES.md)
-	s.notifyRoutes(mux, id)                        // run notifications (notify.go, SCHEDULES.md)
-	mux.HandleFunc("GET /activity", s.activityOut) // sealed activity records, for the relay (docs/24)
+	s.scheduleRoutes(mux, id)                                    // schedules for personal spaces (schedules.go, SCHEDULES.md)
+	s.notifyRoutes(mux, id)                                      // run notifications (notify.go, SCHEDULES.md)
+	mux.HandleFunc("POST /schedules/handoff", s.scheduleHandoff) // sealed results to the relay (handoff.go, SCHEDULES.md)
+	mux.HandleFunc("GET /activity", s.activityOut)               // sealed activity records, for the relay (docs/24)
 	// Signed policies and stop lists; the signature is the authorization. Only served when the compose pins a key
 	// (stage 2): without one nothing could verify, so there's nothing to take.
 	if st.Keyed() {

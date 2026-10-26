@@ -342,7 +342,13 @@ func (s *server) scheduleList(w http.ResponseWriter, r *http.Request) {
 			NotAfter: in.Def.NotAfter.UTC(), Definition: in.Env, Triggers: s.triggerViews(in, state, true), Running: len(s.running(in.Def.Agent)),
 			StopReason: s.triggers.StopReason(in)})
 	}
-	writeJSON(w, 200, map[string]any{"schedules": out})
+	ans := map[string]any{"schedules": out}
+	// v0.18.0: the key the results handed to the relay are signed with (handoff.go), told over EHBP from the attested
+	// VM: the browser pins it for the space and takes a result from the relay only when it checks.
+	if s.rec != nil {
+		ans["signer"] = s.rec.Signer.Public()
+	}
+	writeJSON(w, 200, ans)
 }
 
 type agentRequest struct {

@@ -252,3 +252,50 @@ func (m *MemResults) PruneResults(t time.Time) error {
 	m.del(func(r Result) bool { return !r.EndedAt.Before(t) })
 	return nil
 }
+
+// SpaceTask names one result: its space and its task.
+type SpaceTask struct {
+	Space string `json:"space"`
+	Task  string `json:"task"`
+}
+
+// HandoffStore is what the hand-off to the relay needs of a ResultStore (v0.18.0, SCHEDULES.md "Hand-off to the relay").
+type HandoffStore interface {
+	// Pending lists the results, oldest first, at most limit, without their ciphertext (CT's capacity is its size).
+	Pending(limit int) ([]Result, error)
+	// DeleteCollected deletes the named results (the relay says the person's browser saved them from its copy), as
+	// DeleteResults does: their schedules' uncollected counts start again. It returns how many it deleted.
+	DeleteCollected(items []SpaceTask) (int, error)
+}
+
+var _ HandoffStore = (*MemResults)(nil)
+
+func (m *MemResults) Pending(limit int) ([]Result, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []Result
+	for _, r := range m.rs {
+		if len(out) == limit {
+			break
+		}
+		r.Enc, r.CT = nil, make([]byte, 0, len(r.CT))
+		out = append(out, r)
+	}
+	return out, nil
+}
+
+func (m *MemResults) DeleteCollected(items []SpaceTask) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	set := map[SpaceTask]bool{}
+	for _, it := range items {
+		set[it] = true
+	}
+	return m.del(func(r Result) bool {
+		if set[SpaceTask{Space: r.Space, Task: r.Task}] {
+			delete(m.missed, r.Agent) // collected: the count starts again
+			return false
+		}
+		return true
+	}), nil
+}

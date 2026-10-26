@@ -160,6 +160,8 @@ func (f *failingCollect) Uncollected(agent string) (int, error) {
 
 func TestMemCollectStore(t *testing.T) { RunCollectStoreTests(t, &MemResults{}) }
 
+func TestMemHandoffStore(t *testing.T) { RunHandoffStoreTests(t, &MemResults{}) }
+
 // testStoredFile is a valid stored file for a definition (no URL), its key all 7s.
 func testStoredFile(t *testing.T) proto.StoredFile {
 	padded, err := storedfiles.PaddedFor(1000)

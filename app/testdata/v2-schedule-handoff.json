@@ -1,0 +1,15 @@
+{
+  "constants": {
+    "labels": {
+      "handoff": "tacy/v2/schedule-handoff"
+    }
+  },
+  "label": "tacy/v2/schedule-handoff",
+  "signer": "ed25519:6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=",
+  "space": "s_aaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "task": "tk_bbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "enc": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+  "ct": "Y2lwaGVydGV4dCBvZiBhIHNjaGVkdWxlZCBydW4ncyByZXN1bHQ=",
+  "digest": "2ba4d81d71eb241a69c58386a183081013073b68dabb85fded41a8c27a973f4b",
+  "sig": "7IXKGpHvdxw+1t/OEaMeahVHJrT/23SWtduwrA2oPR5B7aB7rUcFpNbpC0v+3dHJWZEWsQFSHMaEVuHk56DtCA=="
+}

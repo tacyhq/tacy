@@ -52,6 +52,16 @@ func DeriveSigner(ikm []byte, firm string) (*Signer, error) {
 // Public is the signer's key as records name it: "ed25519:<base64>".
 func (s *Signer) Public() string { return s.pub }
 
+// SignLabeled signs label ‖ 0x00 ‖ digest with the signing key: a statement other than a record. A record's
+// signature covers Label ‖ 0x00 ‖ header ("tacy-activity/v1…"), so a label that isn't Label never makes the same
+// bytes. The VM signs the schedule results it hands to the relay with it (app/handoff.go).
+func (s *Signer) SignLabeled(label string, digest [32]byte) ([]byte, error) {
+	if label == Label || strings.HasPrefix(label, Label+"\x00") {
+		return nil, errors.New("activity: that label is the records'")
+	}
+	return ed25519.Sign(s.priv, append([]byte(label+"\x00"), digest[:]...)), nil
+}
+
 // KeyString is an Ed25519 public key as records name it.
 func KeyString(pub ed25519.PublicKey) string { return "ed25519:" + b64.EncodeToString(pub) }
 

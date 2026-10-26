@@ -31,6 +31,7 @@ var (
 	_ trigger.ResultStore  = (*Side)(nil)
 	_ trigger.MemoryStore  = (*Side)(nil)
 	_ trigger.CollectStore = (*Side)(nil)
+	_ trigger.HandoffStore = (*Side)(nil)
 )
 
 // sideMigrations are the side file's schema versions (PRAGMA user_version), forward only.
@@ -588,6 +589,56 @@ func (s *Side) DeleteResults(space, seal string, tasks []string) (int, error) {
 			return 0, err
 		}
 		res, err := tx.Exec(`DELETE FROM results WHERE space = ? AND seal = ? AND task = ?`, space, seal, t)
+		if err != nil {
+			return 0, err
+		}
+		k, _ := res.RowsAffected()
+		n += int(k)
+		if _, err := tx.Exec(`UPDATE collect SET missed = 0 WHERE agent = ?`, agent); err != nil {
+			return 0, err
+		}
+	}
+	return n, tx.Commit()
+}
+
+// Pending lists every result, oldest first, without its ciphertext (trigger.HandoffStore: the hand-off to the relay).
+func (s *Side) Pending(limit int) ([]trigger.Result, error) {
+	rows, err := s.db.Query(`SELECT `+resultCols+`, length(ct) FROM results ORDER BY seq LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []trigger.Result
+	for rows.Next() {
+		var n int
+		r, err := scanResult(rows, &n)
+		if err != nil {
+			return nil, err
+		}
+		r.CT = make([]byte, 0, n)
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// DeleteCollected deletes results the relay says the person's browser saved from its copy: as DeleteResults, their
+// schedules' uncollected counts start again, in the same transaction.
+func (s *Side) DeleteCollected(items []trigger.SpaceTask) (int, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	n := 0
+	for _, it := range items {
+		var agent string
+		switch err := tx.QueryRow(`SELECT agent FROM results WHERE space = ? AND task = ?`, it.Space, it.Task).Scan(&agent); {
+		case errors.Is(err, sql.ErrNoRows):
+			continue
+		case err != nil:
+			return 0, err
+		}
+		res, err := tx.Exec(`DELETE FROM results WHERE space = ? AND task = ?`, it.Space, it.Task)
 		if err != nil {
 			return 0, err
 		}

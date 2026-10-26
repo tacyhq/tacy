@@ -14,6 +14,10 @@ func TestSideCollect(t *testing.T) {
 	trigger.RunCollectStoreTests(t, openSide(t, filepath.Join(t.TempDir(), "side.db")))
 }
 
+func TestSideHandoff(t *testing.T) {
+	trigger.RunHandoffStoreTests(t, openSide(t, filepath.Join(t.TempDir(), "side.db")))
+}
+
 // The collect table (v0.17.0) is an extra: the schema stays 2, opening again changes nothing, and a count survives.
 func TestSideCollectExtraKeepsSchema(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "side.db")

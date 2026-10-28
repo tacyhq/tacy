@@ -1,6 +1,6 @@
 {
   "format": "tacy-golden-crypto-vectors",
-  "note": "VM v0.13.0 schedule kinds (poc/05-agent-vm/SCHEDULES.md): a definition on chosen weekdays (daily + days) and a one-time one (at), each envelope and its hash, and each install call's where and who. Made once from v2-search.json's fixed seeds with node:crypto (scripts/gen-golden-v2-schedule-kinds-vectors.mjs); never regenerate.",
+  "note": "VM v0.13.0 schedule kinds (services/agent-vm/SCHEDULES.md): a definition on chosen weekdays (daily + days) and a one-time one (at), each envelope and its hash, and each install call's where and who. Made once from v2-search.json's fixed seeds with node:crypto (scripts/gen-golden-v2-schedule-kinds-vectors.mjs); never regenerate.",
   "constants": {
     "labels": {
       "spaceProof": "tacy/v2/space-proof",

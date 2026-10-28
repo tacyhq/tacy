@@ -24,6 +24,7 @@ func main() {
 	socket := flag.String("socket", "", "the vault's unix socket")
 	uid := flag.Int("gateway-uid", -1, "the only uid allowed to connect (required on Linux)")
 	group := flag.Bool("group-mode", false, "socket mode 0660: gatewayd connects through the socket's group (vaultd's primary group is gatewayd's)")
+	connFile := flag.String("conn-file", "", "the people's connections (email accounts) on vaultd's own volume (empty: memory only)")
 	var sf safety.Flags
 	sf.Register(flag.CommandLine)
 	flag.Parse()
@@ -61,6 +62,12 @@ func main() {
 		log.Fatal(err)
 	}
 	v.SetSafety(st)
+	// Connections (CONNECTIONS.md, v0.19.0): a per-boot seal key, and the accounts kept on this container's own
+	// volume. A file that can't be read leaves connections off (mail answers unavailable) rather than stopping the
+	// vault, which holds every other key, or starting over an account file it couldn't read.
+	if err := v.EnableConns(*connFile); err != nil {
+		log.Printf("vaultd: connections off: %v", err)
+	}
 	mode := os.FileMode(0o600)
 	if *group {
 		mode = 0o660

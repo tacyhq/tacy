@@ -1,6 +1,6 @@
 {
   "format": "tacy-golden-crypto-vectors",
-  "note": "Run notifications' signed VM call (POST /notify/set, poc/05-agent-vm SCHEDULES.md 'Run notifications'): the where and who under tacy/v2/notify-set, own item 'on' or 'off'. Made once from v2-schedule.json's fixed seeds with node:crypto (scripts/gen-golden-v2-notify-vectors.mjs); never regenerate.",
+  "note": "Run notifications' signed VM call (POST /notify/set, services/agent-vm SCHEDULES.md 'Run notifications'): the where and who under tacy/v2/notify-set, own item 'on' or 'off'. Made once from v2-schedule.json's fixed seeds with node:crypto (scripts/gen-golden-v2-notify-vectors.mjs); never regenerate.",
   "constants": {
     "labels": {
       "spaceProof": "tacy/v2/space-proof",

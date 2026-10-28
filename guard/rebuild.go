@@ -51,6 +51,13 @@ func (t *task) rebuild(ti *harness.TaskInfo) {
 			if req.Name == "files.read" { // a review's sections read, and their quote numbers (files.go)
 				quotes = max(quotes, t.files.restore(t, res.Output))
 			}
+			if isMailAction(req.Name) { // its message ids and quote numbers (mail.go)
+				if req.Name == MailSearchAction {
+					t.mail.restore(res.Output)
+				}
+				quotes = max(quotes, journaledMailQuotes(res.Output))
+				continue
+			}
 			n, used, urls := journaledOutput(req.Name, res.Output)
 			cites, images, quotes = max(cites, n), images+used, max(quotes, journaledQuotes(res.Output))
 			sites = append(sites, urls...)
@@ -139,6 +146,24 @@ func journaledQuotes(out []byte) int {
 	n := 0
 	if json.Unmarshal(out, &o) == nil && o.Read != nil {
 		for _, q := range o.Read.Quotes {
+			n = max(n, q.ID)
+		}
+	}
+	return n
+}
+
+// journaledMailQuotes is the highest quote number in a journaled mail action's output (its "reader" quotes).
+func journaledMailQuotes(out []byte) int {
+	var o struct {
+		Reader *struct {
+			Quotes []struct {
+				ID int `json:"id"`
+			} `json:"quotes"`
+		} `json:"reader"`
+	}
+	n := 0
+	if json.Unmarshal(out, &o) == nil && o.Reader != nil {
+		for _, q := range o.Reader.Quotes {
 			n = max(n, q.ID)
 		}
 	}

@@ -48,6 +48,7 @@ const (
 	tEvent  = "event"  // gatewayd → agentd: one of the task's events
 	tResult = "result" // gatewayd → agentd: request rid's result
 	tSafety = "safety" // agentd → gatewayd, a connection's only frame: signed policies and stop lists (step 6)
+	tConn   = "conn"   // agentd → gatewayd, a connection's only frame: a Settings → Connections call (CONNECTIONS.md)
 )
 
 type frame struct {
@@ -93,6 +94,9 @@ type frame struct {
 	// result of model and action: what gatewayd saw and did for it (hosts, bytes, leases, leak-scan ids); of end:
 	// the task's egress outside any request (site icons). Metadata only, for the activity record (docs/24).
 	Facts *guard.FactsData `json:"facts,omitzero"`
+	// conn: a Settings call (the box of a put stays sealed to the vault); its result.
+	Conn       *guard.ConnRequest `json:"conn,omitzero"`
+	ConnResult *guard.ConnResult  `json:"conn_result,omitzero"`
 }
 
 // record is a journal entry as gatewayd needs it to rebuild a task's state (guard/rebuild.go): actions whole, model

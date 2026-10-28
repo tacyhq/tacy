@@ -232,7 +232,7 @@ func (p *Prompts) Answer(g Grant) (string, error) {
 	}
 	switch g.Decision {
 	case DecideOnce, DecideAlways:
-		if CheckGrantValue(pr.kind, g.Value) != nil {
+		if CheckGrantValue(pr.kind, g.Value) != nil || isMailAction(pr.kind) && g.Value != pr.value { // mail: not editable
 			p.mu.Unlock()
 			return "", ErrBadValue
 		}

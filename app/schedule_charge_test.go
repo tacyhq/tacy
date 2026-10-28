@@ -43,7 +43,7 @@ func TestScheduleRunCostVectors(t *testing.T) {
 		{"glm-5-3", false, 145_340}, {"glm-5-3", true, 250_000},
 		{"kimi-k3", false, 250_000}, {"kimi-k3", true, 250_000},
 	} {
-		if got := scheduleRunCost(v.model, v.search, false); got != v.want {
+		if got := scheduleRunCost(v.model, v.search, false, false); got != v.want {
 			t.Errorf("%s search=%v: %d, want %d", v.model, v.search, got, v.want)
 		}
 	}
@@ -59,9 +59,61 @@ func TestScheduleRunCostVectors(t *testing.T) {
 		{"glm-5-3", false, 220_453}, {"glm-5-3", true, 250_000},
 		{"kimi-k3", false, 250_000}, {"kimi-k3", true, 250_000},
 	} {
-		if got := scheduleRunCost(v.model, v.search, true); got != v.want {
+		if got := scheduleRunCost(v.model, v.search, true, false); got != v.want {
 			t.Errorf("files %s search=%v: %d, want %d", v.model, v.search, got, v.want)
 		}
+	}
+}
+
+// Reading the sponsor's email (v0.19.0): the same share as stored files, on top, still capped; files and email together
+// get both. The chat's agent-charge.test.ts has the same numbers.
+func TestScheduleRunCostMailVectors(t *testing.T) {
+	for _, v := range []struct {
+		model      string
+		search     bool
+		mail, both int64
+	}{
+		{"deepseek-v4-1-flash", false, 120_000, 170_000}, {"deepseek-v4-1-flash", true, 200_000, 250_000},
+		{"gpt-oss-120b", false, 93_773, 137_216}, {"gpt-oss-120b", true, 160_659, 204_102},
+		{"gemma4-31b", false, 106_459, 153_073}, {"gemma4-31b", true, 179_688, 226_302},
+		{"glm-5-3", false, 220_453, 250_000}, {"glm-5-3", true, 250_000, 250_000},
+		{"kimi-k3", false, 250_000, 250_000}, {"kimi-k3", true, 250_000, 250_000},
+	} {
+		if got := scheduleRunCost(v.model, v.search, false, true); got != v.mail {
+			t.Errorf("mail %s search=%v: %d, want %d", v.model, v.search, got, v.mail)
+		}
+		if got := scheduleRunCost(v.model, v.search, true, true); got != v.both {
+			t.Errorf("files and mail %s search=%v: %d, want %d", v.model, v.search, got, v.both)
+		}
+	}
+}
+
+// A definition that reads email is charged its share only with a mail tool allowed always.
+func TestScheduleChargeWithMail(t *testing.T) {
+	e := newSchedEnv(t)
+	mail := []string{"mail.search", "mail.read", "mail.folders"}
+	d := e.daily(e.me, func(d *trigger.Definition) {
+		d.Models = []string{"deepseek-v4-1-flash"}
+		d.Tools = append([]string{"web.fetch"}, mail...)
+		d.Allow = map[string]string{"web.fetch": safety.PermAlways, "mail.search": safety.PermAlways, "mail.read": safety.PermAlways,
+			"mail.folders": safety.PermAlways}
+		d.NotAfter = time.Date(2027, 1, 19, 9, 0, 0, 0, time.UTC)
+	})
+	if got, want := scheduleCharge(&d), "v1 "+d.Agent+" daily=120000 once=0 until=2027-01-19"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+	for _, m := range mail {
+		d.Allow[m] = safety.PermNever
+	}
+	if got, want := scheduleCharge(&d), "v1 "+d.Agent+" daily=70000 once=0 until=2027-01-19"; got != want {
+		t.Fatalf("never: got %q, want %q", got, want)
+	}
+	for _, m := range mail {
+		d.Allow[m] = safety.PermAlways
+	}
+	d.Files = []proto.StoredFile{{Object: "ob_aaaaaaaaaaaaaaaaaaaaaaaaaa"}}
+	if got, want := scheduleCharge(&d), "v1 "+d.Agent+" daily=170000 once=0 until=2027-01-19"; got != want {
+		t.Fatalf("with files: got %q, want %q", got, want)
 	}
 }
 

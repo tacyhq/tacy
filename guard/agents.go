@@ -55,6 +55,10 @@ type AgentDef struct {
 	// Searches and Reads cap the web searches and page reads a task sends out (0: no cap of its own).
 	Searches int `json:"searches,omitzero"`
 	Reads    int `json:"reads,omitzero"`
+	// MailSearches and MailReads cap the mail searches and message reads a task makes (mail.go; 0: no cap of its
+	// own). Only the agents that may read mail have them (the chat on request, schedules).
+	MailSearches int `json:"mail_searches,omitzero"`
+	MailReads    int `json:"mail_reads,omitzero"`
 	// Work is the running time a task may use (time waiting for its person doesn't count); Overall its deadline from
 	// the start, waits included.
 	Work    time.Duration `json:"work"`
@@ -93,7 +97,7 @@ type AgentDef struct {
 // There are no signed agent definitions yet: its digest stays "unsigned", as before.
 var chatDef = AgentDef{ID: AgentChat, Version: "1", Tools: allTools, Steps: maxSteps, Work: RunTimeout,
 	Run:    safety.Limits{Tokens: 8_000_000, ToolCalls: 64, WallSeconds: int64(RunTimeout / time.Second), CostMicros: 20_000_000},
-	Extras: true}
+	Extras: true, MailSearches: 10, MailReads: 20}
 
 // researchDef is a_research (docs/30, "The built-in agents"): a plan of 3-6 sub-questions, searches and page
 // reads through the quarantined reader, and a cited brief. No image search; no site icons or card pictures.
@@ -129,7 +133,10 @@ var scheduledDef = AgentDef{ID: AgentScheduled, Version: "1", Tools: []string{"w
 	FinalReserve: 30_000,
 	// A definition with stored files (branch files-vm-read) reads them as research reads the person's files, at most
 	// scheduledFileParts parts; one without has no files tools.
-	Files: true, FilesOptional: true, FileParts: scheduledFileParts}
+	Files: true, FilesOptional: true, FileParts: scheduledFileParts,
+	// A definition with the mail tools (v0.19.0, mail.go) reads the sponsor's connected account: a morning digest of
+	// unread mail is a few searches and a dozen reads.
+	MailSearches: 6, MailReads: 12}
 
 // scheduledFileParts is the most parts of its stored files a scheduled run reads (about 96,000 characters, about
 // $0.08 of reader calls, inside the run's $0.25).

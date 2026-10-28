@@ -698,13 +698,17 @@ func generate(r *Release) (string, error) {
       - vaultsock:/run/tacy/vault
       - runnersock:/run/tacy/runner
       - state:/state
+      - vaultstate:/vault
 `)
 	args("-dir", "/run/tacy/agent="+agentdUID+":"+gatewaydUID+":0770",
 		"-dir", "/run/tacy/vault="+vaultdUID+":"+gatewaydUID+":0750",
 		"-dir", "/run/tacy/runner="+runnerdUID+":"+agentdUID+":0750",
 		"-remove", "/state/queue.db", "-remove", "/state/queue.db-wal", "-remove", "/state/queue.db-shm",
 		"-remove", "/state/queue.db-journal",
-		"-tree", "/state/agentd="+agentdUID+":"+agentdUID+":0700")
+		"-tree", "/state/agentd="+agentdUID+":"+agentdUID+":0700",
+		// v0.19.0: vaultd's own volume on the encrypted disk (the people's connections, CONNECTIONS.md), its uid only;
+		// no other long-running container mounts it.
+		"-tree", "/vault="+vaultdUID+":"+vaultdUID+":0700")
 	service("agentd", "agentd", agentdUID+":"+agentdUID, false)
 	b.WriteString(`    group_add: ["` + gatewaydUID + `"]
     volumes:
@@ -750,14 +754,17 @@ func generate(r *Release) (string, error) {
 	service("vaultd", "vaultd", vaultdUID+":"+gatewaydUID, false) // primary group: gatewayd's, so its socket is the gateway's to open
 	b.WriteString(`    volumes:
       - vaultsock:/run/tacy/vault
+      - vaultstate:/vault
 `)
 	env(vaultEnv)
-	args(append([]string{"-socket", "/run/tacy/vault/vault.sock", "-gateway-uid", gatewaydUID, "-group-mode"}, safetyArgs()...)...)
+	args(append([]string{"-socket", "/run/tacy/vault/vault.sock", "-gateway-uid", gatewaydUID, "-group-mode",
+		"-conn-file", "/vault/connections.json"}, safetyArgs()...)...)
 	b.WriteString(`volumes:
   state:
   runnersock:
   agentsock:
   vaultsock:
+  vaultstate:
 `)
 	// The verifier's rule (every image by digest, no tag, no build:), on what it will see.
 	if _, err := verifier.ComposeImages(b.String()); err != nil {

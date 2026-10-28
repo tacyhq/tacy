@@ -94,6 +94,9 @@ type ReaderConfig struct {
 	// ResearchFiles: the reader of a research task's file parts (files.go, v0.13.x): its own question-led prompt
 	// (readerResearchFilesSystem), no items.
 	ResearchFiles bool
+	// Mail: the reader of email (mail.go, v0.19.0): a message, or a search's headers; its own prompt
+	// (readerMailSystem), no items.
+	Mail bool
 }
 
 // DefaultReader is the release's reader (docs/27 section 5): deepseek-v4-1-flash with thinking off, gpt-oss-120b at
@@ -234,6 +237,10 @@ func readerReserve(action string, allows func(model string) bool) (tokens, cost 
 		}
 	case "files.read":
 		calls, doc = maxSectionsPerRead, maxSectionRunes
+	case MailSearchAction:
+		doc = mailListRunes
+	case MailReadAction:
+		doc = mailTextRunes + 600
 	default:
 		return 0, 0, false
 	}
@@ -258,6 +265,10 @@ func ReaderCallMax(action string) (prompt, completion int64) {
 		doc = maxSearchDocRunes
 	case "files.read":
 		doc, completion = crossMaxRunes, crossMaxOut
+	case MailSearchAction:
+		doc = mailListRunes
+	case MailReadAction:
+		doc = mailTextRunes + 600
 	}
 	return readerCallMax(doc), completion
 }
@@ -270,7 +281,7 @@ func readerCallMax(doc int) int64 {
 
 // readerSystemBytes is the longer of the reader's prompts.
 var readerSystemBytes = max(len(readerSystem), len(readerSpansSystem)+16, len(readerItemsSystem)+16, len(readerFilesSystem)+16,
-	len(readerCrossSystem)+16, len(readerResearchFilesSystem)+16)
+	len(readerCrossSystem)+16, len(readerResearchFilesSystem)+16, len(readerMailSystem)+16)
 
 // ReaderUse is one reader call as the activity record and the budget see it: numbers and fixed words only.
 type ReaderUse struct {
@@ -345,7 +356,7 @@ var readerMembers = []string{"summary", "facts", "entities", "dates", "amounts",
 
 // items: the answer has the items list (quotes by reference, unless NoItems).
 func (rc *ReaderConfig) items() bool {
-	return rc.Spans && !rc.NoItems && !rc.Files && !rc.ResearchFiles
+	return rc.Spans && !rc.NoItems && !rc.Files && !rc.ResearchFiles && !rc.Mail
 }
 
 // members are the answer's members for rc.
@@ -492,6 +503,9 @@ func (rc *ReaderConfig) system() string {
 		return readerSystem
 	}
 	facts, quotes, spans := rc.caps()
+	if rc.Mail {
+		return fmt.Sprintf(readerMailSystem, facts, quotes, spans)
+	}
 	if rc.Files && rc.Cross {
 		return fmt.Sprintf(readerCrossSystem, facts, quotes, spans)
 	}
@@ -573,7 +587,7 @@ type keptQuote struct {
 // segments is what quotes are matched against (and verbatim copies looked for): the page's text, or each search
 // result's title and snippet. With quotes by reference a page is two: its title and its text.
 func (d *readerDoc) segments(spans bool) []string {
-	if d.kind == "page" || d.kind == "file" {
+	if d.kind == "page" || d.kind == "file" || d.kind == "mail" {
 		if spans {
 			return []string{d.title, d.text}
 		}
@@ -756,6 +770,10 @@ func (d *readerDoc) prompt(question string, spans []span) string {
 		default:
 			b.WriteString("Kind: one part of a file the person attached for review (the file's name and the part are the first line of the document; a \"Continues under\" line after it, when there is one, gives the file's headings above where the part starts)\n")
 		}
+	case "mail":
+		b.WriteString("Kind: one email message from the person's own mailbox (its Subject and From lines are the first line of the document, then its text)\n")
+	case "mail_list":
+		fmt.Fprintf(&b, "Kind: email headers (%d messages from the person's own mailbox, newest first), labelled R1, R2, ...\n", len(d.results))
 	default:
 		fmt.Fprintf(&b, "Kind: search results (%d), labelled R1, R2, ...\n", len(d.results))
 	}
@@ -772,6 +790,8 @@ func (d *readerDoc) prompt(question string, spans []span) string {
 		fmt.Fprintf(&b, "Title: %s\nAddress: %s\n\n%s", text(0), d.url, text(1))
 	case "file":
 		fmt.Fprintf(&b, "File: %s\n\n%s", text(0), text(1))
+	case "mail":
+		fmt.Fprintf(&b, "%s\n\n%s", text(0), text(1))
 	default:
 		for i := range d.results {
 			fmt.Fprintf(&b, "R%d. %s\n\n", i+1, text(i))
@@ -789,6 +809,9 @@ func (d *readerDoc) prompt(question string, spans []span) string {
 // result read, as it is (from that call's goroutine), before the others are done.
 func (g *Guard) read(ctx context.Context, t *task, step int, d *readerDoc, onPart func(result int, r *readerResult)) *readerResult {
 	rc := g.cfg.Reader
+	if d.kind == "mail" || d.kind == "mail_list" {
+		rc = g.mailReader()
+	}
 	// The sources read before this one are cut against too; then this one joins them.
 	d.earlier, d.earlierSkel = t.sources.before()
 	runs, skel := t.sources.add(d.segments(rc.Spans))
@@ -903,9 +926,19 @@ func (g *Guard) readOne(ctx context.Context, t *task, step int, rc *ReaderConfig
 // blankRead: a page with at least blankReadRunes of text came back without a summary or a fact (at most an item, a
 // quote or a wording line: nothing to say what the page says).
 func blankRead(d *readerDoc, r *readerResult) bool {
-	return d.kind == "page" && r.out != nil && utf8.RuneCountInString(d.text) >= blankReadRunes && strings.TrimSpace(r.out.Summary) == "" &&
-		len(r.out.Facts) == 0
+	least := blankReadRunes
+	switch d.kind {
+	case "page":
+	case "mail": // an email is often a few lines (mail lab round 4: a blank answer for a 120-character message)
+		least = blankMailRunes
+	default:
+		return false
+	}
+	return r.out != nil && utf8.RuneCountInString(d.text) >= least && strings.TrimSpace(r.out.Summary) == "" && len(r.out.Facts) == 0
 }
+
+// blankMailRunes: an email shorter than this may truly say nothing (a "thanks!").
+const blankMailRunes = 40
 
 // blankReadRunes: below this a page may truly have nothing to say (a title and a cookie line).
 const blankReadRunes = 400
@@ -1270,7 +1303,7 @@ func checkAnswer(rc *ReaderConfig, d *readerDoc, segs []string, spans []span, ou
 				continue
 			}
 		}
-		if d.kind == "page" || d.kind == "file" {
+		if d.kind == "page" || d.kind == "file" || d.kind == "mail" {
 			seg = -1
 		}
 		res.quotes = append(res.quotes, keptQuote{local: q.ID, location: q.Location, topic: q.Topic, text: exact, result: seg})
@@ -1328,7 +1361,7 @@ func alignClause(loc string, from, to int, segs []string, spans []span, most int
 
 // sources is how many sources a document has for items to name: its search results, or 1 (a page).
 func (d *readerDoc) sources() int {
-	if d.kind == "search" {
+	if d.kind == "search" || d.kind == "mail_list" {
 		return len(d.results)
 	}
 	return 1

@@ -72,7 +72,7 @@ var web = &http.Client{Timeout: 30 * time.Second}
 
 func get(ctx context.Context, url string) ([]byte, error) {
 	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
-	req.Header.Set("User-Agent", "sealed-agent-vm/0.1")
+	req.Header.Set("User-Agent", "Tacy/1.0")
 	res, err := web.Do(req)
 	if err != nil {
 		return nil, err

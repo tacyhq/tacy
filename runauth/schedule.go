@@ -32,6 +32,11 @@ const (
 	ResultsDeleteLabel = "tacy/v2/schedule-results-delete"
 	// NotifyLabel: turning run notifications on or off for the space (app/notify.go); own item "on" or "off".
 	NotifyLabel = "tacy/v2/notify-set"
+	// Connections (app/connections.go, CONNECTIONS.md, v0.19.0): list (no own items), put (the connection, then the
+	// hex SHA-256 of the sealed box's enc ‖ ct) and remove (the connection).
+	ConnListLabel   = "tacy/v2/connection-list"
+	ConnPutLabel    = "tacy/v2/connection-put"
+	ConnRemoveLabel = "tacy/v2/connection-remove"
 )
 
 // Where is a schedule call's where and who, as a run request has them (the JSON field names are the run's).

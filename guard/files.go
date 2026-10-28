@@ -181,6 +181,9 @@ func toolAction(name string) string {
 	if name == documentTool {
 		return DocumentAction
 	}
+	if a := mailToolAction(name); a != "" {
+		return a
+	}
 	return webAction(name)
 }
 
@@ -193,6 +196,9 @@ func toolName(action string) string {
 	}
 	if action == DocumentAction {
 		return documentTool
+	}
+	if n := mailToolName(action); n != "" {
+		return n
 	}
 	return appTool(action)
 }

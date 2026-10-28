@@ -88,6 +88,7 @@ import (
 	"github.com/tacyhq/tacy/runner"
 	"github.com/tacyhq/tacy/safety"
 	"github.com/tacyhq/tacy/trigger"
+	"github.com/tacyhq/tacy/vault"
 )
 
 type server struct {
@@ -495,10 +496,18 @@ func main() {
 		searchName = search.Name()
 		fetcher := guard.NewFetcher(*devFetchAny)
 		reader := guard.DefaultReader // the quarantined reader, as in gatewayd
+		// Connections in this process's memory (no vaultd here): a local run's email account lasts until it stops.
+		lv, err := vault.New(nil, nil, nil)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if err := lv.EnableConns(""); err != nil {
+			log.Fatal(err)
+		}
 		gw = guard.New(guard.Config{Up: up, Search: search, Fetcher: fetcher, Reader: &reader,
 			Icons:  fetcher, // site icons go through the same guarded client (guard/favicons.go)
 			Limits: &lim, CacheSecret: randomHex(32), Now: func() time.Time { return time.Now().UTC() }, Safety: st,
-			Stored: guard.NewStoredConfig()})
+			Stored: guard.NewStoredConfig(), Mail: &guard.MailConfig{Vault: vault.Local{V: lv}}})
 	}
 	sg := newSafeGateway(gw, st, &safety.Ledger{Dir: safetyDir})
 	sg.firstHeard = 20 * time.Second
@@ -689,6 +698,7 @@ func main() {
 	s.searchRoutes(mux, id)
 	s.step7Routes(mux, id)
 	s.scheduleRoutes(mux, id)                                    // schedules for personal spaces (schedules.go, SCHEDULES.md)
+	s.connectionRoutes(mux, id)                                  // Settings → Connections (connections.go, CONNECTIONS.md)
 	s.notifyRoutes(mux, id)                                      // run notifications (notify.go, SCHEDULES.md)
 	mux.HandleFunc("POST /schedules/handoff", s.scheduleHandoff) // sealed results to the relay (handoff.go, SCHEDULES.md)
 	mux.HandleFunc("GET /activity", s.activityOut)               // sealed activity records, for the relay (docs/24)

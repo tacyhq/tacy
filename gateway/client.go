@@ -78,6 +78,29 @@ func (c *Client) PushDocs(ctx context.Context, docs []safety.Envelope) error {
 	return nil
 }
 
+// Conn passes a Settings → Connections call to gatewayd (guard.Connections): a connection's only frame, one result.
+// The sealed box inside a put stays sealed here (only vaultd opens it).
+func (c *Client) Conn(ctx context.Context, r *guard.ConnRequest) *guard.ConnResult {
+	fail := &guard.ConnResult{Error: &guard.ConnError{Code: "unavailable", Detail: "the gateway didn't answer"}}
+	var d net.Dialer
+	nc, err := d.DialContext(ctx, "unix", c.Path)
+	if err != nil {
+		return fail
+	}
+	defer nc.Close()
+	nc.SetDeadline(time.Now().Add(90 * time.Second)) // a put's test login: connect, TLS, login, list
+	if err := writeFrame(nc, &frame{T: tConn, Version: Version, Conn: r}); err != nil {
+		return fail
+	}
+	var f frame
+	if err := readFrame(nc, &f); err != nil || f.T != tResult || f.ConnResult == nil {
+		return fail
+	}
+	return f.ConnResult
+}
+
+var _ guard.Connections = (*Client)(nil)
+
 // ReplaySafe: as the guard's (it depends on the request only).
 func (c *Client) ReplaySafe(_ *harness.TaskInfo, req any) bool { return guard.ReplaySafe(req) }
 

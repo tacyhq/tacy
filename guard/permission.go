@@ -63,14 +63,17 @@ const maxGrantValue = 2000
 // actions, each its own kind (web search, page reading, image search). Set here, in the release; never by a model or
 // a policy.
 func PermissionKind(action string) string {
-	if appTool(action) != "" {
+	if appTool(action) != "" || isMailAction(action) {
 		return action
 	}
 	return ""
 }
 
-// PermissionKinds are the kinds this release has.
-func PermissionKinds() []string { return []string{"web.search", "web.fetch", "web.images"} }
+// PermissionKinds are the kinds this release has (the mail connector's since v0.19.0: what goes to the person's own
+// mail server).
+func PermissionKinds() []string {
+	return []string{"web.search", "web.fetch", "web.images", MailSearchAction, MailReadAction, MailFoldersAction}
+}
 
 // AllowAll is a run's settings with every kind on Always allow: for the operator's own tools (cmd/client, cmd/e2e,
 // the load test), which run no person's chat and can't answer prompts. People's runs carry their own.
@@ -91,6 +94,12 @@ func kindLabel(kind string) string {
 		return "page reading"
 	case "web.images":
 		return "image search"
+	case MailSearchAction:
+		return "mail search"
+	case MailReadAction:
+		return "mail reading"
+	case MailFoldersAction:
+		return "mail folder listing"
 	}
 	return kind
 }
@@ -143,6 +152,9 @@ func fetchURLArg(args []byte) (string, bool) {
 // task's source it names ("[n]", from sources). ok is false when the arguments are unusable (the connector refuses
 // them without sending anything), a [n] the task doesn't have included.
 func Outgoing(action string, args []byte, sources map[int]string) (value string, ok bool) {
+	if isMailAction(action) {
+		return mailOutgoing(action, args)
+	}
 	switch appTool(action) {
 	case "web_search", "image_search":
 		var a struct {
@@ -368,6 +380,10 @@ func PermissionDenial(kind, outcome string) *harness.ActionResult {
 		return &harness.ActionResult{Status: harness.ActionDenied, Error: NotFromResultsError}
 	}
 	what := kindLabel(kind)
+	checked := "didn't check the web for this"
+	if isMailAction(kind) {
+		checked = "didn't look in their email for this"
+	}
 	var why string
 	switch outcome {
 	case PermDenied:
@@ -384,5 +400,5 @@ func PermissionDenial(kind, outcome string) *harness.ActionResult {
 		why = "no valid permission from the person for this " + what
 	}
 	return &harness.ActionResult{Status: harness.ActionDenied,
-		Error: "permission_denied: " + why + "; nothing was sent. Answer without it, and say plainly that you didn't check the web for this."}
+		Error: "permission_denied: " + why + "; nothing was sent. Answer without it, and say plainly that you " + checked + "."}
 }

@@ -62,6 +62,9 @@ type Config struct {
 	Approvals *ApprovalCheck
 	// Stored reads the person's stored files (stored.go); nil: a task with stored files can't open them.
 	Stored *StoredConfig
+	// Mail reads the person's connected email account (mail.go) and serves Settings → Connections; nil: mail tools
+	// answer that mail isn't available here.
+	Mail *MailConfig
 }
 
 // Guard is a harness.Guard: the runtime's Runtime.Guard. Run serves one chat request on a runtime with it.
@@ -253,6 +256,7 @@ type task struct {
 	sent map[string]int
 
 	files filesState // a review task's files and which sections were read (files.go)
+	mail  mailState  // the message ids the task's mail searches handed out (mail.go)
 	// texted: the task's model wrote text people saw (guarded by emitMu)
 	texted bool
 }
@@ -266,6 +270,10 @@ func (t *task) takeCap(action string) (int, bool) {
 		limit = t.def.Searches
 	case "web.fetch":
 		limit = t.def.Reads
+	case MailSearchAction:
+		limit = t.def.MailSearches
+	case MailReadAction:
+		limit = t.def.MailReads
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -366,7 +374,8 @@ func ReplaySafe(req any) bool {
 		// document.create (nothing sent or changed)
 		// files.fetch is never a brain's action: the guard's own read of a stored file's ciphertext (stored.go), checked
 		// as a read (it goes on while the stop list is stale, as the files.read that needs it does).
-		return appTool(b.Name) != "" || isFilesAction(b.Name) || IsNoChangeAction(b.Name) || isDocumentAction(b.Name) || b.Name == storedFetchAction
+		return appTool(b.Name) != "" || isFilesAction(b.Name) || IsNoChangeAction(b.Name) || isDocumentAction(b.Name) || b.Name == storedFetchAction ||
+			isMailAction(b.Name) // read-only: EXAMINE, SEARCH, FETCH with BODY.PEEK (mail.go)
 	}
 	return false
 }
@@ -381,7 +390,7 @@ func (g *Guard) Untrusted(_ *harness.TaskInfo, req any) bool { return Untrusted(
 // isn't: its result is the guard's own check of what the model wrote, nothing from outside.
 func Untrusted(req any) bool {
 	a, ok := req.(*harness.Action)
-	return ok && (appTool(a.Name) != "" || isFilesAction(a.Name)) // a person's file may carry an injection too
+	return ok && (appTool(a.Name) != "" || isFilesAction(a.Name) || isMailAction(a.Name)) // a person's file or mail may carry an injection too
 }
 
 // TaintedAtStart: a task whose input holds an earlier assistant turn is tainted from its start (StartTaint).
@@ -680,6 +689,9 @@ func startFor(r *proto.RunRequest, now time.Time, reader bool) (harness.Start, T
 		if n == documentTool { // only when the request names it (a chat that shows documents: documents.go)
 			a = DocumentAction
 		}
+		if ma := mailToolAction(n); ma != "" { // only when the request names them (a person with a connected account: mail.go)
+			a = ma
+		}
 		if a == "" {
 			return s, TaskOptions{}, fmt.Errorf("unknown tool %q", n)
 		}
@@ -819,6 +831,9 @@ func chatInstructions(actions []string, now time.Time, reader bool) string {
 	}
 	if slices.Contains(actions, DocumentAction) {
 		b.WriteString(chatDocumentLine)
+	}
+	if slices.ContainsFunc(actions, isMailAction) {
+		b.WriteString(mailLine)
 	}
 	if slices.Contains(actions, "web.images") {
 		img := harness.ModelToolName("web.images")

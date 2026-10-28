@@ -64,6 +64,9 @@ func (g *Guard) Action(ctx context.Context, ti *harness.TaskInfo, id string, req
 	if isDocumentAction(req.Name) { // a document for the person's own conversation: nothing goes out (documents.go)
 		return g.documentAction(ctx, ti, id, req)
 	}
+	if isMailAction(req.Name) { // the person's own email account, read-only (mail.go)
+		return g.mailAction(ctx, ti, id, req)
+	}
 	if strings.HasPrefix(req.Name, "sink.") && g.cfg.Sink != nil { // the test-only connector with effects (sink.go)
 		return g.sinkAction(withTask(ctx, ti.ID), ti, id, req)
 	}
@@ -204,7 +207,8 @@ const CapDenied = "agent_cap"
 // capDenial is what the model sees for an action past its agent's cap (limit; -1: an agent this release doesn't
 // have, which may send nothing): nothing was sent, and it should answer from what it has.
 func capDenial(action string, limit int) *harness.ActionResult {
-	what := map[string]string{"web.search": "searches", "web.fetch": "page reads"}[action]
+	what := map[string]string{"web.search": "searches", "web.fetch": "page reads", MailSearchAction: "mail searches",
+		MailReadAction: "message reads"}[action]
 	msg := fmt.Sprintf("%s: this task has used its %d %s; nothing was sent. Don't call this tool again: write your answer now from what you have, and say what you couldn't check.", CapDenied, limit, what)
 	if limit < 0 {
 		msg = CapDenied + ": this task's agent isn't one this VM runs; nothing was sent."

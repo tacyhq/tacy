@@ -1,6 +1,6 @@
 {
   "format": "tacy-golden-crypto-vectors",
-  "note": "Moving a personal space's pinned seal key on the VM (POST /spaces/reseal, VM v0.16.0, poc/05-agent-vm SCHEDULES.md): the where and who for the NEW seal key under tacy/v2/space-reseal, own items the old seal key and base64 of its space proof; body plus old_seal and old_proof. 'forward' is a data key rotation's move; 'back' the move back an interrupted one makes. Made once from v2-schedule.json's fixed seeds (its seal is the old key) and one more fixed seal key with node:crypto (scripts/gen-golden-v2-reseal-vectors.mjs); never regenerate.",
+  "note": "Moving a personal space's pinned seal key on the VM (POST /spaces/reseal, VM v0.16.0, services/agent-vm SCHEDULES.md): the where and who for the NEW seal key under tacy/v2/space-reseal, own items the old seal key and base64 of its space proof; body plus old_seal and old_proof. 'forward' is a data key rotation's move; 'back' the move back an interrupted one makes. Made once from v2-schedule.json's fixed seeds (its seal is the old key) and one more fixed seal key with node:crypto (scripts/gen-golden-v2-reseal-vectors.mjs); never regenerate.",
   "constants": {
     "labels": {
       "spaceProof": "tacy/v2/space-proof",

@@ -1,0 +1,66 @@
+{
+  "format": "tacy-golden-crypto-vectors",
+  "note": "Connection calls (VM v0.19.0, services/agent-vm/CONNECTIONS.md): the email connection sealed to the vault's key (HPKE base mode, info tacy/v2/connection, aad info ‖ 0 ‖ space ‖ 0 ‖ connection, fixed ephemeral key) and the three signed calls. Made once from v2-schedule.json's fixed seeds with node:crypto (scripts/gen-golden-v2-connection-vectors.mjs); never regenerate.",
+  "constants": {
+    "labels": {
+      "spaceProof": "tacy/v2/space-proof",
+      "connectionList": "tacy/v2/connection-list",
+      "connectionPut": "tacy/v2/connection-put",
+      "connectionRemove": "tacy/v2/connection-remove",
+      "connectionSeal": "tacy/v2/connection"
+    }
+  },
+  "vm_private": "7171717171717171717171717171717171717171717171717171717171717171",
+  "vm_public": "ab4f197998fcc56cc6ed68c1d931af9bb522ec00743e181f7330915df4aa3176",
+  "seal": "x25519:zUjQaB6nPwmgD4OFm9EIgN9WgiAZzaPIg+DRUU41sQY=",
+  "seal_private": "7272727272727272727272727272727272727272727272727272727272727272",
+  "space": "s_aebagbafaydqqcikbmga2dqpca",
+  "proof": "zTb+BtQgYYMbLs86VLweygquYWFPiLcuVOZKLV+y+yw=",
+  "identity": {
+    "seed": "7373737373737373737373737373737373737373737373737373737373737373",
+    "id": "i_cahq4dimbmfascahaycqiaycae",
+    "key": "ed25519:/sFChnP2r+iSZLOAc0SuiyadElpQOFUgJofbWnEoV58="
+  },
+  "connection": "email",
+  "vault_private": "7575757575757575757575757575757575757575757575757575757575757575",
+  "ephemeral_private": "7676767676767676767676767676767676767676767676767676767676767676",
+  "plaintext": "{\"type\":\"tacy.connection.email/v1\",\"provider\":\"gmail\",\"host\":\"imap.gmail.com\",\"port\":993,\"security\":\"tls\",\"address\":\"person@example.com\",\"username\":\"person@example.com\",\"password\":\"abcd efgh ijkl mnop\"}",
+  "aad": "dGFjeS92Mi9jb25uZWN0aW9uAHNfYWViYWdiYWZheWRxcWNpa2JtZ2EyZHFwY2EAZW1haWw=",
+  "sealed": {
+    "key": "x25519:Q/J2xIge+m9+ERiqelmx67G/dQwyBjJRCcsPdMaoPwg=",
+    "enc": "bBq3qZ0192YFNiixFZqNRUwTqYBvfydnB3GJrDJliAg=",
+    "ct": "kK1/wD7HaQUWvM0lp0XxI7YJlqsnPBdv84u8dfxGCi855/Q7VISMMrOuvd7AH2mcQWd4uZDZL1rt4bbo6shpon8ncDlDGcSrI7m6Xp2zarcvqcEqXhlKxwL2ocuzhD1LeQooZmxO5eUIcPPwbG0PRYMGmt2UFmV032lEovSRjNZZE9CUkC2wx6ueUxAn+ATRwLXmBu2kPAnc+cHvmMFk97QLx8PU5DsmPWmKxSjjP3DHe+svQWeaY4qXIEBg+DjmsVx9n/Eo4ueqT1tkJe9jGSl41FR3A3QYW78="
+  },
+  "box_sha256": "37b749b338cfca18630137026bfc6d86b3a984db26e3d7eabce44816244df7da",
+  "calls": [
+    {
+      "name": "list",
+      "call": "list",
+      "label": "tacy/v2/connection-list",
+      "own": [],
+      "body": "{\"space\":\"s_aebagbafaydqqcikbmga2dqpca\",\"space_seal\":\"x25519:zUjQaB6nPwmgD4OFm9EIgN9WgiAZzaPIg+DRUU41sQY=\",\"identity\":\"i_cahq4dimbmfascahaycqiaycae\",\"identity_key\":\"ed25519:/sFChnP2r+iSZLOAc0SuiyadElpQOFUgJofbWnEoV58=\",\"nonce\":\"61616161616161616161616161616161\",\"signed_at\":1792000200,\"space_proof\":\"zTb+BtQgYYMbLs86VLweygquYWFPiLcuVOZKLV+y+yw=\",\"identity_sig\":\"Gh92swBFjTyVguwhKxMg57E+dJQlz5VMF7MfBqOdASpqLo92Mh7Iqzf1+mQLKgZfPl0344eF97EGy3ZAfeK/AA==\"}",
+      "digest": "980b4c4b40e797c3d1563b9e4ac5884de635ce0f7a88ed585475c531b8abaa42"
+    },
+    {
+      "name": "put",
+      "call": "put",
+      "label": "tacy/v2/connection-put",
+      "own": [
+        "email",
+        "37b749b338cfca18630137026bfc6d86b3a984db26e3d7eabce44816244df7da"
+      ],
+      "body": "{\"connection\":\"email\",\"sealed\":{\"key\":\"x25519:Q/J2xIge+m9+ERiqelmx67G/dQwyBjJRCcsPdMaoPwg=\",\"enc\":\"bBq3qZ0192YFNiixFZqNRUwTqYBvfydnB3GJrDJliAg=\",\"ct\":\"kK1/wD7HaQUWvM0lp0XxI7YJlqsnPBdv84u8dfxGCi855/Q7VISMMrOuvd7AH2mcQWd4uZDZL1rt4bbo6shpon8ncDlDGcSrI7m6Xp2zarcvqcEqXhlKxwL2ocuzhD1LeQooZmxO5eUIcPPwbG0PRYMGmt2UFmV032lEovSRjNZZE9CUkC2wx6ueUxAn+ATRwLXmBu2kPAnc+cHvmMFk97QLx8PU5DsmPWmKxSjjP3DHe+svQWeaY4qXIEBg+DjmsVx9n/Eo4ueqT1tkJe9jGSl41FR3A3QYW78=\"},\"space\":\"s_aebagbafaydqqcikbmga2dqpca\",\"space_seal\":\"x25519:zUjQaB6nPwmgD4OFm9EIgN9WgiAZzaPIg+DRUU41sQY=\",\"identity\":\"i_cahq4dimbmfascahaycqiaycae\",\"identity_key\":\"ed25519:/sFChnP2r+iSZLOAc0SuiyadElpQOFUgJofbWnEoV58=\",\"nonce\":\"62626262626262626262626262626262\",\"signed_at\":1792000201,\"space_proof\":\"zTb+BtQgYYMbLs86VLweygquYWFPiLcuVOZKLV+y+yw=\",\"identity_sig\":\"xpQQRw8bRvH3lgl2UJauAf3Da7iSJMrcPLlSsx67Ef4rHfB6fMFn8VeocXU4UHeCmxd/hKRqNzEoubrMMJZRBQ==\"}",
+      "digest": "668021f5ff5449337e49cb283c9ff5ac4a18f1f975c704ed811e4fec378d45da"
+    },
+    {
+      "name": "remove",
+      "call": "remove",
+      "label": "tacy/v2/connection-remove",
+      "own": [
+        "email"
+      ],
+      "body": "{\"connection\":\"email\",\"space\":\"s_aebagbafaydqqcikbmga2dqpca\",\"space_seal\":\"x25519:zUjQaB6nPwmgD4OFm9EIgN9WgiAZzaPIg+DRUU41sQY=\",\"identity\":\"i_cahq4dimbmfascahaycqiaycae\",\"identity_key\":\"ed25519:/sFChnP2r+iSZLOAc0SuiyadElpQOFUgJofbWnEoV58=\",\"nonce\":\"63636363636363636363636363636363\",\"signed_at\":1792000202,\"space_proof\":\"zTb+BtQgYYMbLs86VLweygquYWFPiLcuVOZKLV+y+yw=\",\"identity_sig\":\"HzMhRPBSDih4KgY/f1VeH+sJbzDr9RhyJ44XLCH4O+R26H+ME1cK8E3oMj++yI2l6XYPJ4x0FCrILUDvHHP0AA==\"}",
+      "digest": "11a3f125880ca66503945b9c54212daa9ac776720f605ff252cd2ba173079806"
+    }
+  ]
+}

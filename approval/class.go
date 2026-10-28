@@ -44,11 +44,16 @@ var classes = map[string]Class{
 	// the run's encrypted result; nothing leaves, nothing changes. Missing here it would be a Send, and every document
 	// would wait for an approval nobody can give on a personal space (the v0.13.0 lesson; approval_test.go).
 	"document.create": Read,
-	"sink.post":       Send,
-	"sink.put":        Change,
-	"task.spawn":      Read,
-	"task.wait":       Read,
-	"person.ask":      Read,
+	// The person's own email account, read by IMAP with nothing changed (guard/mail.go, v0.19.0): what goes out is
+	// the search words, a message's number or a folder listing, to their own mail server. A permission prompt, not an approval.
+	"mail.search":  ReadOut,
+	"mail.read":    ReadOut,
+	"mail.folders": ReadOut,
+	"sink.post":    Send,
+	"sink.put":     Change,
+	"task.spawn":   Read,
+	"task.wait":    Read,
+	"person.ask":   Read,
 }
 
 // ClassOf is an action's class. An action the release doesn't know is a Send: unknown means it may send (fail

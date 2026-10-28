@@ -304,12 +304,17 @@ func Personal(d *Definition, space, seal, who string) error {
 	}
 	for _, t := range d.Tools {
 		// document.create: its result as a document in the person's own conversation, nothing sent (guard/documents.go).
-		if t != "web.fetch" && t != "web.search" && t != "web.images" && t != "document.create" {
-			return fmt.Errorf("tool %s isn't one a personal schedule may use (web.fetch, web.search, web.images, document.create)", t)
+		// mail.*: the sponsor's own connected email account, read-only (guard/mail.go, v0.19.0).
+		if !slices.Contains(PersonalTools, t) {
+			return fmt.Errorf("tool %s isn't one a personal schedule may use (%s)", t, strings.Join(PersonalTools, ", "))
 		}
 	}
 	return nil
 }
+
+// PersonalTools are the tools a personal schedule may use: web reads, a document for the person, and (v0.19.0) the
+// person's own email, read-only.
+var PersonalTools = []string{"web.fetch", "web.search", "web.images", "document.create", "mail.search", "mail.read", "mail.folders"}
 
 // Steps is the definition's step limit (its max_steps, else 6).
 func (d *Definition) Steps() int {

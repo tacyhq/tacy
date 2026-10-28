@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/tacyhq/tacy/keylog"
@@ -28,6 +29,13 @@ type reply struct {
 	Lease string   `json:"lease,omitzero"`
 	Names []string `json:"names,omitzero"` // a names request's answer
 	Error string   `json:"error,omitzero"`
+	// Connections (conn.go): the seal key, a pending id, one connection's info or a space's list, and an error's
+	// detail (which field of a sealed box was wrong; never a value).
+	Key     string     `json:"key,omitzero"`
+	Pending string     `json:"pending,omitzero"`
+	Info    *ConnInfo  `json:"info,omitzero"`
+	Infos   []ConnInfo `json:"infos,omitzero"`
+	Detail  string     `json:"detail,omitzero"`
 }
 
 func writeFrame(w io.Writer, v any) error {
@@ -141,6 +149,8 @@ func (v *Vault) serveConn(c net.Conn, peerUID int) {
 						s.Policy, s.OperatorSeq, s.FirmSeq)})
 				}
 			}
+		case "conn_key", "conn_put", "conn_commit", "conn_discard", "conn_get", "conn_list", "conn_remove":
+			rep = v.connOp(r)
 		default:
 			return // unknown op: closed, like any malformed frame
 		}
@@ -151,6 +161,161 @@ func (v *Vault) serveConn(c net.Conn, peerUID int) {
 			return
 		}
 	}
+}
+
+// connOp answers a connection op (conn.go). A request carries only the fields its op needs.
+func (v *Vault) connOp(r Request) reply {
+	fail := func(err error) reply {
+		rep := reply{Error: err.Error()}
+		for _, k := range connKnown {
+			if errors.Is(err, k) {
+				rep.Error = k.Error()
+				if d, ok := strings.CutPrefix(err.Error(), k.Error()+": "); ok {
+					rep.Detail = d
+				}
+			}
+		}
+		return rep
+	}
+	extra := r.Secret != "" || r.Connector != "" || r.Host != "" || r.Task != "" || r.Action != "" || r.Effect || len(r.Docs) > 0
+	if extra {
+		return reply{Error: ErrBadRequest.Error()}
+	}
+	switch r.Op {
+	case "conn_key":
+		if k := v.SealKey(); k != "" {
+			return reply{Key: k}
+		}
+		return reply{Error: ErrNoConn.Error()}
+	case "conn_put":
+		if r.Sealed == nil {
+			return reply{Error: ErrBadRequest.Error()}
+		}
+		pid, info, err := v.ConnPut(r.Space, r.Conn, *r.Sealed)
+		if err != nil {
+			return fail(err)
+		}
+		return reply{Pending: pid, Info: &info}
+	case "conn_commit":
+		info, err := v.ConnCommit(r.Pending)
+		if err != nil {
+			return fail(err)
+		}
+		return reply{Info: &info}
+	case "conn_discard":
+		v.ConnDiscard(r.Pending)
+		return reply{}
+	case "conn_get":
+		info, err := v.ConnGet(r.Space, r.Conn)
+		if err != nil {
+			return fail(err)
+		}
+		return reply{Info: &info}
+	case "conn_list":
+		return reply{Infos: v.ConnList(r.Space), Key: v.SealKey()}
+	case "conn_remove":
+		if err := v.ConnRemove(r.Space, r.Conn); err != nil {
+			return fail(err)
+		}
+		return reply{}
+	}
+	return reply{Error: ErrBadRequest.Error()}
+}
+
+// ConnError is a connection op's refusal over the wire: one of the vault's errors (errors.Is works) and its detail.
+type ConnError struct {
+	Err    error
+	Detail string
+}
+
+func (e *ConnError) Error() string {
+	if e.Detail != "" {
+		return e.Err.Error() + ": " + e.Detail
+	}
+	return e.Err.Error()
+}
+func (e *ConnError) Unwrap() error { return e.Err }
+
+func (c *Client) conn(ctx context.Context, r Request) (*reply, error) {
+	var rep reply
+	if err := c.do(ctx, r, &rep); err != nil {
+		return nil, err
+	}
+	if rep.Error != "" {
+		for _, k := range known {
+			if rep.Error == k.Error() {
+				return nil, &ConnError{Err: k, Detail: rep.Detail}
+			}
+		}
+		return nil, errors.New("vault: refused")
+	}
+	return &rep, nil
+}
+
+// SealKey is the vault's connection seal key for this boot.
+func (c *Client) SealKey(ctx context.Context) (string, error) {
+	rep, err := c.conn(ctx, Request{Op: "conn_key"})
+	if err != nil {
+		return "", err
+	}
+	return rep.Key, nil
+}
+
+// ConnPut has the vault open a sealed connection and hold it pending.
+func (c *Client) ConnPut(ctx context.Context, space, id string, s Sealed) (string, ConnInfo, error) {
+	rep, err := c.conn(ctx, Request{Op: "conn_put", Space: space, Conn: id, Sealed: &s})
+	if err != nil {
+		return "", ConnInfo{}, err
+	}
+	if rep.Info == nil || rep.Pending == "" {
+		return "", ConnInfo{}, errors.New("vault: empty reply")
+	}
+	return rep.Pending, *rep.Info, nil
+}
+
+// ConnCommit keeps a pending connection.
+func (c *Client) ConnCommit(ctx context.Context, pending string) (ConnInfo, error) {
+	rep, err := c.conn(ctx, Request{Op: "conn_commit", Pending: pending})
+	if err != nil {
+		return ConnInfo{}, err
+	}
+	if rep.Info == nil {
+		return ConnInfo{}, errors.New("vault: empty reply")
+	}
+	return *rep.Info, nil
+}
+
+// ConnDiscard drops a pending connection.
+func (c *Client) ConnDiscard(ctx context.Context, pending string) error {
+	_, err := c.conn(ctx, Request{Op: "conn_discard", Pending: pending})
+	return err
+}
+
+// ConnGet is a space's connection's info.
+func (c *Client) ConnGet(ctx context.Context, space, id string) (ConnInfo, error) {
+	rep, err := c.conn(ctx, Request{Op: "conn_get", Space: space, Conn: id})
+	if err != nil {
+		return ConnInfo{}, err
+	}
+	if rep.Info == nil {
+		return ConnInfo{}, errors.New("vault: empty reply")
+	}
+	return *rep.Info, nil
+}
+
+// ConnList is a space's connections and the seal key.
+func (c *Client) ConnList(ctx context.Context, space string) ([]ConnInfo, string, error) {
+	rep, err := c.conn(ctx, Request{Op: "conn_list", Space: space})
+	if err != nil {
+		return nil, "", err
+	}
+	return rep.Infos, rep.Key, nil
+}
+
+// ConnRemove forgets a space's connection.
+func (c *Client) ConnRemove(ctx context.Context, space, id string) error {
+	_, err := c.conn(ctx, Request{Op: "conn_remove", Space: space, Conn: id})
+	return err
 }
 
 // Client is the gateway's side: one short connection per lease, so a gateway restart or a vault restart needs

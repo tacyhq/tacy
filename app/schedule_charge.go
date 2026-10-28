@@ -52,7 +52,15 @@ const (
 	// digest with files runs there.
 	scheduleFilesModel = 10_000
 	scheduleFilesFixed = 40_000
+	// A definition that reads the sponsor's email (v0.19.0, CONNECTIONS.md "Scheduled tasks": any mail tool allowed
+	// always) adds the quarantined reader on the mail it opens (at most 6 searches' headers and 12 messages) and the
+	// acting model reading what it found: the same estimate as stored files, on top of them.
+	scheduleMailModel = 10_000
+	scheduleMailFixed = 40_000
 )
+
+// scheduleMailActions are the tools that count as reading email.
+var scheduleMailActions = []string{"mail.search", "mail.read", "mail.folders"}
 
 // scheduleWeight is a model's price for a typical step (2,048 prompt and 1,500 completion tokens), in whole units of
 // the price table: what a schedule's model share is scaled by.
@@ -62,14 +70,17 @@ func scheduleWeight(model string) int64 {
 }
 
 // scheduleRunCost is one run's expected cost on model (the dearest the schedule names), µ$, in integers: whether it
-// may search, and whether it reads stored files (files).
-func scheduleRunCost(model string, search, files bool) int64 {
+// may search, whether it reads stored files (files), and whether it reads email (mail).
+func scheduleRunCost(model string, search, files, mail bool) int64 {
 	share, fixed := int64(scheduleReadModel), int64(scheduleReadFixed)
 	if search {
 		share, fixed = scheduleSearchModel, scheduleSearchFixed
 	}
 	if files {
 		share, fixed = share+scheduleFilesModel, fixed+scheduleFilesFixed
+	}
+	if mail {
+		share, fixed = share+scheduleMailModel, fixed+scheduleMailFixed
 	}
 	w, base := scheduleWeight(model), scheduleWeight(scheduleMeasuredModel)
 	return min(scheduleRunCap, fixed+(share*w+base-1)/base)
@@ -99,7 +110,8 @@ func scheduleCharge(d *trigger.Definition) string {
 		}
 	}
 	search := slices.Contains(d.Tools, "web.search") && d.Allow["web.search"] == "always"
-	run := scheduleRunCost(model, search, len(d.Files) > 0)
+	mail := slices.ContainsFunc(scheduleMailActions, func(a string) bool { return slices.Contains(d.Tools, a) && d.Allow[a] == "always" })
+	run := scheduleRunCost(model, search, len(d.Files) > 0, mail)
 	return fmt.Sprintf("v1 %s daily=%d once=%d until=%s", d.Agent, (run*week+6)/7, run*once, d.NotAfter.UTC().Format(time.DateOnly))
 }
 

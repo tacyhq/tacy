@@ -48,6 +48,11 @@ func ChatRelease(firm, tinfoilHost string, models []string, runSeconds int64) *P
 			// A notify-changes schedule's "nothing changed" (guard/schedule.go): no host, nothing sent; it marks
 			// only the run's own result quiet.
 			"schedule": {Tools: []string{"schedule.no_change"}, Hosts: []string{}},
+			// The person's own email account, read by IMAP (guard/mail.go, v0.19.0, CONNECTIONS.md): read-only tools;
+			// its password (a connection the person sealed to the vault) goes only to the account's own server, any
+			// public host the person entered (fetch "*"; the connector's dialer refuses private ranges and the SMTP
+			// ports). A signed policy can narrow it to named servers.
+			"mail": {Tools: []string{"mail.search", "mail.read", "mail.folders"}, Hosts: []string{}, Fetch: []string{"*"}},
 		},
 		StaleReads: true,
 		Budget: Budgets{

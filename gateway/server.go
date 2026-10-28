@@ -107,6 +107,18 @@ func (s *Server) serve(c net.Conn) {
 		writeFrame(c, &frame{T: tResult})
 		return
 	}
+	if open.T == tConn {
+		if open.Conn == nil {
+			return
+		}
+		c.SetReadDeadline(time.Time{})
+		ctx, cancel := context.WithTimeout(context.Background(), 80*time.Second)
+		res := s.G.Conn(ctx, open.Conn)
+		cancel()
+		c.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		writeFrame(c, &frame{T: tResult, ConnResult: res})
+		return
+	}
 	if open.T != tOpen || !validID(open.Task) {
 		return
 	}

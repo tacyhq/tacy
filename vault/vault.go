@@ -50,6 +50,12 @@ type Request struct {
 	Effect bool   `json:"effect,omitzero"`
 	// Docs (op "safety"): signed policies and stop lists, checked here before they count.
 	Docs []safety.Envelope `json:"docs,omitzero"`
+	// Connections (conn.go): Conn names a space's connection ("email"): a lease of its password (Secret
+	// ConnSecret, Connector "mail", Host its server), or the conn_* ops. Pending is a pending connection's id (the
+	// test login's lease, conn_commit, conn_discard); Sealed the box conn_put opens.
+	Conn    string  `json:"conn,omitzero"`
+	Pending string  `json:"pending,omitzero"`
+	Sealed  *Sealed `json:"sealed,omitzero"`
 }
 
 // Record is what the vault writes for every request: names and ids, never the value. Later these go to the
@@ -82,7 +88,8 @@ var (
 )
 
 // known are the errors that cross the wire by their text.
-var known = []error{ErrNoGrant, ErrHost, ErrNotSet, ErrBadRequest, ErrStopped, ErrStale, ErrPolicyMissing, ErrPolicy, ErrRateLimited}
+var known = []error{ErrNoGrant, ErrHost, ErrNotSet, ErrBadRequest, ErrStopped, ErrStale, ErrPolicyMissing, ErrPolicy, ErrRateLimited,
+	ErrStaleKey, ErrBadSealed, ErrNoConn, ErrConnStore}
 
 // Vault holds the secrets and grants. Safe for concurrent use.
 type Vault struct {
@@ -92,6 +99,7 @@ type Vault struct {
 	record  func(Record)
 	now     func() time.Time
 	safety  *safety.State // nil: no step 6 checks
+	conns   *connState    // nil: connections off (conn.go)
 	rates   safety.Limiter
 }
 
@@ -140,7 +148,14 @@ func New(secrets map[string][]byte, grants []Grant, record func(Record)) (*Vault
 func (v *Vault) Lease(r Request) ([]byte, string, error) {
 	rec := Record{Time: v.now().UTC(), Secret: r.Secret, Connector: r.Connector, Host: r.Host, Task: r.Task,
 		Action: r.Action, Space: r.Space, Decision: "denied"}
-	val, lease, err := v.lease(r)
+	var val []byte
+	var lease string
+	var err error
+	if r.Conn != "" {
+		val, lease, err = v.leaseConn(r)
+	} else {
+		val, lease, err = v.lease(r)
+	}
 	if err == nil {
 		rec.Decision, rec.Lease = "released", lease
 	} else {
@@ -160,8 +175,11 @@ func (v *Vault) Lease(r Request) ([]byte, string, error) {
 
 func (v *Vault) lease(r Request) ([]byte, string, error) {
 	if !validName(r.Secret) || !validConnector(r.Connector) || !validHost(r.Host) || !validID(r.Task) || !validID(r.Action) ||
-		r.Space != "" && !safety.ValidID(r.Space) || len(r.Docs) > 0 {
+		r.Space != "" && !safety.ValidID(r.Space) || len(r.Docs) > 0 || r.Pending != "" || r.Sealed != nil {
 		return nil, "", ErrBadRequest
+	}
+	if r.Secret == ConnSecret { // only through a connection (leaseConn)
+		return nil, "", ErrNoGrant
 	}
 	v.mu.Lock()
 	defer v.mu.Unlock()

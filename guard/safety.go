@@ -165,6 +165,9 @@ func ToolAction(tool string) string {
 	if tool == documentTool {
 		return DocumentAction
 	}
+	if a := mailToolAction(tool); a != "" {
+		return a
+	}
 	return webAction(tool)
 }
 

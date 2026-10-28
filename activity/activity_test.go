@@ -399,7 +399,7 @@ func TestVector(t *testing.T) {
 		if err := os.WriteFile(path, b, 0o644); err != nil {
 			t.Fatal(err)
 		}
-		os.WriteFile(filepath.Join("..", "..", "04-private-chat", "test", "fixtures", "activity-vector.json"), b, 0o644)
+		os.WriteFile(filepath.Join("..", "..", "..", "apps", "chat", "test", "fixtures", "activity-vector.json"), b, 0o644)
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {

@@ -51,6 +51,21 @@ func retryLease(lease guard.Lease, push func()) guard.Lease {
 	}
 }
 
+// retryVault is the vault client for the mail connector (guard.MailVault) with retryLease's rule for its leases.
+type retryVault struct {
+	*vault.Client
+	push func()
+}
+
+func (r retryVault) Lease(ctx context.Context, req vault.Request) (*vault.Secret, error) {
+	s, err := r.Client.Lease(ctx, req)
+	if errors.Is(err, vault.ErrPolicyMissing) || errors.Is(err, vault.ErrStale) {
+		r.push()
+		s, err = r.Client.Lease(ctx, req)
+	}
+	return s, err
+}
+
 // pullSafety fetches the firm key log from ku (keys v2 slice 5) and the signed stop lists and policies from u every
 // so often, and passes them to agentd (POST /keylog, then POST /safety on its HTTP socket), which checks them and
 // keeps the floors on disk; gatewayd then gets agentd's newest documents back (and checks them itself). The log

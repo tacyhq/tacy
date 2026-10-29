@@ -17,8 +17,8 @@ import (
 	"github.com/tacyhq/tacy/storedfiles"
 )
 
-// The person's stored files in a task (the stored-files design's "VM read path",
-// proposed). A run the person starts names the files they picked (proto.RunRequest.StoredFiles: each object's key,
+// The person's stored files in a task (since v0.17.0, the stored-files design's
+// "VM read path"). A run the person starts names the files they picked (proto.RunRequest.StoredFiles: each object's key,
 // unwrapped in their browser for this request, and an hour's presigned GET the chat's Worker minted); a schedule's
 // definition names them without URLs, with a read grant (trigger.Definition.Files, FilesGrant), and its runs ask the
 // Worker for URLs (storedfiles.URLSource). They become the task's files after its attached ones, read through
@@ -37,7 +37,7 @@ import (
 // range read of its first chunks), and says so; once the task holds that much, no more files are opened.
 
 // storedFetchAction is the guard's own action that fetches a stored file (never a brain's tool): what the signed
-// policy's files connector must list for stored files to be read (policies/chat-v5.json).
+// policy's files connector must list for stored files to be read (the chat's policy since v5).
 const storedFetchAction = "files.fetch"
 
 // maxStoredText is the most text of stored files one task holds (UTF-8 bytes): the cap on attached files' text too.

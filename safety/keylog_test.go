@@ -13,7 +13,7 @@ import (
 	"github.com/tacyhq/tacy/keylog"
 )
 
-// Keys v2 slice 5: admin signers from the firm key log. The log is the browser's golden one
+// The firm key log: admin signers from the firm key log. The log is the browser's golden one
 // (../keysv2/testdata/v2-keylog.json): 1 genesis (owner + kit), 2 owner adds bea (admin), 3 bea adds cal,
 // 4 threshold 2, 5 bea revokes herself, 6 the kit names owner and cal admins, 7 owner and cal rotate the root.
 type klFixture struct {
@@ -192,7 +192,7 @@ func TestKeylogAdminSigners(t *testing.T) {
 	}
 }
 
-// docs/26 decision 12: a revoked key admin's policy stays in force until another admin re-signs it; their new
+// a revoked key admin's policy stays in force until another admin re-signs it; their new
 // documents are refused. Also across a restart (agentd's disk) and in a process fed agentd's documents in order
 // (gatewayd, the vault), but not for anyone else who presents it later.
 func TestRevokedAdminPolicyStaysInForce(t *testing.T) {
@@ -335,7 +335,7 @@ func toEntries(envs []Envelope) []keylog.Entry {
 	return out
 }
 
-// docs/26 decision 6: the compose's old admin key becomes the log's recovery kit. A document it signed before the
+// the compose's old admin key becomes the log's recovery kit. A document it signed before the
 // move stays in force when the release pins its hash (Carry), and only then; the kit signs nothing new.
 func TestCarriedDocument(t *testing.T) {
 	f := newKL(t)
@@ -409,7 +409,7 @@ func TestCarriedDocument(t *testing.T) {
 	}
 }
 
-// docs/23 decision 6: with two or more key admins, a policy that widens the one in force needs two signatures.
+// docs/23: with two or more key admins, a policy that widens the one in force needs two signatures.
 func TestWideningNeedsTwoAdmins(t *testing.T) {
 	f := newKL(t)
 	s := f.state(t)

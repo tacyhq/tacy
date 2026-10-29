@@ -77,7 +77,7 @@ type ledgerDay struct {
 	reserved Usage
 }
 
-// Ledger keeps the budgets (keys v2 slice 6, docs/26 section 7): per run in memory, and per UTC day on the encrypted
+// Ledger keeps the budgets (keys v2 spaces and identities): per run in memory, and per UTC day on the encrypted
 // disk (counts only) for each space, each member (all spaces together) and the whole VM. A request reserves what
 // it may use from all four before it runs, under one lock, so parallel requests can't each see room that only one of
 // them has; the reservation is replaced by what was actually used when it ends. A member is whoever the run's
@@ -492,7 +492,7 @@ func ModelCost(model string, prompt, completion int64) int64 {
 
 // SearchCost is one search provider call (web.search, web.images), in millionths of a USD: about what the providers
 // charge, rounded up (Exa $0.007, Tavily ~$0.008 a basic search, Brave $0.005; checked 2026-10-18). It was $0.05,
-// which made a_research's $1 budget bind after about 16 searches (docs/30 slice 1).
+// which made a_research's $1 budget bind after about 16 searches.
 const SearchCost = 10_000
 
 // CompletionReserve is the most a model call reserves for its completion before it runs (less when the budget

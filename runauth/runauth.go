@@ -1,4 +1,4 @@
-// Package runauth is where and who for a run request (keys v2 slice 6, docs/26-keys-v2.md section 6).
+// Package runauth is where and who for a run request (keys v2 spaces and identities, runauth).
 //
 // Where: the request names its space ("s_…") and the space's seal public key ("x25519:<base64>"), and proves it
 // holds the seal private key with an HMAC keyed by one X25519 agreement between the seal key and this boot's attested
@@ -19,10 +19,10 @@
 //	         names joined by ","), cache_secret, run_secret, permissions (sorted "kind=setting" joined by ","),
 //	         fallback_models (in order, joined by ","), auto_fallback ("true" or "false"), the number of messages
 //	         (decimal), then each message's role and content, then, only when the request names an agent, "agent="
-//	         and its id (docs/30; absent for the chat, so a chat request's digest is the one v0.10.0 checks), then
+//	         and its id (absent for the chat, so a chat request's digest is the one v0.10.0 checks), then
 //	         each image of each message, in order, as "image=<message index (decimal)>:<data URL>" (v0.12.0; none
 //	         without images, so such a request's digest is unchanged), then each stored file (proto.StoredFile,
-//	         branch files-vm-read; none without them) as StoredItem: "stored=" and its object, file, owner, epoch,
+//	         since v0.17.0; none without them) as StoredItem: "stored=" and its object, file, owner, epoch,
 //	         padded, size, name, type, extracted ("1" or "0"), base64 key and url, joined by NUL
 //	sig   = Ed25519(identity key, "tacy/v2/run-request" ‖ 0 ‖ digest)
 //
@@ -232,7 +232,7 @@ func Digest(r *proto.RunRequest, vmPub []byte) [32]byte {
 			rest = append(rest, "image="+strconv.Itoa(i)+":"+u)
 		}
 	}
-	// Stored files (branch files-vm-read) come last, one item each, only when there are any: a request without them
+	// Stored files (since v0.17.0) come last, one item each, only when there are any: a request without them
 	// hashes exactly as before, and an older release refuses the field (strict decoding), never drops it.
 	for _, f := range r.StoredFiles {
 		rest = append(rest, StoredItem(f))

@@ -90,8 +90,8 @@ type Ledger struct {
 // keepDays: days older than this are dropped (the relay's counters keep 31).
 const keepDays = 31
 
-// DefaultPath is the ledger's place: $TACY_TEST_SPEND_LEDGER, else ~/.tacy-lab/test-spend.json (next to the labs'
-// Exa ledger).
+// DefaultPath is the ledger's place: $TACY_TEST_SPEND_LEDGER, else
+// ~/.tacy-lab/test-spend.json.
 func DefaultPath() string {
 	if p := os.Getenv("TACY_TEST_SPEND_LEDGER"); p != "" {
 		return p

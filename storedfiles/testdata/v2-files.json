@@ -2,7 +2,7 @@
   "format": "tacy-golden-crypto-vectors",
   "version": 2,
   "scheme": "keys-v2-files",
-  "note": "Encrypted file storage (D79): object and tree keys, chunked objects, a node record and a manifest. Fixed fake inputs; generated once and never regenerated.",
+  "note": "Encrypted file storage: object and tree keys, chunked objects, a node record and a manifest. Fixed fake inputs; generated once and never regenerated.",
   "constants": {
     "labels": {
       "fileChunk": "tacy/v2/file-chunk",

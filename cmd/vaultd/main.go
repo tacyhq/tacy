@@ -62,7 +62,7 @@ func main() {
 		log.Fatal(err)
 	}
 	v.SetSafety(st)
-	// Connections (CONNECTIONS.md, v0.19.0): a per-boot seal key, and the accounts kept on this container's own
+	// Connections (the connections contract, v0.19.0): a per-boot seal key, and the accounts kept on this container's own
 	// volume. A file that can't be read leaves connections off (mail answers unavailable) rather than stopping the
 	// vault, which holds every other key, or starting over an account file it couldn't read.
 	if err := v.EnableConns(*connFile); err != nil {

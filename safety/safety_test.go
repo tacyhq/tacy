@@ -750,7 +750,7 @@ func TestPermissionCap(t *testing.T) {
 	}
 }
 
-// Keys v2 slice 6: the member's and the VM's day budgets (docs/26 section 7). A member's runs count together in
+// Keys v2 spaces and identities: the member's and the VM's day budgets. A member's runs count together in
 // every space, so a new space gets no new budget; parallel runs of one member in many spaces can't each see room
 // only one has; one member using up their day leaves the others theirs, until the VM's day is used up for all.
 func TestBudgetPerMemberAndVM(t *testing.T) {
@@ -845,7 +845,7 @@ func TestBudgetPerMemberAndVM(t *testing.T) {
 	}
 }
 
-// Keys v2 slice 6: a space's policy may name its seal key (a firm policy may not); the member's and the VM's day
+// Keys v2 spaces and identities: a space's policy may name its seal key (a firm policy may not); the member's and the VM's day
 // budgets narrow across layers like the others, and raising or removing one widens.
 func TestPolicySealAndNewBudgets(t *testing.T) {
 	seal := "x25519:" + base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32))

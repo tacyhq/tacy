@@ -2,7 +2,7 @@
   "format": "tacy-golden-crypto-vectors",
   "version": 2,
   "scheme": "keys-v2",
-  "note": "Keys v2 slice 1 (docs/26-keys-v2.md). Fixed fake inputs; generated once and never regenerated. Checked byte for byte by the chat client (TypeScript, WebCrypto) and by the Go keysv2 package (standard library).",
+  "note": "Keys v2. Fixed fake inputs; generated once and never regenerated. Checked byte for byte by the chat client (TypeScript, WebCrypto) and by the Go keysv2 package (standard library).",
   "constants": {
     "labels": {
       "recordThread": "tacy/v2/thread",

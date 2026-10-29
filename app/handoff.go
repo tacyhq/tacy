@@ -14,7 +14,7 @@ import (
 	"github.com/tacyhq/tacy/trigger"
 )
 
-// Results handed to the relay (v0.18.0; SCHEDULES.md "Hand-off to the relay"). A scheduled run's result is sealed to
+// Results handed to the relay (v0.18.0; the schedules contract "Hand-off to the relay"). A scheduled run's result is sealed to
 // the space's seal key when the run ends (schedules.go triggeredDone). Until now it waited here for the person's
 // browser, so with the VM stopped between runs (the Worker wakes it only for a run) nobody saw it until a tab started
 // the VM again and collected it (about a minute of boot). Now the relay's cron, while the VM is up, takes a copy of

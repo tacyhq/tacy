@@ -16,8 +16,8 @@ import (
 	"github.com/tacyhq/tacy/proto"
 )
 
-// The production bucket's S3 endpoint and name (the chat's Cloudflare account; DEPLOY.md "File storage"). The release
-// pins them; the signed policy must list the host for the files connector too (files.fetch, policies/chat-v5.json).
+// The production bucket's S3 endpoint and name (the chat's Cloudflare account). The release
+// pins them; the signed policy must list the host for the files connector too (files.fetch, since the chat's policy v5).
 const (
 	R2Host = "df4bf4829cdbbca3dca42a266b41b170.r2.cloudflarestorage.com"
 	Bucket = "tacy-files"

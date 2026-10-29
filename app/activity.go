@@ -75,7 +75,7 @@ func newRecGateway(sg *safeGateway, rec *activity.Recorder, vmKey *ecdh.PrivateK
 		pins: &runauth.MemPins{}}
 }
 
-// Verify checks a request's where and who once, when it arrives (keys v2 slice 6, docs/26 section 6; package
+// Verify checks a request's where and who once, when it arrives (keys v2 spaces and identities; package
 // runauth), and notes what it verified in r.Verified, which StartFor then requires: the space proof and the identity's
 // signature against this boot's attested key (so the request can't be replayed to another boot), the time, and the
 // nonce, claimed here (so it runs at most once on this one). On a firm's VM the seal key must be the one the space's

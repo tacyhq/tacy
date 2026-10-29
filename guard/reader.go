@@ -1292,6 +1292,14 @@ func checkAnswer(rc *ReaderConfig, d *readerDoc, segs []string, spans []span, ou
 			// Code fills in the text: from the first span's start to the last one's end, as the source has it.
 			first, last := spans[q.From-1], spans[q.To-1]
 			exact, seg = segs[first.seg][first.start:last.end], first.seg
+			if d.kind == "mail" { // boilerplate lines off a mail quote's ends; nothing else: dropped (mailquotes.go)
+				a, b, ok := trimMailQuote(segs[first.seg], first.start, last.end)
+				if !ok {
+					use.Dropped++
+					continue
+				}
+				exact = segs[first.seg][a:b]
+			}
 			if utf8.RuneCountInString(exact) > maxQuoteRunes {
 				use.Dropped++
 				continue

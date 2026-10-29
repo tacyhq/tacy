@@ -1,6 +1,6 @@
 {
   "format": "tacy-golden-crypto-vectors",
-  "note": "VM v0.12.0 schedule calls (services/agent-vm/SCHEDULES.md): each call's where and who under its own label, the definition envelope and its hash, and a run's result sealed to the space's seal key. Made once from v2-search.json's fixed seeds with node:crypto (scripts/gen-golden-v2-schedule-vectors.mjs); never regenerate.",
+  "note": "VM v0.12.0 schedule calls: each call's where and who under its own label, the definition envelope and its hash, and a run's result sealed to the space's seal key. Made once from v2-search.json's fixed seeds with node:crypto (scripts/gen-golden-v2-schedule-vectors.mjs); never regenerate.",
   "constants": {
     "labels": {
       "spaceProof": "tacy/v2/space-proof",

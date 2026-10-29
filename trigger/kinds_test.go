@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// Schedules on chosen weekdays and one-time schedules (v0.13.0; SCHEDULES.md "Triggers").
+// Schedules on chosen weekdays and one-time schedules (v0.13.0; the schedules contract "Triggers").
 
 func TestKindTriggerChecks(t *testing.T) {
 	bad := []Trigger{

@@ -68,11 +68,11 @@ type safeOpts struct {
 	// reader turns the quarantined reader on (as gatewayd runs it); the model server answers its calls with
 	// reader(prompt) and counts them in readerReqs.
 	reader func(prompt string) string
-	// keylog: admin signers from a firm key log (keys v2 slice 5) instead of a compose key: genesis pinned (its
+	// keylog: admin signers from a firm key log (the firm key log) instead of a compose key: genesis pinned (its
 	// entries in e.keylog, e.admin the first owner's identity key, e.kit the recovery kit), carry pinned hashes.
 	keylog bool
 	carry  []string
-	// firmVM: a firm's VM (keys v2 slice 6): no personal spaces, so a space runs only under its own signed policy
+	// firmVM: a firm's VM (keys v2 spaces and identities): no personal spaces, so a space runs only under its own signed policy
 	// naming its seal key, for an identity current in the key log. Off: the shared chat VM, as f_chat's compose.
 	firmVM bool
 	// wrapUp wraps the model upstream (fake slow or overloaded models); slowAfter is the guard's first-token wait.

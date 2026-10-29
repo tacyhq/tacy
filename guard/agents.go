@@ -18,7 +18,7 @@ import (
 	"github.com/tacyhq/tacy/safety"
 )
 
-// Built-in agents (docs/30-agents-in-chat.md, slice 1). A task start names one by id (proto.RunRequest.Agent); its
+// Built-in agents. A task start names one by id (proto.RunRequest.Agent); its
 // definition (instructions, tools, limits) is compiled into the release, so the attested image fixes what each agent
 // may do, and a request can only pick one and narrow it (fewer tools, fewer steps), never widen it. An unknown id is
 // refused at the door. The chat (a_chat, also when the request names none) keeps the behaviour it had before agents
@@ -70,7 +70,7 @@ type AgentDef struct {
 	// run's cost budget is refused (the model is told to write its brief now), so the last model call can still run.
 	FinalReserve int64 `json:"final_reserve,omitzero"`
 	// BriefOnly: the task takes one message, the brief (optionally after the chat's date note): no conversation
-	// history, so the agent gets only what the start card showed (docs/30 principles).
+	// history, so the agent gets only what the start card showed.
 	BriefOnly bool `json:"brief_only,omitzero"`
 	// Keep is how long an ended task's result stays on the VM for the browser to collect, when its event stream
 	// didn't hand it on (Host.Delivered) and nobody deleted it (POST /tasks/delete); 0: the host's default (Host.Keep),
@@ -99,7 +99,7 @@ var chatDef = AgentDef{ID: AgentChat, Version: "1", Tools: allTools, Steps: maxS
 	Run:    safety.Limits{Tokens: 8_000_000, ToolCalls: 64, WallSeconds: int64(RunTimeout / time.Second), CostMicros: 20_000_000},
 	Extras: true, MailSearches: 10, MailReads: 20}
 
-// researchDef is a_research (docs/30, "The built-in agents"): a plan of 3-6 sub-questions, searches and page
+// researchDef is a_research: a plan of 3-6 sub-questions, searches and page
 // reads through the quarantined reader, and a cited brief. No image search; no site icons or card pictures.
 // Since v0.13.0 the brief may come with up to 5 of the person's files (review's intake, review.go): read inside the
 // VM through files.* and the quarantined reader as review reads them, at most researchFileParts parts, and never sent
@@ -122,7 +122,7 @@ const researchFileParts = 60
 
 var agentDefs = map[string]*AgentDef{AgentChat: &chatDef, AgentResearch: &researchDef, AgentReview: &reviewDef}
 
-// scheduledDef is AgentScheduled (docs/30 "Scheduled tasks", decision 8): at most 20 steps and $0.25 per run (the
+// scheduledDef is AgentScheduled: at most 20 steps and $0.25 per run (the
 // definition's max_steps may ask for fewer), 10 page reads and 5 searches per step budget's worth, 10 minutes of work.
 // No site icons or card pictures. Its result is sealed to the space's seal key when it ends and kept 7 days (agentd's
 // schedules.go); the task itself (its plaintext) is then forgotten at once.
@@ -131,7 +131,7 @@ var scheduledDef = AgentDef{ID: AgentScheduled, Version: "1", Tools: []string{"w
 	Run: safety.Limits{Tokens: 4_000_000, ToolCalls: 40, WallSeconds: 10 * 60, CostMicros: 250_000},
 	// Kept for the digest's last answer over a long conversation (a cent or two on the default model).
 	FinalReserve: 30_000,
-	// A definition with stored files (branch files-vm-read) reads them as research reads the person's files, at most
+	// A definition with stored files (since v0.17.0) reads them as research reads the person's files, at most
 	// scheduledFileParts parts; one without has no files tools.
 	Files: true, FilesOptional: true, FileParts: scheduledFileParts,
 	// A definition with the mail tools (v0.19.0, mail.go) reads the sponsor's connected account: a morning digest of
@@ -376,7 +376,7 @@ func agentStart(d AgentDef, r *proto.RunRequest, s harness.Start, now time.Time,
 		links = personLinks([]proto.Message{{Role: "user", Content: brief}})
 	}
 	return s, TaskOptions{ReasoningEffort: r.ReasoningEffort, CacheSecret: r.CacheSecret, Agent: d.ID, Files: files,
-		Stored:    r.StoredFiles,
+		Stored: r.StoredFiles, Zone: zoneFromNotes(r.Messages),
 		Question:  capRunes(strings.TrimSpace(brief), maxQuestionRunes),
 		RunSecret: r.RunSecret, Permissions: maps.Clone(r.Permissions), Links: links,
 		// Numbered links (links.go, v0.14.0): a page the brief names comes with its links to open and cite, as a

@@ -101,7 +101,7 @@ func coded(err error) (string, string) {
 // out (the model never sees them); the deadline (the run's overall cap, guard.RunCap) is moved earlier when the
 // day's running time has less left. The run's own running-time limit isn't a deadline: watch enforces it.
 func (g *safeGateway) StartFor(r *proto.RunRequest) (harness.Start, guard.TaskOptions, error) {
-	// The space and member agentd verified (recGateway.Verify, keys v2 slice 6): whose stops, policy and budgets.
+	// The space and member agentd verified (recGateway.Verify, keys v2 spaces and identities): whose stops, policy and budgets.
 	v := r.Verified
 	if v == nil {
 		return harness.Start{}, guard.TaskOptions{}, errors.New("the request's space and identity aren't verified")
@@ -152,7 +152,7 @@ func (g *safeGateway) StartFor(r *proto.RunRequest) (harness.Start, guard.TaskOp
 	if len(opts.Files) > 0 && !e.AllowsTool("files.read") {
 		return harness.Start{}, guard.TaskOptions{}, &safety.Error{Code: safety.CodePolicyDenied, Msg: "reading attached files isn't allowed by the policy (it has no files connector)"}
 	}
-	// Stored files (branch files-vm-read) are fetched from the files bucket: under a policy without files.fetch
+	// Stored files (since v0.17.0) are fetched from the files bucket: under a policy without files.fetch
 	// (chat-v4 and before) the start is refused, before anything is fetched.
 	if len(opts.Stored) > 0 {
 		if err := guard.StoredPolicyError(e); err != nil {
@@ -862,7 +862,7 @@ func (s *server) safetyIn(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, out)
 }
 
-// keylogIn takes firm key log entries from anyone (keys v2 slice 5): the relay's pull (gatewayd's -keylog-url), an
+// keylogIn takes firm key log entries from anyone (the firm key log): the relay's pull (gatewayd's -keylog-url), an
 // admin's browser. Entries are authorized by their signatures and checked against the log this VM verified from
 // the genesis its compose pins; the next entries are appended, ones it holds are no-ops, a different valid entry at
 // a held position is a fork (kept as proof; from then on no admin-signed change is taken). Served only when the

@@ -15,7 +15,7 @@ import (
 	"github.com/tacyhq/tacy/safety"
 )
 
-// Keys v2 slice 5: the release pins f_chat's real genesis. testdata/fchat-genesis.json is the entry f_chat's owner
+// The firm key log: the release pins f_chat's real genesis. testdata/fchat-genesis.json is the entry f_chat's owner
 // signed offline on 2026-10-18, byte for byte as it is uploaded in Admin → Safety (the chat's
 // test/golden/fchat-genesis.json is the same file, replayed by the browser's verifier), and
 // testdata/chat-policy-v1.signed.json and chat-policy-v2.signed.json are the policies the old compose admin key

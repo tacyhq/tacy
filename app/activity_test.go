@@ -157,7 +157,7 @@ func testActivityChain(t *testing.T, behindRunner bool) {
 	all = append(all, runs...)
 	e.mustPost(e.stop(safety.IssuerFirm, 2, nil, e.admin))
 
-	// 4. Every run is recorded (keys v2 slice 6): one in another space, with its own seal key, goes to that key's chain,
+	// 4. Every run is recorded (keys v2 spaces and identities): one in another space, with its own seal key, goes to that key's chain,
 	// never this one. This space's seal key is pinned to priv now (v0.16.0): naming it with another key is refused at
 	// the door, and nothing runs or is recorded.
 	pinned := proto.RunRequest{Model: proto.DefaultModel, Permissions: guard.AllowAll(), Messages: user1("hi")}

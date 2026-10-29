@@ -34,7 +34,7 @@ func randID(prefix string) string {
 	return identity.IDFrom(prefix, b)
 }
 
-type step7Env struct {
+type triggerEnv struct {
 	*safeEnv
 	dir     identity.Static
 	space   string
@@ -43,8 +43,8 @@ type step7Env struct {
 	asks    chan proto.Approval
 }
 
-func newStep7Env(t *testing.T, replies ...string) *step7Env {
-	se := &step7Env{space: randID("s"), sink: &guard.Sink{}, asks: make(chan proto.Approval, 8)}
+func newTriggerEnv(t *testing.T, replies ...string) *triggerEnv {
+	se := &triggerEnv{space: randID("s"), sink: &guard.Sink{}, asks: make(chan proto.Approval, 8)}
 	se.sponsor = approvaltest.NewPerson(t, &se.dir, "f_chat", se.space)
 	check := approval.Config{Dir: &se.dir, RP: approvaltest.RP}
 	addSink := func(p *safety.Policy) {
@@ -69,20 +69,20 @@ func newStep7Env(t *testing.T, replies ...string) *step7Env {
 	return se
 }
 
-func (se *step7Env) call(h func(w *httptest.ResponseRecorder, body []byte), v any) (int, string) {
+func (se *triggerEnv) call(h func(w *httptest.ResponseRecorder, body []byte), v any) (int, string) {
 	b, _ := jsonv2.Marshal(v)
 	w := httptest.NewRecorder()
 	h(w, b)
 	return w.Code, strings.TrimSpace(w.Body.String())
 }
 
-func (se *step7Env) install(env safety.Envelope) (int, string) {
+func (se *triggerEnv) install(env safety.Envelope) (int, string) {
 	return se.call(func(w *httptest.ResponseRecorder, b []byte) {
 		se.s.triggersInstall(w, httptest.NewRequest("POST", "/triggers", bytes.NewReader(b)))
 	}, env)
 }
 
-func (se *step7Env) list(p *approvaltest.Person, edit func(*listRequest)) (int, string) {
+func (se *triggerEnv) list(p *approvaltest.Person, edit func(*listRequest)) (int, string) {
 	nonce := make([]byte, 16)
 	rand.Read(nonce)
 	req := listRequest{Identity: p.ID, Space: se.space, SignedAt: time.Now().UTC().Truncate(time.Second), Nonce: hex.EncodeToString(nonce)}
@@ -95,13 +95,13 @@ func (se *step7Env) list(p *approvaltest.Person, edit func(*listRequest)) (int, 
 	}, req)
 }
 
-func (se *step7Env) answer(sub *approval.Submission) (int, string) {
+func (se *triggerEnv) answer(sub *approval.Submission) (int, string) {
 	return se.call(func(w *httptest.ResponseRecorder, b []byte) {
 		se.s.approvalsAnswer(w, httptest.NewRequest("POST", "/approvals", bytes.NewReader(b)))
 	}, sub)
 }
 
-func (se *step7Env) definition(edit func(*trigger.Definition)) trigger.Definition {
+func (se *triggerEnv) definition(edit func(*trigger.Definition)) trigger.Definition {
 	now := time.Now().UTC()
 	d := trigger.Definition{Firm: "f_chat", Space: se.space, Agent: randID("a"), Version: 1, Instructions: "Send the client the daily summary.",
 		Seal:   testSealKey,
@@ -141,7 +141,7 @@ func TestStep7RoutesFailClosedWithoutDirectory(t *testing.T) {
 
 func TestScheduledSendApprovedThroughAgentd(t *testing.T) {
 	args := `{"to":"client@example.com","body":"Daily summary: all good."}`
-	se := newStep7Env(t, pCalls([3]string{"c1", "sink_post", args}), pText("Sent the summary."))
+	se := newTriggerEnv(t, pCalls([3]string{"c1", "sink_post", args}), pText("Sent the summary."))
 	// Installing needs the sponsor's signature; a stranger's isn't enough.
 	_, stranger, _ := ed25519.GenerateKey(nil)
 	bad, _ := trigger.SignDefinition(se.definition(nil), stranger)
@@ -196,7 +196,7 @@ func TestScheduledSendApprovedThroughAgentd(t *testing.T) {
 // doesn't fire again.
 func TestSponsorRevokedStopsTheTask(t *testing.T) {
 	args := `{"to":"client@example.com","body":"x"}`
-	se := newStep7Env(t, pCalls([3]string{"c1", "sink_post", args}), pText("done"))
+	se := newTriggerEnv(t, pCalls([3]string{"c1", "sink_post", args}), pText("done"))
 	env, _ := trigger.SignDefinition(se.definition(nil), se.sponsor.Identity)
 	se.install(env)
 	se.s.triggerTick(context.Background())
@@ -219,7 +219,7 @@ func TestSponsorRevokedStopsTheTask(t *testing.T) {
 
 // An inbound event over POST /triggers/event: signed by the definition's sender, once per delivery.
 func TestEventRoute(t *testing.T) {
-	se := newStep7Env(t, pText("Nothing to do."))
+	se := newTriggerEnv(t, pText("Nothing to do."))
 	_, sender, _ := ed25519.GenerateKey(nil)
 	evTrigger := randID("tr")
 	env, _ := trigger.SignDefinition(se.definition(func(d *trigger.Definition) {

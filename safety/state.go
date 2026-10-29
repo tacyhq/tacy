@@ -61,9 +61,9 @@ const DefaultMaxSilence = 3 * time.Minute
 
 // Config is a process's trust roots (pinned in the attested compose) and the release's ceiling.
 //
-// Admin signers come from one of two places. Before keys v2 slice 5 (and on a VM whose compose pins no key log):
-// Admins, Ed25519 keys pinned in the compose. With slice 5: Genesis, the hash of the firm key log's first entry
-// (docs/26 section 4); the VM verifies the log from it (entries arrive over POST /keylog) and policies and the
+// Admin signers come from one of two places. Before the firm key log (and on a VM whose compose pins no key log):
+// Admins, Ed25519 keys pinned in the compose. With the key log: Genesis, the hash of its first entry; the
+// VM verifies the log from it (entries arrive over POST /keylog) and policies and the
 // firm's stop lists are signed by the log's current key admins (its threshold). Never both.
 type Config struct {
 	Firm      string              // the firm this VM serves (one CVM per firm)
@@ -72,10 +72,10 @@ type Config struct {
 	Threshold int                 // distinct compose admin signatures needed; 0: 1
 	Genesis   string              // the firm key log's genesis hash (hex); "": admin keys from Admins
 	// Carry: hashes of documents signed before the move to the key log (by a compose admin key that is now the
-	// log's recovery kit, docs/26 decision 6). Each listed document is taken as admin-signed when the log's kit signed
+	// log's recovery kit). Each listed document is taken as admin-signed when the log's kit signed
 	// it; nothing else the kit signs is. Only with Genesis. The release pins them, so the list is attested.
 	Carry []string
-	// PersonalSpaces (the shared chat VM, keys v2 slice 6): a space without a signed policy of its own runs under the
+	// PersonalSpaces (the shared chat VM, keys v2 spaces and identities): a space without a signed policy of its own runs under the
 	// firm's policy, with the seal key its request proves and its budget counted for the relay's per-user tag
 	// (people's personal spaces, which nobody signs a policy for). Off (a firm's VM): a space runs only under a
 	// signed policy of its own that names its seal key, and only for an identity current in the firm key log.
@@ -188,7 +188,7 @@ func (s *State) Apply(envs []Envelope) ([]error, bool) { return s.apply(envs, fa
 // ApplyOrdered is Apply for what another process of this VM passes on (agentd's documents to gatewayd, gatewayd's
 // to the vault): its Docs, the key log entries in order with each document right after the entry it was taken
 // at. A document is checked against the key log as it stood there, so one signed by a key admin who was revoked
-// later stays in force (docs/26 decision 12) here too, as it does in agentd. That position is agentd's word, the
+// later stays in force here too, as it does in agentd. That position is agentd's word, the
 // same trust gatewayd and vaultd already give agentd for floors (they have none of their own after a restart):
 // it can only name a point of the log they verify themselves, so a document still needs the signatures of keys
 // that were key admins there.
@@ -259,7 +259,7 @@ func (s *State) apply(envs []Envelope, ordered, fromDisk bool) ([]error, bool) {
 
 // addEntry takes one key log entry: checked on its own outside the lock, then against the log. A proven fork
 // is kept (and persisted) and from then on nothing admin-signed is taken: no entry past the head, no policy, no
-// firm stop list (docs/26 section 4 and decision 5).
+// firm stop list.
 func (s *State) addEntry(e Envelope) (int64, bool, error) {
 	if s.log == nil {
 		return 0, false, errors.New("key log: this VM pins no key log genesis")
@@ -465,7 +465,7 @@ func (s *State) take(v *verified) (bool, error) {
 		if !ok {
 			return false, err
 		}
-		// Two key admins' signatures to widen the policy in force, once the firm has two (docs/23 decision 6).
+		// Two key admins' signatures to widen the policy in force, once the firm has two (docs/23).
 		if old := s.policies[v.p.Space]; old != nil && v.auth.logged && v.auth.count >= 2 && v.sigs < 2 && Widens(&old.p, v.p) {
 			return false, errors.New("policy: it allows more than the policy in force, so it needs two key admins' signatures")
 		}
@@ -680,7 +680,7 @@ type Status struct {
 
 // Keys is the VM's firm key log head, announced to browsers in every run's meta (EHBP-authenticated to the attested
 // key) and in GET /safety, so a browser can compare it with the log it verified itself and catch a server showing
-// people different logs (docs/26 section 4). Genesis is the compose's pin; Seq 0 and Head "" until it arrives.
+// people different logs. Genesis is the compose's pin; Seq 0 and Head "" until it arrives.
 type Keys struct {
 	Firm    string `json:"firm"`
 	Genesis string `json:"genesis"`
@@ -847,7 +847,7 @@ func (s *State) load() error {
 		s.floors[k] = f
 	}
 	// Replayed in order: each document is checked again against the key log as it stood when it was taken (its
-	// signers may have been revoked since: it stays in force, docs/26 decision 12). A document or entry that no longer
+	// signers may have been revoked since: it stays in force). A document or entry that no longer
 	// verifies (keys changed in a new release, another genesis pinned) is dropped; its floor stays, so the slot
 	// fails closed until a newer signed one arrives.
 	errs, _ := s.apply(sv.Docs, true, true)

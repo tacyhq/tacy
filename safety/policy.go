@@ -40,7 +40,7 @@ type Policy struct {
 	// "always", which caps nothing). A person's setting above the cap is lowered to it: a firm can make its members
 	// be asked every time, or turn a kind off. Unnamed kinds aren't capped.
 	AskCap map[string]string `json:"ask_cap,omitzero"`
-	// Seal is the space's seal public key ("x25519:<base64>"; space policies only, keys v2 slice 6): a run in the
+	// Seal is the space's seal public key ("x25519:<base64>"; space policies only, keys v2 spaces and identities): a run in the
 	// space must prove it holds the private half (runauth), and its activity records are sealed to it. A space key
 	// rotation makes a new seal key, so the space's holders sign a new policy naming it. On a firm's VM (not the
 	// shared chat VM) a space can't run without a signed policy naming its seal key.
@@ -381,7 +381,7 @@ func (e *Effective) Tools(actions []string) []string {
 	return out
 }
 
-// Widens says whether p allows anything old doesn't (docs/23 decision 6: on a firm with two or more key admins, a
+// Widens says whether p allows anything old doesn't (docs/23: on a firm with two or more key admins, a
 // policy that widens the one in force needs two admin signatures). Conservative: anything that might allow more
 // counts (a fetch pattern old doesn't list word for word, unless old allows any host; an approval dropped; reads
 // while stale turned on; a budget or rate raised or removed).

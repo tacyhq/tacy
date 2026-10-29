@@ -26,7 +26,7 @@ import (
 	"github.com/tacyhq/tacy/trigger"
 )
 
-// Schedule upgrades (the release after v0.14.0, SCHEDULES.md): searching, memory across runs and "only tell me when
+// Schedule upgrades (the release after v0.14.0, the schedules contract): searching, memory across runs and "only tell me when
 // something changes", through agentd's routes, the trigger engine, the runtime, the brain and the guard, with a
 // scripted model (no inference).
 

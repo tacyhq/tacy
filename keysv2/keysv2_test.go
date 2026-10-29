@@ -1,4 +1,4 @@
-// Package keysv2 holds the Go side of keys v2 slice 1 (docs/26-keys-v2.md): for now only this test, which checks
+// Package keysv2 holds the Go side of keys v2's first vectors: for now only this test, which checks
 // the browser's golden vectors (testdata/v2.json, written once by the chat client's generator) with the standard
 // library alone, so the VM's later verifiers (firm key log, space proofs, unattended custody) and the browser
 // agree byte for byte. Nothing here runs in the VM yet.

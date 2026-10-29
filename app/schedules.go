@@ -25,8 +25,8 @@ import (
 	"github.com/tacyhq/tacy/trigger"
 )
 
-// Schedules for personal spaces (v0.12.0, docs/30 "Scheduled tasks"; the contract the chat builds on is
-// SCHEDULES.md next to this package). On the shared chat VM a person installs, lists, stops and removes their own
+// Schedules for personal spaces (v0.12.0; the contract the chat builds on is
+// the schedules contract next to this package). On the shared chat VM a person installs, lists, stops and removes their own
 // space's schedules and fetches their results. Every call carries the same where and who as a run (the space proof
 // against this boot's key and the identity's signature, package runauth), each under its own label, and its nonce is
 // used once. An install also records that the identity holds the space (trigger.HolderDirectory): that record is what
@@ -527,7 +527,7 @@ func (s *server) scheduleResultsDelete(w http.ResponseWriter, r *http.Request) {
 
 // ---- results ------------------------------------------------------------------------------------------------
 
-// resultBody is a sealed result's plaintext (SCHEDULES.md, "Fetch a result").
+// resultBody is a sealed result's plaintext (the schedules contract, "Fetch a result").
 type resultBody struct {
 	Type        string    `json:"type"`
 	Task        string    `json:"task"`

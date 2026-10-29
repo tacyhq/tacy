@@ -1,5 +1,5 @@
-// Package imapro is a read-only IMAP client (RFC 3501 / 9051 subset) for the mail connector in gatewayd (docs/34
-// step 4, CONNECTIONS.md). The person's app password could read, send and delete their mail; this client can only
+// Package imapro is a read-only IMAP client (RFC 3501 / 9051 subset) for the mail connector in gatewayd (v0.19.0,
+// step 4, the connections contract). The person's app password could read, send and delete their mail; this client can only
 // read it, and that is enforced here in code, at the one place commands are written (Client.write, via Allowed):
 //
 //   - commands: CAPABILITY, STARTTLS, LOGIN, AUTHENTICATE PLAIN, EXAMINE, SEARCH, FETCH, UID SEARCH, UID FETCH, LIST,

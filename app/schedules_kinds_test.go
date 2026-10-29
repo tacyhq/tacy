@@ -14,7 +14,7 @@ import (
 	"github.com/tacyhq/tacy/trigger"
 )
 
-// Schedules on chosen weekdays and one-time schedules through agentd's routes (v0.13.0, SCHEDULES.md).
+// Schedules on chosen weekdays and one-time schedules through agentd's routes (v0.13.0, the schedules contract).
 
 // shiftedEngine gives the env an engine whose clock runs off from the real one (the calls' signed_at and the
 // operator's time stay real; the shift stays within their 5 minutes).

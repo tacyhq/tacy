@@ -2,7 +2,7 @@
 // schedule's runs) was given, each with its own key, fetched as ciphertext from R2 and checked chunk by chunk exactly
 // as the browser checks them (the chat's src/client/storage/crypto.ts decryptRange; the layout is
 // src/shared/file-format.ts; both replay test/golden/v2-files.json, of which testdata/v2-files.json is a copy the
-// chat's tests require to be identical). Branch files-vm-read; not released.
+// chat's tests require to be identical). Shipped in v0.17.0.
 //
 // A stored object is one version of one file, or the text the browser extracted from a PDF or Office file at upload:
 //

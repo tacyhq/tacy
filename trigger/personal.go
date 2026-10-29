@@ -8,7 +8,7 @@ import (
 	"github.com/tacyhq/tacy/identity"
 )
 
-// Personal spaces on the shared chat VM (docs/30 "Scheduled tasks", slice 2). There is no space log there: a
+// Personal spaces on the shared chat VM. There is no space log there: a
 // person's space is theirs because they hold its key. An install proves that the way a run does (the space proof
 // against this boot's key, and the identity's signature, package runauth); the VM then records "identity X holds
 // space S, with identity key K and seal key P" (a Holder). That record is the Directory the definition's signature
@@ -82,7 +82,7 @@ func (m *MemHolders) Holder(space, id string) (*Holder, error) {
 }
 
 // Result is a finished scheduled run's result, sealed to the space's seal key, kept until the browser deletes it or
-// ResultKeep passes (docs/30 "Scheduled tasks", decision 4).
+// ResultKeep passes.
 type Result struct {
 	Seq         int64 // the store's order (results listed after a seq)
 	Task        string
@@ -259,7 +259,7 @@ type SpaceTask struct {
 	Task  string `json:"task"`
 }
 
-// HandoffStore is what the hand-off to the relay needs of a ResultStore (v0.18.0, SCHEDULES.md "Hand-off to the relay").
+// HandoffStore is what the hand-off to the relay needs of a ResultStore (v0.18.0, the schedules contract "Hand-off to the relay").
 type HandoffStore interface {
 	// Pending lists the results, oldest first, at most limit, without their ciphertext (CT's capacity is its size).
 	Pending(limit int) ([]Result, error)

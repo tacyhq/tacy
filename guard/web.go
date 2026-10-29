@@ -77,7 +77,7 @@ func (g *Guard) Action(ctx context.Context, ti *harness.TaskInfo, id string, req
 	ctx = withTask(ctx, ti.ID)
 	t := g.task(ti)
 	// An agent with no outbound tool (a_review): nothing goes out, before any other check, whatever the request, its
-	// permissions, the policy or a grant say (docs/30: enforced here in gatewayd, not by a prompt).
+	// permissions, the policy or a grant say (enforced here in gatewayd, not by a prompt).
 	if t.def.NoEgress {
 		g.record(Egress{Task: ti.ID, Action: id, Op: req.Name, Decision: "denied", Rule: NoEgressDenied})
 		return noEgressDenial(req.Name), nil

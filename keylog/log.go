@@ -8,7 +8,7 @@ import (
 
 // View is what the log said at one entry: the key admins' Ed25519 keys and the signatures an admin-signed
 // document needs then. Documents (policies, the firm's stop lists) are checked against the view at the log head
-// when they arrive; one the VM already took stays in force after its signers leave (docs/26 decision 12).
+// when they arrive; one the VM already took stays in force after its signers leave.
 type View struct {
 	Seq       int64
 	Head      string

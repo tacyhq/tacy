@@ -2,13 +2,13 @@ package safety
 
 import "time"
 
-// ChatPolicyV1 is the hash of the chat VM's first signed policy (policies/chat-v1.json, signed 2026-10-18 by our
-// offline admin key, live since v0.6.0). With keys v2 slice 5 that key becomes f_chat's recovery kit and
-// signs no new documents; a release that moves f_chat to its key log carries this one (Config.Carry, docs/26 decision 6)
+// ChatPolicyV1 is the hash of the chat VM's first signed policy (its v1, signed 2026-10-18 by our
+// offline admin key, live since v0.6.0). With the firm key log that key becomes f_chat's recovery kit and
+// signs no new documents; a release that moves f_chat to its key log carries this one (Config.Carry)
 // until a key admin re-signs it.
 const ChatPolicyV1 = "e6f08a761337f9a367594c3ed43a07723ac50cbf790f5b740e25442d9a8c7496"
 
-// ChatPolicyV2 is the hash of the chat VM's second signed policy (policies/chat-v2.json: api.exa.ai and the run's
+// ChatPolicyV2 is the hash of the chat VM's second signed policy (its v2: api.exa.ai and the run's
 // wall_seconds 900), signed 2026-10-18 by the same offline admin key and in force since v0.8.11. A VM that took it
 // keeps its version floor (2), so a release that moves f_chat to its key log carries it too: carrying v1 alone
 // would leave that VM with no policy it can take (v2 not carried, v1 below the floor).
@@ -37,7 +37,7 @@ func ChatRelease(firm, tinfoilHost string, models []string, runSeconds int64) *P
 			"web": {Tools: []string{"web.search", "web.fetch", "web.images"}, Hosts: []string{"api.tavily.com", "api.search.brave.com", "api.exa.ai"},
 				Fetch: []string{"*"}},
 			// The person's attached files, read inside the VM (a_review): no host, nothing leaves. Their stored files
-			// (files.fetch, branch files-vm-read): ciphertext fetched from the files bucket with the presigned URLs the
+			// (files.fetch, branch v0.17.0): ciphertext fetched from the files bucket with the presigned URLs the
 			// chat's Worker mints, and, for a schedule's run, those URLs asked of the chat's Worker; nothing is sent but
 			// the request (GET of one object; the grant and the object ids). No key leased.
 			"files": {Tools: []string{"files.list", "files.read", "files.fetch"}, Hosts: []string{},
@@ -48,7 +48,7 @@ func ChatRelease(firm, tinfoilHost string, models []string, runSeconds int64) *P
 			// A notify-changes schedule's "nothing changed" (guard/schedule.go): no host, nothing sent; it marks
 			// only the run's own result quiet.
 			"schedule": {Tools: []string{"schedule.no_change"}, Hosts: []string{}},
-			// The person's own email account, read by IMAP (guard/mail.go, v0.19.0, CONNECTIONS.md): read-only tools;
+			// The person's own email account, read by IMAP (guard/mail.go, v0.19.0, the connections contract): read-only tools;
 			// its password (a connection the person sealed to the vault) goes only to the account's own server, any
 			// public host the person entered (fetch "*"; the connector's dialer refuses private ranges and the SMTP
 			// ports). A signed policy can narrow it to named servers.
@@ -58,7 +58,7 @@ func ChatRelease(firm, tinfoilHost string, models []string, runSeconds int64) *P
 		Budget: Budgets{
 			Run: Limits{Tokens: 8_000_000, ToolCalls: 64, WallSeconds: runSeconds, CostMicros: 20_000_000},
 			Day: Limits{Tokens: 200_000_000, ToolCalls: 5_000, WallSeconds: 24 * 3600, CostMicros: 200_000_000},
-			// Keys v2 slice 6: one member (on the shared chat VM, one person's daily tag) can use a quarter of the
+			// Keys v2 spaces and identities: one member (on the shared chat VM, one person's daily tag) can use a quarter of the
 			// day, and the whole VM no more than one space could before (today's cost cap, now for everyone).
 			Member: Limits{Tokens: 50_000_000, ToolCalls: 1_250, WallSeconds: 6 * 3600, CostMicros: 50_000_000},
 			VM:     Limits{Tokens: 200_000_000, ToolCalls: 5_000, WallSeconds: 24 * 3600, CostMicros: 200_000_000},

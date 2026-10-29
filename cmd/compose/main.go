@@ -151,7 +151,7 @@ const (
 	safetyURL   = "https://chat.tacy.io/api/safety/docs"
 )
 
-// Keys v2 slice 5 (docs/26 section 4, decisions 5 and 6): once f_chat's firm key log exists, keylogGenesis is
+// The firm key log: once f_chat's firm key log exists, keylogGenesis is
 // its genesis entry's hash (safetysign keylog-check prints it) and the admin key leaves the compose: the VM takes
 // admin signers from the log's current key admins and verifies the log itself (entries from keylogURL, pulled by
 // gatewayd with the documents, or POST /keylog). Our offline admin key becomes the log's recovery kit, so
@@ -169,7 +169,7 @@ const (
 // safetyArgs are the trust-root flags every guard process gets.
 func safetyArgs() []string { return trustArgs(adminKeys, keylogGenesis, keylogCarry) }
 
-// personalSpaces: f_chat's VM is the shared chat VM (keys v2 slice 6, docs/26 section 7): people's personal spaces
+// personalSpaces: f_chat's VM is the shared chat VM (keys v2 spaces and identities): people's personal spaces
 // run under the firm's policy with the seal key their request proves, and member budgets count per the relay's
 // daily per-user tag. A firm's own VM leaves it off: a space there runs only under its own signed policy.
 const personalSpaces = true
@@ -211,7 +211,7 @@ func pullArgs(genesis string) []string {
 // images are the images: name (under Registry; its entrypoint is the binary of that name), the other binaries in
 // its layer, and whether it carries gVisor (its own layer, /tacy/gvisor). Every binary is in exactly one image; the
 // brain runs inside runnerd's sandbox, so it ships in runnerd's image. Adding a binary: an entry in bins, here, and
-// a service below that uses its image (README "Adding a process or binary").
+// a service below that uses its image.
 var images = []struct {
 	name   string
 	with   []string
@@ -706,7 +706,7 @@ func generate(r *Release) (string, error) {
 		"-remove", "/state/queue.db", "-remove", "/state/queue.db-wal", "-remove", "/state/queue.db-shm",
 		"-remove", "/state/queue.db-journal",
 		"-tree", "/state/agentd="+agentdUID+":"+agentdUID+":0700",
-		// v0.19.0: vaultd's own volume on the encrypted disk (the people's connections, CONNECTIONS.md), its uid only;
+		// v0.19.0: vaultd's own volume on the encrypted disk (the people's connections, the connections contract), its uid only;
 		// no other long-running container mounts it.
 		"-tree", "/vault="+vaultdUID+":"+vaultdUID+":0700")
 	service("agentd", "agentd", agentdUID+":"+agentdUID, false)

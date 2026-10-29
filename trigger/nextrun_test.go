@@ -43,7 +43,7 @@ func TestNextRunDailyAndCatchUp(t *testing.T) {
 		}
 	}
 	want(time.Date(2026, 10, 21, 9, 0, 0, 0, lis), time.Date(2026, 10, 22, 7, 0, 0, 0, lis))
-	// Off past 3 h late (decision 2): that day is skipped, not owed, and the next run is the day after.
+	// Off past 3 h late: that day is skipped, not owed, and the next run is the day after.
 	want(time.Date(2026, 10, 22, 10, 1, 0, 0, lis), time.Date(2026, 10, 23, 7, 0, 0, 0, lis))
 	if f := w.tick(time.Date(2026, 10, 22, 10, 1, 0, 0, lis)); len(f) != 0 {
 		t.Fatalf("fired 3 h late: %+v", f)

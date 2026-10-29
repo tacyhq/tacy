@@ -16,7 +16,7 @@ import (
 	"github.com/tacyhq/tacy/safety"
 )
 
-// Built-in agents (docs/30 slice 1): the definitions are the release's, a request only picks and narrows one, a
+// Built-in agents: the definitions are the release's, a request only picks and narrows one, a
 // brief-only agent takes one message, and the guard counts its searches and page reads against its caps.
 
 func researchReq(msgs ...proto.Message) *proto.RunRequest {
@@ -46,7 +46,7 @@ func TestAgentDefinitions(t *testing.T) {
 	if string(b1) == string(b2) {
 		t.Fatal("digest input ignores the caps")
 	}
-	// docs/30's limits.
+	// The release's limits.
 	if d, _ := Definition(AgentResearch); d.Steps != 30 || d.Searches != 20 || d.Reads != 40 || d.Work != 15*time.Minute ||
 		d.Overall != time.Hour || d.Run.CostMicros != 1_000_000 || !d.BriefOnly || d.Keep != 0 || d.Extras ||
 		slices.Contains(d.Tools, "image_search") {

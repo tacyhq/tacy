@@ -19,7 +19,7 @@ import (
 	"github.com/tacyhq/tacy/safety"
 )
 
-// POST /search: the plain chat's web search (docs/29; guard/searchtask.go). With agent mode off, the chat's model
+// POST /search: the plain chat's web search (guard/searchtask.go). With agent mode off, the chat's model
 // asks for a search, the person's tab shows the permission prompt with the exact masked query, and only when they allow it
 // does the tab verify this VM and send that query here, EHBP-encrypted like a run. Nothing else can be asked for:
 // one query (strict JSON, proto.SearchRequest), no messages, no model, no pages, no images.
@@ -223,7 +223,7 @@ func (s *server) search(w http.ResponseWriter, r *http.Request) {
 		fail(w, 404, "search_unavailable")
 		return
 	}
-	// Where and who (keys v2 slice 6, v0.10.0): checked once, here, as for a run; a refusal writes nothing.
+	// Where and who (keys v2 spaces and identities, v0.10.0): checked once, here, as for a run; a refusal writes nothing.
 	if rg, ok := s.agent.(*recGateway); ok {
 		if err := rg.VerifySearch(&req, userFrom(r.Context())); err != nil {
 			fail(w, 400, err.Error())

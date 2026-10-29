@@ -9,7 +9,7 @@ import (
 	"github.com/tacyhq/tacy/safety"
 )
 
-// a_review (docs/30, "The built-in agents", slice 3): contract and document review of the person's attached files.
+// a_review: contract and document review of the person's attached files.
 //   - Input: 1 to 5 files as text (the chat converts PDFs and office files in Tinfoil's attested document enclave,
 //     reads text files in the browser) and the brief, with an optional checklist, in one message. The files come
 //     first in it, in the chat's attachment blocks (its formatForModel), so the run
@@ -24,7 +24,7 @@ import (
 //     reviewed" list is written by the VM from its own record of what was read (files.go coverageText).
 //   - Limits: 12 steps, 10 minutes of work, 60 minutes overall, a $0.50 run budget with $0.08 kept for the review.
 
-// Review's intake caps (docs/30: up to 5 files, review text about 1M characters). maxReviewBytes bounds the files'
+// Review's intake caps (up to 5 files, review text about 1M characters). maxReviewBytes bounds the files'
 // text in UTF-8 (the relay takes 4 MiB a request, agentd 6 MiB).
 const (
 	maxReviewFiles   = 5

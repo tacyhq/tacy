@@ -14,7 +14,7 @@ import (
 	"github.com/tacyhq/tacy/trigger"
 )
 
-// Schedule upgrades (the VM release after v0.14.0; docs/30 "Scheduled tasks", upgrades; SCHEDULES.md): a schedule
+// Schedule upgrades (the VM release after v0.14.0; the schedules contract): a schedule
 // may remember what its runs found (memory), tell the person only when something changed (notify "changes"), and
 // search the web (its signed tools and allow, as any kind).
 //

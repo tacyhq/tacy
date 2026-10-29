@@ -428,7 +428,7 @@ func (e *Engine) ended(d *Definition) bool {
 }
 
 // Active counts the definitions that can fire a schedule now: active, sponsor current, before not_after, with a
-// schedule trigger. A count only (the Worker's keep-on signal, docs/30 "Scheduled tasks", decision 3).
+// schedule trigger. A count only (the Worker's keep-on signal).
 func (e *Engine) Active() int {
 	n := 0
 	for _, in := range e.Installed() {
@@ -441,7 +441,7 @@ func (e *Engine) Active() int {
 
 // NextRun is the earliest instant a schedule run is due that hasn't started yet, over every definition Active counts,
 // floored to the minute; zero when none is ahead. It lets the Worker stop the VM between runs and start it a little
-// before the next one (docs/30 "Scheduled tasks", decision 3 as revised 2026-10-23), so it errs early: a run due now
+// before the next one, so it errs early: a run due now
 // that hasn't fired (the VM just booted, its clock not trusted yet) is reported at its own, past instant until it
 // fires or Due skips it (MaxLate), and a slot whose record can't be read counts as not fired. One time for all
 // definitions together: no ids, no counts per schedule.
@@ -636,7 +636,7 @@ func (e *Engine) Due() ([]Fire, error) {
 			if ok && last >= slot {
 				continue
 			}
-			if (tr.IsDaily() || tr.IsOnce()) && now.Sub(at) > MaxLate { // too late: skipped, never fired later (decision 2)
+			if (tr.IsDaily() || tr.IsOnce()) && now.Sub(at) > MaxLate { // too late: skipped, never fired later
 				if err := e.cfg.Store.SetFired(slotKey(&tr), slot); err != nil {
 					return out, err
 				}

@@ -2,7 +2,7 @@ package safety
 
 import "testing"
 
-// Built-in agents (docs/30 slice 1): an agent's own run budget narrows the policy's (never widens it), and a small
+// Built-in agents: an agent's own run budget narrows the policy's (never widens it), and a small
 // cost budget sizes a model call's completion instead of refusing it.
 
 func TestNarrowRun(t *testing.T) {

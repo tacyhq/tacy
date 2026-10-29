@@ -1,6 +1,6 @@
 package trigger
 
-// Orphaned schedules stop themselves (decided 2026-10-21). A schedule's results wait on the VM until the person's
+// Orphaned schedules stop themselves (v0.17.0). A schedule's results wait on the VM until the person's
 // browser collects them (it fetches each, saves it in the schedule's conversation, then deletes it). A schedule whose
 // results nobody collects for MaxUncollected runs in a row (an account nobody opens any more, a browser that can't
 // sign) stops itself when its next run is due: the VM decides alone, from its own side file, with no network call.

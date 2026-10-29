@@ -1,6 +1,6 @@
-// Keys v2 slice 4: the Go side of the firm key log (docs/26-keys-v2.md section 4), checked against the browser's
+// The firm key log's vectors: the Go side of the firm key log, checked against the browser's
 // golden vectors (testdata/v2-keylog.json, identical to the chat client's test/golden/v2-keylog.json). A small
-// replay of the chain with the signer rules, so the VM's verifier in slice 5 and the browser agree on every entry
+// replay of the chain with the signer rules, so the VM's key log verifier and the browser agree on every entry
 // before either ships: hash, prev, canonical payload, signatures, who may sign what, and the final state. Also the
 // safety code (the VM never shows one, but its inputs are pinned here too). Nothing here runs in the VM yet.
 package keysv2

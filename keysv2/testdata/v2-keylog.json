@@ -2,7 +2,7 @@
   "format": "tacy-golden-crypto-vectors",
   "version": 2,
   "scheme": "keys-v2-keylog",
-  "note": "Keys v2 slice 4 (docs/26-keys-v2.md section 4): the firm key log's payloads and chain, the member email hash, the safety code, entries both verifiers refuse, a sealed space name. Fixed fake inputs. Regenerated once for M8 (email_hash in identity entries, member/user/email_hash in the safety code) while keys v2 was off for every firm, so no stored key log used the earlier format; never regenerated again. Checked by the chat client (TypeScript) and, for the key log, the email hash and the safety code, by the Go keysv2 package.",
+  "note": "Keys v2, the firm key log: its payloads and chain, the member email hash, the safety code, entries both verifiers refuse, a sealed space name. Fixed fake inputs. Regenerated once for M8 (email_hash in identity entries, member/user/email_hash in the safety code) while keys v2 was off for every firm, so no stored key log used the earlier format; never regenerated again. Checked by the chat client (TypeScript) and, for the key log, the email hash and the safety code, by the Go keysv2 package.",
   "constants": {
     "labels": {
       "keylog": "tacy-keylog/v1",

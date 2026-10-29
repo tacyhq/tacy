@@ -2,6 +2,14 @@
 
 What changed in the agent VM, release by release, newest first. Every release is a signed tag `vX.Y.Z`; its [GitHub Release](https://github.com/tacyhq/tacy/releases) carries `compose.yaml`, `release.json` and the Sigstore bundle, and [README.md](README.md) says how to check them. Entries name the package they touch; the specs are in [docs/](docs/README.md).
 
+## v0.19.2
+
+Mail times in the person's time zone; mail quotes that carry the point.
+
+- **`guard/`:** `mail_search` and `mail_read` show each message's arrival time (the server's INTERNALDATE; the Date header when there is none) in the person's time zone (`mailtime.go`): `date` is RFC 3339 with their offset, `local` the same in words with the zone's abbreviation, and `times` says which zone. `mail_search`'s `since` and `before` take the person's local `YYYY-MM-DD` or `YYYY-MM-DD HH:MM`; the server is asked by day, a day wider on each side, and the VM keeps the messages that arrived inside the exact window. The zone is a schedule's own (daily or one-time), or the chat's time note, a system message in exactly the form the brief-only agents' date note takes, its zone checked against the embedded tzdata; without one, times are UTC and the result says the zone is unknown.
+- **`guard/`:** The mail reader's prompt asks for quotes that state what a message says or asks and names the boilerplate to skip; code trims boilerplate lines and sentences off a mail quote's ends (image alt text, a bare address, "view in browser", unsubscribe, legal and "this email was sent to" lines) and drops a quote that is nothing else (`mailquotes.go`).
+- **`app/`:** The trigger routes' internal names (`triggers.go`); no change in behaviour.
+
 ## v0.19.1
 
 Fetches say `Mozilla/5.0 (compatible; Tacy/1.0)`; mail citations' details are for the browser only.

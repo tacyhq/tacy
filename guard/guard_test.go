@@ -7,11 +7,11 @@ import (
 	"github.com/tacyhq/tacy/proto"
 )
 
-// testSpace is the space the guard's tests run in (keys v2 slice 6: every run names one; agentd proves it, a guard
+// testSpace is the space the guard's tests run in (keys v2 spaces and identities: every run names one; agentd proves it, a guard
 // alone takes it as named).
 const testSpace = "s_test"
 
-// Keys v2 slice 6: no run without a space, and the one agentd verified wins over what the request names.
+// Keys v2 spaces and identities: no run without a space, and the one agentd verified wins over what the request names.
 func TestStartForSpace(t *testing.T) {
 	msgs := []proto.Message{{Role: "user", Content: "hi"}}
 	if _, _, err := StartFor(&proto.RunRequest{Messages: msgs}, time.Now()); err == nil {

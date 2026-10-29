@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// Schedule calls (v0.12.0, docs/30 "Scheduled tasks"; the contract is in the chat's repository): installing,
+// Schedule calls (v0.12.0; the contract is in the chat's repository): installing,
 // listing, stopping and removing a personal space's schedules and fetching their sealed results carry the same where
 // and who as a run, each call under its own label, followed by the call's own items:
 //
@@ -32,7 +32,7 @@ const (
 	ResultsDeleteLabel = "tacy/v2/schedule-results-delete"
 	// NotifyLabel: turning run notifications on or off for the space (app/notify.go); own item "on" or "off".
 	NotifyLabel = "tacy/v2/notify-set"
-	// Connections (app/connections.go, CONNECTIONS.md, v0.19.0): list (no own items), put (the connection, then the
+	// Connections (app/connections.go, the connections contract, v0.19.0): list (no own items), put (the connection, then the
 	// hex SHA-256 of the sealed box's enc ‖ ct) and remove (the connection).
 	ConnListLabel   = "tacy/v2/connection-list"
 	ConnPutLabel    = "tacy/v2/connection-put"

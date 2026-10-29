@@ -66,7 +66,7 @@ func (r retryVault) Lease(ctx context.Context, req vault.Request) (*vault.Secret
 	return s, err
 }
 
-// pullSafety fetches the firm key log from ku (keys v2 slice 5) and the signed stop lists and policies from u every
+// pullSafety fetches the firm key log from ku (the firm key log) and the signed stop lists and policies from u every
 // so often, and passes them to agentd (POST /keylog, then POST /safety on its HTTP socket), which checks them and
 // keeps the floors on disk; gatewayd then gets agentd's newest documents back (and checks them itself). The log
 // goes first, so a policy signed by a key admin it adds is taken in the same round. gatewayd doesn't take what it

@@ -1,6 +1,6 @@
 {
   "format": "tacy-golden-crypto-vectors",
-  "note": "Connection calls (VM v0.19.0, services/agent-vm/CONNECTIONS.md): the email connection sealed to the vault's key (HPKE base mode, info tacy/v2/connection, aad info ‖ 0 ‖ space ‖ 0 ‖ connection, fixed ephemeral key) and the three signed calls. Made once from v2-schedule.json's fixed seeds with node:crypto (scripts/gen-golden-v2-connection-vectors.mjs); never regenerate.",
+  "note": "Connection calls (VM v0.19.0): the email connection sealed to the vault's key (HPKE base mode, info tacy/v2/connection, aad info ‖ 0 ‖ space ‖ 0 ‖ connection, fixed ephemeral key) and the three signed calls. Made once from v2-schedule.json's fixed seeds with node:crypto (scripts/gen-golden-v2-connection-vectors.mjs); never regenerate.",
   "constants": {
     "labels": {
       "spaceProof": "tacy/v2/space-proof",

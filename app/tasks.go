@@ -38,7 +38,7 @@ import (
 //	POST /tasks/cancel   {task, mac} -> {task, state}
 //	POST /tasks/delete   {task, mac} -> {task, deleted: true}: deletes the task and everything kept for it (its
 //	                     start, journal and events: the result), as the browser asks once it saved the result or the
-//	                     person deleted the conversation (docs/30 decision 5); a task still running is cancelled
+//	                     person deleted the conversation; a task still running is cancelled
 //	                     first (billing witness as for cancel) and deleted as soon as it ended. Without a delete an
 //	                     ended task is kept 10 minutes once its events stream handed on its end and [DONE] (the
 //	                     result reached the tab: guard.Host.Delivered), else a day (guard.DefaultKeep; v0.16.0, before
@@ -105,7 +105,7 @@ func (s *server) tasksOpen(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	schedules := 0 // the keep-on signal for personal schedules (docs/30 "Scheduled tasks", decision 3): a count only
+	schedules := 0 // the keep-on signal for personal schedules: a count only
 	var next *time.Time
 	if s.personal() {
 		schedules = s.triggers.Active()
@@ -267,7 +267,7 @@ func (s *server) taskStart(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, err.Error())
 		return
 	}
-	// Where and who (keys v2 slice 6): checked once, here; the task is made from what was verified.
+	// Where and who (keys v2 spaces and identities): checked once, here; the task is made from what was verified.
 	err = s.verifyWho(&req.RunRequest, userFrom(r.Context()))
 	if err != nil && safety.CodeOf(err) == "" {
 		fail(w, 400, err.Error())

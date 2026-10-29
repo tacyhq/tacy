@@ -20,7 +20,7 @@ import (
 	"github.com/tacyhq/tacy/safety"
 )
 
-// The files connector (a_review, docs/30 slice 3): files.list and files.read over a review task's own files
+// The files connector (a_review): files.list and files.read over a review task's own files
 // (TaskOptions.Files), inside the VM. Nothing here reaches the network except the quarantined reader's model calls
 // (the attested inference enclave, through the model gateway like every model call), and, for the person's stored
 // files (TaskOptions.Stored, stored.go), the fetch of their ciphertext when a files.read first needs one.

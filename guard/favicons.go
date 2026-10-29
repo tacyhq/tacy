@@ -361,7 +361,7 @@ func iconGet(ctx context.Context, client *http.Client, raw string) ([]byte, erro
 	ctx, cancel := context.WithTimeout(ctx, iconFetchTime)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, "GET", raw, nil)
-	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; sealed-agent/0.1)")
+	req.Header.Set("User-Agent", FetchUserAgent)
 	req.Header.Set("Accept", "image/x-icon,image/png,image/webp,image/gif,image/jpeg;q=0.9,*/*;q=0.1")
 	res, err := client.Do(req)
 	if err != nil {
@@ -406,7 +406,7 @@ func iconPage(ctx context.Context, client *http.Client, raw string) ([]byte, *ur
 	ctx, cancel := context.WithTimeout(ctx, iconFetchTime)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, "GET", raw, nil)
-	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; sealed-agent/0.1)")
+	req.Header.Set("User-Agent", FetchUserAgent)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml;q=0.9,*/*;q=0.1")
 	res, err := client.Do(req)
 	if err != nil {

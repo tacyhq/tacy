@@ -292,7 +292,7 @@ func downloadImage(ctx context.Context, client *http.Client, raw string) ([]byte
 	ctx, cancel := context.WithTimeout(ctx, imageFetchTime)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, "GET", raw, nil)
-	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; sealed-agent/0.1)")
+	req.Header.Set("User-Agent", FetchUserAgent)
 	req.Header.Set("Accept", "image/jpeg,image/png,image/webp,image/gif;q=0.9,*/*;q=0.1")
 	res, err := client.Do(req)
 	if err != nil {

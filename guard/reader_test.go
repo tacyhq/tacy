@@ -227,6 +227,7 @@ type taintStore struct {
 	*harness.MemStore
 	mu      sync.Mutex
 	tainted map[string]string
+	written [][]byte // journal results and checkpoints, as written
 }
 
 func (s *taintStore) SetTaint(id, by string) error {
@@ -239,6 +240,22 @@ func (s *taintStore) SetTaint(id, by string) error {
 	}
 	s.mu.Unlock()
 	return s.MemStore.SetTaint(id, by)
+}
+
+// Finish and SaveCheckpoint also keep a copy of what was written (the rows are gone once a /run task ends).
+func (s *taintStore) Finish(task, id string, body jsontext.Value, e *harness.Error) error {
+	s.mu.Lock()
+	s.written = append(s.written, slices.Clone([]byte(body)))
+	s.mu.Unlock()
+	return s.MemStore.Finish(task, id, body, e)
+}
+
+func (s *taintStore) SaveCheckpoint(task string, cp *harness.Checkpoint) error {
+	b, _ := json.Marshal(cp)
+	s.mu.Lock()
+	s.written = append(s.written, b)
+	s.mu.Unlock()
+	return s.MemStore.SaveCheckpoint(task, cp)
 }
 
 type readerE2E struct {

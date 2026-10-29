@@ -275,6 +275,10 @@ type Event struct {
 	// Quotes: tool_result of a source the quarantined reader read (docs/27 section 5): the exact passages the
 	// answer may cite as [quote N]. The acting model never sees their text; the browser shows it.
 	Quotes []Quote `json:"quotes,omitempty"`
+	// Mail: tool_result of mail_search and mail_read, for the person's browser only (its citation chips): each listed
+	// or read message's sender name, subject and Message-ID, from the headers the VM fetched anyway. Never part of
+	// Result, never given to a model (the acting model gets neither a subject nor a sender's name).
+	Mail []MailDetail `json:"mail,omitempty"`
 	// Pictures: a "pictures" event (v0.8.21), at a run's end: the ticket for its cards' photos the VM didn't look up
 	// because pictures weren't allowed yet (POST /pictures, once the person allows them).
 	Pictures string   `json:"pictures,omitempty"`
@@ -360,6 +364,15 @@ type Quote struct {
 	// File is the name of the person's file a quote is from (a_review's and a_research's files.read, v0.13.0); ""
 	// for a web source's. A research task's file quotes have Index 0: they are no web source's.
 	File string `json:"file,omitempty"`
+}
+
+// MailDetail is what the browser shows of one message a mail tool named (Event.Mail): untrusted text from the
+// message's headers, display only. ID is the run's id for it (m1, m2, ...), as in the tool's result.
+type MailDetail struct {
+	ID        string `json:"id"`
+	Name      string `json:"name,omitempty"`       // the sender's display name
+	Subject   string `json:"subject,omitempty"`    // the subject
+	MessageID string `json:"message_id,omitempty"` // the Message-ID header, <local@domain>
 }
 
 // Image is one picture image_search shows: a JPEG the VM decoded, scaled to at most 1024 px and re-encoded from

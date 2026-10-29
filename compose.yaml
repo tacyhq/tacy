@@ -11,9 +11,9 @@
 # sha256 180dd277f657c1478f09490e8a9a595f7378257510b43d1d3694a769aef9ed02, each binary checked; its Apache-2.0 LICENSE at
 # /tacy/gvisor/LICENSE). Rebuild them from the tagged source (scripts/reproduce.sh) to get the same digests.
 # Binaries (linux/amd64, sha256):
-#   agentd   9e4935c66ef36f29c2463cf9768e3faca1d7d2365336b7fbd8d1db2f02d4de3b
+#   agentd   74afecb8d9ebd041dd7837c259a293d6f847a390d18a8213aef6d9a3f305b930
 #   brain    7c984294c1b91fd5c27fb407d655bb2536b35e427b23b6d5082055e73d88cf60
-#   gatewayd 0c770e4c9c79e996b955d93da04fd35ce63636a11a0e3bc7664f95c83d4dfd6c
+#   gatewayd d3f54a0c6342a92d847a1c803e31b11d7b075765e3c82ac8e6afb8177844367f
 #   runnerd  b1c1a2432beaf866395941d4d598ade89a0e885e226c6e13c5d2a4c359990bcb
 #   setup    80f380d97b1cc77da758d69ba978e5f09c720f10ef853f6afa06e06ffa006de6
 #   vaultd   43da5e7e895726f1dd1afc9e97c65cacb1e6822caa2df769ff0a6b2ed82e7c0b
@@ -40,7 +40,7 @@ services:
       - vaultstate:/vault
     command: ["-dir", "/run/tacy/agent=10003:10001:0770", "-dir", "/run/tacy/vault=10002:10001:0750", "-dir", "/run/tacy/runner=10004:10003:0750", "-remove", "/state/queue.db", "-remove", "/state/queue.db-wal", "-remove", "/state/queue.db-shm", "-remove", "/state/queue.db-journal", "-tree", "/state/agentd=10003:10003:0700", "-tree", "/vault=10002:10002:0700"]
   agentd:
-    image: ghcr.io/tacyhq/tacy/agentd@sha256:213cbde109e79e009ab121183420bbeb46447c8e52c91b9337c8784fd2b17782
+    image: ghcr.io/tacyhq/tacy/agentd@sha256:20660e354084ca4c460bdbe8a51860df47215c86f8f796e70404d703ba20237a
     entrypoint: ["/tacy/agentd"]
     network_mode: none
     restart: unless-stopped
@@ -80,7 +80,7 @@ services:
       - runnersock:/run/tacy/runner
     command: ["-socket", "/run/tacy/runner/runner.sock", "-agent-uid", "10003", "-gvisor", "/tacy/gvisor", "-gvisor-release", "20261012.0", "-runsc-sha256", "56996c546dbafd5716e1d09e307a131d97eb3b6483c22a1178631751f3e0392f", "-brain", "/tacy/brain", "-brain-sha256", "7c984294c1b91fd5c27fb407d655bb2536b35e427b23b6d5082055e73d88cf60", "-dir", "/run/runner", "-platform", "systrap", "-rootless"]
   agentvm:
-    image: ghcr.io/tacyhq/tacy/gatewayd@sha256:28bd01104410d2dea244f604bb1ee38241c78fd9858e18af58451840e8665da8
+    image: ghcr.io/tacyhq/tacy/gatewayd@sha256:8d68896dc3c311c86434e55ae07827b68e4155d1dc79486deb79bb1783c8040e
     entrypoint: ["/tacy/gatewayd"]
     restart: unless-stopped
     depends_on:

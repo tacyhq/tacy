@@ -1,12 +1,14 @@
 package guard
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -78,7 +80,12 @@ type mailE2E struct {
 
 func newMailE2E(t *testing.T, sm *splitModel) *mailE2E {
 	t.Helper()
-	srv := mailFixture(t)
+	return newMailE2EOn(t, sm, mailFixture(t))
+}
+
+// newMailE2EOn is newMailE2E on a mailbox of the test's own (started).
+func newMailE2EOn(t *testing.T, sm *splitModel, srv *imaptest.Server) *mailE2E {
+	t.Helper()
 	v, err := vault.New(nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -356,6 +363,145 @@ func TestMailDialerPublicIMAPOnly(t *testing.T) {
 }
 
 // Settings → Connections through the guard: a test login decides whether a box is kept; refusals have their codes.
+// The browser-only mail field (v0.19.1): mail_search and mail_read's tool_result carry each message's sender name,
+// subject and Message-ID for the person's chips, from the headers already fetched. None of it is in the result, so
+// none of it reaches a model: the acting model never gets a subject, a sender's name or a Message-ID, and no model
+// (the reader neither) gets a Message-ID; the task's journal and checkpoint (what a restart replays) hold none of it.
+//
+// MAIL_DETAILS_EVENTS=<file> also writes the run's events, as the browser gets them (the chat's test fixture).
+func TestMailDetailsBrowserOnly(t *testing.T) {
+	const (
+		priyaName = "Priya Raman (Northwind)"
+		priyaSubj = "Your November statement is ready"
+		priyaID   = "<stmt-2026-11.88@mail.northwind.example>"
+		lenaID    = "lena-q3-final@finance.example"
+	)
+	srv := imaptest.New()
+	srv.Users[mailUser] = mailPassword
+	at := func(d int) time.Time { return time.Date(2026, 10, d, 9, 0, 0, 0, time.UTC) }
+	// Oldest first, so the newest (m1) is Priya's. No name, no subject and a Message-ID with a space: no details.
+	srv.Add("INBOX", []byte("Date: Mon, 26 Oct 2026 09:00:00 +0000\r\nFrom: noreply@shop.example\r\nMessage-ID: <bad id@shop.example>\r\n\r\nHi.\r\n"), at(26))
+	// A name and subject with hidden characters (shown as spaces), a Message-ID without its brackets (added).
+	srv.Add("INBOX", []byte("Date: Tue, 27 Oct 2026 09:00:00 +0000\r\nFrom: \"Lena‮ Fischer\" <lena@finance.example>\r\n"+
+		"Subject: Q3 report​ final\r\nMessage-ID: "+lenaID+"\r\n\r\nThe Q3 report is final.\r\n"), at(27))
+	srv.Add("INBOX", []byte("Date: Wed, 28 Oct 2026 08:30:00 +0000\r\nFrom: \""+priyaName+"\" <billing@northwind.example>\r\nTo: Me <me@example.com>\r\n"+
+		"Subject: "+priyaSubj+"\r\nMessage-ID:\r\n "+priyaID+"\r\n\r\nHello, your November statement total is 512.40 EUR, due 20 November.\r\n"), at(28))
+	srv.AddFolder("[Gmail]/Sent Mail")
+	if err := srv.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(srv.Close)
+	sm := &splitModel{acting: []string{
+		toolCallSSE("c1", "mail_search", `{}`),
+		toolCallSSE("c2", "mail_read", `{"id":"m1"}`),
+		textSSE("Your November statement is 512.40 EUR, due 20 November [m1]; [quote 1]."),
+	}}
+	sm.reader = func(prompt string) string {
+		return answerJSON(t, func(m map[string]any) {
+			if strings.Contains(prompt, "Kind: email headers") {
+				m["summary"], m["facts"], m["quotes"] = "Three messages.", []string{"A statement is ready [R1].", "A report [R2]."}, []any{}
+			} else {
+				m["summary"], m["facts"] = "A statement.", []string{"The total is 512.40 EUR, due 20 November [Q1]."}
+				m["quotes"] = []map[string]any{{"id": 1, "from": spanAt(prompt, "Hello, your November"), "to": spanAt(prompt, "Hello, your November"),
+					"location": "opening", "topic": "the total"}}
+			}
+			m["entities"], m["dates"], m["amounts"] = []string{}, []string{}, []string{}
+			m["source"] = map[string]any{"kind": "other", "title": "", "publisher": "", "published": ""}
+		})
+	}
+	e := newMailE2EOn(t, sm, srv)
+	evs := e.run(t, proto.RunRequest{Permissions: AllowAll(), Messages: user("What's my Northwind statement?")})
+	if p := os.Getenv("MAIL_DETAILS_EVENTS"); p != "" {
+		b, _ := json.MarshalIndent(map[string]any{"question": "What's my Northwind statement?",
+			"note":   "Recorded from guard TestMailDetailsBrowserOnly (VM v0.19.1): a stand-in Gmail-like mailbox, fake models.",
+			"events": evs}, "", " ")
+		if err := os.WriteFile(p, append(b, '\n'), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	search, read := toolResults(evs, "mail_search"), toolResults(evs, "mail_read")
+	if len(search) != 1 || len(read) != 1 {
+		t.Fatalf("results: %s", types(evs))
+	}
+	priya := proto.MailDetail{ID: "m1", Name: priyaName, Subject: priyaSubj, MessageID: priyaID}
+	lena := proto.MailDetail{ID: "m2", Name: "Lena Fischer", Subject: "Q3 report final", MessageID: "<" + lenaID + ">"}
+	if !slices.Equal(search[0].Mail, []proto.MailDetail{priya, lena}) {
+		t.Fatalf("search details %+v", search[0].Mail)
+	}
+	if !slices.Equal(read[0].Mail, []proto.MailDetail{priya}) {
+		t.Fatalf("read details %+v", read[0].Mail)
+	}
+	if !strings.Contains(string(search[0].Result), `"[Gmail]/Sent Mail"`) {
+		t.Fatalf("no Gmail folder in %s", search[0].Result)
+	}
+	// Never in a result: no mail field, no name, subject or Message-ID.
+	secrets := []string{priyaName, priyaSubj, "stmt-2026-11.88", "Lena", "Q3 report", "lena-q3-final", "bad id", "message_id"}
+	for _, ev := range append(search, read...) {
+		var o map[string]any
+		if err := json.Unmarshal(ev.Result, &o); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := o["mail"]; ok {
+			t.Fatalf("a mail field in the result: %s", ev.Result)
+		}
+		for _, s := range secrets {
+			if strings.Contains(string(ev.Result), s) {
+				t.Fatalf("%s's result carries %q: %s", ev.Name, s, ev.Result)
+			}
+		}
+	}
+	// Never in a model's prompt: the acting model gets none of it; no model gets a Message-ID.
+	if len(e.sm.actReqs) < 3 || len(e.sm.readReqs) != 2 {
+		t.Fatalf("model calls: %d acting, %d reader", len(e.sm.actReqs), len(e.sm.readReqs))
+	}
+	for i, raw := range e.sm.actReqs {
+		for _, s := range secrets {
+			if strings.Contains(string(raw), s) {
+				t.Fatalf("acting request %d carries %q", i, s)
+			}
+		}
+	}
+	for i, req := range e.sm.readReqs {
+		b, _ := json.Marshal(req)
+		for _, s := range []string{"stmt-2026-11.88", "lena-q3-final", "bad id", "message_id", "Message-ID"} {
+			if strings.Contains(string(b), s) {
+				t.Fatalf("reader request %d carries %q", i, s)
+			}
+		}
+	}
+	if b, _ := json.Marshal(e.sm.readReqs[0]); !strings.Contains(string(b), priyaSubj) {
+		t.Fatal("the reader never saw the subjects (the check above would prove nothing)")
+	}
+	// Nor in what the task keeps: its journal and checkpoint (a restart rebuilds the model's context from them).
+	e.st.mu.Lock()
+	defer e.st.mu.Unlock()
+	kept := string(bytes.Join(e.st.written, []byte("\n")))
+	if !strings.Contains(kept, "512.40 EUR") {
+		t.Fatal("the journal never got the read's result (the check below would prove nothing)")
+	}
+	for _, s := range secrets {
+		if strings.Contains(kept, s) {
+			t.Fatalf("the task keeps %q", s)
+		}
+	}
+}
+
+// A secret in a message's headers is redacted in the browser's details as everywhere else; a Message-ID with one
+// is dropped (a redacted one would name no message).
+func TestMailDetailsLeakScan(t *testing.T) {
+	gh := "ghp_" + strings.Repeat("aB3dE5fG7h", 4)[:36]
+	out := toolOutcome{content: `{"ok":true}`, mail: []proto.MailDetail{
+		{ID: "m1", Name: "Ops " + gh, Subject: "token " + gh, MessageID: "<" + gh + "@x.example>"},
+		{ID: "m2", Name: "Alice", Subject: "Lunch", MessageID: "<a.1@x.example>"}}}
+	if ids := redactOutcome(&out); len(ids) == 0 {
+		t.Fatal("nothing found")
+	}
+	b, _ := json.Marshal(out.mail)
+	if strings.Contains(string(b), gh) || out.mail[0].MessageID != "" || out.mail[1] != (proto.MailDetail{ID: "m2", Name: "Alice", Subject: "Lunch", MessageID: "<a.1@x.example>"}) {
+		t.Fatalf("details %s", b)
+	}
+}
+
 func TestConnPutTestsLogin(t *testing.T) {
 	srv := mailFixture(t)
 	srv.Refuse["blocked@example.com"] = "web_login"

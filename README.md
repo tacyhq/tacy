@@ -169,7 +169,6 @@ What you still have to trust, honestly:
 Tacy was renamed from an earlier working name. These identifiers keep the old name on purpose, because they are part of the protocol or of signed data:
 
 - `sealed-agent-vm/v1`: the attestation format version and the report_data label.
-- User agent: `Mozilla/5.0 (compatible; sealed-agent/0.1)` (web pages, images and site icons the VM fetches), until a renamed one is checked against the sites it reads. Since v0.19.0 the VM's requests to verify Tinfoil say `Tacy/1.0`.
 - `globalThis.sealedAgentVM`: the browser verifier's JavaScript entry point.
 - `testdata/attest-061.json`: the recorded VM ran a compose that predates this repository (old Go module path in its embedded source).
 

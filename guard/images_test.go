@@ -427,3 +427,44 @@ func TestAgentImageSearchReaderTitles(t *testing.T) {
 		t.Fatal("an image title reached the model")
 	}
 }
+
+// Every fetch from the VM's web side says it is a Tacy agent: pages (agent_test.go), images, site icons and
+// the home page an icon is looked up on. No browser disguise, no URL.
+func TestFetchUserAgent(t *testing.T) {
+	if FetchUserAgent != "Mozilla/5.0 (compatible; Tacy/1.0)" {
+		t.Fatalf("FetchUserAgent = %q", FetchUserAgent)
+	}
+	var mu sync.Mutex
+	got := map[string]string{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		got[r.URL.Path] = r.Header.Get("User-Agent")
+		mu.Unlock()
+		if r.URL.Path == "/" {
+			w.Header().Set("Content-Type", "text/html")
+			w.Write([]byte(`<html><head><link rel="icon" href="/favicon.png"></head></html>`))
+			return
+		}
+		w.Header().Set("Content-Type", "image/png")
+		w.Write(pngBytes(t, 32, 32, false))
+	}))
+	defer srv.Close()
+	ctx := context.Background()
+	open := newFetcher(func(string, string, syscall.RawConn) error { return nil })
+	if _, err := downloadImage(ctx, open, srv.URL+"/pic.png"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := iconGet(ctx, open, srv.URL+"/favicon.png"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := iconPage(ctx, open, srv.URL+"/"); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for _, p := range []string{"/pic.png", "/favicon.png", "/"} {
+		if got[p] != FetchUserAgent {
+			t.Errorf("%s sent User-Agent %q", p, got[p])
+		}
+	}
+}

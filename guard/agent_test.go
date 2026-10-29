@@ -326,7 +326,7 @@ func TestFetchPageHeaders(t *testing.T) {
 		t.Fatalf("page not read: %s", out.content)
 	}
 	want := map[string]string{
-		"User-Agent": "Mozilla/5.0 (compatible; sealed-agent/0.1)", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document",
+		"User-Agent": "Mozilla/5.0 (compatible; Tacy/1.0)", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document",
 		"Sec-Fetch-Site": "none", "Sec-Fetch-User": "?1", "Upgrade-Insecure-Requests": "1", "Accept-Language": "en-US,en;q=0.9",
 	}
 	for k, v := range want {

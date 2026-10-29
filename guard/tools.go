@@ -81,6 +81,9 @@ type toolOutcome struct {
 	tail     *imageTail    // image_search: images still loading after the call returned (nil: none)
 	istats   *imageStats   // image_search: numbers for the metrics event
 	quotes   []proto.Quote // read by the quarantined reader: the exact passages, for the person only (tool_result)
+	// mail: mail_search and mail_read's messages, their senders' names, subjects and Message-IDs, for the person
+	// only (tool_result's mail field; never in content)
+	mail []proto.MailDetail
 	// links: a page's links numbered as sources (links.go): fetchable by number and shown to people with the
 	// citations, but not sources of the page's own (no site icons, no card pictures). citeOnly: they are a page's
 	// links to cite only (TaskOptions.CiteLinks): numbered and shown when cited, never fetchable.
@@ -596,8 +599,14 @@ func newFetcher(control func(string, string, syscall.RawConn) error) *http.Clien
 // answers 429 "Too many requests" or 403 to a GET without Sec-Fetch-Mode, whatever the User-Agent; with it, the same
 // request gets the page (measured 2026-10-17 on keychron.com, epomaker.com and newegg.com product pages: 429/403
 // before, 200 after; Sec-Fetch-Mode alone was enough). Nothing identifying: no cookies, no Referer, one fixed language.
+//
+// FetchUserAgent is what every page, image and icon fetch says it is: a Tacy agent, no browser disguise and no URL
+// (with "; +https://tacy.io" one news site of 32 checked held the request until it timed out; this form kept every
+// site the old "sealed-agent/0.1" got).
+const FetchUserAgent = "Mozilla/5.0 (compatible; Tacy/1.0)"
+
 var pageHeaders = map[string]string{
-	"User-Agent":                "Mozilla/5.0 (compatible; sealed-agent/0.1)",
+	"User-Agent":                FetchUserAgent,
 	"Accept":                    "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.1",
 	"Accept-Language":           "en-US,en;q=0.9",
 	"Sec-Fetch-Dest":            "document",

@@ -38,7 +38,7 @@ func RequestID(ctx context.Context) string {
 	return id
 }
 
-// ReplayGuard is a Guard that says which requests are "replay: safe" (decided 2026-10-16, docs/20 open question 3):
+// ReplayGuard is a Guard that says which requests are "replay: safe" (docs/20 "Replay and idempotency"):
 // reads that send or change nothing (a model call, a web search). A safe request a previous runtime process
 // recorded but never finished is run again after a restart instead of answered "interrupted". Anything else (a
 // mail sent, an exec) is never repeated. A Guard that isn't a ReplayGuard has nothing safe.

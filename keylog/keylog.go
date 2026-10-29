@@ -1,6 +1,6 @@
-// Package keylog is the VM's side of the firm key log (keys v2 slice 5, docs/26-keys-v2.md section 4 and its
-// decisions 5, 6 and 12): an append-only, hash-chained list of signed entries per firm naming its identities'
-// public keys, its key admins, the signature threshold, the firm root public key and the recovery-kit signer.
+// Package keylog is the VM's side of the firm key log (keys v2): an append-only, hash-chained list of signed
+// entries per firm naming its identities' public keys, its key admins, the signature threshold, the firm root
+// public key and the recovery-kit signer.
 //
 // The VM's compose pins the firm and the genesis entry's hash; the VM verifies the chain from that genesis itself
 // and takes the firm's admin signers (for policies and the firm's stop lists) from the log's current key admins,
@@ -51,7 +51,7 @@ import (
 // Label is what every key log signature and hash starts with.
 const Label = "tacy-keylog/v1"
 
-// Placeholder is the chat VM's firm id until slice 6.
+// Placeholder is the chat VM's firm id until spaces and identities (v0.10.0).
 const Placeholder = "f_chat"
 
 // Kinds of entries.

@@ -17,7 +17,7 @@ import (
 	"github.com/tacyhq/tacy/runauth"
 )
 
-// Run notifications (decided 2026-10-21; the chat's Web Push relay is the other half): a content-free notice
+// Run notifications (v0.15.0; the chat's Web Push relay is the other half): a content-free notice
 // on the person's devices when a run of theirs finished unattended or waits for them, so they know to open Tacy. Off
 // unless the person turned it on for their space (POST /notify/set, signed like a schedule call: the relay can't turn
 // it on for anyone). Then, and only then, the space is marked when

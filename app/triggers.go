@@ -25,7 +25,7 @@ import (
 // Triggers and approvals (docs/27 sections 3 and 4): approve before send and authenticated triggers, agentd's routes and the
 // scheduler. Each call is a POST with an EHBP-encrypted body, like the task calls; what authorizes it is a person's
 // signature inside, checked here against the identity directory (keys v2). Until keys v2's key log reaches this VM
-// (slices 5 and 6), no directory is set and every one of these answers identity_unavailable: nothing can be
+// (later), no directory is set and every one of these answers identity_unavailable: nothing can be
 // approved, installed or triggered (fail closed).
 //
 //	POST /approvals/list  {identity, space, signed_at, nonce, sig} -> {approvals: [proto.Approval]}: what waits for
@@ -64,8 +64,8 @@ func listSigned(vmKey string, r *listRequest) []byte {
 	return b
 }
 
-// step7Routes serves the routes on mux behind EHBP with id.
-func (s *server) step7Routes(mux *http.ServeMux, id *ehbpidentity.Identity) {
+// triggerRoutes serves the routes on mux behind EHBP with id.
+func (s *server) triggerRoutes(mux *http.ServeMux, id *ehbpidentity.Identity) {
 	mux.Handle("POST /approvals/list", s.taskGuard(false, false, id.Middleware()(http.HandlerFunc(s.approvalsList))))
 	mux.Handle("POST /approvals", s.taskGuard(false, false, id.Middleware()(http.HandlerFunc(s.approvalsAnswer))))
 	mux.Handle("POST /triggers", s.taskGuard(false, false, id.Middleware()(http.HandlerFunc(s.triggersInstall))))

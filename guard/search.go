@@ -487,7 +487,7 @@ func (b *brave) Images(ctx context.Context, query string, count int) ([]ImageCan
 }
 
 // NewSearch picks the provider: provider (SEARCH_PROVIDER: exa | brave | tavily) if set, else Exa when its key is
-// set (has: the vault's names, never values; the production default since v0.8.10, docs/29), else Brave when its key
+// set (has: the vault's names, never values; the production default since v0.8.10), else Brave when its key
 // is set, else Tavily. Keys are leased per request. Exa has no image search: with Exa, image_search goes to Brave
 // when its key is set, else Tavily (as before Exa). With Exa and Tavily's key set, a search Exa fails on its side goes
 // to Tavily (searchfallback.go, v0.13.0).

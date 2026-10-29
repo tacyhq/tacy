@@ -121,7 +121,7 @@ type server struct {
 	searchSlots  chan struct{}
 	searchMu     sync.Mutex
 	userSearches map[string]int
-	// Triggers and approvals (step7.go): the identity directory (keys v2's key log; nil until it reaches this VM, and then
+	// Triggers and approvals (triggers.go): the identity directory (keys v2's key log; nil until it reaches this VM, and then
 	// nothing that needs a person's signature works), approvals (POST /approvals) and triggers (POST /triggers).
 	dir       identity.Directory
 	approvals *guard.Approvals
@@ -296,10 +296,10 @@ func (s *server) run(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, err.Error())
 		return
 	}
-	// Where and who (keys v2 slice 6): checked once, here; StartFor then uses what was verified.
+	// Where and who (keys v2 spaces and identities): checked once, here; StartFor then uses what was verified.
 	err = s.verifyWho(&req, userFrom(r.Context()))
 	if _, known := guard.Definition(req.Agent); err == nil && known && !guard.IsChat(req.Agent) {
-		err = fmt.Errorf("%s starts through POST /tasks", req.Agent) // its task outlives the tab (docs/30)
+		err = fmt.Errorf("%s starts through POST /tasks", req.Agent) // its task outlives the tab
 	}
 	if err == nil {
 		_, _, err = s.agent.StartFor(&req) // the request checks (Run makes the task from it again)
@@ -575,7 +575,7 @@ func main() {
 		Sources: host.Sources}
 	// Approve before send and triggers (docs/27 sections 3 and 4): their records in the queue's side file (its own
 	// file, so a rollback's older agentd still opens the queue). No identity directory on this VM yet (keys v2's key
-	// log comes with slices 5 and 6): no approval, definition or event verifies, so sends are denied and nothing is
+	// log comes later): no approval, definition or event verifies, so sends are denied and nothing is
 	// triggered.
 	var side interface {
 		approval.Store
@@ -694,20 +694,20 @@ func main() {
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) { fmt.Fprintln(w, "ok") })
 	mux.Handle("POST /run", s.guard(id.Middleware()(http.HandlerFunc(s.run))))
 	s.taskRoutes(mux, id)
-	// The plain chat's web search (search.go, docs/29).
+	// The plain chat's web search (search.go).
 	s.searchRoutes(mux, id)
-	s.step7Routes(mux, id)
-	s.scheduleRoutes(mux, id)                                    // schedules for personal spaces (schedules.go, SCHEDULES.md)
-	s.connectionRoutes(mux, id)                                  // Settings → Connections (connections.go, CONNECTIONS.md)
-	s.notifyRoutes(mux, id)                                      // run notifications (notify.go, SCHEDULES.md)
-	mux.HandleFunc("POST /schedules/handoff", s.scheduleHandoff) // sealed results to the relay (handoff.go, SCHEDULES.md)
+	s.triggerRoutes(mux, id)
+	s.scheduleRoutes(mux, id)                                    // schedules for personal spaces (schedules.go, the schedules contract)
+	s.connectionRoutes(mux, id)                                  // Settings → Connections (connections.go, the connections contract)
+	s.notifyRoutes(mux, id)                                      // run notifications (notify.go, the schedules contract)
+	mux.HandleFunc("POST /schedules/handoff", s.scheduleHandoff) // sealed results to the relay (handoff.go, the schedules contract)
 	mux.HandleFunc("GET /activity", s.activityOut)               // sealed activity records, for the relay (docs/24)
 	// Signed policies and stop lists; the signature is the authorization. Only served when the compose pins a key
 	// (stage 2): without one nothing could verify, so there's nothing to take.
 	if st.Keyed() {
 		mux.HandleFunc("POST /safety", s.safetyIn)
 	}
-	// Firm key log entries (keys v2 slice 5); only when the compose pins the log's genesis.
+	// Firm key log entries (the firm key log); only when the compose pins the log's genesis.
 	if st.KeyLogged() {
 		mux.HandleFunc("POST /keylog", s.keylogIn)
 	}

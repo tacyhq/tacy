@@ -9,7 +9,7 @@ import (
 	"errors"
 )
 
-// Since keys v2 slice 6 (v0.10.0) the VM no longer takes record_to: a run's records go to its space's seal key, proven
+// Since keys v2 spaces and identities (v0.10.0) the VM no longer takes record_to: a run's records go to its space's seal key, proven
 // with runauth.SpaceProof (the same construction under its own label). RecordProof stays for its vector, which the
 // chat checks while it still talks to older releases.
 //

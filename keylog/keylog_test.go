@@ -13,7 +13,7 @@ import (
 	"testing"
 )
 
-// The browser's golden vectors (keys v2 slice 4): the same file as the chat's test/golden/v2-keylog.json.
+// The browser's golden vectors (the firm key log's vectors): the same file as the chat's test/golden/v2-keylog.json.
 type vectors struct {
 	Firm       string `json:"firm"`
 	Identities map[string]struct {
@@ -366,7 +366,7 @@ func makeFchat(t *testing.T) *fchatVectors {
 		sid, smem, suser = "i_dmaaaaaaaaaaaaaaaaaaaaaaaa", "m_dmaaaaaaaaaaaaaaaaaaaaaaaa", "u_dmaaaaaaaaaaaaaaaaaaaaaaaa"
 	)
 	out := &fchatVectors{Format: "tacy-golden-crypto-vectors", Firm: Placeholder,
-		Note: "Keys v2 slice 5: the f_chat placeholder's key log (the VM's keylog package, TestFchatVectors). Made once from fixed seeds; never regenerate."}
+		Note: "The firm key log: the f_chat placeholder's key log (the VM's keylog package, TestFchatVectors). Made once from fixed seeds; never regenerate."}
 	var es []Entry
 	push := func(e Entry) {
 		es = append(es, e)

@@ -63,7 +63,7 @@ type Conn struct {
 	// Kind and PriceModel, when set, are sent as X-Agent-Kind and X-Agent-Price-Model with a run or a task start: what
 	// the relay prices it at (v0.16.0; guard/charge.go). The VM refuses a start whose body doesn't match them.
 	Kind, PriceModel string
-	// Asker fills each request's space and identity (keys v2 slice 6; runauth) unless the request names a space
+	// Asker fills each request's space and identity (keys v2 spaces and identities; runauth) unless the request names a space
 	// already (tests that send their own). New makes a fresh one: a personal space and identity of this connection.
 	Asker *runauth.Asker
 	key   []byte

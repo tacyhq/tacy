@@ -800,7 +800,7 @@ func PicturesStart(r *proto.PicturesRequest, now time.Time) (harness.Start, Task
 	secret := make([]byte, 32)
 	rand.Read(secret)
 	args, _ := json.Marshal(map[string]any{"query": "pictures"})
-	// Its space (keys v2 slice 6, v0.10.0): the one agentd verified (runauth), or as the request names it for a guard
+	// Its space (keys v2 spaces and identities, v0.10.0): the one agentd verified (runauth), or as the request names it for a guard
 	// that runs alone (tests: nothing is recorded there). No default: every request names one.
 	switch {
 	case r.Verified != nil:

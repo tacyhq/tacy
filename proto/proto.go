@@ -82,7 +82,7 @@ type RunRequest struct {
 	// CacheSecret scopes Tinfoil's prompt cache (user_cache_secret); the chat sends its per-user secret.
 	// When empty, a per-boot random secret is used.
 	CacheSecret string `json:"cache_secret,omitempty"`
-	// Where and who (keys v2 slice 6, docs/26 section 6; package runauth). Every run names its space and that
+	// Where and who (keys v2 spaces and identities; package runauth). Every run names its space and that
 	// space's seal public key, with a proof made against this boot's attested key that the sender holds the seal
 	// private key (which only the space's holders can open); the run's activity records are sealed to the seal key,
 	// so the request can neither choose nor drop their recipient. On a firm's VM the seal key must be the one the
@@ -117,7 +117,7 @@ type RunRequest struct {
 	// retried once on the first allowed fallback (model_slow, model_switched). False for a hand-picked model: a slow
 	// one is waited for, an overloaded one ends the run (code model_overloaded).
 	AutoFallback bool `json:"auto_fallback,omitempty"`
-	// Agent names the built-in agent definition the task runs (docs/30-agents-in-chat.md): "a_chat" (the chat, also
+	// Agent names the built-in agent definition the task runs: "a_chat" (the chat, also
 	// when absent) or "a_research". The definitions (instructions, tools, limits) are compiled into the release
 	// (guard/agents.go); a request only picks one, and an unknown one is refused. Covered by the run signature
 	// (runauth) when set. A non-chat agent starts only through POST /tasks and takes one message: the brief.
@@ -128,7 +128,7 @@ type RunRequest struct {
 	// from the headers, never read from or written to the wire; "": nothing dropped (in-process tests, scheduled runs).
 	ChargedModel string `json:"-"`
 	// StoredFiles are files the person picked from their encrypted file storage for an agent that reads files
-	// (a_research, a_review; branch files-vm-read, not released): each names one stored object, the key that opens it
+	// (a_research, a_review; since v0.17.0): each names one stored object, the key that opens it
 	// and a short-lived read URL the chat's Worker minted for it. The VM fetches the ciphertext itself, checks every
 	// chunk as the browser does and keeps the text in memory only (package storedfiles). Covered by the run
 	// signature, one item each after the images (runauth.Digest); an older VM refuses the field (strict decoding).
@@ -156,7 +156,7 @@ type StoredFile struct {
 	URL string `json:"url,omitempty"`
 }
 
-// SearchRequest is POST /search's body: the plain chat's one web search the person allowed in their tab (docs/29;
+// SearchRequest is POST /search's body: the plain chat's one web search the person allowed in their tab (
 // agentd app/search.go, guard/searchtask.go). EHBP-encrypted; strict JSON, nothing else accepted.
 type SearchRequest struct {
 	// Query is exactly what the person allowed in their tab (the model's query, masked there, or their edit). The
@@ -174,7 +174,7 @@ type SearchRequest struct {
 	Edited bool `json:"edited,omitzero"`
 	// CacheSecret scopes Tinfoil's prompt cache for the reader's call (RunRequest.CacheSecret).
 	CacheSecret string `json:"cache_secret,omitzero"`
-	// Where and who, as for a run (RunRequest; keys v2 slice 6, v0.10.0): the space, its seal key and proof, and the
+	// Where and who, as for a run (RunRequest; keys v2 spaces and identities, v0.10.0): the space, its seal key and proof, and the
 	// identity's signature (runauth.SearchDigest, its own label, so a run's signature can't pass as a search's or
 	// the reverse). The search's record is sealed to the seal key; record_to and record_proof are gone.
 	Space       string `json:"space,omitzero"`
@@ -423,11 +423,11 @@ type Meta struct {
 	Controls *Controls `json:"controls,omitempty"`
 	// Activity says where the run's activity record goes (docs/24); nil when it isn't recorded.
 	Activity *Activity `json:"activity,omitempty"`
-	// Keys is the firm key log's head as this VM holds it (keys v2 slice 5); nil on a VM without a key log pin.
+	// Keys is the firm key log's head as this VM holds it (the firm key log); nil on a VM without a key log pin.
 	Keys *Keys `json:"keys,omitempty"`
 }
 
-// Keys announces the VM's firm key log head (docs/26 section 4) over EHBP: the browser compares it with the log it
+// Keys announces the VM's firm key log head over EHBP: the browser compares it with the log it
 // verified itself, so a server showing different people different logs is caught. Genesis is the compose's pin.
 type Keys struct {
 	Firm    string `json:"firm"`

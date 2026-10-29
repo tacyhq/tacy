@@ -73,7 +73,7 @@ func makeVectors(t *testing.T) *vectors {
 	a := &Asker{Space: space, Seal: seal, Identity: IDFrom("i", [16]byte{16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1}), Key: id,
 		Now: func() time.Time { return time.Unix(at, 0) }}
 	v := &vectors{Format: "tacy-golden-crypto-vectors",
-		Note: "Keys v2 slice 6: a run request's space proof and identity signature (runauth, TestVectors). Made once from fixed seeds; never regenerate.",
+		Note: "Keys v2 where and who: a run request's space proof and identity signature (runauth, TestVectors). Made once from fixed seeds; never regenerate.",
 		VM:   hex.EncodeToString(vm.Bytes()), VMPublic: hex.EncodeToString(vm.PublicKey().Bytes()),
 		Seal: hex.EncodeToString(seal.Bytes()), SealPub: SealString(seal.PublicKey()), Space: space}
 	v.Constants.Labels = map[string]string{"spaceProof": ProofLabel, "runRequest": RequestLabel}
@@ -158,7 +158,7 @@ func makeVectors(t *testing.T) *vectors {
 	r = base
 	r.IdentitySig = Sign(id, &w, xkey(t, strings.Repeat("76", 32)).PublicKey().Bytes())
 	refuse("signed for another VM", r)
-	// Built-in agents (docs/30 slice 1), added after the vectors above: they keep their bytes (a request without an
+	// Built-in agents, added after the vectors above: they keep their bytes (a request without an
 	// agent hashes as before), and these come after them.
 	add("research agent", proto.RunRequest{Model: "gpt-oss-120b", Agent: "a_research", RunSecret: strings.Repeat("cd", 32),
 		Tools: []string{"web_search", "fetch_page"}, Permissions: map[string]string{"web.search": "always", "web.fetch": "always"},
@@ -177,7 +177,7 @@ func makeVectors(t *testing.T) *vectors {
 	r = base
 	r.Messages = []proto.Message{{Role: "user", Content: "hi", Images: []string{img1}}}
 	refuse("an image added after signing", r)
-	// Stored files (branch files-vm-read), added after the vectors above: they keep their bytes (a request without
+	// Stored files (since v0.17.0), added after the vectors above: they keep their bytes (a request without
 	// stored files hashes as before), and these come after them. Fake ids and keys; the URL is never fetched.
 	stored := []proto.StoredFile{
 		{Object: "ob_6eaaaaaaaaaaaaaaaaaaaaaaau", File: "fl_6eaaaaaaaaaaaaaaaaaaaaaaai", Owner: "ow_6eaaaaaaaaaaaaaaaaaaaaaaaa", Epoch: 1,
@@ -371,7 +371,7 @@ func makeKindVectors(t *testing.T) *kindVectors {
 	a := &Asker{Space: space, Seal: seal, Identity: IDFrom("i", [16]byte{16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1}), Key: id,
 		Now: func() time.Time { return time.Unix(at, 0) }}
 	v := &kindVectors{Format: "tacy-golden-crypto-vectors",
-		Note: "Keys v2 slice 6 (v0.10.0): a search's and a pictures request's space proof and identity signature (runauth, TestKindVectors). Made once from fixed seeds; never regenerate.",
+		Note: "Keys v2 where and who (v0.10.0): a search's and a pictures request's space proof and identity signature (runauth, TestKindVectors). Made once from fixed seeds; never regenerate.",
 		VM:   hex.EncodeToString(vm.Bytes()), VMPublic: hex.EncodeToString(vmPub),
 		Seal: hex.EncodeToString(seal.Bytes()), SealPub: SealString(seal.PublicKey()), Space: space}
 	v.Constants.Labels = map[string]string{"spaceProof": ProofLabel, "searchRequest": SearchLabel, "picturesRequest": PicturesLabel}

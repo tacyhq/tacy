@@ -24,7 +24,7 @@ import (
 	"github.com/tacyhq/tacy/trigger"
 )
 
-// Schedules for personal spaces in agentd (v0.12.0, SCHEDULES.md): installs need the space proof and the identity's
+// Schedules for personal spaces in agentd (v0.12.0, the schedules contract): installs need the space proof and the identity's
 // signature for this boot, once; the run is recorded in the space's chain and its result sealed to the space's seal
 // key; only the space's holder lists, fetches, stops or removes; the run's budget and permissions are the
 // definition's, never asked.

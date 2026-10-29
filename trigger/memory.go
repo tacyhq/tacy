@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-// Memory across runs (schedule upgrades, the VM release after v0.14.0; docs/30 "Scheduled tasks", upgrades): a
+// Memory across runs (schedule upgrades, the VM release after v0.14.0): a
 // definition with memory has what its last runs found kept on the VM, per schedule, and each run starts with it,
 // so a daily digest can skip what it reported before, and a "tell me only when it changes" schedule can compare.
 //

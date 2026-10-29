@@ -22,7 +22,7 @@ import (
 	"github.com/tacyhq/tacy/safety"
 )
 
-// Connections (CONNECTIONS.md, docs/34 step 4): a person's own accounts, the first an email account read by IMAP
+// Connections (v0.19.0): a person's own accounts, the first an email account read by IMAP
 // with an app password. The browser seals the account (server, address, user name, password) to the vault's
 // per-boot key; only this process opens it. A new account is pending until the gateway's test login with it works
 // (Commit), then it is kept in memory and in a file on the vault's own volume of the encrypted disk, so scheduled
@@ -51,7 +51,7 @@ type Sealed struct {
 	CT  []byte `json:"ct"`
 }
 
-// The seal's labels (CONNECTIONS.md).
+// The seal's labels (the connections contract).
 const (
 	ConnInfoLabel = "tacy/v2/connection"
 	EmailType     = "tacy.connection.email/v1"

@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// Daily schedules (docs/30 "Scheduled tasks", decisions 1 and 2): one slot a day, at a wall-clock time in an IANA
+// Daily schedules: one slot a day, at a wall-clock time in an IANA
 // zone. A slot is a local date, numbered by its days since 1970-01-01, so a slot can't fire twice whatever the
 // zone's offset does. Its instant is the first one whose wall clock in the zone reads the time on that date:
 //   - a time the spring-forward change skips (02:30 when clocks jump from 02:00 to 03:00) fires at the change

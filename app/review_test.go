@@ -15,7 +15,7 @@ import (
 	"github.com/tacyhq/tacy/safety"
 )
 
-// a_review in agentd (docs/30 slice 3): started through POST /tasks with the full stack (signed request, policy,
+// a_review in agentd: started through POST /tasks with the full stack (signed request, policy,
 // budgets, the quarantined reader, activity records), its files read through files_read; nothing goes out; a
 // policy without the files connector refuses its reads (a signed policy must list files.list and files.read).
 

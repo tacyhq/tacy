@@ -12,7 +12,7 @@ import (
 	"github.com/tacyhq/tacy/proto"
 )
 
-// A page's own links as numbered sources (docs/30 "Scheduled tasks", decision 9; the HN digest). The reader keeps a
+// A page's own links as numbered sources (the HN digest). The reader keeps a
 // page's links from the acting model (links come from code), and on a tainted task an address the model writes is
 // never opened (ComposedFetch), so a task that read a list page (Hacker News's front page) could name its stories
 // but never open or link them. With PageLinks on, code pulls the page's links out of its markup and numbers them

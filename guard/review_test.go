@@ -19,7 +19,7 @@ import (
 	"github.com/tacyhq/tacy/storedfiles"
 )
 
-// a_review (docs/30 slice 3): the person's files in the brief's message, read only inside the VM through files.*
+// a_review: the person's files in the brief's message, read only inside the VM through files.*
 // and the quarantined reader; no outbound tool at all, refused here in gatewayd's code; the VM's own list of the
 // sections it didn't read.
 
@@ -72,7 +72,7 @@ func TestReviewDefinition(t *testing.T) {
 		t.Fatalf("research's definition: %s", r)
 	}
 	// The release ceiling allows the files connector's two tools, and files.fetch from the files bucket and the chat's
-	// Worker (stored files, branch files-vm-read), with no key leased (a signed policy must list them too).
+	// Worker (stored files, since v0.17.0), with no key leased (a signed policy must list them too).
 	if p := ReleasePolicy("f_chat", ""); !slices.Equal(p.Connectors["files"].Tools, []string{"files.list", "files.read", "files.fetch"}) ||
 		len(p.Connectors["files"].Hosts) != 0 || !slices.Equal(p.Connectors["files"].Fetch, []string{storedfiles.R2Host, storedfiles.ChatHost}) {
 		t.Fatalf("ceiling %+v", p.Connectors["files"])

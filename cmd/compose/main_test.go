@@ -468,7 +468,7 @@ func TestGVisorLayer(t *testing.T) {
 	}
 }
 
-// Keys v2 slice 5: the compose pins either the admin keys or the key log genesis (with the carried chat policy and
+// The firm key log: the compose pins either the admin keys or the key log genesis (with the carried chat policy and
 // the key log source for gatewayd), never both; and every guard process gets the same trust roots.
 func TestTrustArgs(t *testing.T) {
 	legacy := strings.Join(trustArgs(adminKeys, "", keylogCarry), " ")

@@ -14,7 +14,7 @@ import (
 	"github.com/tacyhq/tacy/vault"
 )
 
-// Settings → Connections (v0.19.0; the contract is CONNECTIONS.md next to this package): a person connects their
+// Settings → Connections (v0.19.0; the contract is the connections contract next to this package): a person connects their
 // own email account for the mail tools. Every call carries the where and who of a schedule call (runauth), under its
 // own label, its nonce used once and the space's seal key pinned. agentd checks who asks and passes the call on to
 // gatewayd (guard.Connections): the box with the account and its app password is sealed in the browser to the
@@ -49,7 +49,7 @@ func connViewOf(c vault.ConnInfo) connView {
 		Security: c.Security, ReadOnly: true, ConnectedAt: c.ConnectedAt}
 }
 
-// connStatus is the HTTP status of a refused call's code (CONNECTIONS.md).
+// connStatus is the HTTP status of a refused call's code (the connections contract).
 var connStatus = map[string]int{
 	"login_failed": 401, "app_password_required": 401, "app_passwords_blocked": 401,
 	"unreachable": 502, "tls_failed": 502, "not_imap": 502,

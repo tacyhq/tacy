@@ -17,7 +17,7 @@ import (
 	"github.com/tacyhq/tacy/trigger"
 )
 
-// The person's stored files in a research task (branch files-vm-read), with the full stack: the signed request with
+// The person's stored files in a research task (since v0.17.0), with the full stack: the signed request with
 // stored_files, the policy (files.fetch), the guard fetching ciphertext from a stand-in bucket (TLS, the production
 // host names), checking and decrypting it, the quarantined reader, the outbound passage check, the activity record.
 

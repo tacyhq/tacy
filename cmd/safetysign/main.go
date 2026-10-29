@@ -8,7 +8,7 @@
 //	go run ./cmd/safetysign heartbeat -key K [-ttl 15m] [-all]   # the operator's list: seq = now in ms
 //	go run ./cmd/safetysign stop -key K -firm f_chat [-seq N] [-space s_… | -all]   # the firm's own stop list
 //
-// The firm key log's entries (keys v2 slice 5): identity, x25519, keylog-genesis, keylog-sign, keylog-check
+// The firm key log's entries (the firm key log): identity, x25519, keylog-genesis, keylog-sign, keylog-check
 // (keylog.go).
 package main
 

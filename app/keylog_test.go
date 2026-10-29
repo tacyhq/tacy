@@ -18,7 +18,7 @@ import (
 	"github.com/tacyhq/tacy/safety"
 )
 
-// Keys v2 slice 5 end to end in agentd: the compose pins f_chat's key log genesis, entries arrive over
+// The firm key log end to end in agentd: the compose pins f_chat's key log genesis, entries arrive over
 // POST /keylog, policies are signed by the log's key admins, and every run's meta announces the log head.
 
 func xkey(t *testing.T) string {

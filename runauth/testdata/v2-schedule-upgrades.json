@@ -1,6 +1,6 @@
 {
   "format": "tacy-golden-crypto-vectors",
-  "note": "Schedule upgrades (the VM release after v0.14.0; services/agent-vm/SCHEDULES.md): a definition that searches, remembers and tells only of changes, and one that only remembers; each envelope and its hash, and each install call's where and who. Made once from v2-search.json's fixed seeds with node:crypto (scripts/gen-golden-v2-schedule-upgrades-vectors.mjs); never regenerate once shipped.",
+  "note": "Schedule upgrades (the VM release after v0.14.0): a definition that searches, remembers and tells only of changes, and one that only remembers; each envelope and its hash, and each install call's where and who. Made once from v2-search.json's fixed seeds with node:crypto (scripts/gen-golden-v2-schedule-upgrades-vectors.mjs); never regenerate once shipped.",
   "constants": {
     "labels": {
       "spaceProof": "tacy/v2/space-proof",

@@ -54,7 +54,7 @@ type LoginError struct {
 
 func (e *LoginError) Error() string { return "imapro: login refused: " + e.Code }
 
-// Login failure codes (CONNECTIONS.md).
+// Login failure codes (the connections contract).
 const (
 	LoginFailed          = "login_failed"
 	AppPasswordRequired  = "app_password_required"
@@ -542,12 +542,15 @@ func (c *Client) Examine(name string) (*Mailbox, error) {
 	return mb, nil
 }
 
-// Criteria is a search, all parts ANDed. Words are each searched in headers and text (TEXT).
+// Criteria is a search, all parts ANDed. Words are each searched in headers and text (TEXT). Since and Before are
+// dates (their year, month and day as given, in their own location; the time of day is ignored): the server compares
+// them with its own day of each message's arrival (RFC 3501 SEARCH, day granularity, in the server's zone). A search
+// to the minute asks for a day more on each side and filters by Fetched.Internal after (guard/mailtime.go).
 type Criteria struct {
 	Words  []string
 	From   string
 	To     string    // a recipient (To, Cc or Bcc as the server's TO key reads it): what was sent to someone
-	Since  time.Time // on or after this date (the server's dates, day granularity)
+	Since  time.Time // on or after this date
 	Before time.Time // before this date
 	Unseen bool
 }
@@ -611,14 +614,17 @@ func (c *Client) Search(cr Criteria) ([]uint32, error) {
 	return slices.Compact(uids), nil
 }
 
-func imapDate(t time.Time) string { return t.UTC().Format("2-Jan-2006") }
+// imapDate is t's own calendar date (in t's location): the caller says which day it means.
+func imapDate(t time.Time) string { return t.Format("2-Jan-2006") }
 
 // Fetched is one message as a FETCH returned it.
 type Fetched struct {
 	UID   uint32
 	Flags []string
 	Size  uint32
-	Body  []byte // the BODY.PEEK section asked for (headers, or the message's first bytes)
+	// Internal is when the server got the message (INTERNALDATE, with its zone offset); zero if it didn't say.
+	Internal time.Time
+	Body     []byte // the BODY.PEEK section asked for (headers, or the message's first bytes)
 }
 
 // Unseen: the message hasn't been read (no \Seen flag).
@@ -634,14 +640,21 @@ func (f *Fetched) Unseen() bool {
 // HeaderFields is the header section the connector reads for a search's results.
 const HeaderFields = "BODY.PEEK[HEADER.FIELDS (DATE FROM TO CC SUBJECT MESSAGE-ID CONTENT-TYPE)]"
 
-// FetchHeaders fetches the given UIDs' flags, sizes and a few header fields (never marking anything read).
+// FetchHeaders fetches the given UIDs' flags, sizes, arrival times and a few header fields (never marking anything
+// read).
 func (c *Client) FetchHeaders(uids []uint32) ([]Fetched, error) {
-	return c.fetch(uids, HeaderFields)
+	return c.fetch(uids, "INTERNALDATE "+HeaderFields)
 }
 
-// FetchMessage fetches one message's first max bytes (BODY.PEEK[]<0.max>), its flags and size.
+// FetchDates fetches the given UIDs' flags, sizes and arrival times only (INTERNALDATE): a search's candidates, to
+// filter by time.
+func (c *Client) FetchDates(uids []uint32) ([]Fetched, error) {
+	return c.fetch(uids, "INTERNALDATE")
+}
+
+// FetchMessage fetches one message's first max bytes (BODY.PEEK[]<0.max>), its flags, size and arrival time.
 func (c *Client) FetchMessage(uid uint32, max int) (*Fetched, error) {
-	fs, err := c.fetch([]uint32{uid}, fmt.Sprintf("BODY.PEEK[]<0.%d>", max))
+	fs, err := c.fetch([]uint32{uid}, fmt.Sprintf("INTERNALDATE BODY.PEEK[]<0.%d>", max))
 	if err != nil {
 		return nil, err
 	}
@@ -681,6 +694,8 @@ func (c *Client) fetch(uids []uint32, section string) ([]Fetched, error) {
 				f.UID, _ = v.num()
 			case key == "RFC822.SIZE":
 				f.Size, _ = v.num()
+			case key == "INTERNALDATE":
+				f.Internal = ParseInternalDate(v.str())
 			case key == "FLAGS":
 				for _, fl := range v.list {
 					f.Flags = append(f.Flags, fl.str())
@@ -694,6 +709,18 @@ func (c *Client) fetch(uids []uint32, section string) ([]Fetched, error) {
 		}
 	}
 	return out, nil
+}
+
+// ParseInternalDate reads an INTERNALDATE ("29-Oct-2026 06:03:00 -0700"; the day may be space-padded); zero if it
+// isn't one.
+func ParseInternalDate(s string) time.Time {
+	s = strings.TrimSpace(s)
+	for _, layout := range []string{"_2-Jan-2006 15:04:05 -0700", "2-Jan-2006 15:04:05 -0700"} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
 }
 
 // Logout ends the session politely and closes the connection.

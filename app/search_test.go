@@ -26,7 +26,7 @@ import (
 	"github.com/tacyhq/tacy/safety"
 )
 
-// POST /search, the plain chat's web search (search.go, docs/29): one search the person allowed, through the same
+// POST /search, the plain chat's web search (search.go): one search the person allowed, through the same
 // checks as agent mode's (policy, budgets, gatewayd's permission check, the quarantined reader, the record), and
 // nothing else.
 

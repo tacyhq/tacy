@@ -2,7 +2,7 @@
 // the id format, Ed25519 identity keys as the key log names them ("ed25519:<base64>"), and the Directory that says
 // whether an identity is current and holds a space.
 //
-// The real Directory is the firm key log and the space log (keys v2 slices 5 and 6, docs/26; the keylog package on
+// The real Directory is the firm key log and the space log (keys v2's key log and spaces; the keylog package on
 // their branch). Until that merges, nothing in the VM's mains sets one, so every check that needs a person's
 // signature (a sponsor, an approver) fails closed. Static is the in-memory one tests and local development use.
 // Standard library only.

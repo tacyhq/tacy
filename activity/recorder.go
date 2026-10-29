@@ -35,7 +35,7 @@ type Start struct {
 	Run      string
 	Space    string
 	To       string // recipient: "x25519:<base64>" (the space's seal key)
-	Member   string // the identity that asked for the run ("i_…"; keys v2 slice 6)
+	Member   string // the identity that asked for the run ("i_…"; keys v2 spaces and identities)
 	Agent    Agent
 	Trigger  Trigger
 	Controls *Controls

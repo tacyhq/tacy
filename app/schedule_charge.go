@@ -10,7 +10,7 @@ import (
 	"github.com/tacyhq/tacy/trigger"
 )
 
-// What the relay charges a person's schedule (v0.16.0; decided 2026-10-21, "charge up front", the server
+// What the relay charges a person's schedule (v0.16.0, "charge up front", the server
 // learning nothing new about the schedule). A scheduled run fires on this VM's clock and the relay never hears of it,
 // so the relay charges each active schedule an expected cost per UTC day on the person's own budget. It learns only
 // prices, from one plaintext header on the install (or renewal) call, which this VM recomputes from the signed
@@ -52,7 +52,7 @@ const (
 	// digest with files runs there.
 	scheduleFilesModel = 10_000
 	scheduleFilesFixed = 40_000
-	// A definition that reads the sponsor's email (v0.19.0, CONNECTIONS.md "Scheduled tasks": any mail tool allowed
+	// A definition that reads the sponsor's email (v0.19.0, the connections contract "Scheduled tasks": any mail tool allowed
 	// always) adds the quarantined reader on the mail it opens (at most 6 searches' headers and 12 messages) and the
 	// acting model reading what it found: the same estimate as stored files, on top of them.
 	scheduleMailModel = 10_000

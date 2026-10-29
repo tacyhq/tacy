@@ -17,7 +17,7 @@ import (
 
 // The chat's golden vectors for the connection calls (the chat's test/golden/v2-connection.json, made with node:crypto
 // by scripts/gen-golden-v2-connection-vectors.mjs): the email connection sealed in the browser opens in the vault with
-// its key (info and aad as CONNECTIONS.md says) to the plaintext the chat wrote, and passes the vault's checks; every
+// its key (info and aad as the connections contract says) to the plaintext the chat wrote, and passes the vault's checks; every
 // call's body decodes strictly as the VM's handler reads it, with its own items (the box's digest for a put), and its
 // digest and identity signature check under its own label against the VM key, and under no other.
 func TestConnectionGoldenVectors(t *testing.T) {

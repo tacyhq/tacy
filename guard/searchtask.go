@@ -14,7 +14,7 @@ import (
 	"github.com/tacyhq/tacy/proto"
 )
 
-// The plain chat's web search (docs/29, v0.8.10): with agent mode off, the chat's model may ask for one web search;
+// The plain chat's web search (v0.8.10): with agent mode off, the chat's model may ask for one web search;
 // the person's tab shows the permission prompt with the exact, masked query, and only once they allow it does the tab
 // verify this VM and send that query here (agentd's POST /search). The VM runs it as a task of its own kind
 // (TaskOptions.Via = ViaSearch) with no brain and no model calls: the masked query goes to the search provider,
@@ -82,7 +82,7 @@ func SearchStart(r *proto.SearchRequest, now time.Time) (harness.Start, TaskOpti
 	secret := make([]byte, 32)
 	rand.Read(secret)
 	args, _ := json.Marshal(map[string]any{"query": q, "count": r.Count})
-	// Its space (keys v2 slice 6, v0.10.0): the one agentd verified (runauth), or as the request names it for a guard
+	// Its space (keys v2 spaces and identities, v0.10.0): the one agentd verified (runauth), or as the request names it for a guard
 	// that runs alone (tests: nothing is recorded there). No default: every request names one.
 	switch {
 	case r.Verified != nil:

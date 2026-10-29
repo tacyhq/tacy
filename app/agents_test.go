@@ -23,7 +23,7 @@ import (
 	"github.com/tacyhq/tacy/safety"
 )
 
-// Built-in agents in agentd (docs/30 slice 1): a_research started through POST /tasks with the full stack (signed
+// Built-in agents in agentd: a_research started through POST /tasks with the full stack (signed
 // request, policy, budgets, the quarantined reader, permission prompts, activity records), against a stand-in model,
 // search provider and pages: it completes within its caps with a cited brief; its caps, the policy's narrowing and
 // the brief-only rule hold; a link the model composed still asks under "allow for this task"; a delete removes the
@@ -413,7 +413,7 @@ func TestResearchFinalReserve(t *testing.T) {
 	}
 }
 
-// "Allow searches and page reads for this task" (decision 2) covers what code gave the task (results by number, the
+// "Allow searches and page reads for this task" covers what code gave the task (results by number, the
 // brief's own links); a link the model composed after reading the web is refused without asking (not_from_results,
 // b75711c), and the task goes on to its brief.
 func TestResearchComposedLinkRefused(t *testing.T) {
@@ -487,7 +487,7 @@ func TestTaskDelete(t *testing.T) {
 	}
 }
 
-// Retention (decision 5): an ended research task's result stays until collected, at most 7 days; a chat task's for
+// Retention: an ended research task's result stays until collected, at most 7 days; a chat task's for
 // the host's day, as before.
 func TestAgentRetention(t *testing.T) {
 	ae := newAgentEnv(t, nil, pText(researchAnswer), pText("chat answer"), pText(researchAnswer), pText("chat answer"))

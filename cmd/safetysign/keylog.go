@@ -1,6 +1,6 @@
 package main
 
-// Keys v2 slice 5: the firm key log entries for f_chat (docs/26 section 4, decision 6), made and signed offline
+// The firm key log: the firm key log entries for f_chat, made and signed offline
 // like the policies. The first owner's identity for f_chat is made here (its private halves only in files and
 // then the password manager, as the admin key's), the genesis is signed by it and co-signed by the offline admin key
 // (from then on f_chat's recovery kit), and keylog-check prints the genesis hash the compose pins.

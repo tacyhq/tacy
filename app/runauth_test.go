@@ -20,7 +20,7 @@ import (
 	"github.com/tacyhq/tacy/safety"
 )
 
-// Keys v2 slice 6 in agentd (docs/26 sections 6 and 7): every run names its space and proves the space's seal key;
+// Keys v2 spaces and identities in agentd: every run names its space and proves the space's seal key;
 // an identity signs it with this boot's key and a fresh nonce; its records go to the space's chain, naming the
 // identity; its budget counts for the space, the member and the VM.
 

@@ -48,7 +48,7 @@ const (
 	tEvent  = "event"  // gatewayd → agentd: one of the task's events
 	tResult = "result" // gatewayd → agentd: request rid's result
 	tSafety = "safety" // agentd → gatewayd, a connection's only frame: signed policies and stop lists (step 6)
-	tConn   = "conn"   // agentd → gatewayd, a connection's only frame: a Settings → Connections call (CONNECTIONS.md)
+	tConn   = "conn"   // agentd → gatewayd, a connection's only frame: a Settings → Connections call (the connections contract)
 )
 
 type frame struct {

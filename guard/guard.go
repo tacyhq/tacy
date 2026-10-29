@@ -124,10 +124,10 @@ type TaskOptions struct {
 	User            string `json:"user,omitzero"`             // whose tool caps (the relay's opaque X-Agent-User tag)
 	Space           string `json:"space,omitzero"`            // the task's space: whose policy, stop and rates apply
 	// RecordTo is who the run's activity record is sealed to: the space's seal key ("x25519:<base64>", docs/24 and
-	// docs/26 section 6, from proto.Verified); "": not recorded.
+	// from proto.Verified); "": not recorded.
 	RecordTo string `json:"record_to,omitzero"`
 	// Identity is who asked for the run ("i_…", proven by its signature); Member whose member budget it uses (the
-	// identity on a firm's VM, the relay's daily per-user tag on the shared chat VM). Keys v2 slice 6.
+	// identity on a firm's VM, the relay's daily per-user tag on the shared chat VM). Keys v2 spaces and identities.
 	Identity string `json:"identity,omitzero"`
 	Member   string `json:"member,omitzero"`
 	// Via is how the task was started: ViaRun (POST /run's shim) or ViaTasks (POST /tasks); see tasks.go.
@@ -142,8 +142,8 @@ type TaskOptions struct {
 	// Links are the addresses in the person's own messages (personLinks): a fetch of one came from the person, not
 	// from the model (ComposedFetch).
 	Links []string `json:"links,omitzero"`
-	// PageLinks: a page read comes with the page's own links as numbered sources (links.go; docs/30 "Scheduled
-	// tasks", decision 9), with the reader on. An unattended task with page reads has it (TriggeredStart), and so do
+	// PageLinks: a page read comes with the page's own links as numbered sources (links.go), with
+	// the reader on. An unattended task with page reads has it (TriggeredStart), and so do
 	// the chat's and research's (v0.14.0).
 	PageLinks bool `json:"page_links,omitzero"`
 	// CiteLinks (v0.14.0, the chat's web turns): a page read the person didn't name, and didn't reach through another
@@ -195,7 +195,7 @@ type TaskOptions struct {
 	// through files.*, never shown to the acting model. On the encrypted disk with the task, deleted with it.
 	Files []TaskFile `json:"files,omitzero"`
 	// Stored are files the person picked from their encrypted storage (proto.StoredFile; stored.go, branch
-	// files-vm-read): numbered after Files, opened (fetched, checked, decrypted) the first time the task reads them,
+	// v0.17.0): numbered after Files, opened (fetched, checked, decrypted) the first time the task reads them,
 	// their text kept in gatewayd's memory only. Their keys and read URLs are never written to the queue
 	// (StoredKeysOff): only the process memory of agentd and gatewayd holds them, so a task resumed after agentd
 	// restarted lists its stored files but can't open them. FilesGrant is a schedule run's read grant (its
@@ -207,6 +207,9 @@ type TaskOptions struct {
 	// compare with; schedule.go).
 	Memory   bool `json:"memory,omitzero"`
 	NoChange bool `json:"no_change,omitzero"`
+	// Zone is the person's IANA time zone (mailtime.go): a schedule's own, or the chat's time note's; "": unknown
+	// (UTC). Mail times are shown in it and mail_search's since and before are read in it.
+	Zone string `json:"zone,omitzero"`
 }
 
 // task is the guard's state for one task: what the old app/agent.go kept per run.
@@ -361,7 +364,7 @@ func (g *Guard) task(ti *harness.TaskInfo) *task {
 }
 
 // ReplaySafe: model calls and the web connector's reads may run again after a runtime restart interrupted them
-// (decided 2026-10-16, docs/20 open question 3); they send and change nothing. Anything else may not.
+// (docs/20 "Replay and idempotency"); they send and change nothing. Anything else may not.
 func (g *Guard) ReplaySafe(_ *harness.TaskInfo, req any) bool { return ReplaySafe(req) }
 
 // ReplaySafe is Guard.ReplaySafe for any gateway (it depends on the request only).
@@ -743,7 +746,7 @@ func startFor(r *proto.RunRequest, now time.Time, reader bool) (harness.Start, T
 		// Numbered links (links.go, v0.14.0): a page the person named comes with its links to open and cite, as a
 		// schedule's does; any other page read with its links to cite only.
 		PageLinks: true, CiteLinks: true, LinksCap: linksCapFor(r.Messages[len(r.Messages)-1].Content),
-		AutoFallback: r.AutoFallback, Fallbacks: fallbacks, Images: images}, nil
+		AutoFallback: r.AutoFallback, Fallbacks: fallbacks, Images: images, Zone: zoneFromNotes(r.Messages)}, nil
 }
 
 // checkRunOptions checks what every agent's request may carry: the cache scope, the run secret, the permissions.
@@ -757,7 +760,7 @@ func checkRunOptions(r *proto.RunRequest) error {
 	return checkPermissions(r.Permissions)
 }
 
-// runSpace is the run's space (keys v2 slice 6): the one agentd verified (runauth), or as the request names it for a
+// runSpace is the run's space (keys v2 spaces and identities): the one agentd verified (runauth), or as the request names it for a
 // guard that runs alone (local development and tests: nothing is recorded there). No default: every run names one.
 func runSpace(r *proto.RunRequest) (string, error) {
 	switch {

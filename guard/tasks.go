@@ -839,7 +839,7 @@ func (h *Host) Cancel(id, user string) (refundable bool, err error) {
 }
 
 // Delete deletes the starter's task and everything kept for it (its start, journal, events: the result), as the
-// browser asks once it saved the result, or when the person deletes the conversation (docs/30). A task still running
+// browser asks once it saved the result, or when the person deletes the conversation. A task still running
 // is cancelled ("person") first and deleted as soon as it ended. refundable is Cancel's billing witness. Activity
 // records aren't touched: they are the space's history, sealed to its key.
 func (h *Host) Delete(id, user string) (refundable bool, err error) {

@@ -58,16 +58,16 @@ const (
 	MinEvery        = 15 * time.Minute
 	MaxEvery        = 31 * 24 * time.Hour
 	MaxSponsorship  = 366 * 24 * time.Hour // not_after at most this long after issued_at
-	// DefaultSponsorship is how long the chat makes a schedule last unless the person picks otherwise (docs/30
-	// "Scheduled tasks", decision 7); renewing is a new version signed again.
+	// DefaultSponsorship is how long the chat makes a schedule last unless the person picks otherwise;
+	// renewing is a new version signed again.
 	DefaultSponsorship = 90 * 24 * time.Hour
-	// MaxLate: a daily run that can't start within this of its time is skipped for that day (decision 2).
+	// MaxLate: a daily run that can't start within this of its time is skipped for that day.
 	MaxLate         = 3 * time.Hour
 	MaxIssuedAhead  = 5 * time.Minute
 	maxTriggers     = 8
 	maxDefModels    = 8
 	maxDefTools     = 16
-	maxDefSteps     = 20 // docs/30 "Scheduled tasks", decision 8: the digest's 20 steps
+	maxDefSteps     = 20 // a scheduled run's 20 steps (the digest's)
 	defaultDefSteps = 6
 )
 
@@ -81,7 +81,7 @@ type Definition struct {
 	Instructions string   `json:"instructions"`
 	Models       []string `json:"models"`
 	// Seal is the space's seal public key ("x25519:<base64>"): each run's activity records and its result are sealed
-	// to it (docs/27 section 12 decision 14: no triggered run without records).
+	// to it (docs/27 section 12: no triggered run without records).
 	Seal     string    `json:"seal"`
 	Tools    []string  `json:"tools,omitzero"`
 	MaxSteps int       `json:"max_steps,omitzero"`
@@ -98,7 +98,7 @@ type Definition struct {
 	// that changed against what it remembers (it needs Memory); a run that found nothing new ends quiet (no message,
 	// its result marked quiet) through the schedule.no_change tool, never by reading its text.
 	Notify string `json:"notify,omitzero"`
-	// Files (branch files-vm-read, not released): stored files the sponsor picked for every run, each with its
+	// Files (since v0.17.0): stored files the sponsor picked for every run, each with its
 	// object's key (proto.StoredFile, no URL), unwrapped in their browser at install and sent only inside this
 	// definition (EHBP to the attested VM key, signed with it); FilesGrant is the chat Worker's read grant for exactly
 	// these objects, with which a run asks for an hour's read URLs (guard/stored.go). A run reads the versions picked:
@@ -117,8 +117,8 @@ type Trigger struct {
 	ID   string `json:"id"` // tr_
 	Kind string `json:"kind"`
 	// Schedule: a slot every Every (a Go duration, whole minutes, 15m to 744h), counted from Anchor; or one a day at
-	// Daily ("HH:MM", 24 h) wall-clock time in Zone (an IANA zone name), following its DST changes (docs/30
-	// "Scheduled tasks", decision 1), only on Days when it names some ("mon" … "sun", 1 to 6 of them in week order;
+	// Daily ("HH:MM", 24 h) wall-clock time in Zone (an IANA zone name), following its DST changes,
+	// only on Days when it names some ("mon" … "sun", 1 to 6 of them in week order;
 	// absent: every day); or once, at At ("YYYY-MM-DDTHH:MM") wall-clock time in Zone (v0.13.0, daily.go).
 	Every  string    `json:"every,omitzero"`
 	Anchor time.Time `json:"anchor,omitzero"`
@@ -286,8 +286,8 @@ func validSeal(s string) bool {
 	return err == nil
 }
 
-// Personal checks a definition installed in a person's own space on the shared chat VM (docs/30 "Scheduled
-// tasks"): it is for the space and seal key the request proved, its author and sponsor are the identity that
+// Personal checks a definition installed in a person's own space on the shared chat VM:
+// it is for the space and seal key the request proved, its author and sponsor are the identity that
 // signed the request, its triggers are daily (or chosen days) or one-time schedules and its tools web reads only (nothing that sends or
 // changes something: approvals don't exist for personal spaces yet).
 func Personal(d *Definition, space, seal, who string) error {

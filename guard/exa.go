@@ -13,7 +13,7 @@ import (
 	"github.com/tacyhq/tacy/vault"
 )
 
-// exa is Exa's search API (POST api.exa.ai/search; docs/29, decided 2026-10-18): the web search provider since
+// exa is Exa's search API (POST api.exa.ai/search): the web search provider since
 // v0.8.10. Exa sees the VM's IP, our key and the masked query, nothing else: the body has only the query, the result
 // count, the search type, moderation and the highlights asked for; never Exa's optional user id, location or
 // integration fields (userLocation, userIdentifier, x-exa-integration). Exa has no image search, so image_search

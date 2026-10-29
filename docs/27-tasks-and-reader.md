@@ -27,8 +27,8 @@ One SQLite file per space on the VM's encrypted disk, the runtime its only write
 
 **Rolling back to v0.6.0.** v0.6.0 predates the version number: it doesn't read it and uses only version 1's columns, which a migrated file keeps (the newer columns have defaults), so it runs on the file as is. Tasks open at that moment are cancelled at its boot, as after any restart. Back on v0.7.0, `Open` gives the tasks v0.6.0 ended their state and end time and drops events of tasks it deleted (`TestOlderReleaseOnMigratedFile`).
 
-## 3. Agent definitions, sponsors, triggers (later)
-Signed agent definitions, the person an unattended agent runs on behalf of, schedules and steering rights. Not in the VM yet.
+## 3. Agent definitions, sponsors, triggers
+Signed agent definitions, the person an unattended agent runs on behalf of (its sponsor) and schedules: in the VM since v0.12.0 (`trigger/`, `identity/`; see the [changelog](../CHANGELOG.md)).
 
 ## 4. Approve before send (later)
 Any send or share, and any change from a tainted task, will be held until a person approves that exact effect with a passkey. `harness.HoldGuard` and the `held` journal state are the runtime's part, in the VM since v0.7.0; the approvals themselves aren't.
@@ -76,5 +76,5 @@ Before data leaves the VM for a task, the person is asked, with exactly what wou
 ## 7. Sub-tasks (later)
 `task.spawn` and `task.wait` with depth and width caps and one budget per tree; a child of a tainted task is tainted.
 
-## 8. Slices
-Each slice is a release on the usual path (a throwaway VM and the end-to-end test first). v0.7.0 has slices 1 (the task model) and 2 (the reader and taint); v0.8.0 slice 3 (permission prompts). `/run` stays as a shim until the chat moves to `/tasks`, then goes one release later.
+## 8. Releases
+v0.7.0 shipped the task model, the reader and taint; v0.8.0 permission prompts. `/run` stays as a shim until the chat moves to `/tasks`, then goes one release later.

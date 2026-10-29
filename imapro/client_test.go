@@ -104,7 +104,8 @@ func TestReadOnlySessionChangesNothing(t *testing.T) {
 			if err != nil || len(hs) != 1 || !hs[0].Unseen() {
 				t.Fatalf("FetchHeaders = %+v, %v", hs, err)
 			}
-			if h := imapro.ParseHeaders(hs[0].Body); h.Subject != "Invoice for October" || h.From[0].Addr != "alice@client.example" {
+			if h := imapro.ParseHeaders(hs[0].Body); h.Subject != "Invoice for October" || h.From[0].Addr != "alice@client.example" ||
+				h.From[0].Name != "Alice Client" || h.MessageID != "<1@client.example>" {
 				t.Fatalf("headers = %+v", h)
 			}
 			m, err := c.FetchMessage(uids[0], 1<<20)
@@ -365,6 +366,13 @@ func TestParseMessage(t *testing.T) {
 	}
 	if m.Date.IsZero() {
 		t.Fatal("no date")
+	}
+	if m.MessageID != "" {
+		t.Fatalf("no Message-ID header, got %q", m.MessageID)
+	}
+	// A folded Message-ID comes back on one line.
+	if id := imapro.ParseHeaders([]byte("Message-ID:\r\n <CAF=x.y+z@mail.example.com>\r\n")).MessageID; id != "<CAF=x.y+z@mail.example.com>" {
+		t.Fatalf("folded Message-ID %q", id)
 	}
 	// Cut mid-part: what decoded is kept.
 	cut := imapro.ParseMessage([]byte(raw[:strings.Index(raw, "pr=EAt")]))

@@ -35,6 +35,7 @@ type Message struct {
 	To          []Address
 	Cc          []Address
 	Date        time.Time
+	MessageID   string // the Message-ID header (unfolded, trimmed), unchecked; "" when there is none
 	Text        string // the text/plain body (the first one), or ""
 	HTML        string // the text/html body when there's no text/plain, or ""
 	Attachments []Attachment
@@ -101,7 +102,7 @@ func ParseHeaders(raw []byte) *Message {
 
 func headerFields(h mail.Header) *Message {
 	msg := &Message{Subject: decodeHeader(h.Get("Subject")), From: addresses(h, "From"), To: addresses(h, "To"),
-		Cc: addresses(h, "Cc")}
+		Cc: addresses(h, "Cc"), MessageID: strings.TrimSpace(h.Get("Message-Id"))}
 	if d, err := h.Date(); err == nil {
 		msg.Date = d
 	}

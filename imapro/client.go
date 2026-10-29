@@ -632,7 +632,7 @@ func (f *Fetched) Unseen() bool {
 }
 
 // HeaderFields is the header section the connector reads for a search's results.
-const HeaderFields = "BODY.PEEK[HEADER.FIELDS (DATE FROM TO CC SUBJECT CONTENT-TYPE)]"
+const HeaderFields = "BODY.PEEK[HEADER.FIELDS (DATE FROM TO CC SUBJECT MESSAGE-ID CONTENT-TYPE)]"
 
 // FetchHeaders fetches the given UIDs' flags, sizes and a few header fields (never marking anything read).
 func (c *Client) FetchHeaders(uids []uint32) ([]Fetched, error) {

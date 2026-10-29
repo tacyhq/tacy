@@ -96,6 +96,14 @@ func redactOutcome(out *toolOutcome) []string {
 	for i := range out.quotes {
 		str(&out.quotes[i].Text)
 	}
+	for i := range out.mail {
+		str(&out.mail[i].Name)
+		str(&out.mail[i].Subject)
+		if fs := leakscan.Scan([]byte(out.mail[i].MessageID)); len(patternIDs(fs, false)) > 0 {
+			add(fs)
+			out.mail[i].MessageID = "" // a redacted one would name no message
+		}
+	}
 	slices.Sort(ids)
 	return ids
 }

@@ -165,17 +165,20 @@ func (s *Store) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		from, to = x, y+1
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", from, to-1, len(body)))
-		w.Header().Set("Content-Length", strconv.FormatInt(to-from, 10))
-		w.WriteHeader(http.StatusPartialContent)
 	}
-	w.Write(body[from:to])
+	// Counted before anything is written: a test may read the counters as soon as the client has the body.
 	obj := k[strings.LastIndexByte(k, '/')+1:]
 	s.mu.Lock()
 	s.Gets[obj]++
 	s.Bytes += to - from
 	s.Ranges[obj] = append(s.Ranges[obj], int(from))
 	s.mu.Unlock()
+	if r.Header.Get("Range") != "" {
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", from, to-1, len(body)))
+		w.Header().Set("Content-Length", strconv.FormatInt(to-from, 10))
+		w.WriteHeader(http.StatusPartialContent)
+	}
+	w.Write(body[from:to])
 }
 
 func (s *Store) urls(w http.ResponseWriter, r *http.Request) {

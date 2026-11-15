@@ -20,7 +20,7 @@ import (
 	"github.com/tacyhq/tacy/identity"
 )
 
-// Origin and RPID the helpers sign for (the release pins https://chat.tacy.io and tacy.io).
+// Origin and RPID the helpers sign for by default (the release pins tacy.io, and https://chat.tacy.io among its origins).
 const (
 	Origin = "https://chat.tacy.io"
 	RPID   = "tacy.io"
@@ -77,6 +77,12 @@ type Options struct {
 	RPID   string // "": RPID
 	NoUV   bool   // user not verified
 	Type   string // "": webauthn.get
+	// CrossOrigin and TopOrigin: the client data of a page framed by another site.
+	CrossOrigin bool
+	TopOrigin   string
+	// NativeClientData: the client data exactly as macOS's passkey API writes it for an app,
+	// {"type":…,"challenge":…,"origin":…} in that order and nothing else (no crossOrigin member).
+	NativeClientData bool
 }
 
 // Sign makes the payload's bytes and a submission for it, as the browser would after the person's touch.
@@ -102,8 +108,18 @@ func (p *Person) SignBytes(t testing.TB, payload []byte, o Options) *approval.Su
 	if o.Type == "" {
 		o.Type = "webauthn.get"
 	}
-	cd, _ := json.Marshal(map[string]any{"type": o.Type, "challenge": base64.RawURLEncoding.EncodeToString(approval.Challenge(payload)),
-		"origin": o.Origin, "crossOrigin": false})
+	fields := map[string]any{"type": o.Type, "challenge": base64.RawURLEncoding.EncodeToString(approval.Challenge(payload)),
+		"origin": o.Origin, "crossOrigin": o.CrossOrigin}
+	if o.TopOrigin != "" {
+		fields["topOrigin"] = o.TopOrigin
+	}
+	cd, _ := json.Marshal(fields)
+	if o.NativeClientData {
+		ty, _ := json.Marshal(o.Type)
+		c, _ := json.Marshal(fields["challenge"])
+		org, _ := json.Marshal(o.Origin)
+		cd = []byte(`{"type":` + string(ty) + `,"challenge":` + string(c) + `,"origin":` + string(org) + `}`)
+	}
 	rp := sha256.Sum256([]byte(o.RPID))
 	flags := byte(0x01 | 0x04)
 	if o.NoUV {

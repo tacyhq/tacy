@@ -11,7 +11,7 @@
 # sha256 180dd277f657c1478f09490e8a9a595f7378257510b43d1d3694a769aef9ed02, each binary checked; its Apache-2.0 LICENSE at
 # /tacy/gvisor/LICENSE). Rebuild them from the tagged source (scripts/reproduce.sh) to get the same digests.
 # Binaries (linux/amd64, sha256):
-#   agentd   7b3d91ac832bca02daad94a64224ed28445eea987e1f104f7b9eb9798be3013e
+#   agentd   0c6c84a2ecb3b8ac843794600512837bf6c093c67206cfa66623aa8d0e3956a6
 #   brain    7c984294c1b91fd5c27fb407d655bb2536b35e427b23b6d5082055e73d88cf60
 #   gatewayd a38f147c842b5e54c0b527c859dee200331ab7438dd2aaa7ac9de1b072d525d4
 #   runnerd  b1c1a2432beaf866395941d4d598ade89a0e885e226c6e13c5d2a4c359990bcb
@@ -40,7 +40,7 @@ services:
       - vaultstate:/vault
     command: ["-dir", "/run/tacy/agent=10003:10001:0770", "-dir", "/run/tacy/vault=10002:10001:0750", "-dir", "/run/tacy/runner=10004:10003:0750", "-remove", "/state/queue.db", "-remove", "/state/queue.db-wal", "-remove", "/state/queue.db-shm", "-remove", "/state/queue.db-journal", "-tree", "/state/agentd=10003:10003:0700", "-tree", "/vault=10002:10002:0700"]
   agentd:
-    image: ghcr.io/tacyhq/tacy/agentd@sha256:eb789e97d0e87e7d53dd7987859fee7cc050cbb2064dfa6637c9b0eb331102bd
+    image: ghcr.io/tacyhq/tacy/agentd@sha256:9f3dc90a9947388f86c7af791cecde09ede0e87ff99c49b2a4f7f6bd9f9ab75d
     entrypoint: ["/tacy/agentd"]
     network_mode: none
     restart: unless-stopped

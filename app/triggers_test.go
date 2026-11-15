@@ -44,9 +44,14 @@ type triggerEnv struct {
 }
 
 func newTriggerEnv(t *testing.T, replies ...string) *triggerEnv {
+	return newTriggerEnvRP(t, approvaltest.RP, replies...)
+}
+
+// newTriggerEnvRP is newTriggerEnv with agentd and gatewayd checking approvals for rp.
+func newTriggerEnvRP(t *testing.T, rp approval.RP, replies ...string) *triggerEnv {
 	se := &triggerEnv{space: randID("s"), sink: &guard.Sink{}, asks: make(chan proto.Approval, 8)}
 	se.sponsor = approvaltest.NewPerson(t, &se.dir, "f_chat", se.space)
-	check := approval.Config{Dir: &se.dir, RP: approvaltest.RP}
+	check := approval.Config{Dir: &se.dir, RP: rp}
 	addSink := func(p *safety.Policy) {
 		p.Connectors["sink"] = safety.Connector{Tools: []string{"sink.post", "sink.put"}}
 	}

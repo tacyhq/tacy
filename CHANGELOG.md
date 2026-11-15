@@ -2,6 +2,13 @@
 
 What changed in the agent VM, release by release, newest first. Every release is a signed tag `vX.Y.Z`; its [GitHub Release](https://github.com/tacyhq/tacy/releases) carries `compose.yaml`, `release.json` and the Sigstore bundle, and [README.md](README.md) says how to check them. Entries name the package they touch; the specs are in [docs/](docs/README.md).
 
+## v0.19.3
+
+Agent approvals accept the desktop app's passkey origin.
+
+- **`app/`:** The relying party a passkey approval must be for (`ReleaseRP`, `triggers.go`) pins exactly two origins with rpId `tacy.io`: `https://chat.tacy.io` (the web chat) and `https://tacy.io`, which the operating system's passkey API writes into the client data for the desktop app. Origins match exactly (no other scheme, port, path, subdomain or case; never cross-origin or framed). A page on tacy.io still can't approve anything: an approval's challenge is the hash of a payload that must name one held approval field for field (an id that is an HMAC with agentd's per-firm key, the task, the request, the effect hash the VM computed, the approver and the expiry it set), and those reach only the approver's own client, EHBP-encrypted; each held approval takes one decision, checked again by gatewayd. No identity directory for approvals is set on this release, so no approval verifies yet for any origin. Tests: `releaserp_test.go`.
+- **`storedfiles/storedfilestest/`:** The stand-in store counts a GET before writing its body, so a test that reads the counters right after the response no longer races it (tests only).
+
 ## v0.19.2
 
 Mail times in the person's time zone; mail quotes that carry the point.

@@ -34,6 +34,20 @@ type BootMeasurement struct {
 // changes (README.md, "Boot measurements"); the verifier refuses any other.
 var BootMeasurements = []BootMeasurement{
 	{
+		Name:    "dstack-0.6.4, 1 vCPU, 2 GiB (Phala tdx.small, QEMU 8.2.2)",
+		OSImage: "feff3645893ad910d4f0e06d8f553cf80a7c9fede2ce0698fa63116283260366",
+		MRTD:    "2a674327c50218dba880066b349b8d559d749ed68dce33fd651c184a877d084b07a9e583767a7ad5da13ed91deec2b70",
+		RTMR0:   "68102e7b524af310f7b7d426ce75481e36c40f5d513a9009c046e9d37e31551f0134d954b496a3357fd61d03f07ffe96",
+		RTMR1:   "0d390cdff163d981adbe90bb1d3666463be9de93a83de9b09ad0fe233974fdddc475731ba40d0bdc523efe8887cf82b8",
+		RTMR2:   "df939336955fec7a8d316b4ee4fe7b7e0810194c6911aa61c559882ad17984bfb4a7fc7c3112d25a4968f23bd6b907be",
+		Source: "computed with dstack-mr (Dstack-TEE/dstack mkosi-os-v0.6.4, commit bb80091, built from source; it " +
+			"reproduces the 0.6.1 set below from the live CVM's vm_config) from dstack-0.6.4.tar.gz of the GitHub release " +
+			"mkosi-os-v0.6.4 (sha256 72102489…, as the release lists; its sha256sum.txt hashes to the os-image-hash; " +
+			"metadata.json: version 0.6.4, is_dev false, cmdline with systemd.gpt_auto=0 systemd.import_credentials=no, " +
+			"the GHSA-c79w-3x5w-gmm5 fix) and the live CVM's vm_config (prod9) with the image swapped; equal to the quote " +
+			"of a throwaway CVM moved in place from 0.6.1 to 0.6.4 on Phala prod5, 2026-11-15 (testdata/attest-064.json)",
+	},
+	{
 		Name:    "dstack-0.6.1, 1 vCPU, 2 GiB (Phala tdx.small, QEMU 8.2.2)",
 		OSImage: "ec43cb8c5e04b6bb6c53b33b16076a01d83d01f7f4b703f2f78a0d947d6247e6",
 		MRTD:    "2a674327c50218dba880066b349b8d559d749ed68dce33fd651c184a877d084b07a9e583767a7ad5da13ed91deec2b70",

@@ -43,8 +43,10 @@ import (
 // ProdImages are Phala's non-dev dstack OS images we accept, by os-image-hash (phala os-images). This label check
 // comes first for a clear error on a dev image; what binds the image is BootMeasurements (MRTD, RTMR0-2), which
 // also has to list the image. Only 0.6.1 since 2026-10-17 (the live CVM moved to it with the gateway/vault
-// release; RetiredImages are the ones dropped then).
+// release; RetiredImages are the ones dropped then). 0.6.4 next to it while the live CVM moves off 0.6.1
+// (GHSA-c79w-3x5w-gmm5: 0.6.1's guest acts on host-appended partitions; fixed in 0.6.2 and later).
 var ProdImages = map[string]string{
+	"feff3645893ad910d4f0e06d8f553cf80a7c9fede2ce0698fa63116283260366": "dstack-0.6.4",
 	"ec43cb8c5e04b6bb6c53b33b16076a01d83d01f7f4b703f2f78a0d947d6247e6": "dstack-0.6.1",
 }
 

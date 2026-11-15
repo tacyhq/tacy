@@ -5,11 +5,13 @@ import (
 	"crypto/ecdh"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/hex"
 	"encoding/json"
 	"os"
 	"strings"
 	"testing"
+	"unicode/utf16"
 
 	"github.com/tacyhq/tacy/internal/tdx"
 	"github.com/tacyhq/tacy/proto"
@@ -51,8 +53,9 @@ func TestRetiredImagesRefused(t *testing.T) {
 			t.Fatalf("retired image %s still accepted", h)
 		}
 	}
-	if len(ProdImages) != 1 || ProdImages["ec43cb8c5e04b6bb6c53b33b16076a01d83d01f7f4b703f2f78a0d947d6247e6"] != "dstack-0.6.1" ||
-		len(BootMeasurements) != 1 {
+	if len(ProdImages) != 2 || ProdImages["ec43cb8c5e04b6bb6c53b33b16076a01d83d01f7f4b703f2f78a0d947d6247e6"] != "dstack-0.6.1" ||
+		ProdImages["feff3645893ad910d4f0e06d8f553cf80a7c9fede2ce0698fa63116283260366"] != "dstack-0.6.4" ||
+		len(BootMeasurements) != 2 {
 		t.Fatalf("accepted images %v, %d sets", ProdImages, len(BootMeasurements))
 	}
 }
@@ -61,7 +64,7 @@ func TestRetiredImagesRefused(t *testing.T) {
 // next to it (unsigned, only a cross-check here).
 func TestBootMeasurementsRecorded(t *testing.T) {
 	a, _, _ := load061(t)
-	checkBootRecorded(t, a, &BootMeasurements[0])
+	checkBootRecorded(t, a, set061(t))
 	for _, s := range allSets() {
 		for _, h := range []string{s.MRTD, s.RTMR0, s.RTMR1, s.RTMR2} {
 			if d, err := hex.DecodeString(h); err != nil || len(d) != 48 {
@@ -147,17 +150,29 @@ func attestedCompose(t *testing.T, a *proto.Attestation) string {
 	return ac.DockerComposeFile
 }
 
+// set061 is the dstack-0.6.1 set, wherever it is listed.
+func set061(t *testing.T) *BootMeasurement {
+	t.Helper()
+	for _, s := range allSets() {
+		if s.OSImage == "ec43cb8c5e04b6bb6c53b33b16076a01d83d01f7f4b703f2f78a0d947d6247e6" {
+			return &s
+		}
+	}
+	t.Fatal("no dstack-0.6.1 set")
+	return nil
+}
+
 func TestRecorded061Offline(t *testing.T) {
 	a, nonce, compose := load061(t)
 	p := offline
 	p.Compose = compose
 	res, err := Verify(context.Background(), a, nonce, p)
 	onlyImagesFailed(t, res, err)
-	if res.Facts["OS image"] != "dstack-0.6.1" || res.Facts["boot measurements"] != BootMeasurements[0].Name ||
+	if res.Facts["OS image"] != "dstack-0.6.1" || res.Facts["boot measurements"] != set061(t).Name ||
 		res.Facts["pre-launch script"] != "Phala pre-launch script v0.0.20" || res.Facts["brain binary sha256"] == "" {
 		t.Fatalf("facts %v", res.Facts)
 	}
-	checkBootRecorded(t, a, &BootMeasurements[0])
+	checkBootRecorded(t, a, set061(t))
 }
 
 // dstack 0.5.5+ runs app-compose's init_script as root before dockerd; any non-empty one is refused. The test
@@ -424,7 +439,7 @@ func TestTamper(t *testing.T) {
 			p.VerifyQuote = changeQuote(func(q *tdx.Quote) { q.Rtmrs[2] = flip(q.Rtmrs[2]) })
 		}},
 		{"pinned set is for another OS image", "event log reports OS image", func(_ *proto.Attestation, _ *[]byte, p *Policy) {
-			b := BootMeasurements[0] // the recording's (dstack-0.6.1)
+			b := *set061(t) // the recording's (dstack-0.6.1)
 			b.OSImage = strings.Repeat("ab", 32)
 			p.Boot = []BootMeasurement{b}
 		}},
@@ -567,5 +582,106 @@ func TestDockerCompose(t *testing.T) {
 	dc, err := DockerCompose(a)
 	if err != nil || dc != string(compose) {
 		t.Fatalf("%v (%d bytes)", err, len(dc))
+	}
+}
+
+// testdata/attest-064.json is a real /attest response from a throwaway CVM moved in place from dstack-0.6.1 to
+// dstack-0.6.4 (Phala prod5, tdx.small, 2026-11-15; the rehearsal of the live CVM's move off 0.6.1 for
+// GHSA-c79w-3x5w-gmm5), running v0.19.3's compose.
+func load064(t *testing.T) (*proto.Attestation, []byte, []byte) {
+	t.Helper()
+	raw, err := os.ReadFile("../testdata/attest-064.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var a proto.Attestation
+	if err := json.Unmarshal(raw, &a); err != nil {
+		t.Fatal(err)
+	}
+	n, _ := os.ReadFile("../testdata/attest-064.nonce")
+	nonce, _ := hex.DecodeString(strings.TrimSpace(string(n)))
+	return &a, nonce, []byte(attestedCompose(t, &a))
+}
+
+func set064(t *testing.T) *BootMeasurement {
+	t.Helper()
+	for _, s := range BootMeasurements {
+		if s.OSImage == "feff3645893ad910d4f0e06d8f553cf80a7c9fede2ce0698fa63116283260366" {
+			return &s
+		}
+	}
+	t.Fatal("dstack-0.6.4 isn't an accepted set")
+	return nil
+}
+
+// The 0.6.4 recording passes every check before the images rule with the default image and boot policy, and its
+// registers are the pinned set (computed with dstack-mr before any VM booted it).
+func TestRecorded064Offline(t *testing.T) {
+	a, nonce, compose := load064(t)
+	p := Policy{AllowStaleTCB: true, VerifyQuote: offline.VerifyQuote, Compose: compose}
+	res, err := Verify(context.Background(), a, nonce, p)
+	if err != nil {
+		t.Fatalf("0.6.4 recording: %v", err)
+	}
+	if res.Facts["OS image"] != "dstack-0.6.4" || res.Facts["boot measurements"] != set064(t).Name ||
+		res.Facts["pre-launch script"] != "Phala pre-launch script v0.0.20" {
+		t.Fatalf("facts %v", res.Facts)
+	}
+	checkBootRecorded(t, a, set064(t))
+}
+
+// cmdline064 is dstack-0.6.4's kernel command line (metadata.json of mkosi-os-v0.6.4). OVMF measures it into RTMR2
+// with " initrd=initrd" appended, as UTF-16LE with a terminating NUL.
+const cmdline064 = "console=ttyS0 init=/init panic=1 net.ifnames=0 biosdevname=0 mce=off oops=panic pci=noearly " +
+	"random.trust_cpu=y random.trust_bootloader=n tsc=reliable no-kvmclock systemd.gpt_auto=0 " +
+	"systemd.import_credentials=no dstack.rootfs_hash=4910dee53b84eed040c8179c91390ec41dc71ac8ff755ebe3a860e209e2c5573 " +
+	"dstack.rootfs_size=605687808"
+
+// The fix for GHSA-c79w-3x5w-gmm5 is in what the pinned 0.6.4 set measures: the recording's RTMR2 log (it replays
+// to the pinned RTMR2) opens with the digest of a command line that turns off systemd's GPT auto-generator and
+// host-supplied credentials.
+func TestDstack064CmdlineFix(t *testing.T) {
+	for _, f := range []string{"systemd.gpt_auto=0", "systemd.import_credentials=no"} {
+		if !strings.Contains(cmdline064, " "+f+" ") {
+			t.Fatalf("cmdline lacks %s", f)
+		}
+	}
+	a, _, _ := load064(t)
+	var q struct {
+		Quote    string          `json:"quote"`
+		EventLog json.RawMessage `json:"event_log"`
+	}
+	if err := json.Unmarshal(a.Quote, &q); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := hex.DecodeString(q.Quote)
+	quote, err := tdx.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ev, err := tdx.ParseEventLog(q.EventLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tdx.ReplayFirmware(quote, ev); err != nil {
+		t.Fatal(err)
+	}
+	if got := hex.EncodeToString(quote.Rtmrs[2]); got != set064(t).RTMR2 {
+		t.Fatalf("RTMR2 %s isn't the pinned set's", got)
+	}
+	var rtmr2 []string
+	for _, e := range ev {
+		if e.IMR == 2 && e.EventType != 3 {
+			rtmr2 = append(rtmr2, e.Digest)
+		}
+	}
+	u := utf16.Encode([]rune(cmdline064 + " initrd=initrd"))
+	b := make([]byte, 0, 2*len(u)+2)
+	for _, c := range u {
+		b = append(b, byte(c), byte(c>>8))
+	}
+	sum := sha512.Sum384(append(b, 0, 0))
+	if len(rtmr2) != 2 || rtmr2[0] != hex.EncodeToString(sum[:]) {
+		t.Fatalf("RTMR2 events %v; the first isn't the 0.6.4 command line's %x", rtmr2, sum)
 	}
 }

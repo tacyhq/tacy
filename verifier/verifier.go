@@ -42,16 +42,16 @@ import (
 
 // ProdImages are Phala's non-dev dstack OS images we accept, by os-image-hash (phala os-images). This label check
 // comes first for a clear error on a dev image; what binds the image is BootMeasurements (MRTD, RTMR0-2), which
-// also has to list the image. Only 0.6.1 since 2026-10-17 (the live CVM moved to it with the gateway/vault
-// release; RetiredImages are the ones dropped then). 0.6.4 next to it while the live CVM moves off 0.6.1
-// (GHSA-c79w-3x5w-gmm5: 0.6.1's guest acts on host-appended partitions; fixed in 0.6.2 and later).
+// also has to list the image. Only 0.6.4 since 2026-11-15 (the live CVM moved to it off 0.6.1: GHSA-c79w-3x5w-gmm5,
+// 0.6.0 and 0.6.1's guest acts on partitions the host appends to its disk; fixed in 0.6.2 and later).
 var ProdImages = map[string]string{
 	"feff3645893ad910d4f0e06d8f553cf80a7c9fede2ce0698fa63116283260366": "dstack-0.6.4",
-	"ec43cb8c5e04b6bb6c53b33b16076a01d83d01f7f4b703f2f78a0d947d6247e6": "dstack-0.6.1",
 }
 
-// RetiredImages were accepted before 2026-10-17 and are refused now (RetiredBootMeasurements has their sets).
+// RetiredImages were accepted once and are refused now (RetiredBootMeasurements has their sets): 0.5.8, 0.5.9 and
+// 0.6.0 since 2026-10-17, 0.6.1 since 2026-11-15 (GHSA-c79w-3x5w-gmm5).
 var RetiredImages = map[string]string{
+	"ec43cb8c5e04b6bb6c53b33b16076a01d83d01f7f4b703f2f78a0d947d6247e6": "dstack-0.6.1",
 	"bd369a8c2f9edb2b52dad48ac8e0b32dde5f1337c423a506b48d07403a7d8033": "dstack-0.5.9",
 	"6427f4f5ded88b72d326bd973e581c1689c5080c6444a0cf90fec7d9e4c8b92a": "dstack-0.5.8",
 	"8409e2a24ea8325f3ea45d7c50622c952a8a4a961ffc139f5d9a81c4e47bd744": "dstack-0.6.0",

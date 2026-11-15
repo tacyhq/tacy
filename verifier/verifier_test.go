@@ -40,9 +40,10 @@ func allSets() []BootMeasurement {
 	return append(append([]BootMeasurement{}, BootMeasurements...), RetiredBootMeasurements...)
 }
 
-// Since 2026-10-17 only dstack-0.6.1 is accepted: a VM on a retired image fails the image check by default.
+// Since 2026-11-15 only dstack-0.6.4 is accepted (2026-10-17 to 2026-11-15 only 0.6.1): a policy of only the retired
+// images refuses the 0.6.4 recording at the image check.
 func TestRetiredImagesRefused(t *testing.T) {
-	a, nonce, compose := load061(t)
+	a, nonce, compose := load064(t)
 	p := Policy{AllowStaleTCB: true, VerifyQuote: offline.VerifyQuote, Compose: compose,
 		ProdImages: RetiredImages, Boot: RetiredBootMeasurements}
 	if _, err := Verify(context.Background(), a, nonce, p); err == nil || !strings.Contains(err.Error(), "isn't a known production image") {
@@ -53,9 +54,8 @@ func TestRetiredImagesRefused(t *testing.T) {
 			t.Fatalf("retired image %s still accepted", h)
 		}
 	}
-	if len(ProdImages) != 2 || ProdImages["ec43cb8c5e04b6bb6c53b33b16076a01d83d01f7f4b703f2f78a0d947d6247e6"] != "dstack-0.6.1" ||
-		ProdImages["feff3645893ad910d4f0e06d8f553cf80a7c9fede2ce0698fa63116283260366"] != "dstack-0.6.4" ||
-		len(BootMeasurements) != 2 {
+	if len(ProdImages) != 1 || ProdImages["feff3645893ad910d4f0e06d8f553cf80a7c9fede2ce0698fa63116283260366"] != "dstack-0.6.4" ||
+		len(BootMeasurements) != 1 {
 		t.Fatalf("accepted images %v, %d sets", ProdImages, len(BootMeasurements))
 	}
 }
@@ -304,9 +304,11 @@ func TestRecordedOnline(t *testing.T) {
 	if testing.Short() {
 		t.Skip("needs Intel PCS")
 	}
-	a, nonce, compose := load061(t)
+	a, nonce, compose := load064(t)
 	res, err := Verify(context.Background(), a, nonce, Policy{Compose: compose})
-	onlyImagesFailed(t, res, err)
+	if err != nil || res.HPKEPublicKey == nil {
+		t.Fatalf("the 0.6.4 recording, online: %v", err)
+	}
 }
 
 // onlyImagesFailed: the recordings run composes that built the binaries on the VM, from before the OCI images.
@@ -683,5 +685,25 @@ func TestDstack064CmdlineFix(t *testing.T) {
 	sum := sha512.Sum384(append(b, 0, 0))
 	if len(rtmr2) != 2 || rtmr2[0] != hex.EncodeToString(sum[:]) {
 		t.Fatalf("RTMR2 events %v; the first isn't the 0.6.4 command line's %x", rtmr2, sum)
+	}
+}
+
+// Since 2026-11-15 dstack-0.6.1 is refused (GHSA-c79w-3x5w-gmm5): the 0.6.1 recording, which passes every check
+// when 0.6.1 is allowed (TestRecorded061Offline), fails the image check by default, and its boot measurements match
+// no accepted set even when its image label is allowed again, so both pins refuse it.
+func TestDstack061Refused(t *testing.T) {
+	a, nonce, compose := load061(t)
+	p := Policy{AllowStaleTCB: true, VerifyQuote: offline.VerifyQuote, Compose: compose}
+	res, err := Verify(context.Background(), a, nonce, p)
+	if err == nil || !strings.Contains(err.Error(), "isn't a known production image") || res.HPKEPublicKey != nil {
+		t.Fatalf("dstack-0.6.1 accepted: %v", err)
+	}
+	p.ProdImages = map[string]string{"ec43cb8c5e04b6bb6c53b33b16076a01d83d01f7f4b703f2f78a0d947d6247e6": "dstack-0.6.1"}
+	res, err = Verify(context.Background(), a, nonce, p)
+	if err == nil || !strings.Contains(err.Error(), "match no pinned set") || res.HPKEPublicKey != nil {
+		t.Fatalf("dstack-0.6.1's boot measurements accepted: %v", err)
+	}
+	if _, ok := RetiredImages["ec43cb8c5e04b6bb6c53b33b16076a01d83d01f7f4b703f2f78a0d947d6247e6"]; !ok {
+		t.Fatal("dstack-0.6.1 isn't in RetiredImages")
 	}
 }

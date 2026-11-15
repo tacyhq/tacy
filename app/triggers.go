@@ -41,8 +41,20 @@ import (
 //	POST /triggers/event  a signed tacy.event/v1 envelope -> {task, existed}: an inbound event (trigger.Engine.Event).
 //	                      409 replayed, 403 refused, 503 clock not trusted, 429 too many open tasks for the agent.
 
-// ReleaseRP is the relying party a passkey approval must be for: the release pins the chat's origin and rpId.
-var ReleaseRP = approval.RP{ID: "tacy.io", Origins: []string{"https://chat.tacy.io"}}
+// ReleaseRP is the relying party a passkey approval must be for: the release pins the rpId and the exact origins a
+// person approves from. https://chat.tacy.io is the web chat's page. https://tacy.io is what the desktop app's
+// operating-system passkey API writes into the client data (https and the rpId: macOS gives a native app's request
+// no page origin of its own). Origins match exactly (approval.Assertion.Verify): no other scheme, port, path,
+// subdomain or case, and never cross-origin.
+//
+// Accepting https://tacy.io doesn't let a page there approve anything. A passkey can only approve by signing an
+// approval's challenge, SHA-256 of a payload that must name the held approval exactly: its id (an HMAC with agentd's
+// per-firm key from dstack's KMS), task, request, the effect hash this VM computed, the approver and the expiry it
+// set. Those reach only the approver's own client, encrypted to it: the task's events (EHBP, behind the run's secret)
+// and POST /approvals/list (signed by the approver's identity for this boot's key, answered EHBP-encrypted to that
+// request). A page that can't name a held approval has nothing to get signed that this VM would take, and each held
+// approval takes one decision, before its expiry.
+var ReleaseRP = approval.RP{ID: "tacy.io", Origins: []string{"https://chat.tacy.io", "https://tacy.io"}}
 
 // listLabel prefixes what an approvals list request's signature covers.
 const listLabel = "tacy-approvals-list/v1"

@@ -2,6 +2,13 @@
 
 What changed in the agent VM, release by release, newest first. Every release is a signed tag `vX.Y.Z`; its [GitHub Release](https://github.com/tacyhq/tacy/releases) carries `compose.yaml`, `release.json` and the Sigstore bundle, and [README.md](README.md) says how to check them. Entries name the package they touch; the specs are in [docs/](docs/README.md).
 
+## v0.19.4
+
+The VM's guest OS moves to dstack 0.6.4; dstack 0.6.1 is refused.
+
+- **`verifier/`:** Accepts only dstack-0.6.4 (os-image-hash `feff3645…`) and its boot measurements on tdx.small (MRTD and RTMR0 as 0.6.1's; RTMR1 `0d390cdf…`, RTMR2 `df939336…`), computed with `dstack-mr` v0.6.4 from the release's `dstack-0.6.4.tar.gz` and equal to a test VM's quote (`testdata/attest-064.json`). dstack-0.6.1 moves to `RetiredImages` / `RetiredBootMeasurements`: its guest OS acts on partitions the host appends to its disk ([GHSA-c79w-3x5w-gmm5](https://github.com/Dstack-TEE/dstack/security/advisories/GHSA-c79w-3x5w-gmm5), High), fixed from 0.6.2 by `systemd.gpt_auto=0 systemd.import_credentials=no` on the measured kernel command line. Tests: `TestRecorded064Offline`, `TestDstack064CmdlineFix` (the recorded RTMR2 log opens with that command line's digest), `TestDstack061Refused`.
+- **`compose.yaml` and the images:** unchanged from v0.19.3; the VM keeps its disk, keys and URL across the OS change.
+
 ## v0.19.3
 
 Agent approvals accept the desktop app's passkey origin.

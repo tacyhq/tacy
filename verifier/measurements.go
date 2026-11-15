@@ -41,31 +41,19 @@ var BootMeasurements = []BootMeasurement{
 		RTMR1:   "0d390cdff163d981adbe90bb1d3666463be9de93a83de9b09ad0fe233974fdddc475731ba40d0bdc523efe8887cf82b8",
 		RTMR2:   "df939336955fec7a8d316b4ee4fe7b7e0810194c6911aa61c559882ad17984bfb4a7fc7c3112d25a4968f23bd6b907be",
 		Source: "computed with dstack-mr (Dstack-TEE/dstack mkosi-os-v0.6.4, commit bb80091, built from source; it " +
-			"reproduces the 0.6.1 set below from the live CVM's vm_config) from dstack-0.6.4.tar.gz of the GitHub release " +
+			"reproduces the retired 0.6.1 set from the live CVM's vm_config) from dstack-0.6.4.tar.gz of the GitHub release " +
 			"mkosi-os-v0.6.4 (sha256 72102489…, as the release lists; its sha256sum.txt hashes to the os-image-hash; " +
 			"metadata.json: version 0.6.4, is_dev false, cmdline with systemd.gpt_auto=0 systemd.import_credentials=no, " +
 			"the GHSA-c79w-3x5w-gmm5 fix) and the live CVM's vm_config (prod9) with the image swapped; equal to the quote " +
 			"of a throwaway CVM moved in place from 0.6.1 to 0.6.4 on Phala prod5, 2026-11-15 (testdata/attest-064.json)",
 	},
-	{
-		Name:    "dstack-0.6.1, 1 vCPU, 2 GiB (Phala tdx.small, QEMU 8.2.2)",
-		OSImage: "ec43cb8c5e04b6bb6c53b33b16076a01d83d01f7f4b703f2f78a0d947d6247e6",
-		MRTD:    "2a674327c50218dba880066b349b8d559d749ed68dce33fd651c184a877d084b07a9e583767a7ad5da13ed91deec2b70",
-		RTMR0:   "68102e7b524af310f7b7d426ce75481e36c40f5d513a9009c046e9d37e31551f0134d954b496a3357fd61d03f07ffe96",
-		RTMR1:   "89ef86c5125b986c325f0a94acfa87718a4ef3a4d4f237dbb72dda3cf777fd2c054555fb4407eb53338d7d67329a7333",
-		RTMR2:   "e9000e338f33233e8f51b7fd031e1c158bdcf8572eab041c0bc8eb7fef48b23259a6a556e6c8e2af99999fc39c793179",
-		Source: "computed with dstack-mr (Dstack-TEE/dstack v0.6.1, commit 7f14314, built from source) from " +
-			"dstack-0.6.1.tar.gz of the GitHub release mkosi-os-v0.6.1 (sha256 7583f51c…, as the release lists; its " +
-			"sha256sum.txt hashes to the os-image-hash; metadata.json: version 0.6.1, is_dev false; MRTD is the " +
-			"image's two-pass value in measurement.tdx.cbor, QEMU 8.2.2) and the VM's vm_config; equal to the quote " +
-			"of a throwaway CVM on Phala prod5 recorded 2026-10-17 (testdata/attest-061.json), and to the live CVM's on " +
-			"prod9 after it moved to 0.6.1 the same day (the chat's test/fixtures/agent/attest-v8.json)",
-	},
 }
 
 // RetiredBootMeasurements are sets the verifier no longer accepts (since 2026-10-17: only 0.6.1 once the live
-// CVM moved to it, with the gateway/vault release). Kept for the record and for tests on older recordings: 0.5.9
-// (computed and observed: the live CVM until 2026-10-17), 0.5.8 and 0.6.0 (computed only, never booted by us).
+// CVM moved to it, with the gateway/vault release; 2026-11-15: only 0.6.4 once it moved off 0.6.1). Kept for the
+// record and for tests on older recordings: 0.5.9 (computed and observed: the live CVM until 2026-10-17), 0.5.8 and
+// 0.6.0 (computed only, never booted by us), 0.6.1 (computed and observed: the live CVM until 2026-11-15; refused for
+// GHSA-c79w-3x5w-gmm5, its guest acts on partitions the host appends to its disk).
 var RetiredBootMeasurements = []BootMeasurement{
 	{
 		Name:    "dstack-0.5.9, 1 vCPU, 2 GiB (Phala tdx.small, QEMU 8.2.2)",
@@ -99,6 +87,20 @@ var RetiredBootMeasurements = []BootMeasurement{
 		Source: "computed only (2026-10-17), dstack-mr v0.6.1 from dstack-0.6.0.tar.gz of the GitHub release " +
 			"mkosi-os-v0.6.0 (sha256 73f9950f…, as listed; sha256sum.txt hashes to the os-image-hash; is_dev false) " +
 			"and the 0.6.1 VM's vm_config with the image swapped; not observed",
+	},
+	{
+		Name:    "dstack-0.6.1, 1 vCPU, 2 GiB (Phala tdx.small, QEMU 8.2.2)",
+		OSImage: "ec43cb8c5e04b6bb6c53b33b16076a01d83d01f7f4b703f2f78a0d947d6247e6",
+		MRTD:    "2a674327c50218dba880066b349b8d559d749ed68dce33fd651c184a877d084b07a9e583767a7ad5da13ed91deec2b70",
+		RTMR0:   "68102e7b524af310f7b7d426ce75481e36c40f5d513a9009c046e9d37e31551f0134d954b496a3357fd61d03f07ffe96",
+		RTMR1:   "89ef86c5125b986c325f0a94acfa87718a4ef3a4d4f237dbb72dda3cf777fd2c054555fb4407eb53338d7d67329a7333",
+		RTMR2:   "e9000e338f33233e8f51b7fd031e1c158bdcf8572eab041c0bc8eb7fef48b23259a6a556e6c8e2af99999fc39c793179",
+		Source: "computed with dstack-mr (Dstack-TEE/dstack v0.6.1, commit 7f14314, built from source) from " +
+			"dstack-0.6.1.tar.gz of the GitHub release mkosi-os-v0.6.1 (sha256 7583f51c…, as the release lists; its " +
+			"sha256sum.txt hashes to the os-image-hash; metadata.json: version 0.6.1, is_dev false; MRTD is the " +
+			"image's two-pass value in measurement.tdx.cbor, QEMU 8.2.2) and the VM's vm_config; equal to the quote " +
+			"of a throwaway CVM on Phala prod5 recorded 2026-10-17 (testdata/attest-061.json), and to the live CVM's on " +
+			"prod9 after it moved to 0.6.1 the same day (the chat's test/fixtures/agent/attest-v8.json)",
 	},
 }
 

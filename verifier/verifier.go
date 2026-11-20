@@ -7,6 +7,7 @@
 //   - the OS image (os-image-hash event) is a production dstack image, not a dev one (dev allows debug access)
 //   - the boot measurements (MRTD, RTMR0-2: firmware, its configuration and the VM shape, kernel, command line
 //     with the root filesystem hash, initramfs) are one of the pinned sets (BootMeasurements), for that OS image
+//   - the VM's keys come from a pinned dstack KMS root (KMSRoots, the attested key-provider event)
 //   - app-compose.json: a reviewed pre-launch script, the docker-compose runner, expected env names only
 //   - the docker compose the VM runs (which names every image by digest) is a signed release: a Sigstore bundle
 //     from this repo's release workflow on a version tag, in Sigstore's public log, for exactly
@@ -42,20 +43,40 @@ import (
 
 // ProdImages are Phala's non-dev dstack OS images we accept, by os-image-hash (phala os-images). This label check
 // comes first for a clear error on a dev image; what binds the image is BootMeasurements (MRTD, RTMR0-2), which
-// also has to list the image. Only 0.6.4 since 2026-11-15 (the live CVM moved to it off 0.6.1: GHSA-c79w-3x5w-gmm5,
-// 0.6.0 and 0.6.1's guest acts on partitions the host appends to its disk; fixed in 0.6.2 and later).
+// also has to list the image. Only 0.6.5 since 2026-11-20 (Phala moved the live CVM to it, with its KMS's new root,
+// off 0.6.4; 0.6.4 had replaced 0.6.1 on 2026-11-15 for GHSA-c79w-3x5w-gmm5).
 var ProdImages = map[string]string{
-	"feff3645893ad910d4f0e06d8f553cf80a7c9fede2ce0698fa63116283260366": "dstack-0.6.4",
+	"4771a29e03e93f0e2d5e37174cd8bb1112942c9689deb36b16c5df9e183d8623": "dstack-0.6.5",
 }
 
 // RetiredImages were accepted once and are refused now (RetiredBootMeasurements has their sets): 0.5.8, 0.5.9 and
-// 0.6.0 since 2026-10-17, 0.6.1 since 2026-11-15 (GHSA-c79w-3x5w-gmm5).
+// 0.6.0 since 2026-10-17, 0.6.1 since 2026-11-15 (GHSA-c79w-3x5w-gmm5), 0.6.4 since 2026-11-20 (the live CVM's disk
+// moved to the KMS's new root, which only a 0.6.5 guest migrates to).
 var RetiredImages = map[string]string{
+	"feff3645893ad910d4f0e06d8f553cf80a7c9fede2ce0698fa63116283260366": "dstack-0.6.4",
 	"ec43cb8c5e04b6bb6c53b33b16076a01d83d01f7f4b703f2f78a0d947d6247e6": "dstack-0.6.1",
 	"bd369a8c2f9edb2b52dad48ac8e0b32dde5f1337c423a506b48d07403a7d8033": "dstack-0.5.9",
 	"6427f4f5ded88b72d326bd973e581c1689c5080c6444a0cf90fec7d9e4c8b92a": "dstack-0.5.8",
 	"8409e2a24ea8325f3ea45d7c50622c952a8a4a961ffc139f5d9a81c4e47bd744": "dstack-0.6.0",
 }
+
+// KMSRoots are the dstack KMS roots a VM may take its keys from, by key-provider id: the KMS root CA's public key
+// (P-256 SubjectPublicKeyInfo, DER, hex) that the guest checked the KMS's answer against and measured into RTMR3
+// ("key-provider" event) before it used the keys. Every key the VM has (disk, encrypted env, dstack GetKey) derives
+// from that root, so a VM served by another root, such as Phala's root from before its 2026-11-06 rotation (its
+// incident report: KMS-derived secrets possibly exposed), is refused. A stopgap while keys move to Tacy's own handling.
+var KMSRoots = map[string]string{
+	"3059301306072a8648ce3d020106082a8648ce3d03010703420004e8e325a477b0bf22800dc927a46c68638938d283fe73d1f9028eeac7028193f3470122193875f598b7addc503e534712ab437b4120776bbac32ddf8897f844ee": "Phala KMS, root since 2026-11-06",
+}
+
+// RetiredKMSRoots were accepted once and are refused now: Phala's KMS root before its 2026-11-06 rotation (the live
+// CVM's until 2026-11-20).
+var RetiredKMSRoots = map[string]string{
+	"3059301306072a8648ce3d020106082a8648ce3d030107034200048844eb42ccdf8c52fd4f174f362fcb9bbd19c45fd48f1edec2d8f1ca23536ec1a74021b4cee610c074f8294d431b2b7fee2c39e5333fdaf0a4522d43fb159d9f": "Phala KMS, root until 2026-11-06",
+}
+
+// KMSCheck is the name of the key-provider check.
+const KMSCheck = "keys from a pinned dstack KMS root (attested key-provider event)"
 
 // PreLaunchScripts are Phala pre-launch scripts we accept, by sha256. Phala adds this script to app-compose.json
 // (so the compose hash covers it) and dstack runs it as root before the containers start, so it must be pinned as
@@ -88,6 +109,7 @@ type Policy struct {
 	AllowE2EDiag    bool              // test tools only: accept the e2e overlay's diag service (ComposeImagesE2E)
 	PreLaunch       map[string]string // allowed pre-launch script sha256s; nil = PreLaunchScripts
 	Boot            []BootMeasurement // allowed MRTD/RTMR0-2 sets; nil = BootMeasurements
+	KMSRoots        map[string]string // allowed key-provider ids (KMS root CA keys); nil = KMSRoots
 	// VerifyQuote checks a raw quote; nil = tdx.VerifyWith(Getter, Now) (needs Intel PCS). Tests replace it.
 	VerifyQuote func(ctx context.Context, raw []byte) (*tdx.Quote, error)
 	// Getter fetches Intel PCS collateral; nil = net/http straight to Intel. The browser (WebAssembly) build passes
@@ -293,6 +315,34 @@ func Verify(ctx context.Context, att *proto.Attestation, nonce []byte, p Policy)
 	}
 	if !r.add("boot measurements (MRTD, RTMR0-2) are a pinned set: firmware, kernel, initramfs, root filesystem, VM size",
 		err, detail) {
+		return failed()
+	}
+
+	// The keys' source: the event's {"name":"kms","id":"<root CA key>"}, measured by the guest (dstack-util).
+	roots := p.KMSRoots
+	if roots == nil {
+		roots = KMSRoots
+	}
+	var provider struct {
+		Name string `json:"name"`
+		ID   string `json:"id"`
+	}
+	err = json.Unmarshal(kp, &provider)
+	root := ""
+	if err != nil {
+		err = errors.New("no key-provider event (or not JSON)")
+	} else if provider.Name != "kms" {
+		err = fmt.Errorf("key provider %q, want a dstack KMS", provider.Name)
+	} else if root = roots[strings.ToLower(provider.ID)]; root == "" {
+		err = fmt.Errorf("KMS root %s isn't a pinned one", short(strings.ToLower(provider.ID)))
+		if old, ok := RetiredKMSRoots[strings.ToLower(provider.ID)]; ok {
+			err = fmt.Errorf("KMS root %s is retired (%s)", short(strings.ToLower(provider.ID)), old)
+		}
+	}
+	if root != "" {
+		r.Facts["KMS root"] = root
+	}
+	if !r.add(KMSCheck, err, root) {
 		return failed()
 	}
 

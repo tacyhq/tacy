@@ -2,6 +2,13 @@
 
 What changed in the agent VM, release by release, newest first. Every release is a signed tag `vX.Y.Z`; its [GitHub Release](https://github.com/tacyhq/tacy/releases) carries `compose.yaml`, `release.json` and the Sigstore bundle, and [README.md](README.md) says how to check them. Entries name the package they touch; the specs are in [docs/](docs/README.md).
 
+## Unreleased
+
+The verifier follows the VM to dstack 0.6.5 and pins the KMS root its keys come from.
+
+- **`verifier/`:** Accepts only dstack-0.6.5 (os-image-hash `4771a29e…`) and its boot measurements on tdx.small (MRTD and RTMR0 as 0.6.4's, the same firmware; RTMR1 `2f72a4db…`, RTMR2 `3d9910a3…`), computed with `dstack-mr` built at mkosi-os-v0.6.5 from the release's `dstack-0.6.5.tar.gz`; the same build reproduces the 0.6.4 set. Phala moved the VM in place to 0.6.5 on 2026-11-20, with its KMS's new root (rotated 2026-11-06 after Phala's incident); only a 0.6.5 guest migrates its disk and env to a new root epoch, so dstack-0.6.4 moves to `RetiredImages` / `RetiredBootMeasurements`. New check: the VM's keys must come from a pinned KMS root (`KMSRoots`, the attested `key-provider` event: the KMS root CA's key); Phala's root from before the rotation is in `RetiredKMSRoots` and refused. Tests: `TestDstack065CmdlineFix` (the pinned RTMR2 recomputed from the 0.6.5 command line, which keeps `systemd.gpt_auto=0 systemd.import_credentials=no`, and its initramfs), `TestDstack064Refused`, `TestKMSRoots`.
+- **`compose.yaml` and the images:** unchanged.
+
 ## v0.19.4
 
 The VM's guest OS moves to dstack 0.6.4; dstack 0.6.1 is refused.

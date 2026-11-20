@@ -15,11 +15,12 @@
 //     pin is ReleaseAppCompose of the docker compose the VM runs, so it is the signed release's app-compose.json
 //     exactly; in the older exact mode it is Policy.AppCompose
 //   - the Tacy KMS the compose names (-kms-key) is a pinned one (KMSIDs or a signed trust list)
-//   - a signed trust list (trustlist.go, Policy.WithTrustList) may add OS images, boot sets, pre-launch scripts and
-//     KMS ids to the built-in ones, never remove one, and may raise the release floor
+//   - a signed trust list (trustlist.go, Policy.WithTrustList) may add OS images, boot sets, pre-launch scripts, KMS
+//     ids and signed VM releases to the built-in ones, never remove one, and may raise the release floor
 //   - the docker compose the VM runs (which names every image by digest) is a signed release: a Sigstore bundle
 //     from this repo's release workflow on a version tag, in Sigstore's public log, for exactly
-//     sha256(docker compose), at least release.MinVersion (package release) and the trust list's floor
+//     sha256(docker compose), at least release.MinVersion (package release) and the trust list's floor. The bundle
+//     is Policy.Bundle, or, when none is given, one a trust list's release names for that compose (Policy.Releases)
 //   - the docker compose pins every container to an image digest (name@sha256, no tag, no build:, extends: or
 //     include:), so the compose hash covers exactly the code that runs (ComposeImages)
 //
@@ -115,7 +116,8 @@ var Envs = []string{"TINFOIL_API_KEY", "BRAVE_SEARCH_API_KEY", "TAVILY_API_KEY",
 // Policy is what the verifier requires.
 type Policy struct {
 	// Bundle is the Sigstore bundle (JSON) that proves the VM's docker compose is a signed release (see package
-	// release; GitHub serves it at release.AttestationsURL for the compose's sha256). Required unless Compose is set.
+	// release; GitHub serves it at release.AttestationsURL for the compose's sha256). Unless Compose is set, it is
+	// required, or one of Releases' bundles for the attested compose (ReleaseBundles) must verify.
 	Bundle []byte
 	// Release is what the signed release must satisfy; the zero value is the pinned production policy.
 	Release release.Policy
@@ -143,6 +145,10 @@ type Policy struct {
 	// ReleaseFloor (vX.Y.Z) is the oldest signed VM release the release mode accepts on top of Release's minimum
 	// (a trust list's vm_release_floor); unused by the exact mode.
 	ReleaseFloor string
+	// Releases are signed VM releases (a trust list's releases, MergeReleases) whose bundles a release-mode verifier
+	// may look up for the attested compose (ReleaseBundles), each verified as a built-in one; the release mode tries
+	// them when Bundle is empty. Unused by the exact mode.
+	Releases []safety.TrustRelease
 	// VerifyQuote checks a raw quote; nil = tdx.VerifyWith(Getter, Now) (needs Intel PCS). Tests replace it.
 	VerifyQuote func(ctx context.Context, raw []byte) (*tdx.Quote, error)
 	// Getter fetches Intel PCS collateral; nil = net/http straight to Intel. The browser (WebAssembly) build passes
@@ -581,6 +587,16 @@ func Verify(ctx context.Context, att *proto.Attestation, nonce []byte, p Policy)
 			err = floorErr
 		} else if len(p.Bundle) > 0 {
 			rel, err = release.Verify(p.Bundle, sum[:], rp)
+		} else {
+			// No bundle given: a signed trust list's release for this compose, each checked as a given one would be.
+			for _, b := range p.ReleaseBundles(hex.EncodeToString(sum[:])) {
+				r, e := release.Verify(b, sum[:], rp)
+				if e == nil {
+					rel, err = r, nil
+					break
+				}
+				err = fmt.Errorf("the trust list's release for this compose: %w", e)
+			}
 		}
 		detail := ""
 		if rel != nil {

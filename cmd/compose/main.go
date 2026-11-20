@@ -8,8 +8,8 @@
 // linked only by unix sockets in volumes shared by exactly two containers:
 //
 //   - agentd (./app, service "agentd"): the front door and the runtime (journal and queue, the harness to the
-//     brain). No network at all (network_mode none) and no keys: it checks the relay's token against the hash
-//     vaultd gives it after the Worker's push.
+//     brain). No network at all (network_mode none) and no keys: it checks the relay's signatures with the pinned
+//     -relay-auth-key (its public half; no environment).
 //   - runnerd (./cmd/runnerd, service "runner"): runs the brain (./cmd/brain, our agent loop, untrusted) in a gVisor
 //     sandbox for agentd: no network, no keys, no capabilities, rootless runsc, Docker's seccomp profile off (runsc
 //     brings its own), memory and process limits on the container. The brain's sandbox has a root holding only its
@@ -69,6 +69,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -82,6 +83,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/tarball"
 	"github.com/google/go-containerregistry/pkg/v1/types"
 
+	"github.com/tacyhq/tacy/kms"
 	"github.com/tacyhq/tacy/safety"
 	"github.com/tacyhq/tacy/sandbox"
 	"github.com/tacyhq/tacy/verifier"
@@ -100,27 +102,45 @@ const Registry = "ghcr.io/tacyhq/tacy"
 
 const modulePath = "github.com/tacyhq/tacy"
 
-// The keys the chat Worker pushes to vaultd after it verified the VM (vault/secrets.go; with them the relay's run
-// token, which only agentd checks, as its hash). gatewayd picks its search provider as if they were set, since none
-// is when it starts. No container gets an environment variable from the deployer (allowed_envs is empty).
-var pushedKeys = []string{"TINFOIL_API_KEY", "EXA_API_KEY", "TAVILY_API_KEY"}
+// The keys vaultd gets from the Tacy key service after boot (its release: the secrets bundle's TINFOIL, EXA and
+// TAVILY keys; vault/secrets.go, cmd/vaultd). gatewayd picks its search provider as if they were set, since none is
+// when it starts. No container gets an environment variable from the deployer (allowed_envs is empty), and the chat
+// Worker pushes nothing.
+var expectedKeys = []string{"TINFOIL_API_KEY", "EXA_API_KEY", "TAVILY_API_KEY"}
 
 // searchProvider is gatewayd's search provider (it was the SEARCH_PROVIDER env variable before v0.20.0).
 const searchProvider = "exa"
 
-// secretsSigner is the only key whose secrets pushes vaultd takes (vault/secrets.go): its private half is the chat
-// Worker's VM_SECRETS_SIGNING_KEY (and, for throwaways on a release compose, the e2e keys file's). Empty: vaultd
-// takes the operator key's (-operator-key, the Worker's SAFETY_OPERATOR_KEY). Public key only; changing it is a
-// release.
-const secretsSigner = ""
+// The Tacy key service (the keys plan §2): kmsID is its id (ed25519:<base64>, from the genesis ceremony: kmsctl genesis
+// prints it and writes kms-id.txt), which agentd and vaultd pin (-kms-key) so they take only replies it signed;
+// kmsURLs are its replicas' https base URLs, in the order gatewayd tries them (-kms-url). The verifier checks every
+// -kms-key is a pinned KMS id (verifier.KMSIDs or the signed trust list) and every -kms-url https. kmsID is the
+// verifier's release pin (verifier.ReleaseKMSID, filled in at the release), so the compose and the verifiers can't
+// disagree. Empty: not pinned yet, and the generator refuses to write a compose (the VM would have no keys at all).
+const kmsID = verifier.ReleaseKMSID
+
+var kmsURLs = []string{}
+
+// stateURL is the chat Worker, whose sealed-state API (GET/PUT /api/vm/state/<name>, the chat's vm-state.ts) keeps
+// the VM's sealed state: ciphertext only, under the key service's keys (-state-url, gatewayd's fixed calls).
+const stateURL = "https://chat.tacy.io"
 
 // socketVolumes are the only volumes: a tmpfs each (nothing on the disk), owned and moded for the two containers
-// that share it (as setup's -dir sets them too).
+// that share it (as setup's -dir sets them too). opssock is gatewayd's ops socket for vaultd's fixed calls (the key
+// service and the sealed-state API): vaultd's primary group is gatewayd's.
 var socketVolumes = []struct{ name, uid, gid, mode string }{
 	{"runnersock", runnerdUID, agentdUID, "0750"},
 	{"agentsock", agentdUID, gatewaydUID, "0770"},
 	{"vaultsock", vaultdUID, gatewaydUID, "0750"},
+	{"opssock", gatewaydUID, gatewaydUID, "0750"},
 }
+
+// relayAuthKey is the public half of the relay's request-signing key (purpose relay-auth; ../relay, the keys plan §3.4):
+// agentd takes only envelopes it signed (-relay-auth-key). Its private half is the chat Worker's secret
+// AGENT_VM_RELAY_KEY for now (later the Tacy key service's). Make it offline with
+// `go run ./cmd/safetysign keygen DIR relay-auth` (prints the public key for here; DIR/relay-auth.key is the seed).
+// Empty: not pinned yet, and the generator refuses to write a compose (agentd would take no request).
+const relayAuthKey = ""
 
 // uids. Each process has its own; none is root (agentd was until VM release 2). Each socket is 0660, owned by the
 // process that listens, with the group of the one peer (also checked by uid with SO_PEERCRED). agentd needs no
@@ -187,6 +207,36 @@ const (
 	keylogCarry   = safety.ChatPolicyV1 + "," + safety.ChatPolicyV2
 	keylogURL     = "https://chat.tacy.io/api/safety/keylog"
 )
+
+// dnsTLS is gatewayd's DNS-over-TLS resolver (gateway/dot.go, the keys plan §3.4, PX-4): every lookup the VM makes goes
+// there over TLS, checked against this name, never as plain DNS through the provider's network. The resolver sees
+// every name the VM looks up, so which one is still open: Quad9 here as the placeholder
+// (others: Cloudflare one.one.one.one@1.1.1.1:853, Mullvad dns.mullvad.net@194.242.2.2:853, or our own). Changing
+// it is a release (the attested compose names it).
+const dnsTLS = "dns.quad9.net@9.9.9.9:853,149.112.112.112:853"
+
+// agentdArgs is agentd's command: its sockets, the relay's signing key, the key service it takes its keys from (its
+// sealed state at the chat Worker), and the trust roots.
+func agentdArgs(relayKey, kms string, hosts int) []string {
+	return append([]string{"-runner-socket", "/run/tacy/runner/runner.sock",
+		"-gateway-socket", "/run/tacy/agent/gateway.sock", "-listen-unix", "/run/tacy/agent/http.sock", "-listen-uid", gatewaydUID,
+		"-listen-gid", gatewaydUID, "-mem-limit-mib", "600", "-relay-auth-key", relayKey,
+		"-kms-key", kms, "-kms-hosts", strconv.Itoa(hosts), "-state", "relay"}, safetyArgs()...)
+}
+
+// gatewaydKMSArgs are gatewayd's fixed hosts: each key service replica, the chat Worker, and vaultd's ops socket.
+func gatewaydKMSArgs(urls []string, state string) []string {
+	var a []string
+	for _, u := range urls {
+		a = append(a, "-kms-url", u)
+	}
+	return append(a, "-state-url", state, "-ops-socket", "/run/tacy/ops/gateway.sock", "-vault-uid", vaultdUID)
+}
+
+// vaultdKMSArgs: vaultd's release from the key service, through gatewayd's ops socket.
+func vaultdKMSArgs(kms string, hosts int) []string {
+	return []string{"-kms-key", kms, "-kms-hosts", strconv.Itoa(hosts), "-ops-socket", "/run/tacy/ops/gateway.sock"}
+}
 
 // safetyArgs are the trust-root flags every guard process gets.
 func safetyArgs() []string { return trustArgs(adminKeys, keylogGenesis, keylogCarry) }
@@ -626,7 +676,7 @@ func build() (*Release, error) {
 		if err != nil {
 			return nil, err
 		}
-		r.Images = append(r.Images, Image{Name: im.name, Ref: Registry + "/" + im.name + "@" + d.String(), img: img})
+		r.Images = append(r.Images, Image{Name: im.name, Ref: registry + "/" + im.name + "@" + d.String(), img: img})
 	}
 	if len(used) != len(bins) {
 		return nil, fmt.Errorf("%d binaries, %d in images", len(bins), len(used))
@@ -634,8 +684,22 @@ func build() (*Release, error) {
 	return r, nil
 }
 
-// generate returns compose.yaml for the release's images.
-func generate(r *Release) (string, error) {
+// releasePins are what a compose pins beyond its images: the relay's key, the key service and the chat Worker.
+type releasePins struct {
+	relayAuthKey, kmsID, stateURL string
+	kmsURLs                       []string
+}
+
+// pinned is this release's (the constants above).
+func pinned() releasePins {
+	return releasePins{relayAuthKey: relayAuthKey, kmsID: kmsID, stateURL: stateURL, kmsURLs: kmsURLs}
+}
+
+// generate returns compose.yaml for the release's images and pins.
+func generate(r *Release) (string, error) { return generateWith(r, pinned()) }
+
+// generateWith is generate with other pins (tests: dev keys).
+func generateWith(r *Release, p releasePins) (string, error) {
 	ref := map[string]string{}
 	for _, im := range r.Images {
 		ref[im.Name] = im.Ref
@@ -716,10 +780,12 @@ func generate(r *Release) (string, error) {
       - agentsock:/run/tacy/agent
       - vaultsock:/run/tacy/vault
       - runnersock:/run/tacy/runner
+      - opssock:/run/tacy/ops
 `)
 	args("-dir", "/run/tacy/agent="+agentdUID+":"+gatewaydUID+":0770",
 		"-dir", "/run/tacy/vault="+vaultdUID+":"+gatewaydUID+":0750",
-		"-dir", "/run/tacy/runner="+runnerdUID+":"+agentdUID+":0750")
+		"-dir", "/run/tacy/runner="+runnerdUID+":"+agentdUID+":0750",
+		"-dir", "/run/tacy/ops="+gatewaydUID+":"+gatewaydUID+":0750")
 	service("agentd", "agentd", agentdUID+":"+agentdUID, false)
 	b.WriteString(`    group_add: ["` + gatewaydUID + `"]
     volumes:
@@ -727,9 +793,13 @@ func generate(r *Release) (string, error) {
       - runnersock:/run/tacy/runner
       - agentsock:/run/tacy/agent
 `)
-	args(append([]string{"-runner-socket", "/run/tacy/runner/runner.sock",
-		"-gateway-socket", "/run/tacy/agent/gateway.sock", "-listen-unix", "/run/tacy/agent/http.sock", "-listen-uid", gatewaydUID,
-		"-listen-gid", gatewaydUID, "-mem-limit-mib", "600"}, safetyArgs()...)...)
+	if p.relayAuthKey == "" {
+		return "", fmt.Errorf("relayAuthKey isn't pinned (the keys plan §3.4): agentd would take no request")
+	}
+	if p.kmsID == "" || len(p.kmsURLs) == 0 || p.stateURL == "" {
+		return "", fmt.Errorf("kmsID, kmsURLs and stateURL aren't pinned (the keys plan §2): the VM would have no keys")
+	}
+	args(agentdArgs(p.relayAuthKey, p.kmsID, len(p.kmsURLs))...)
 	// runner: rootless runsc needs no capabilities, only Docker's seccomp profile off (it refuses the user and mount
 	// namespaces runsc makes; runsc filters its own sandbox and gofer). The container's memory and pids limits bound
 	// every sandbox in it (runsc runs with --ignore-cgroups). A tmpfs holds runsc's state and the brain's root; it
@@ -753,21 +823,26 @@ func generate(r *Release) (string, error) {
     volumes:
       - agentsock:/run/tacy/agent
       - vaultsock:/run/tacy/vault
+      - opssock:/run/tacy/ops
 `)
 	b.WriteString("    environment:\n      HOME: /tmp\n")
 	gw := append([]string{"-socket", "/run/tacy/agent/gateway.sock", "-agent-uid", agentdUID, "-vault-socket", "/run/tacy/vault/vault.sock",
 		"-listen", ":8080", "-forward", "/run/tacy/agent/http.sock", "-search-provider", searchProvider,
-		"-pushed-keys", strings.Join(pushedKeys, ",")}, safetyArgs()...)
+		"-expected-keys", strings.Join(expectedKeys, ",")}, gatewaydKMSArgs(p.kmsURLs, p.stateURL)...)
+	gw = append(gw, safetyArgs()...)
 	gw = append(gw, pullArgs(keylogGenesis)...)
+	if dnsTLS != "" {
+		gw = append(gw, "-dns-tls", dnsTLS)
+	}
 	args(gw...)
 	service("vaultd", "vaultd", vaultdUID+":"+gatewaydUID, false) // primary group: gatewayd's, so its socket is the gateway's to open
+	// dstack's socket for its own quote (GetQuote and Info only: never GetKey), and gatewayd's ops socket.
 	b.WriteString(`    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
       - vaultsock:/run/tacy/vault
+      - opssock:/run/tacy/ops
 `)
-	va := []string{"-socket", "/run/tacy/vault/vault.sock", "-gateway-uid", gatewaydUID, "-group-mode"}
-	if secretsSigner != "" {
-		va = append(va, "-secrets-signer", secretsSigner)
-	}
+	va := append([]string{"-socket", "/run/tacy/vault/vault.sock", "-gateway-uid", gatewaydUID, "-group-mode"}, vaultdKMSArgs(p.kmsID, len(p.kmsURLs))...)
 	args(append(va, safetyArgs()...)...)
 	b.WriteString("volumes:\n")
 	for _, v := range socketVolumes {
@@ -850,15 +925,91 @@ func main() {
 	commit := flag.String("commit", "", "release commit for the manifest")
 	kmsFallback := flag.Bool("kms-fallback", true, "app-compose.json takes keys from the pinned KMS root (key_provider kms) "+
 		"instead of making them in the VM (key_provider none); set pins.go KMSFallback with it")
+	kmsMode := flag.Bool("kms", false, "build the key service's image and write "+KMSComposeFile+" instead (kms.go)")
+	kmsAdmin := flag.String("kms-admin-keys", "", "--kms: the admin keys kmsd pins (required, no default; a staging key service needs keys of its own)")
+	kmsThreshold := flag.Int("kms-admin-threshold", 1, "--kms: admin signatures an admin document needs")
+	kmsID := flag.String("kms-id", "", "--kms: the pinned KMS id (start locked); empty: start empty (genesis)")
+	kmsFloor := flag.String("kms-floor", "", "--kms: the lowest release any policy may allow")
+	kmsPeers := flag.String("kms-peers", "", "--kms: replica URLs to get M from while locked")
+	kmsRole := flag.String("kms-role", kms.RolePrimary, "--kms: primary (leases and the register) or standby (keeps M only)")
+	kmsStaging := flag.Bool("kms-staging", false, "--kms: a staging key service (its admin keys may not include a production admin key)")
+	kmsRelease := flag.Bool("kms-release", false, "--kms: the production key service (kmsAdminKeys, the release's KMS id; kms.go), what --check and --manifest take")
+	ifPinned := flag.Bool("if-pinned", false, "when the release pins (relayAuthKey, kmsID, kmsURLs) aren't set yet, say so and build nothing (CI before the key service's genesis)")
+	devOut := flag.String("dev-out", "", "development (throwaways): write the composes into this directory, never over the repo's (dev.go)")
+	devPins := flag.String("dev-pins", "", "development: a JSON file of staging pins (relay key, key service, state API) in place of the release's; needs --dev-out")
+	devRegistry := flag.String("dev-registry", "", "development: name the images in this registry (host/path) instead of "+Registry+"; needs --dev-out")
 	flag.Parse()
+	if (*devPins != "" || *devRegistry != "") && *devOut == "" {
+		fail(fmt.Errorf("--dev-pins and --dev-registry need --dev-out (a development compose never replaces the repo's)"))
+	}
+	if *devOut != "" && (*check || *manifest != "") {
+		fail(fmt.Errorf("--dev-out writes a development compose: no --check, no --manifest"))
+	}
+	if err := setDevRegistry(*devRegistry); err != nil {
+		fail(err)
+	}
+	if *devOut != "" {
+		if err := os.MkdirAll(*devOut, 0o755); err != nil {
+			fail(err)
+		}
+	}
 	if *manifest != "" && (*version == "" || *commit == "") {
 		fail(fmt.Errorf("--manifest needs --version and --commit"))
+	}
+	if *kmsMode {
+		if *kmsRelease {
+			// Only the release's settings: no flag may change what the committed kms-compose.yaml says.
+			var set []string
+			flag.Visit(func(f *flag.Flag) {
+				if strings.HasPrefix(f.Name, "kms-") && f.Name != "kms-release" {
+					set = append(set, "--"+f.Name)
+				}
+			})
+			if *devOut != "" {
+				set = append(set, "--dev-out")
+			}
+			if len(set) > 0 {
+				fail(fmt.Errorf("--kms-release takes no other --kms-* flag and no --dev-out (got %s)", strings.Join(set, " ")))
+			}
+			a, err := releaseKMSArgs()
+			if err != nil {
+				fail(err)
+			}
+			kmsMain(*check, *ociDir, "", *manifest, *version, *commit, a)
+			return
+		}
+		if *kmsAdmin == "" {
+			fail(fmt.Errorf("--kms needs --kms-release or --kms-admin-keys (no default)"))
+		}
+		if *check || *manifest != "" {
+			fail(fmt.Errorf("--kms --check and --manifest are for the release: use --kms-release"))
+		}
+		if *devOut != "" && !*kmsStaging {
+			fail(fmt.Errorf("--kms --dev-out is for a staging key service: add --kms-staging"))
+		}
+		kmsMain(false, *ociDir, *devOut, "", "", "", KMSArgs{AdminKeys: *kmsAdmin, AdminThreshold: *kmsThreshold, KMSID: *kmsID, Floor: *kmsFloor, Peers: *kmsPeers,
+			Role: *kmsRole, Staging: *kmsStaging})
+		return
+	}
+	if *kmsRelease {
+		fail(fmt.Errorf("--kms-release needs --kms"))
+	}
+	pins := pinned()
+	if *ifPinned && *devPins == "" && (pins.relayAuthKey == "" || pins.kmsID == "" || len(pins.kmsURLs) == 0) {
+		fmt.Println("the release pins (relayAuthKey, kmsID, kmsURLs) aren't set yet: no agent VM compose at this commit (--if-pinned)")
+		return
+	}
+	if *devPins != "" {
+		var err error
+		if pins, err = loadDevPins(*devPins); err != nil {
+			fail(err)
+		}
 	}
 	rel, err := build()
 	if err != nil {
 		fail(err)
 	}
-	out, err := generate(rel)
+	out, err := generateWith(rel, pins)
 	if err != nil {
 		fail(err)
 	}
@@ -888,16 +1039,16 @@ func main() {
 		}
 		fmt.Printf("compose.yaml and %s match the source, the reproducible binaries and their images\n", AppComposeFile)
 	} else {
-		if err := os.WriteFile("compose.yaml", []byte(out), 0o644); err != nil {
+		if err := os.WriteFile(devPath(*devOut, "compose.yaml"), []byte(out), 0o644); err != nil {
 			fail(err)
 		}
-		if err := os.WriteFile(AppComposeFile, appCompose, 0o644); err != nil {
+		if err := os.WriteFile(devPath(*devOut, AppComposeFile), appCompose, 0o644); err != nil {
 			fail(err)
 		}
-		if err := os.WriteFile(AppComposeDeployFile, deploy, 0o644); err != nil {
+		if err := os.WriteFile(devPath(*devOut, AppComposeDeployFile), deploy, 0o644); err != nil {
 			fail(err)
 		}
-		fmt.Printf("wrote compose.yaml (%d bytes) and %s (%d bytes)\n", len(out), AppComposeFile, len(appCompose))
+		fmt.Printf("wrote %s (%d bytes) and %s (%d bytes)\n", devPath(*devOut, "compose.yaml"), len(out), AppComposeFile, len(appCompose))
 	}
 	fmt.Printf("compose sha256 %x (%d bytes)\n", h, len(out))
 	fmt.Printf("app-compose sha256 %x (%d bytes)\n", ah, len(appCompose))

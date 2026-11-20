@@ -6,6 +6,8 @@
 //	go run ./cmd/safetysign sign -key K policy.json    # a policy (JSON, checked first) -> signed envelope on stdout
 //	go run ./cmd/safetysign sign -key K -kind stop stop.json
 //	go run ./cmd/safetysign sign -key K -kind trust-list list.json   # the agent VM trust list (safety.TrustList)
+//	    its "releases" entries are a client's built-in release list entries as they are (version, commit,
+//	    compose_sha256, bundle), so a new VM release reaches the apps without a rebuild
 //	go run ./cmd/safetysign heartbeat -key K [-ttl 15m] [-all]   # the operator's list: seq = now in ms
 //	go run ./cmd/safetysign stop -key K -firm f_chat [-seq N] [-space s_… | -all]   # the firm's own stop list
 //
@@ -132,6 +134,9 @@ func main() {
 			}
 			if err := l.Validate(); err != nil {
 				die("%v", err)
+			}
+			if len(b) > safety.MaxTrustListPayload {
+				die("trust list: %d bytes, at most %d (fewer releases)", len(b), safety.MaxTrustListPayload)
 			}
 		default:
 			die("unknown kind %q", *kind)

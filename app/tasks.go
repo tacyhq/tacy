@@ -24,7 +24,7 @@ import (
 // not anyone follows it, survives an agentd restart, and its starter can follow it from any event, see its state and
 // cancel it. Every call is a POST with an EHBP-encrypted body, like POST /run: EHBP leaves a request without a body
 // (and its response) unencrypted, and the task id goes in the encrypted body, so the relay sees only which call it
-// was. Same bearer token (cost) and X-Agent-User tag (whose task, required) as /run; only the starter's tag sees a
+// was. Same relay envelope (cost) and X-Agent-User tag (whose task, required) as /run; only the starter's tag sees a
 // task, and status, events and cancel also need a MAC with the run's secret (guard.TaskMAC), which only the tab that
 // started the task has (it sent it inside the encrypted start): the relay sets the tag but can't make the MAC.
 //
@@ -48,7 +48,7 @@ import (
 //	                     tasks are open (not ended) and how many schedules are active (v0.12.0), for the relay's idle
 //	                     timer; (v0.16.0) what scheduled runs cost today and yesterday, all accounts together; and (the
 //	                     release after v0.17.0) when the next scheduled run is due, one UTC time to the minute for all
-//	                     schedules together, or null (bearer token; plaintext, counts, one time and one sum a day only).
+//	                     schedules together, or null (the relay's envelope; plaintext inside, counts, one time and one sum a day only).
 //	POST /tasks/grant    {task, request, kind, decision, value, mac} -> {outcome}: the person's answer to a
 //	                     permission prompt (guard.Prompts) of a /tasks or /run task. The MAC with the run's
 //	                     secret is the authorization (only the tab that started the run has it). 404
@@ -98,7 +98,7 @@ func (s *server) taskRoutes(mux *http.ServeMux, id *ehbpidentity.Identity) {
 }
 
 // tasksOpen: GET /tasks/open, for the relay's idle timer: a task with nobody following it still keeps the VM on.
-// Bearer token; a count only (no ids, users or states).
+// The relay's envelope; a count only (no ids, users or states).
 func (s *server) tasksOpen(w http.ResponseWriter, r *http.Request) {
 	if !s.authorized(r) {
 		fail(w, 401, "unauthorized")
@@ -191,7 +191,7 @@ func (s *server) tasks() *guard.Host {
 	return s.host
 }
 
-// taskGuard is guard's checks for the task calls, before EHBP decryption: token, encrypted body, user tag (required
+// taskGuard is guard's checks for the task calls, before EHBP decryption: the relay's envelope, encrypted body, user tag (required
 // when needTag); for a start, the model header. No run slot: a started task waits in the runtime's queue for the brain.
 func (s *server) taskGuard(start, needTag bool, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

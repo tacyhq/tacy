@@ -53,14 +53,26 @@ jobs:
           go-version: "1.27.2"
           check-latest: false
           cache: false
+      # The agent VM's compose (--if-pinned: until the key service's genesis gives the release pins, there is none to
+      # build), and the key service's when kms-compose.yaml is committed.
       - name: build on the runner
-        run: go run ./cmd/compose --check --oci "$RUNNER_TEMP/oci-runner" | grep -v '^wrote OCI layouts' | tee "$RUNNER_TEMP/runner.txt"
+        run: |
+          set -o pipefail
+          go run ./cmd/compose --check --if-pinned --oci "$RUNNER_TEMP/oci-runner" | grep -v '^wrote OCI layouts' | tee "$RUNNER_TEMP/runner.txt"
+          if [ -f kms-compose.yaml ]; then
+            go run ./cmd/compose --kms --kms-release --check --oci "$RUNNER_TEMP/oci-runner" | tee -a "$RUNNER_TEMP/runner.txt"
+          fi
       - name: build in the pinned Go container (the image releases build in)
         run: |
+          set -o pipefail
           image=$(grep -o 'golang:[^"]*@sha256:[0-9a-f]*' cmd/compose/main.go)
           mkdir -p "$RUNNER_TEMP/oci-container"
           docker run --rm -v "$PWD:/src:ro" -v "$RUNNER_TEMP/oci-container:/oci" -w /src -e GOFLAGS=-mod=readonly "$image" \
-            go run ./cmd/compose --check --oci /oci | grep -v '^wrote OCI layouts' | tee "$RUNNER_TEMP/container.txt"
+            go run ./cmd/compose --check --if-pinned --oci /oci | grep -v '^wrote OCI layouts' | tee "$RUNNER_TEMP/container.txt"
+          if [ -f kms-compose.yaml ]; then
+            docker run --rm -v "$PWD:/src:ro" -v "$RUNNER_TEMP/oci-container:/oci" -w /src -e GOFLAGS=-mod=readonly "$image" \
+              go run ./cmd/compose --kms --kms-release --check --oci /oci | tee -a "$RUNNER_TEMP/container.txt"
+          fi
       - name: same compose, binary hashes, image digests and OCI layouts
         run: |
           diff "$RUNNER_TEMP/runner.txt" "$RUNNER_TEMP/container.txt"

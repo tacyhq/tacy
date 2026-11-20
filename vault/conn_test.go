@@ -1,6 +1,7 @@
 package vault
 
 import (
+	"bytes"
 	"context"
 	"encoding/json/v2"
 	"errors"
@@ -10,7 +11,9 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/tacyhq/tacy/leakscan"
 	"github.com/tacyhq/tacy/safety"
+	"github.com/tacyhq/tacy/sealstate"
 )
 
 const fakeAppPassword = "abcd efgh ijkl mnop"
@@ -28,31 +31,40 @@ func emailJSON(edit func(m map[string]any)) []byte {
 type connRig struct {
 	v    *Vault
 	c    *Client
-	path string
+	keep *sealstate.Keeper
 	mu   sync.Mutex
 	recs []Record
 }
 
-func newConnRig(t *testing.T, path string) *connRig {
+// connKey stands in for the key service's conn/v1 key.
+var testConnKey = bytes.Repeat([]byte{9}, 32)
+
+// newConnRig is a vault whose connections are sealed state in dir (sealstate's file backend; on the VM the relay).
+func newConnRig(t *testing.T, dir string) *connRig {
 	t.Helper()
-	r := &connRig{path: path}
+	r := &connRig{}
+	p, k, err := SealedConns(context.Background(), &sealstate.File{Dir: dir}, testConnKey, "lease", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.keep = k
 	v, err := New(nil, ChatGrants(""), func(rec Record) { r.mu.Lock(); r.recs = append(r.recs, rec); r.mu.Unlock() })
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := v.EnableConns(path); err != nil {
+	if err := v.EnableConns(p); err != nil {
 		t.Fatal(err)
 	}
 	r.v = v
-	dir, _ := os.MkdirTemp("", "vc")
-	t.Cleanup(func() { os.RemoveAll(dir) })
-	l, err := Listen(filepath.Join(dir, "v.sock"))
+	sock, _ := os.MkdirTemp("", "vc")
+	t.Cleanup(func() { os.RemoveAll(sock) })
+	l, err := Listen(filepath.Join(sock, "v.sock"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { l.Close() })
 	go v.Serve(l, -1)
-	r.c = &Client{Path: filepath.Join(dir, "v.sock")}
+	r.c = &Client{Path: filepath.Join(sock, "v.sock")}
 	return r
 }
 
@@ -63,8 +75,7 @@ func (r *connRig) leaseFor(space, host, pending string) (*Secret, error) {
 
 func TestConnSealPutLeaseCommitReload(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "connections.json")
-	r := newConnRig(t, path)
+	r := newConnRig(t, dir)
 	ctx := context.Background()
 	key, err := r.c.SealKey(ctx)
 	if err != nil || !strings.HasPrefix(key, "x25519:") {
@@ -123,12 +134,14 @@ func TestConnSealPutLeaseCommitReload(t *testing.T) {
 		Space: "s_me"}); !errors.Is(err, ErrNoGrant) {
 		t.Fatalf("by name without the connection: %v", err)
 	}
-	// The file: 0600, and a new vault (a restart) has the account; a box sealed to the old boot's key is stale.
-	st, err := os.Stat(path)
-	if err != nil || st.Mode().Perm() != 0o600 {
-		t.Fatalf("file mode %v, %v", st, err)
+	// Saved sealed (the keeper's flush; on the VM within a second and on SIGTERM): one file, TACYSEAL1, nothing of
+	// the account in it in any encoding; a new vault (a restart) has the account; a box sealed to the old boot's key
+	// is stale.
+	if err := r.keep.Flush(ctx); err != nil {
+		t.Fatal(err)
 	}
-	r2 := newConnRig(t, path)
+	sealedOnly(t, dir)
+	r2 := newConnRig(t, dir)
 	s, err = r2.leaseFor("s_me", "imap.gmail.com", "")
 	if err != nil || string(s.Bytes()) != fakeAppPassword {
 		t.Fatalf("after restart: %v", err)
@@ -144,10 +157,13 @@ func TestConnSealPutLeaseCommitReload(t *testing.T) {
 	if _, err := r2.leaseFor("s_me", "imap.gmail.com", ""); !errors.Is(err, ErrNotSet) {
 		t.Fatalf("after remove: %v", err)
 	}
-	b, _ := os.ReadFile(path)
-	if strings.Contains(string(b), "s_me") || strings.Contains(string(b), "gmail") {
-		t.Fatalf("file after remove: %s", b)
+	if err := r2.keep.Flush(ctx); err != nil {
+		t.Fatal(err)
 	}
+	if r3 := newConnRig(t, dir); len(r3.v.ConnList("s_me")) != 0 {
+		t.Fatal("the removed account came back after a restart")
+	}
+	sealedOnly(t, dir)
 	if err := r2.c.ConnRemove(ctx, "s_me", ConnEmail); err != nil {
 		t.Fatalf("remove again: %v", err)
 	}
@@ -165,7 +181,7 @@ func TestConnSealPutLeaseCommitReload(t *testing.T) {
 }
 
 func TestConnPutRefusals(t *testing.T) {
-	r := newConnRig(t, "")
+	r := newConnRig(t, t.TempDir())
 	ctx := context.Background()
 	key, _ := r.c.SealKey(ctx)
 	put := func(space string, pt []byte) error {
@@ -218,7 +234,7 @@ func TestConnPutRefusals(t *testing.T) {
 // fetch patterns allow the account's host.
 func TestConnLeaseUnderPolicy(t *testing.T) {
 	ctx := context.Background()
-	r := newConnRig(t, "")
+	r := newConnRig(t, t.TempDir())
 	st0, err := safety.NewState(safety.Config{Firm: "f_chat", Release: safety.ChatRelease("f_chat", "", nil, 300)})
 	if err != nil {
 		t.Fatal(err)
@@ -256,5 +272,25 @@ func TestConnLeaseUnderPolicy(t *testing.T) {
 	r.v.SetSafety(st)
 	if _, err := r.leaseFor("s_me", "imap.gmail.com", ""); !errors.Is(err, ErrPolicy) {
 		t.Fatalf("host outside the mail connector's servers: %v", err)
+	}
+}
+
+// sealedOnly: every file in dir is a sealed blob holding nothing of the test account, in any encoding.
+func sealedOnly(t *testing.T, dir string) {
+	t.Helper()
+	es, _ := os.ReadDir(dir)
+	if len(es) == 0 {
+		t.Fatal("nothing saved")
+	}
+	for _, e := range es {
+		b, _ := os.ReadFile(filepath.Join(dir, e.Name()))
+		if !bytes.HasPrefix(b, []byte(sealstate.Magic)) {
+			t.Errorf("%s isn't sealed", e.Name())
+		}
+		for _, f := range leakscan.ScanWith(b, [][]byte{[]byte(fakeAppPassword), []byte("me@gmail.com"), []byte("imap.gmail.com")}) {
+			if f.Pattern == leakscan.ExactSecret {
+				t.Errorf("%s holds the account (via %q)", e.Name(), f.Via)
+			}
+		}
 	}
 }

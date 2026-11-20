@@ -1,12 +1,17 @@
-# Release: on a tag vX.Y.Z, build the release (compose.yaml naming one OCI image per process by digest: agentd,
-# runnerd (with the brain and gVisor), gatewayd, vaultd and setup; release.json; the images as OCI layouts), push the images to ghcr.io, check
-# that each one pulls without credentials, sign everything with Sigstore through GitHub artifact attestations, and
-# publish it. README.md ("Releases and signing") has the format and the signing identity the verifier pins:
+# Release: on a tag, build the release, push its images to ghcr.io, check that each one pulls without credentials,
+# sign everything with Sigstore through GitHub artifact attestations, and publish it. Two kinds of tag:
+#   vX.Y.Z      the agent VM: compose.yaml naming one OCI image per process by digest (agentd, runnerd with the brain
+#               and gVisor, gatewayd, vaultd and setup), release.json and the images as OCI layouts; and, when
+#               kms-compose.yaml is committed, the key service too (below), in the same signature.
+#   kms-vX.Y.Z  the key service only: kms-compose.yaml (one image, kmsd, by digest), kms-app-compose.json (the CVM
+#               manifest its policy pins by sha256), kms-release.json and the kmsd image. The agent VM verifier
+#               accepts only vX.Y.Z tags (package release), so a key service release can never pass as a VM release.
+# README.md ("Releases and signing") has the formats and the signing identity the verifier pins:
 #   https://github.com/tacyhq/tacy/.github/workflows/release.yml@refs/tags/vX.Y.Z
 #
 # Two jobs on purpose:
 #   build    read-only; runs tests and builds, in the pinned Go container and again on the runner (the two must
-#            agree byte for byte). It uploads dist/compose.yaml, dist/release.json and dist/oci/<name>.
+#            agree byte for byte). It uploads the manifests, the composes and dist/oci/<name>, dist/oci-kms/kmsd.
 #   release  no checkout, no build, no test code: the only job that can get an OIDC token (signing), push packages
 #            and write the release. It pushes the layouts the build job produced, checks they pull anonymously,
 #            then signs and publishes. If a package is private (new ghcr packages start private, and only an org
@@ -17,7 +22,7 @@ name: release
 
 on:
   push:
-    tags: ["v*"]
+    tags: ["v*", "kms-v*"]
 
 permissions: {}
 
@@ -31,10 +36,12 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: tag is vMAJOR.MINOR.PATCH (the verifier accepts nothing else)
+      - name: tag is vMAJOR.MINOR.PATCH (agent VM) or kms-vMAJOR.MINOR.PATCH (key service)
         run: |
-          [[ "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || {
-            echo "tag $GITHUB_REF_NAME isn't vX.Y.Z"; exit 1; }
+          v='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
+          if [[ "$GITHUB_REF_NAME" =~ ^v$v$ ]]; then echo "KIND=vm" >> "$GITHUB_ENV"
+          elif [[ "$GITHUB_REF_NAME" =~ ^kms-v$v$ ]]; then echo "KIND=kms" >> "$GITHUB_ENV"
+          else echo "tag $GITHUB_REF_NAME isn't vX.Y.Z or kms-vX.Y.Z"; exit 1; fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -43,9 +50,16 @@ jobs:
           go-version: "1.27.2" # = mise.toml
           check-latest: false
           cache: false
+      - name: what this release builds
+        run: |
+          # The key service comes with every release that commits its compose; a kms-v tag must.
+          if [ -f kms-compose.yaml ]; then echo "KMS=1" >> "$GITHUB_ENV"
+          elif [ "$KIND" = kms ]; then echo "a kms-v tag needs kms-compose.yaml (go run ./cmd/compose --kms --kms-release)"; exit 1
+          else echo "KMS=" >> "$GITHUB_ENV"; fi
       - name: test
         run: go vet ./... && go test -short ./...
       - name: compose.yaml, release.json and the images, built in the pinned Go container
+        if: env.KIND == 'vm'
         run: |
           image=$(grep -o 'golang:[^"]*@sha256:[0-9a-f]*' cmd/compose/main.go)
           mkdir -p dist
@@ -54,10 +68,26 @@ jobs:
           sudo chown -R "$(id -u):$(id -g)" dist # the container wrote them as root (some blobs 0600)
           cp compose.yaml dist/compose.yaml
       - name: same result on the runner (reproducible binaries and image digests)
+        if: env.KIND == 'vm'
         run: |
           go run ./cmd/compose --check --oci "$RUNNER_TEMP/oci" --manifest "$RUNNER_TEMP/release.json" --version "$GITHUB_REF_NAME" --commit "$GITHUB_SHA"
           diff dist/release.json "$RUNNER_TEMP/release.json"
           for d in dist/oci/*/; do n=$(basename "$d"); diff -r "$d" "$RUNNER_TEMP/oci/$n"; done
+      - name: kms-compose.yaml, kms-app-compose.json, kms-release.json and the kmsd image, built in the pinned Go container
+        if: env.KMS == '1'
+        run: |
+          image=$(grep -o 'golang:[^"]*@sha256:[0-9a-f]*' cmd/compose/main.go)
+          mkdir -p dist
+          docker run --rm -v "$PWD:/src" -w /src -e GOFLAGS=-mod=readonly "$image" \
+            go run ./cmd/compose --kms --kms-release --check --oci dist/oci-kms --manifest dist/kms-release.json --version "$GITHUB_REF_NAME" --commit "$GITHUB_SHA"
+          sudo chown -R "$(id -u):$(id -g)" dist
+          cp kms-compose.yaml kms-app-compose.json dist/
+      - name: same key service on the runner
+        if: env.KMS == '1'
+        run: |
+          go run ./cmd/compose --kms --kms-release --check --oci "$RUNNER_TEMP/oci-kms" --manifest "$RUNNER_TEMP/kms-release.json" --version "$GITHUB_REF_NAME" --commit "$GITHUB_SHA"
+          diff dist/kms-release.json "$RUNNER_TEMP/kms-release.json"
+          diff -r dist/oci-kms/kmsd "$RUNNER_TEMP/oci-kms/kmsd"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release
@@ -82,7 +112,25 @@ jobs:
         with:
           name: release
           path: dist
-      - name: manifest matches the files, the tag, the commit and the images
+      - name: what the build made (agent VM, key service or both)
+        run: |
+          v='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
+          if [[ "$GITHUB_REF_NAME" =~ ^v$v$ ]]; then
+            [ -f dist/release.json ] || { echo "a vX.Y.Z release without release.json"; exit 1; }
+          elif [[ "$GITHUB_REF_NAME" =~ ^kms-v$v$ ]]; then
+            [ ! -e dist/release.json ] && [ ! -e dist/compose.yaml ] || { echo "a kms-v release with an agent VM compose"; exit 1; }
+            [ -f dist/kms-release.json ] || { echo "a kms-v release without kms-release.json"; exit 1; }
+          else
+            echo "tag $GITHUB_REF_NAME isn't vX.Y.Z or kms-vX.Y.Z"; exit 1
+          fi
+          # Each manifest and the directory of its image layouts, one per line.
+          {
+            [ ! -f dist/release.json ] || echo "dist/release.json dist/oci"
+            [ ! -f dist/kms-release.json ] || echo "dist/kms-release.json dist/oci-kms"
+          } > "$RUNNER_TEMP/manifests.txt"
+          cat "$RUNNER_TEMP/manifests.txt"
+      - name: agent VM manifest matches the files, the tag, the commit and the images
+        if: hashFiles('dist/release.json') != ''
         run: |
           sum=$(sha256sum dist/compose.yaml | cut -d' ' -f1)
           jq -e --arg sum "$sum" --arg v "$GITHUB_REF_NAME" --arg c "$GITHUB_SHA" \
@@ -97,6 +145,24 @@ jobs:
               { echo "dist/oci/$name isn't $ref"; exit 1; }
           done
           [ "$(grep -c '^    image: ' dist/compose.yaml)" = "$(jq '.images | length' dist/release.json)" ] || { echo "compose.yaml names other images"; exit 1; }
+      - name: key service manifest matches the files, the tag, the commit and the image
+        if: hashFiles('dist/kms-release.json') != ''
+        run: |
+          sum=$(sha256sum dist/kms-compose.yaml | cut -d' ' -f1)
+          asum=$(sha256sum dist/kms-app-compose.json | cut -d' ' -f1)
+          jq -e --arg sum "$sum" --arg asum "$asum" --arg v "$GITHUB_REF_NAME" --arg c "$GITHUB_SHA" \
+            '.schema == "tacy-kms-release/v1" and .kms_compose_sha256 == $sum and .kms_app_compose_sha256 == $asum and
+             .version == $v and .commit == $c and (.images | keys) == ["kmsd"]' dist/kms-release.json
+          echo "kms-compose sha256 $sum, kms-app-compose sha256 $asum (the key service policy's pin)"
+          ref=$(jq -r .images.kmsd dist/kms-release.json)
+          [[ "$ref" =~ ^ghcr\.io/tacyhq/tacy/kmsd@sha256:[0-9a-f]{64}$ ]] || { echo "bad image kmsd $ref"; exit 1; }
+          grep -qxF "    image: $ref" dist/kms-compose.yaml || { echo "$ref isn't in kms-compose.yaml"; exit 1; }
+          [ "$(grep -c '^    image: ' dist/kms-compose.yaml)" = 1 ] || { echo "kms-compose.yaml names other images"; exit 1; }
+          jq -e --arg d "${ref#*@}" '.manifests | length == 1 and .[0].digest == $d' dist/oci-kms/kmsd/index.json >/dev/null ||
+            { echo "dist/oci-kms/kmsd isn't $ref"; exit 1; }
+          # The app-compose.json the CVM attests is the one for this compose (its docker_compose_file).
+          jq -e --rawfile c dist/kms-compose.yaml '.docker_compose_file == $c' dist/kms-app-compose.json >/dev/null ||
+            { echo "kms-app-compose.json isn't kms-compose.yaml's"; exit 1; }
       - name: install crane
         run: |
           curl -fsSL "$CRANE_URL" -o "$RUNNER_TEMP/crane.tgz"
@@ -108,11 +174,13 @@ jobs:
         run: |
           export DOCKER_CONFIG="$RUNNER_TEMP/docker-push"
           echo "$GH_TOKEN" | "$RUNNER_TEMP/crane" auth login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
-          jq -r '.images | to_entries[] | "\(.key) \(.value)"' dist/release.json | while read -r name ref; do
-            got=$("$RUNNER_TEMP/crane" push "dist/oci/$name" "${ref%@*}:$GITHUB_REF_NAME")
-            [ "$got" = "$ref" ] || { echo "pushed $got, want $ref"; exit 1; }
-            echo "pushed $ref"
-          done
+          while read -r manifest oci; do
+            jq -r '.images | to_entries[] | "\(.key) \(.value)"' "$manifest" | while read -r name ref; do
+              got=$("$RUNNER_TEMP/crane" push "$oci/$name" "${ref%@*}:$GITHUB_REF_NAME")
+              [ "$got" = "$ref" ] || { echo "pushed $got, want $ref"; exit 1; }
+              echo "pushed $ref"
+            done
+          done < "$RUNNER_TEMP/manifests.txt"
           rm -rf "$DOCKER_CONFIG"
       - name: every image pulls without credentials (else stop before signing anything)
         run: |
@@ -132,19 +200,22 @@ jobs:
               [ "sha256:$got" = "$b" ] || { echo "$ref: blob $b doesn't pull anonymously or differs"; exit 1; }
             done
             echo "pulls anonymously: $ref"
-          done < <(jq -r '.images | to_entries[] | "\(.key) \(.value)"' dist/release.json)
+          done < <(while read -r manifest _; do jq -r '.images | to_entries[] | "\(.key) \(.value)"' "$manifest"; done < "$RUNNER_TEMP/manifests.txt")
           if [ -n "$failed" ]; then
             echo "::error::not public:$failed. Nothing was signed or published. An org owner sets each one public once:"
             for n in $failed; do echo "  https://github.com/orgs/tacyhq/packages/container/package/tacy%2F$n -> Package settings -> Change visibility -> Public"; done
             echo "then re-run this job (same tag)."
             exit 1
           fi
-      - name: subjects (compose.yaml, release.json and each image by digest)
+      - name: subjects (the composes, the manifests and each image by digest)
         run: |
           {
-            sha256sum dist/compose.yaml | sed 's#  dist/#  #'
-            sha256sum dist/release.json | sed 's#  dist/#  #'
-            jq -r '.images[] | "\(.[index("@sha256:")+8:])  \(.[:index("@")])"' dist/release.json
+            for f in compose.yaml release.json kms-compose.yaml kms-app-compose.json kms-release.json; do
+              [ ! -f "dist/$f" ] || sha256sum "dist/$f" | sed 's#  dist/#  #'
+            done
+            while read -r manifest _; do
+              jq -r '.images[] | "\(.[index("@sha256:")+8:])  \(.[:index("@")])"' "$manifest"
+            done < "$RUNNER_TEMP/manifests.txt"
           } > "$RUNNER_TEMP/subjects.txt"
           cat "$RUNNER_TEMP/subjects.txt"
       - name: sign (in-toto SLSA provenance, one statement for all the subjects; logged in Rekor)
@@ -158,12 +229,25 @@ jobs:
           GH_REPO: ${{ github.repository }}
           BUNDLE: ${{ steps.attest.outputs.bundle-path }}
         run: |
-          cp "$BUNDLE" dist/compose.sigstore.json
-          sum=$(jq -r .compose_sha256 dist/release.json)
-          images=$(jq -r '.images | to_entries[] | "- `\(.value)`"' dist/release.json)
-          gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" \
-            --notes "compose sha256 \`$sum\`. Images:
+          files=() notes="" latest=()
+          if [ -f dist/release.json ]; then
+            cp "$BUNDLE" dist/compose.sigstore.json
+            files+=(dist/compose.yaml dist/release.json dist/compose.sigstore.json)
+            sum=$(jq -r .compose_sha256 dist/release.json)
+            images=$(jq -r '.images | to_entries[] | "- `\(.value)`"' dist/release.json)
+            notes="compose sha256 \`$sum\`. Images:
           $images
-
+          "
+          else
+            latest=(--latest=false) # a key service release is never the repository's latest
+          fi
+          if [ -f dist/kms-release.json ]; then
+            cp "$BUNDLE" dist/kms-compose.sigstore.json
+            files+=(dist/kms-compose.yaml dist/kms-app-compose.json dist/kms-release.json dist/kms-compose.sigstore.json)
+            notes="${notes}Key service: kms-compose sha256 \`$(jq -r .kms_compose_sha256 dist/kms-release.json)\`, kms-app-compose sha256 \`$(jq -r .kms_app_compose_sha256 dist/kms-release.json)\`, image \`$(jq -r .images.kmsd dist/kms-release.json)\`.
+          "
+          fi
+          gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" "${latest[@]}" \
+            --notes "${notes}
           Verify: see README.md. Rebuild: \`scripts/reproduce.sh $GITHUB_REF_NAME\`." \
-            dist/compose.yaml dist/release.json dist/compose.sigstore.json
+            "${files[@]}"

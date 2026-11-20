@@ -26,5 +26,11 @@ const seen = JSON.parse(api.verifyReleaseBundle(JSON.stringify(rec.Bundle), rec.
 if (seen.ok || !seen.error.includes("last seen")) fail(`bad lastSeenVersion: ${JSON.stringify(seen)}`);
 const res = JSON.parse(await api.verifyRelease("{}", "00".repeat(32), "{}", async () => fail("no fetch expected")));
 if (res.ok || res.hpkePublicKey) fail(`empty attestation: ${JSON.stringify(res)}`);
+// setTrustList reports the list's VM releases (verifier.TrustInfo): an unsigned list is refused, "" clears.
+if (typeof api.setTrustList !== "function") fail("setTrustList missing");
+const bad = JSON.parse(api.setTrustList("{}", 0));
+if (bad.ok || !bad.error || !("releases" in bad)) fail(`unsigned trust list: ${JSON.stringify(bad)}`);
+const cleared = JSON.parse(api.setTrustList("", 0));
+if (!cleared.ok || cleared.seq) fail(`cleared trust list: ${JSON.stringify(cleared)}`);
 console.log(`wasm smoke OK (release identity ${api.releaseIdentity}vX.Y.Z, min ${api.minVersion})`);
 process.exit(0);

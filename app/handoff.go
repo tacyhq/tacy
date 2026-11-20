@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/json"
 	"io"
@@ -11,6 +12,8 @@ import (
 	"sync"
 
 	"github.com/tacyhq/tacy/harness"
+	"github.com/tacyhq/tacy/identity"
+	"github.com/tacyhq/tacy/runauth"
 	"github.com/tacyhq/tacy/trigger"
 )
 
@@ -22,7 +25,7 @@ import (
 //
 //	POST /schedules/handoff  {spaces, ack, collected} -> {results: [{space, task, enc, ct, sig}], more, deleted}
 //
-// Bearer token, plaintext JSON, like /notify/pending: what crosses is ciphertext only the space's seal key opens (the
+// In the relay's signed envelope (POST /v, ../relay), plaintext JSON inside it, like /notify/pending: what crosses is ciphertext only the space's seal key opens (the
 // relay can't read it), with its space and task ids (the relay knows the space; the task id is random). Nothing else
 // of the run: no schedule id, day, times, state, model or quiet mark (all inside the ciphertext).
 //
@@ -34,9 +37,13 @@ import (
 // ack: the results the relay stored from earlier answers (it isn't sent them again; memory only, so after a restart
 // it gets them again and keeps one copy). collected: results the person's browser saved from the relay's copy and
 // deleted there; the VM deletes its own as the browser's own delete does (results/delete), so their schedules'
-// uncollected counts start again (trigger/collect.go). A relay that lies here can only delete a result early (it
-// holds a copy, and could always withhold one) or keep a schedule from stopping itself (a cost guard for the person,
-// who it bills anyway); it can't read or make one.
+// uncollected counts start again (trigger/collect.go). A delete is the person's to make (the keys plan §3.4, PX-2): each
+// collected entry carries the space holder's identity signature over the space and the task (collectedMessage),
+// made in their browser when it saved the result, and the VM checks it against the identity key the space's holder
+// proved (the holder directory). An entry without one, or by anyone else, is refused and counted, never deleted. So
+// a relay (or whoever holds its key) can withhold a delete or keep a schedule from stopping itself (a cost guard for
+// the person, who it bills anyway), but it can't delete a result, read one or make one up. The signature names the
+// task, whose id is random and used once, so sending it again deletes nothing new; it needs no time or nonce.
 
 const (
 	handoffLabel     = "tacy/v2/schedule-handoff"
@@ -83,9 +90,45 @@ func (h *handedSet) keep(pending map[string]bool) {
 }
 
 type handoffRequest struct {
-	Spaces    []string            `json:"spaces"`
-	Ack       []string            `json:"ack"`
-	Collected []trigger.SpaceTask `json:"collected"`
+	Spaces    []string          `json:"spaces"`
+	Ack       []string          `json:"ack"`
+	Collected []collectedResult `json:"collected"`
+}
+
+// collectedResult is one result the person saved: its space and task, and their identity's signature over both.
+type collectedResult struct {
+	Space    string `json:"space"`
+	Task     string `json:"task"`
+	Identity string `json:"identity"`
+	Sig      []byte `json:"sig"`
+}
+
+// collectedLabel is the label of a collected result's signature (the chat's schedule-center.ts signs it).
+const collectedLabel = "tacy/v2/schedule-collected"
+
+// collectedMessage is what the space holder's identity key signs (Ed25519) for one collected result.
+func collectedMessage(space, identity, task string) []byte {
+	return []byte(collectedLabel + "\n" + space + "\n" + identity + "\n" + task)
+}
+
+// verifyCollected keeps the entries whose signature is by the identity key the space's holder proved.
+func (s *server) verifyCollected(in []collectedResult) (ok []trigger.SpaceTask, refused int, err error) {
+	for _, c := range in {
+		h, err := s.holders.Holder(c.Space, c.Identity)
+		if err != nil {
+			return nil, 0, err
+		}
+		var key ed25519.PublicKey
+		if h != nil {
+			key, _ = identity.ParseKey(h.Key)
+		}
+		if key == nil || len(c.Sig) != ed25519.SignatureSize || !ed25519.Verify(key, collectedMessage(c.Space, c.Identity, c.Task), c.Sig) {
+			refused++
+			continue
+		}
+		ok = append(ok, trigger.SpaceTask{Space: c.Space, Task: c.Task})
+	}
+	return ok, refused, nil
 }
 
 type handoffResult struct {
@@ -124,8 +167,10 @@ func (s *server) scheduleHandoff(w http.ResponseWriter, r *http.Request) {
 	if err != nil || len(req.Spaces) > maxHandoffSpaces || len(req.Ack) > maxHandoffItems || len(req.Collected) > maxHandoffItems ||
 		slices.ContainsFunc(req.Spaces, func(sp string) bool { return !validSpace(sp) }) ||
 		slices.ContainsFunc(req.Ack, func(t string) bool { return !harness.ValidTaskID(t) }) ||
-		slices.ContainsFunc(req.Collected, func(c trigger.SpaceTask) bool { return !validSpace(c.Space) || !harness.ValidTaskID(c.Task) }) {
-		failDetail(w, 400, "bad_request", `body must be {"spaces": ["s_…"], "ack": ["tk_…"], "collected": [{"space", "task"}]}`)
+		slices.ContainsFunc(req.Collected, func(c collectedResult) bool {
+			return !validSpace(c.Space) || !harness.ValidTaskID(c.Task) || !runauth.IsID(c.Identity, "i")
+		}) {
+		failDetail(w, 400, "bad_request", `body must be {"spaces": ["s_…"], "ack": ["tk_…"], "collected": [{"space", "task", "identity", "sig"}]}`)
 		return
 	}
 	hs, ok := s.results.(trigger.HandoffStore)
@@ -133,11 +178,18 @@ func (s *server) scheduleHandoff(w http.ResponseWriter, r *http.Request) {
 		fail(w, 503, "identity_unavailable")
 		return
 	}
-	deleted := 0
+	deleted, refused := 0, 0
 	if len(req.Collected) > 0 {
-		if deleted, err = hs.DeleteCollected(req.Collected); err != nil {
+		var signed []trigger.SpaceTask
+		if signed, refused, err = s.verifyCollected(req.Collected); err != nil {
 			fail(w, 500, "store_unavailable")
 			return
+		}
+		if len(signed) > 0 {
+			if deleted, err = hs.DeleteCollected(signed); err != nil {
+				fail(w, 500, "store_unavailable")
+				return
+			}
 		}
 	}
 	s.handed.add(req.Ack)
@@ -183,5 +235,5 @@ func (s *server) scheduleHandoff(w http.ResponseWriter, r *http.Request) {
 		s.handed.keep(live)
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	writeJSON(w, 200, map[string]any{"results": out, "more": more, "deleted": deleted})
+	writeJSON(w, 200, map[string]any{"results": out, "more": more, "deleted": deleted, "refused": refused})
 }

@@ -73,7 +73,8 @@ func TestExaRequestAndResults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Exactly what Exa may get: the query, the count, the type, moderation and highlights; nothing about the person.
+	// Exactly what Exa may get: the query, the count, the type, moderation (off: no content blocking of Tacy's own,
+	// 2026-11-20) and highlights; nothing about the person.
 	if len(x.bodies) != 1 {
 		t.Fatalf("requests: %d", len(x.bodies))
 	}
@@ -86,7 +87,7 @@ func TestExaRequestAndResults(t *testing.T) {
 	if strings.Join(keys, ",") != "contents,moderation,numResults,query,type" {
 		t.Fatalf("body keys: %v", keys)
 	}
-	if body["query"] != "masked query [email]" || body["numResults"] != float64(2) || body["type"] != exaType || body["moderation"] != true {
+	if body["query"] != "masked query [email]" || body["numResults"] != float64(2) || body["type"] != exaType || body["moderation"] != false {
 		t.Fatalf("body: %v", body)
 	}
 	if c, _ := json.Marshal(body["contents"]); string(c) != `{"highlights":{"maxCharacters":4000}}` {

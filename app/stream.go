@@ -22,14 +22,21 @@ const keepaliveEvery = 2 * time.Second
 // nothing but "still here" (one fixed line, sent on a fixed timer whatever the run is doing).
 const keepaliveLine = ": keepalive\n\n"
 
-// eventStream writes a run's SSE events (each one encrypted EHBP chunk, flushed) and, between them, a keepalive
-// whenever nothing was written for a whole interval. The EHBP writer isn't safe for concurrent use (each chunk
-// has a sequence number), so every write holds mu.
+// eventStream writes a run's SSE events and, between them, a keepalive whenever nothing was written for a whole
+// interval. Writes are batched (proto.StreamBatch: what comes within 50 ms goes out together) and each batch is
+// padded to a multiple of proto.StreamBucket bytes (proto.PadSSE): one encrypted EHBP chunk, flushed. What carries
+// the stream sees bucket-sized chunks at most every 50 ms, not each token's length (the keys plan §3.4, PX-3). The EHBP
+// writer isn't safe for concurrent use (each chunk has a sequence number), so every send holds mu.
 type eventStream struct {
 	mu      sync.Mutex
 	w       io.Writer
 	flusher http.Flusher
-	last    time.Time
+	batch   time.Duration
+	buf     []byte      // written, not yet sent
+	timer   *time.Timer // sends buf when it fires; nil: none set
+	direct  bool        // stopped: a write goes out at once, from its caller (no timer runs after the handler)
+	err     error       // a send failed: the reader is gone
+	last    time.Time   // the last write (queued or sent): keepalives are for a quiet stream
 	closed  bool
 	quit    chan struct{}
 	exited  chan struct{}
@@ -37,7 +44,7 @@ type eventStream struct {
 }
 
 func newEventStream(w http.ResponseWriter, every time.Duration) *eventStream {
-	s := &eventStream{w: w, last: time.Now(), quit: make(chan struct{}), exited: make(chan struct{})}
+	s := &eventStream{w: w, last: time.Now(), batch: proto.StreamBatch, quit: make(chan struct{}), exited: make(chan struct{})}
 	s.flusher, _ = w.(http.Flusher)
 	s.write(keepaliveLine) // first: tells the reader this stream carries keepalives
 	go s.keepalive(every)
@@ -63,19 +70,51 @@ func (s *eventStream) keepalive(every time.Duration) {
 	}
 }
 
+// write queues line for the next batch. An error says an earlier batch couldn't be sent (the reader is gone).
 func (s *eventStream) write(line string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
 		return io.ErrClosedPipe
 	}
-	if _, err := io.WriteString(s.w, line); err != nil {
+	if s.err != nil {
+		return s.err
+	}
+	s.buf = append(s.buf, line...)
+	s.last = time.Now()
+	if s.direct {
+		return s.sendLocked()
+	}
+	if s.timer == nil {
+		s.timer = time.AfterFunc(s.batch, s.sendBatch)
+	}
+	return nil
+}
+
+// sendBatch is the batch timer: whatever was written since the last batch goes out.
+func (s *eventStream) sendBatch() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.timer = nil
+	if !s.direct {
+		s.sendLocked()
+	}
+}
+
+// sendLocked sends buf as one padded chunk and flushes it.
+func (s *eventStream) sendLocked() error {
+	if len(s.buf) == 0 || s.err != nil {
+		return s.err
+	}
+	out := proto.PadSSE(s.buf)
+	s.buf = s.buf[:0]
+	if _, err := s.w.Write(out); err != nil {
+		s.err = err
 		return err
 	}
 	if s.flusher != nil {
 		s.flusher.Flush()
 	}
-	s.last = time.Now()
 	return nil
 }
 
@@ -85,27 +124,40 @@ func (s *eventStream) emit(e proto.Event) error {
 	return s.write(fmt.Sprintf("data: %s\n\n", b))
 }
 
-// done ends the stream with [DONE]; nothing is written after it.
-// done ends the stream with [DONE]; an error says it couldn't be written (the reader is gone).
+// done ends the stream with [DONE], sent at once with whatever is still queued; nothing is written after it. An
+// error says it couldn't be written (the reader is gone).
 func (s *eventStream) done() error {
-	s.stop()
-	s.mu.Lock()
+	s.halt()
 	defer s.mu.Unlock()
 	if s.closed {
 		return io.ErrClosedPipe
 	}
 	s.closed = true
-	if _, err := io.WriteString(s.w, "data: [DONE]\n\n"); err != nil {
-		return err
+	if s.err != nil {
+		return s.err
 	}
-	if s.flusher != nil {
-		s.flusher.Flush()
-	}
-	return nil
+	s.buf = append(s.buf, "data: [DONE]\n\n"...)
+	return s.sendLocked() // with what was queued: one chunk
 }
 
-// stop ends the keepalives and waits for them to stop writing (the handler must not write after it returns).
+// stop ends the keepalives and the batch timer and sends what's queued (the handler must not write after it
+// returns: from here a write goes out at once, from its caller).
 func (s *eventStream) stop() {
+	s.halt()
+	defer s.mu.Unlock()
+	if !s.closed {
+		s.sendLocked()
+	}
+}
+
+// halt ends the keepalives and the batch timer and returns holding mu; writes go out at once from here.
+func (s *eventStream) halt() {
 	s.once.Do(func() { close(s.quit) })
 	<-s.exited
+	s.mu.Lock()
+	if s.timer != nil {
+		s.timer.Stop()
+		s.timer = nil
+	}
+	s.direct = true
 }

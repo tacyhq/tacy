@@ -151,7 +151,7 @@ func (v *Vault) serveConn(c net.Conn, peerUID int) {
 						s.Policy, s.OperatorSeq, s.FirmSeq)})
 				}
 			}
-		case "secrets_key", "secrets_put", "secrets_status":
+		case "secrets_status":
 			rep = v.secretsOp(r)
 		case "conn_key", "conn_put", "conn_commit", "conn_discard", "conn_get", "conn_list", "conn_remove":
 			rep = v.connOp(r)
@@ -226,64 +226,44 @@ func (v *Vault) connOp(r Request) reply {
 	return reply{Error: ErrBadRequest.Error()}
 }
 
-// secretsOp answers a secrets push op (secrets.go). A request carries only the fields its op needs.
+// secretsOp answers a secrets op (secrets.go): the status only (the names held). The secrets themselves come from
+// the key service's release in vaultd's own process, never over a socket.
 func (v *Vault) secretsOp(r Request) reply {
 	if r.Secret != "" || r.Connector != "" || r.Host != "" || r.Task != "" || r.Action != "" || r.Effect || len(r.Docs) > 0 ||
-		r.Space != "" || r.Conn != "" || r.Pending != "" || r.Sealed != nil || (r.Op == "secrets_put") != (r.Push != nil) {
+		r.Space != "" || r.Conn != "" || r.Pending != "" || r.Sealed != nil || r.Op != "secrets_status" {
 		return reply{Error: ErrBadRequest.Error()}
 	}
-	switch r.Op {
-	case "secrets_key":
-		if k := v.SecretsKey(); k != "" {
-			return reply{Key: k}
-		}
-		return reply{Error: ErrSecretsOff.Error()}
-	case "secrets_status":
-		st := v.SecretsStatus()
-		return reply{Secrets: &st}
-	}
-	res, err := v.PutSecrets(*r.Push)
-	if err != nil {
-		return reply{Error: err.Error()}
-	}
-	return reply{Secrets: &res}
+	st := v.SecretsStatus()
+	return reply{Secrets: &st}
 }
 
-// SecretsCall is a secrets op through the gateway: "key", "status" or "put" (with Push).
+// SecretsCall is a secrets op through the gateway: "status".
 type SecretsCall struct {
-	Op   string       `json:"op"`
-	Push *SecretsPush `json:"push,omitzero"`
+	Op string `json:"op"`
 }
 
-// SecretsAnswer is its answer (Error: one of the push errors' text, or "unavailable").
+// SecretsAnswer is its answer (Error: "bad request" or "unavailable").
 type SecretsAnswer struct {
-	Key     string         `json:"key,omitzero"`
 	Secrets *SecretsResult `json:"secrets,omitzero"`
 	Error   string         `json:"error,omitzero"`
 }
 
 // Secrets passes a secrets op to the vault.
 func (c *Client) Secrets(ctx context.Context, call *SecretsCall) *SecretsAnswer {
-	r := Request{Push: call.Push}
-	switch call.Op {
-	case "key", "status", "put":
-		r.Op = "secrets_" + call.Op
-	default:
+	if call.Op != "status" {
 		return &SecretsAnswer{Error: ErrBadRequest.Error()}
 	}
 	var rep reply
-	if err := c.do(ctx, r, &rep); err != nil {
+	if err := c.do(ctx, Request{Op: "secrets_status"}, &rep); err != nil {
 		return &SecretsAnswer{Error: "unavailable"}
 	}
 	if rep.Error != "" {
-		for _, k := range append(errSecretsInvalid, ErrBadRequest) {
-			if rep.Error == k.Error() {
-				return &SecretsAnswer{Error: k.Error()}
-			}
+		if rep.Error == ErrBadRequest.Error() {
+			return &SecretsAnswer{Error: rep.Error}
 		}
 		return &SecretsAnswer{Error: "unavailable"}
 	}
-	return &SecretsAnswer{Key: rep.Key, Secrets: rep.Secrets}
+	return &SecretsAnswer{Secrets: rep.Secrets}
 }
 
 // ConnError is a connection op's refusal over the wire: one of the vault's errors (errors.Is works) and its detail.

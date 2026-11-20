@@ -24,9 +24,9 @@ func TestModelHeader(t *testing.T) {
 	s := newTestServer(t, a, id, defaultLimits)
 	mux := http.NewServeMux()
 	mux.Handle("POST /run", s.guard(id.Middleware()(http.HandlerFunc(s.run))))
-	srv := httptest.NewServer(mux)
+	srv := httptest.NewServer(s.relayed(mux))
 	defer srv.Close()
-	conn, _ := agentclient.New(srv.URL, "tok", id.MarshalPublicKey())
+	conn, _ := agentclient.New(srv.URL, testRelaySeed, id.MarshalPublicKey())
 	run := func(model string) error {
 		return conn.Run(context.Background(), proto.RunRequest{Permissions: guard.AllowAll(), Model: model, Messages: []proto.Message{{Role: "user", Content: "x"}}}, func(proto.Event) {})
 	}
@@ -52,9 +52,8 @@ func TestModelHeader(t *testing.T) {
 	}
 	// No header at all.
 	req, _ := http.NewRequest("POST", srv.URL+"/run", strings.NewReader("ciphertext"))
-	req.Header.Set("Authorization", "Bearer tok")
 	req.Header.Set("Ehbp-Encapsulated-Key", strings.Repeat("ab", 32))
-	res, err := http.DefaultClient.Do(req)
+	res, err := conn.Plain().Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}

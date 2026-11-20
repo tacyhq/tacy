@@ -1,7 +1,10 @@
 package safety
 
 import (
+	"bytes"
 	"crypto/ed25519"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"regexp"
@@ -9,8 +12,8 @@ import (
 )
 
 // KindTrustList is the signed trust list: what agent VM software and keys the verifiers accept besides what they
-// were built with, so a new dstack OS image (or boot measurements, a pre-launch script, a Tacy KMS key, a higher VM
-// release floor) is approved by a signature instead of a rebuild of every app. Signed by the offline admin
+// were built with, so a new dstack OS image (or boot measurements, a pre-launch script, a Tacy KMS key, a signed VM
+// release, a higher VM release floor) is approved by a signature instead of a rebuild of every app. Signed by the offline admin
 // keys (verifier.TrustListKeys pins them, SAFETY_ADMIN_KEYS-style ed25519:<base64>), served by the chat's Worker,
 // checked by the verifier wherever it runs (the browser's WASM, the apps, kmsd). It can only add to the values a
 // verifier was built with (they stay the floor), never remove one.
@@ -22,6 +25,16 @@ const TrustListType = "tacy.trust-list/v1"
 // MaxTrustListLifetime bounds a list's validity: an unattended old list stops counting, and the verifier falls back
 // to what it was built with.
 const MaxTrustListLifetime = 400 * 24 * time.Hour
+
+// MaxTrustListPayload bounds a trust list's payload. It is larger than other documents' (MaxEnvelope), since each
+// VM release in it carries its Sigstore bundle (about 11 KiB).
+const MaxTrustListPayload = 128 << 10
+
+// MaxTrustReleases and MaxTrustBundle bound a list's VM releases and each one's Sigstore bundle (JSON bytes).
+const (
+	MaxTrustReleases = 8
+	MaxTrustBundle   = 32 << 10
+)
 
 // TrustList is one signed trust list. A verifier keeps the highest Seq it has taken and refuses lower ones (a
 // replayed older list), and refuses an expired one.
@@ -41,6 +54,20 @@ type TrustList struct {
 	KMSIDs map[string]string `json:"kms_ids,omitzero"`
 	// VMReleaseFloor (vX.Y.Z): the oldest signed VM release accepted (raises the built-in minimum, never lowers it).
 	VMReleaseFloor string `json:"vm_release_floor,omitzero"`
+	// Releases are signed VM releases a release-mode verifier accepts besides the ones it was built with, so a new VM
+	// release needs no app rebuild. Each one is checked exactly as a built-in one is (its Sigstore bundle, offline: the
+	// release workflow's identity on its vX.Y.Z tag, the transparency log entry, at least the release floor), and one
+	// whose bundle doesn't verify is ignored. They only add: a built-in release stays accepted unless below the floor.
+	Releases []TrustRelease `json:"releases,omitzero"`
+}
+
+// TrustRelease is one signed VM release in a trust list, in the shape of a client's built-in release list entries
+// (version, commit, compose sha256, Sigstore bundle), so a built-in entry can be copied into a list as it is.
+type TrustRelease struct {
+	Version       string         `json:"version"`
+	Commit        string         `json:"commit"`
+	ComposeSHA256 string         `json:"compose_sha256"`
+	Bundle        jsontext.Value `json:"bundle"`
 }
 
 // TrustBoot is one boot measurement set in a trust list.
@@ -57,6 +84,7 @@ type TrustBoot struct {
 var (
 	hex64       = regexp.MustCompile(`^[0-9a-f]{64}$`)
 	hex96       = regexp.MustCompile(`^[0-9a-f]{96}$`)
+	hex40       = regexp.MustCompile(`^[0-9a-f]{40}$`)
 	versionRe   = regexp.MustCompile(`^v[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}$`)
 	trustNameRe = regexp.MustCompile(`^[^\x00-\x1f\x7f]{1,200}$`)
 )
@@ -74,6 +102,21 @@ func (l *TrustList) Validate() error {
 		return errors.New("trust list: at most 64 entries of each kind")
 	case l.VMReleaseFloor != "" && !versionRe.MatchString(l.VMReleaseFloor):
 		return errors.New("trust list: vm_release_floor must be vX.Y.Z")
+	case len(l.Releases) > MaxTrustReleases:
+		return fmt.Errorf("trust list: at most %d releases", MaxTrustReleases)
+	}
+	versions := map[string]bool{}
+	for _, r := range l.Releases {
+		if !versionRe.MatchString(r.Version) || !hex40.MatchString(r.Commit) || !hex64.MatchString(r.ComposeSHA256) {
+			return fmt.Errorf("trust list: bad release %q (version vX.Y.Z; commit and compose_sha256 lowercase hex)", r.Version)
+		}
+		if versions[r.Version] {
+			return fmt.Errorf("trust list: release %s listed twice", r.Version)
+		}
+		versions[r.Version] = true
+		if len(r.Bundle) == 0 || len(r.Bundle) > MaxTrustBundle || r.Bundle.Kind() != '{' || !r.Bundle.IsValid() {
+			return fmt.Errorf("trust list: release %s: the bundle must be a JSON object of at most %d bytes", r.Version, MaxTrustBundle)
+		}
 	}
 	for h, n := range l.OSImages {
 		if !hex64.MatchString(h) || !trustNameRe.MatchString(n) {
@@ -108,6 +151,23 @@ func mustKey(s string) ed25519.PublicKey {
 	return k
 }
 
+// DecodeTrustList reads one trust list envelope (JSON), strictly, as DecodeEnvelopes reads other documents, but with
+// the trust list's own size bound (MaxTrustListPayload: its releases carry their bundles). VerifyTrustList checks it.
+func DecodeTrustList(b []byte) (*Envelope, error) {
+	b = bytes.TrimSpace(b)
+	if len(b) == 0 || len(b) > 2*MaxTrustListPayload {
+		return nil, errors.New("trust list: empty or oversize envelope")
+	}
+	if b[0] != '{' {
+		return nil, errors.New("trust list: one envelope expected")
+	}
+	var e Envelope
+	if err := json.Unmarshal(b, &e, json.RejectUnknownMembers(true)); err != nil {
+		return nil, fmt.Errorf("trust list: bad envelope: %w", err)
+	}
+	return &e, nil
+}
+
 // VerifyTrustList checks e is a trust list signed by at least threshold of keys, valid at now (not expired, not
 // issued more than MaxSkew ahead), and with a seq of at least minSeq (the highest the caller has taken: the same list
 // again is fine, an older one is refused).
@@ -115,7 +175,7 @@ func VerifyTrustList(e *Envelope, keys []ed25519.PublicKey, threshold int, minSe
 	if e.Kind != KindTrustList {
 		return nil, fmt.Errorf("trust list: kind %q", e.Kind)
 	}
-	if len(e.Payload) == 0 || len(e.Payload) > MaxEnvelope || len(e.Sigs) == 0 || len(e.Sigs) > 8 {
+	if len(e.Payload) == 0 || len(e.Payload) > MaxTrustListPayload || len(e.Sigs) == 0 || len(e.Sigs) > 8 {
 		return nil, errors.New("trust list: bad envelope size")
 	}
 	if threshold < 1 || len(keys) == 0 {

@@ -27,7 +27,9 @@ func sampleList(seq uint64) TrustList {
 		KMSIDs:    map[string]string{KeyString(make(ed25519.PublicKey, 32)): "Tacy KMS (test)"},
 		BootMeasurements: []TrustBoot{{Name: "dstack-0.6.6, tdx.small", OSImage: strings.Repeat("ab", 32), MRTD: strings.Repeat("01", 48),
 			RTMR0: strings.Repeat("02", 48), RTMR1: strings.Repeat("03", 48), RTMR2: strings.Repeat("04", 48), Source: "computed (test)"}},
-		VMReleaseFloor: "v0.20.0"}
+		VMReleaseFloor: "v0.20.0",
+		Releases: []TrustRelease{{Version: "v0.21.0", Commit: strings.Repeat("e5", 20), ComposeSHA256: strings.Repeat("ef", 32),
+			Bundle: []byte(`{"mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json"}`)}}}
 }
 
 func signList(t *testing.T, l TrustList, keys ...ed25519.PrivateKey) Envelope {
@@ -67,6 +69,21 @@ func TestTrustList(t *testing.T) {
 	refused("another kind", wrongKind, pinned, 1, 0, tlNow, "kind")
 	unknown := Sign(KindTrustList, []byte(`{"type":"tacy.trust-list/v1","seq":1,"issued_at":"2026-11-20T00:00:00Z","expires":"2026-12-20T00:00:00Z","extra":1}`), admin)
 	refused("an unknown member", unknown, pinned, 1, 0, tlNow, "unknown")
+	if len(l.Releases) != 1 || l.Releases[0].Version != "v0.21.0" || l.Releases[0].Bundle.Kind() != '{' {
+		t.Fatalf("releases %+v", l.Releases)
+	}
+	unknownRel := Sign(KindTrustList, []byte(`{"type":"tacy.trust-list/v1","seq":1,"issued_at":"2026-11-20T00:00:00Z","expires":"2026-12-20T00:00:00Z",`+
+		`"releases":[{"version":"v0.21.0","commit":"`+strings.Repeat("e", 40)+`","compose_sha256":"`+strings.Repeat("a", 64)+`","bundle":{},"app":1}]}`), admin)
+	refused("a release's unknown member", unknownRel, pinned, 1, 0, tlNow, "unknown")
+	// Larger than other documents (bundles), up to MaxTrustListPayload.
+	if e := signList(t, bigList(7), admin); len(e.Payload) <= MaxEnvelope {
+		t.Fatal("not larger than MaxEnvelope")
+	} else if _, err := VerifyTrustList(&e, pinned, 1, 0, tlNow); err != nil {
+		t.Fatalf("a list over MaxEnvelope: %v", err)
+	}
+	over := e
+	over.Payload = make([]byte, MaxTrustListPayload+1)
+	refused("over MaxTrustListPayload", over, pinned, 1, 0, tlNow, "size")
 
 	for _, c := range []struct {
 		name string
@@ -82,11 +99,63 @@ func TestTrustList(t *testing.T) {
 		{"register", func(l *TrustList) { l.BootMeasurements[0].RTMR2 = "00" }},
 		{"no source", func(l *TrustList) { l.BootMeasurements[0].Source = "" }},
 		{"floor", func(l *TrustList) { l.VMReleaseFloor = "0.20" }},
+		{"release version", func(l *TrustList) { l.Releases[0].Version = "0.21.0" }},
+		{"release commit", func(l *TrustList) { l.Releases[0].Commit = "E512" }},
+		{"release compose", func(l *TrustList) { l.Releases[0].ComposeSHA256 = strings.Repeat("EF", 32) }},
+		{"release twice", func(l *TrustList) { l.Releases = append(l.Releases, l.Releases[0]) }},
+		{"no bundle", func(l *TrustList) { l.Releases[0].Bundle = nil }},
+		{"bundle not an object", func(l *TrustList) { l.Releases[0].Bundle = []byte(`["x"]`) }},
+		{"bundle not JSON", func(l *TrustList) { l.Releases[0].Bundle = []byte(`{"x":`) }},
+		{"bundle too large", func(l *TrustList) {
+			l.Releases[0].Bundle = []byte(`{"x":"` + strings.Repeat("x", MaxTrustBundle) + `"}`)
+		}},
+		{"too many releases", func(l *TrustList) {
+			for i := range MaxTrustReleases {
+				r := l.Releases[0]
+				r.Version = "v1.0." + string(rune('0'+i))
+				l.Releases = append(l.Releases, r)
+			}
+		}},
 	} {
 		l := sampleList(1)
 		c.edit(&l)
 		if err := l.Validate(); err == nil {
 			t.Errorf("%s: accepted", c.name)
+		}
+	}
+}
+
+// bigList is a list over MaxEnvelope (two releases with 20 KiB bundles), within MaxTrustListPayload.
+func bigList(seq uint64) TrustList {
+	l := sampleList(seq)
+	l.Releases[0].Bundle = []byte(`{"x":"` + strings.Repeat("x", 20<<10) + `"}`)
+	r := l.Releases[0]
+	r.Version = "v0.21.1"
+	l.Releases = append(l.Releases, r)
+	return l
+}
+
+func TestDecodeTrustList(t *testing.T) {
+	admin := trustKey(t)
+	e := signList(t, bigList(3), admin)
+	b, _ := json.Marshal(e)
+	got, err := DecodeTrustList(b)
+	if err != nil || got.Hash() != e.Hash() {
+		t.Fatalf("%v", err)
+	}
+	// DecodeEnvelopes (the other documents' bound) refuses it; a trust list is one envelope, not an array.
+	if _, err := DecodeEnvelopes(b); err == nil {
+		t.Fatal("DecodeEnvelopes took a trust list over MaxEnvelope")
+	}
+	for name, in := range map[string][]byte{
+		"empty":          nil,
+		"an array":       append(append([]byte("["), b...), ']'),
+		"unknown member": []byte(`{"kind":"trust-list","payload":"e30=","sigs":[],"x":1}`),
+		"oversize":       []byte(`{"kind":"` + strings.Repeat("x", 2*MaxTrustListPayload) + `"}`),
+		"trailing data":  append(append([]byte{}, b...), []byte(" {}")...),
+	} {
+		if _, err := DecodeTrustList(in); err == nil {
+			t.Errorf("%s: accepted", name)
 		}
 	}
 }

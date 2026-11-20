@@ -86,8 +86,17 @@ type Config struct {
 	// again (pulled or pushed) before nothing may go out; 0: not checked (gatewayd and vaultd, which get the list
 	// from agentd, not from the pull).
 	MaxSilence time.Duration
-	Dir        string // where accepted documents, the key log and the floors persist; "": memory only
-	Now        func() time.Time
+	Dir        string // where accepted documents, the key log and the floors persist; "": memory only (tests; the VM uses Persist)
+	// Persist keeps the documents and floors across restarts sealed (sealstate, the keys plan §3.2); nil: Dir, or memory.
+	Persist Persister
+	Now     func() time.Time
+}
+
+// Persister keeps one document's bytes across restarts: on the VM a sealstate.Slot, sealed under the Tacy key
+// service's key and stored outside the VM. Load is what was kept (nil: nothing yet).
+type Persister interface {
+	Load() ([]byte, error)
+	Save([]byte) error
 }
 
 type policyDoc struct {
@@ -161,7 +170,7 @@ func NewState(cfg Config) (*State, error) {
 	}
 	s := &State{cfg: cfg, policies: map[string]*policyDoc{}, stops: map[string]*stopDoc{}, floors: map[string]floor{},
 		changed: make(chan struct{}), log: kl}
-	if cfg.Dir != "" {
+	if cfg.Dir != "" || cfg.Persist != nil {
 		if err := s.load(); err != nil {
 			return nil, err
 		}
@@ -804,11 +813,14 @@ func (s *State) snapshot() ([]byte, error) {
 }
 
 func (s *State) write(b []byte) error {
+	if b == nil && (s.cfg.Persist != nil || s.cfg.Dir != "") {
+		return errors.New("safety: nothing to write")
+	}
+	if s.cfg.Persist != nil {
+		return s.cfg.Persist.Save(b)
+	}
 	if s.cfg.Dir == "" {
 		return nil
-	}
-	if b == nil {
-		return errors.New("safety: nothing to write")
 	}
 	if err := os.MkdirAll(s.cfg.Dir, 0o700); err != nil {
 		return err
@@ -832,8 +844,14 @@ func (s *State) write(b []byte) error {
 }
 
 func (s *State) load() error {
-	b, err := os.ReadFile(s.path())
-	if errors.Is(err, os.ErrNotExist) {
+	var b []byte
+	var err error
+	if s.cfg.Persist != nil {
+		b, err = s.cfg.Persist.Load()
+	} else {
+		b, err = os.ReadFile(s.path())
+	}
+	if errors.Is(err, os.ErrNotExist) || err == nil && len(b) == 0 {
 		return nil
 	}
 	if err != nil {

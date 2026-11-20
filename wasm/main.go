@@ -10,7 +10,8 @@
 //	    Every check, and the VM's docker compose must be a signed release (package release): bundleJSON is the
 //	    Sigstore bundle for sha256(docker compose), as JSON: one "bundle" of GitHub's attestations API response for
 //	    that digest (an entry with only a bundle_url must be fetched and Snappy-decoded first, e.g. by a relay;
-//	    release.ResolveAttestations), or the release asset compose.sigstore.json. Output JSON below.
+//	    release.ResolveAttestations), or the release asset compose.sigstore.json. "" = the bundle of a release the
+//	    signed trust list taken names for that compose (verifier.Policy.Releases), if any. Output JSON below.
 //	verifyReleaseBundle(bundleJSON, composeSha256Hex, lastSeenVersion?) -> string
 //	    Only the release check, for a compose hash (a verify page, or to check a bundle before an attestation).
 //	    JSON {ok, error?, release?: {version, commit, compose_sha256, identity, run_url, log_index, signed_at}}.
@@ -31,7 +32,10 @@
 // tacy.AppCompose).
 //
 //	setTrustList(envelopeJSON, minSeq, nowISO?) -> string
-//	    Takes a signed trust list (admin keys pinned in package verifier) for later checks: JSON trustInfo below.
+//	    Takes a signed trust list (admin keys pinned in package verifier) for later checks: JSON verifier.TrustInfo,
+//	    with releaseEntries (the list's VM releases and their Sigstore bundles) for a client's bundle lookup. Each
+//	    later check applies the list again (it may have expired): its OS images, boot sets, pre-launch scripts and
+//	    Tacy KMS ids next to the built-in ones, its release floor, and its VM releases.
 //	appComposeSha256: the embedded app-compose.json's hash (exact mode).
 package main
 
@@ -43,14 +47,12 @@ import (
 	"errors"
 	"fmt"
 	"net/textproto"
-	"sync"
 	"syscall/js"
 	"time"
 
 	"github.com/tacyhq/tacy"
 	"github.com/tacyhq/tacy/proto"
 	"github.com/tacyhq/tacy/release"
-	"github.com/tacyhq/tacy/safety"
 	"github.com/tacyhq/tacy/verifier"
 )
 
@@ -63,8 +65,8 @@ type output struct {
 	ComposeSHA256 string            `json:"composeSha256"` // the embedded compose's; with a bundle, the VM's (verified)
 	// AppComposeSHA256 is the pinned app-compose.json's (with a bundle, the VM's, verified); TrustList the signed
 	// trust list this check used, if any.
-	AppComposeSHA256 string     `json:"appComposeSha256"`
-	TrustList        *trustInfo `json:"trustList,omitempty"`
+	AppComposeSHA256 string              `json:"appComposeSha256"`
+	TrustList        *verifier.TrustInfo `json:"trustList,omitempty"`
 }
 
 // jsGetter fetches collateral through a JS function returning a Promise.
@@ -133,73 +135,13 @@ func composeSum() string {
 	return hex.EncodeToString(h[:])
 }
 
-// trustInfo is what setTrustList and verify report about a signed trust list.
-type trustInfo struct {
-	OK               bool   `json:"ok"`
-	Error            string `json:"error,omitempty"`
-	Seq              uint64 `json:"seq,omitempty"`
-	IssuedAt         string `json:"issuedAt,omitempty"`
-	Expires          string `json:"expires,omitempty"`
-	OSImages         int    `json:"osImages"`
-	BootMeasurements int    `json:"bootMeasurements"`
-	PreLaunch        int    `json:"preLaunch"`
-	KMSIDs           int    `json:"kmsIds"`
-	ReleaseFloor     string `json:"releaseFloor,omitempty"`
-}
-
-// trust is the signed trust list setTrustList took (the envelope, checked again at each verify: it may have expired).
-var trust struct {
-	sync.Mutex
-	env []byte
-}
+// trust is the signed trust list setTrustList took (verifier.TrustState: the envelope, checked again at each verify,
+// since it may have expired).
+var trust verifier.TrustState
 
 func appComposeSum() string {
 	h := sha256.Sum256(tacy.AppCompose)
 	return hex.EncodeToString(h[:])
-}
-
-// takeTrustList checks env (one signed trust list) at now against minSeq; "" clears it.
-func takeTrustList(env string, minSeq uint64, now time.Time) trustInfo {
-	trust.Lock()
-	defer trust.Unlock()
-	if env == "" {
-		trust.env = nil
-		return trustInfo{OK: true}
-	}
-	l, err := verifier.ParseTrustList([]byte(env), minSeq, now)
-	if err == nil {
-		_, err = verifier.Policy{}.WithTrustList(l)
-	}
-	if err != nil {
-		return trustInfo{Error: err.Error()}
-	}
-	trust.env = []byte(env)
-	return infoOf(l)
-}
-
-func infoOf(l *safety.TrustList) trustInfo {
-	return trustInfo{OK: true, Seq: l.Seq, IssuedAt: l.IssuedAt.UTC().Format(time.RFC3339), Expires: l.Expires.UTC().Format(time.RFC3339),
-		OSImages: len(l.OSImages), BootMeasurements: len(l.BootMeasurements), PreLaunch: len(l.PreLaunch), KMSIDs: len(l.KMSIDs),
-		ReleaseFloor: l.VMReleaseFloor}
-}
-
-// withTrust adds the trust list taken to p, if it still holds at now (else p, the built-in values only).
-func withTrust(p verifier.Policy, now time.Time) (verifier.Policy, *trustInfo) {
-	trust.Lock()
-	env := trust.env
-	trust.Unlock()
-	if env == nil {
-		return p, nil
-	}
-	l, err := verifier.ParseTrustList(env, 0, now)
-	if err == nil {
-		var q verifier.Policy
-		if q, err = p.WithTrustList(l); err == nil {
-			i := infoOf(l)
-			return q, &i
-		}
-	}
-	return p, &trustInfo{Error: err.Error()}
 }
 
 // run verifies an attestation. bundle nil = the deprecated exact mode against the embedded compose.
@@ -233,7 +175,7 @@ func run(attJSON, nonceHex string, bundle []byte, fetch js.Value, now, lastSeen 
 	if at.IsZero() {
 		at = time.Now()
 	}
-	p, out.TrustList = withTrust(p, at)
+	p, out.TrustList = trust.Apply(p, at)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	res, err := verifier.Verify(ctx, &att, nonce, p)
@@ -319,18 +261,19 @@ func main() {
 	api.Set("releaseIdentity", release.Policy{}.Identity())
 	api.Set("minVersion", release.Policy{}.Minimum())
 	api.Set("appComposeSha256", appComposeSum())
-	// setTrustList(envelopeJSON, minSeq, nowISO?) -> JSON trustInfo: takes a signed trust list for later checks if it
-	// is signed by the pinned admin keys, not expired and its seq is at least minSeq ("" clears it).
+	// setTrustList(envelopeJSON, minSeq, nowISO?) -> JSON verifier.TrustInfo: takes a signed trust list for later
+	// checks if it is signed by the pinned admin keys, not expired and its seq is at least minSeq ("" clears it). Its
+	// releaseEntries are the list's VM releases (with their Sigstore bundles) for a release-mode client's lookup.
 	api.Set("setTrustList", js.FuncOf(func(_ js.Value, a []js.Value) any {
 		if len(a) < 2 || a[0].Type() != js.TypeString || a[1].Type() != js.TypeNumber {
-			b, _ := json.Marshal(trustInfo{Error: "setTrustList(envelopeJSON, minSeq, nowISO?)"})
+			b, _ := json.Marshal(verifier.TrustInfo{Error: "setTrustList(envelopeJSON, minSeq, nowISO?)"})
 			return string(b)
 		}
 		now := time.Now()
 		if len(a) > 2 && a[2].Type() == js.TypeString && a[2].String() != "" {
 			t, err := time.Parse(time.RFC3339, a[2].String())
 			if err != nil {
-				b, _ := json.Marshal(trustInfo{Error: "bad time: " + err.Error()})
+				b, _ := json.Marshal(verifier.TrustInfo{Error: "bad time: " + err.Error()})
 				return string(b)
 			}
 			now = t
@@ -339,7 +282,7 @@ func main() {
 		if minSeq < 0 || minSeq > 1<<53 {
 			minSeq = 1 << 53
 		}
-		b, _ := json.Marshal(takeTrustList(a[0].String(), uint64(minSeq), now))
+		b, _ := json.Marshal(trust.Take([]byte(a[0].String()), uint64(minSeq), now))
 		return string(b)
 	}))
 	js.Global().Set("sealedAgentVM", api)

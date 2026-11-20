@@ -2,6 +2,15 @@
 
 What changed in the agent VM, release by release, newest first. Every release is a signed tag `vX.Y.Z`; its [GitHub Release](https://github.com/tacyhq/tacy/releases) carries `compose.yaml`, `release.json` and the Sigstore bundle, and [README.md](README.md) says how to check them. Entries name the package they touch; the specs are in [docs/](docs/README.md).
 
+## v0.21.0 (in preparation)
+
+The Tacy key service: every lasting key and secret of the agent VM comes from `kmsd`, an attested release of its own in its own TDX VM; the VM's state is sealed under those keys; every request to the VM is a signed envelope. Schedules and email connections come back on that state.
+
+- **Key service (`kms/`, `cmd/kmsd`, `cmd/kmsctl`):** `kmsd` holds a master key in memory only and releases per-purpose keys, leases and the sealed API keys only to an agent VM release its admin-signed policy pins (attested app-compose.json sha256, release floor). Genesis splits the master key into threshold shares sealed to passphrase recipients; a cold start rebuilds it from two of three. `kmsctl` (offline admin tool) makes and wraps admin keys, signs policies and secrets bundles, runs genesis, unlock, snapshots and the audit log.
+- **Agent VM (`kmsvm/`, `sealstate/`, `relay/`, `app/`, `gateway/`, `cmd/vaultd`):** agentd and vaultd take their keys from the key service the compose pins (`-kms-key`, `-kms-url`, through gatewayd's fixed calls), hold a lease per instance, and keep their state sealed (`TACYSEAL1`) at the chat server's sealed-state API, which only ever sees ciphertext. agentd takes only envelopes signed by the relay key the compose pins (`-relay-auth-key`, `POST /v`, padded). DNS goes over TLS to the resolver the compose names.
+- **`verifier/`:** the Tacy KMS id a compose names must be pinned (`ReleaseKMSID`, set at the release, or a signed trust list's `kms_ids`). A signed trust list may also carry signed VM releases (`releases`, each with its Sigstore bundle; `Policy.Releases`): release mode looks a bundle up there when none is given, and checks it as a given one. The WASM's `setTrustList` answers `verifier.TrustInfo` with the list's `releaseEntries`, and every check applies the list taken (`verifier.TrustState`). Tests: `trustlist_test.go`, `kmspolicy_test.go`, `release_trustlist_test.go`.
+- **Releases (`release.yml`, `reproduce.sh`, `cmd/compose`):** the key service is built, pushed and signed like the VM's images: `kms-compose.yaml`, `kms-app-compose.json` and `kms-release.json` (`go run ./cmd/compose --kms --kms-release`, from the pinned `kmsAdminKeys` and `ReleaseKMSID` only) on a `kms-vX.Y.Z` tag, or with a `vX.Y.Z` release when committed. `scripts/reproduce.sh` rebuilds and compares it (REPRODUCED, SERVED). CI's compose check runs with `--if-pinned` until the release pins exist, and with `pipefail`.
+
 ## v0.20.0
 
 A memory-only VM that takes no secret from the deployer and no key from a provider, with its whole CVM manifest pinned; on dstack 0.6.5. Schedules and email connections are off in this release.

@@ -1,6 +1,7 @@
 {
   "constants": {
     "labels": {
+      "collected": "tacy/v2/schedule-collected",
       "handoff": "tacy/v2/schedule-handoff"
     }
   },
@@ -11,5 +12,11 @@
   "enc": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
   "ct": "Y2lwaGVydGV4dCBvZiBhIHNjaGVkdWxlZCBydW4ncyByZXN1bHQ=",
   "digest": "2ba4d81d71eb241a69c58386a183081013073b68dabb85fded41a8c27a973f4b",
-  "sig": "7IXKGpHvdxw+1t/OEaMeahVHJrT/23SWtduwrA2oPR5B7aB7rUcFpNbpC0v+3dHJWZEWsQFSHMaEVuHk56DtCA=="
+  "sig": "7IXKGpHvdxw+1t/OEaMeahVHJrT/23SWtduwrA2oPR5B7aB7rUcFpNbpC0v+3dHJWZEWsQFSHMaEVuHk56DtCA==",
+  "collected": {
+    "identity": "i_ccccccccccccccccccccccccca",
+    "identity_key": "ed25519:/RckOFqgx1tk+3jNYC+h2ZH96/drE8WO1wLqyDXp9hg=",
+    "message": "tacy/v2/schedule-collected\ns_aaaaaaaaaaaaaaaaaaaaaaaaaa\ni_ccccccccccccccccccccccccca\ntk_bbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "sig": "0ve2iKpH2yW5wkCkqStQs5OrHnpyZWCuhUXpg8wHfCROhWRTqBwrlQu/RqQZ658jzTp2q8BtcnZEYiSVCxDvAw=="
+  }
 }

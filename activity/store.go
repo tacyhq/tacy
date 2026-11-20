@@ -45,10 +45,11 @@ var errHeadMoved = errors.New("activity: chain head moved")
 
 // MemStore is a Store in memory.
 type MemStore struct {
-	mu    sync.Mutex
-	heads map[string]Link
-	recs  map[string][]memRec
-	open  map[string]OpenRun
+	mu      sync.Mutex
+	heads   map[string]Link
+	recs    map[string][]memRec
+	open    map[string]OpenRun
+	version uint64 // raised by every change (sealstate.Source)
 }
 
 type memRec struct {
@@ -74,6 +75,7 @@ func (m *MemStore) Append(chain string, after, next Link, r Sealed, at time.Time
 	if m.heads[chain] != after {
 		return errHeadMoved
 	}
+	m.version++
 	m.heads[chain] = next
 	m.recs[chain] = append(m.recs[chain], memRec{next.Seq, at, r})
 	if open != nil {
@@ -118,9 +120,67 @@ func (m *MemStore) Prune(before time.Time) error {
 				kept = append(kept, r)
 			}
 		}
+		if len(kept) != len(rs) {
+			m.version++
+		}
 		m.recs[c] = kept
 	}
 	return nil
+}
+
+// memSnap is a MemStore's snapshot: every chain's head and records, and the open runs. The records are already
+// sealed to their spaces; the snapshot is sealed again as a whole (sealstate), so the chains continue after a restart.
+type memSnap struct {
+	Heads map[string]Link      `json:"heads"`
+	Recs  map[string][]snapRec `json:"recs"`
+	Open  map[string]OpenRun   `json:"open"`
+}
+
+type snapRec struct {
+	Seq uint64    `json:"seq"`
+	At  time.Time `json:"at"`
+	R   Sealed    `json:"r"`
+}
+
+// Version changes whenever the store does (sealstate.Source).
+func (m *MemStore) Version() uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.version
+}
+
+// Snapshot is the whole store (sealstate.Source).
+func (m *MemStore) Snapshot() ([]byte, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sn := memSnap{Heads: m.heads, Recs: map[string][]snapRec{}, Open: m.open}
+	for c, rs := range m.recs {
+		for _, r := range rs {
+			sn.Recs[c] = append(sn.Recs[c], snapRec{r.seq, r.at, r.r})
+		}
+	}
+	return json.Marshal(sn)
+}
+
+// LoadMemStore makes a MemStore from a Snapshot.
+func LoadMemStore(b []byte) (*MemStore, error) {
+	var sn memSnap
+	if err := json.Unmarshal(b, &sn); err != nil {
+		return nil, fmt.Errorf("activity: snapshot: %w", err)
+	}
+	m := NewMemStore()
+	for c, l := range sn.Heads {
+		m.heads[c] = l
+	}
+	for c, rs := range sn.Recs {
+		for _, r := range rs {
+			m.recs[c] = append(m.recs[c], memRec{r.Seq, r.At, r.R})
+		}
+	}
+	for k, o := range sn.Open {
+		m.open[k] = o
+	}
+	return m, nil
 }
 
 // Remove drops record seq of chain (tests: a host that deletes a record).
@@ -131,6 +191,7 @@ func (m *MemStore) Remove(chain string, seq uint64) {
 	for i, r := range rs {
 		if r.seq == seq {
 			m.recs[chain] = append(rs[:i:i], rs[i+1:]...)
+			m.version++
 			return
 		}
 	}

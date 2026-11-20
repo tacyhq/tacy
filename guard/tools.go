@@ -552,15 +552,17 @@ func (t *Tools) finishRead(p pending, out toolOutcome, sources []int, head map[s
 
 // ---- fetching -------------------------------------------------------------------------------------------------
 
-// publicOnly refuses connections to anything but public unicast addresses on ports 80/443, checked on the
-// resolved IP at connect time (so DNS tricks and redirects can't reach the CVM's own services, the host, link-local
-// metadata endpoints or private networks).
+// publicOnly refuses connections to anything but public unicast addresses on port 443, checked on the resolved IP
+// at connect time (so DNS tricks and redirects can't reach the CVM's own services, the host, link-local metadata
+// endpoints or private networks). Port 80 isn't allowed either: the VM's traffic goes out through the provider's
+// host network, which could read and change a plain http page (the keys plan §3.4, PX-4), so pages are read over HTTPS
+// only (httpsOnly upgrades an http:// address first).
 func publicOnly(_, address string, _ syscall.RawConn) error {
 	host, port, err := net.SplitHostPort(address)
 	if err != nil {
 		return err
 	}
-	if port != "80" && port != "443" {
+	if port != "443" {
 		return fmt.Errorf("port %s not allowed", port)
 	}
 	ip, err := netip.ParseAddr(host)
@@ -574,6 +576,43 @@ func publicOnly(_, address string, _ syscall.RawConn) error {
 		return errors.New("address not public")
 	}
 	return nil
+}
+
+// errPlainHTTP: an http:// address that can't be upgraded to https:// as it is (it names a port other than 80).
+var errPlainHTTP = errors.New("plain http not allowed: pages are read over https only")
+
+// httpsOnly sends every request over HTTPS: an http:// address (the model's, a page's link, a redirect) goes to the
+// same host on https:// instead (port 80 or none: the default 443), and any other http:// address is refused. The
+// page read is then the https one (the response's Request says so). Nothing goes out in plaintext through the
+// provider's network, where it could be read or changed (the keys plan §3.4, PX-4).
+type httpsOnly struct{ base http.RoundTripper }
+
+func (h httpsOnly) RoundTrip(r *http.Request) (*http.Response, error) {
+	switch {
+	case r.URL.Scheme == "https":
+		return h.base.RoundTrip(r)
+	case r.URL.Scheme != "http", r.URL.Port() != "" && r.URL.Port() != "80":
+		if r.Body != nil {
+			r.Body.Close()
+		}
+		return nil, errPlainHTTP
+	}
+	up := r.Clone(r.Context())
+	u := *r.URL
+	u.Scheme, u.Host = "https", r.URL.Hostname()
+	if strings.Contains(u.Host, ":") {
+		u.Host = "[" + u.Host + "]" // IPv6
+	}
+	up.URL, up.Host = &u, ""
+	return h.base.RoundTrip(up)
+}
+
+// newWebFetcher is the release's client for pages, images and site icons: public addresses on 443 only, every
+// request over HTTPS (httpsOnly).
+func newWebFetcher() *http.Client {
+	c := newFetcher(publicOnly)
+	c.Transport = httpsOnly{c.Transport}
+	return c
 }
 
 func newFetcher(control func(string, string, syscall.RawConn) error) *http.Client {
@@ -664,6 +703,8 @@ func errText(err error) string {
 	switch {
 	case strings.Contains(s, errHostPolicy.Error()):
 		return "host not allowed by the policy"
+	case strings.Contains(s, errPlainHTTP.Error()):
+		return "plain http not allowed (https only)"
 	case strings.Contains(s, "address not public"), strings.Contains(s, "not allowed"):
 		return "address not allowed"
 	case strings.Contains(s, "timeout"), strings.Contains(s, "deadline"):

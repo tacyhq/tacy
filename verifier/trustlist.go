@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"go.yaml.in/yaml/v3"
@@ -22,10 +23,27 @@ var TrustListKeys = []string{"ed25519:Ii1apdLLHa+9d1d/vAjiipxNV7fS9m2lwFva67v4VF
 // TrustListThreshold is how many of TrustListKeys must sign a trust list.
 const TrustListThreshold = 1
 
-// KMSIDs are the Tacy KMS identities (the key service's Ed25519 key, ed25519:<base64>) a VM's compose may name as
-// -kms-key. None yet: the key service isn't running, and a release that names one before it is pinned (here or in a
-// signed trust list) is refused.
-var KMSIDs = map[string]string{}
+// ReleaseKMSID is the RELEASE PIN of the production Tacy KMS id (the key service's Ed25519 key, ed25519:<base64>, from
+// its genesis: kmsctl genesis prints it and writes kms-id.txt). The release step fills it in; cmd/compose's kmsID is
+// this constant, so the compose names exactly the id the verifier accepts. Empty until genesis: KMSIDs is then empty
+// and a compose naming any -kms-key is refused, unless a signed trust list names that id (kms_ids).
+const ReleaseKMSID = ""
+
+// ReleaseKMSName is how the verifier's facts name ReleaseKMSID.
+const ReleaseKMSName = "Tacy KMS (production)"
+
+// KMSIDs are the Tacy KMS identities a VM's compose may name as -kms-key: ReleaseKMSID once it is pinned, else none.
+var KMSIDs = releaseKMSIDs(ReleaseKMSID)
+
+// releaseKMSIDs is {id: ReleaseKMSName} for a well-formed id (ed25519:<base64 of 32 bytes>, canonical), else empty:
+// an empty or malformed pin accepts no id at all (TestReleaseKMSID fails on a malformed one).
+func releaseKMSIDs(id string) map[string]string {
+	k, err := safety.ParseKey(id)
+	if id == "" || err != nil || safety.KeyString(k) != id {
+		return map[string]string{}
+	}
+	return map[string]string{id: ReleaseKMSName}
+}
 
 // KMSIDCheck is the check of the Tacy KMS the compose names. The chat maps its "Tacy KMS:" prefix to "kms_id".
 const KMSIDCheck = "Tacy KMS: the compose names only pinned KMS ids (-kms-key)"
@@ -33,23 +51,21 @@ const KMSIDCheck = "Tacy KMS: the compose names only pinned KMS ids (-kms-key)"
 // ParseTrustList verifies a signed trust list (one envelope, JSON) against TrustListKeys at now, refusing a seq
 // below minSeq (the highest the caller already took) and an expired list.
 func ParseTrustList(envelope []byte, minSeq uint64, now time.Time) (*safety.TrustList, error) {
-	envs, err := safety.DecodeEnvelopes(envelope)
+	env, err := safety.DecodeTrustList(envelope)
 	if err != nil {
 		return nil, err
-	}
-	if len(envs) != 1 {
-		return nil, errors.New("trust list: one envelope expected")
 	}
 	keys, err := safety.ParseKeys(strings.Join(TrustListKeys, ","))
 	if err != nil {
 		return nil, err
 	}
-	return safety.VerifyTrustList(&envs[0], keys, TrustListThreshold, minSeq, now)
+	return safety.VerifyTrustList(env, keys, TrustListThreshold, minSeq, now)
 }
 
 // WithTrustList returns p with l's values added to what p uses (its own, or the built-in ones where p has none):
-// OS images, boot measurement sets, pre-launch scripts, KMS ids, and the higher of the two release floors. It never
-// removes a value, and refuses a list that brings back a retired OS image or adds a set for an unknown image.
+// OS images, boot measurement sets, pre-launch scripts, KMS ids, VM releases (MergeReleases), and the higher of the
+// two release floors. It never removes a value, and refuses a list that brings back a retired OS image or adds a set
+// for an unknown image.
 func (p Policy) WithTrustList(l *safety.TrustList) (Policy, error) {
 	if l == nil {
 		return p, nil
@@ -87,9 +103,111 @@ func (p Policy) WithTrustList(l *safety.TrustList) (Policy, error) {
 		}
 	}
 	p.ProdImages, p.Boot, p.PreLaunch, p.KMSIDs = images, boot, pre, ids
+	p.Releases = MergeReleases(p.Releases, l.Releases)
 	p.ReleaseFloor = NewerVersion(p.ReleaseFloor, l.VMReleaseFloor)
 	p.trust = l
 	return p, nil
+}
+
+// MergeReleases is base (a verifier's built-in releases) with the trust list's added after it: an entry already in
+// base (same version and compose) is not added again, and none of base is removed or replaced. Nothing here makes an
+// entry trusted: a release-mode verifier still checks each one's bundle for the attested compose (ReleaseBundles).
+func MergeReleases(base, add []safety.TrustRelease) []safety.TrustRelease {
+	out := slices.Clone(base)
+	for _, r := range add {
+		if !slices.ContainsFunc(out, func(b safety.TrustRelease) bool { return b.Version == r.Version && b.ComposeSHA256 == r.ComposeSHA256 }) {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// ReleaseBundles are the Sigstore bundles p's releases (Policy.Releases) have for a compose's sha256 (hex), in order;
+// none when no release lists it. A wrong bundle can only make the release check fail.
+func (p Policy) ReleaseBundles(composeSHA256 string) [][]byte {
+	var out [][]byte
+	for _, r := range p.Releases {
+		if r.ComposeSHA256 == composeSHA256 {
+			out = append(out, slices.Clone([]byte(r.Bundle)))
+		}
+	}
+	return out
+}
+
+// TrustInfo is what a verifier reports about a signed trust list it was given (the WASM's setTrustList, and each
+// verification's trustList): whether it was taken, why not, and what it adds. Releases (the entries themselves, with
+// their bundles) only where a caller asked for them (TrustInfoOf), for a release-mode client's bundle lookup.
+type TrustInfo struct {
+	OK               bool                  `json:"ok"`
+	Error            string                `json:"error,omitempty"`
+	Seq              uint64                `json:"seq,omitempty"`
+	IssuedAt         string                `json:"issuedAt,omitempty"`
+	Expires          string                `json:"expires,omitempty"`
+	OSImages         int                   `json:"osImages"`
+	BootMeasurements int                   `json:"bootMeasurements"`
+	PreLaunch        int                   `json:"preLaunch"`
+	KMSIDs           int                   `json:"kmsIds"`
+	Releases         int                   `json:"releases"`
+	ReleaseFloor     string                `json:"releaseFloor,omitempty"`
+	ReleaseEntries   []safety.TrustRelease `json:"releaseEntries,omitempty"`
+}
+
+// TrustInfoOf summarizes a taken list; withReleases adds its release entries.
+func TrustInfoOf(l *safety.TrustList, withReleases bool) TrustInfo {
+	i := TrustInfo{OK: true, Seq: l.Seq, IssuedAt: l.IssuedAt.UTC().Format(time.RFC3339), Expires: l.Expires.UTC().Format(time.RFC3339),
+		OSImages: len(l.OSImages), BootMeasurements: len(l.BootMeasurements), PreLaunch: len(l.PreLaunch), KMSIDs: len(l.KMSIDs),
+		Releases: len(l.Releases), ReleaseFloor: l.VMReleaseFloor}
+	if withReleases {
+		i.ReleaseEntries = slices.Clone(l.Releases)
+	}
+	return i
+}
+
+// TrustState is the signed trust list a long-running verifier took (the WASM in a browser, an app or the chat's
+// Worker): the envelope, checked again at every use, since it may have expired since.
+type TrustState struct {
+	mu  sync.Mutex
+	env []byte
+}
+
+// Take checks env (one signed trust list) at now against minSeq (the highest seq the caller has taken) and keeps it
+// for Apply; an empty env clears it (TrustInfo{OK: true}, Seq 0). A refused list leaves the one taken before.
+func (s *TrustState) Take(env []byte, minSeq uint64, now time.Time) TrustInfo {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(env) == 0 {
+		s.env = nil
+		return TrustInfo{OK: true}
+	}
+	l, err := ParseTrustList(env, minSeq, now)
+	if err == nil {
+		_, err = Policy{}.WithTrustList(l)
+	}
+	if err != nil {
+		return TrustInfo{Error: err.Error()}
+	}
+	s.env = slices.Clone(env)
+	return TrustInfoOf(l, true)
+}
+
+// Apply adds the list taken to p, if it still holds at now; else p (the built-in values only) and why. The info is
+// nil when no list was taken.
+func (s *TrustState) Apply(p Policy, now time.Time) (Policy, *TrustInfo) {
+	s.mu.Lock()
+	env := s.env
+	s.mu.Unlock()
+	if env == nil {
+		return p, nil
+	}
+	l, err := ParseTrustList(env, 0, now)
+	if err == nil {
+		var q Policy
+		if q, err = p.WithTrustList(l); err == nil {
+			i := TrustInfoOf(l, false)
+			return q, &i
+		}
+	}
+	return p, &TrustInfo{Error: err.Error()}
 }
 
 func cmpOr(m, def map[string]string) map[string]string {

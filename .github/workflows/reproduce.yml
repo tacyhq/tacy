@@ -1,7 +1,8 @@
 # Reproduce: after every release (and by hand for any tag), rebuild it from the tag in the pinned Go container and
-# natively on the runner, compare with the published release.json (compose sha256, binary sha256s, image
-# digests), and check that ghcr.io serves exactly the rebuilt images to an anonymous client
-# (scripts/reproduce.sh). Read-only: it checks, it never changes a release.
+# natively on the runner, compare with the published release.json and kms-release.json (compose sha256s, binary
+# sha256s, image digests), and check that ghcr.io serves exactly the rebuilt images to an anonymous client
+# (scripts/reproduce.sh). Agent VM tags (vX.Y.Z) and key service tags (kms-vX.Y.Z). Read-only: it checks, it never
+# changes a release.
 name: reproduce
 
 on:
@@ -11,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: release tag (vX.Y.Z)
+        description: release tag (vX.Y.Z or kms-vX.Y.Z)
         required: true
 
 permissions: {}
@@ -27,7 +28,7 @@ jobs:
         env:
           TAG: ${{ inputs.tag || github.event.workflow_run.head_branch }}
         run: |
-          [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || { echo "not a release tag: $TAG"; exit 1; }
+          [[ "$TAG" =~ ^(kms-)?v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || { echo "not a release tag: $TAG"; exit 1; }
           echo "TAG=$TAG" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

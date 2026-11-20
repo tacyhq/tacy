@@ -1,0 +1,44 @@
+{
+  "seed": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc",
+  "public_key": "ed25519:6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=",
+  "method": "POST",
+  "path": "/tasks",
+  "headers": {
+    "Content-Type": "application/json",
+    "Ehbp-Encapsulated-Key": "abababababababababababababababababababababababababababababababab",
+    "X-Agent-Model": "kimi-k3",
+    "X-Agent-User": "0123456789abcdef"
+  },
+  "body": "b3BhcXVlIGlubmVyIGJvZHk=",
+  "nonce": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+  "time": 1795176000,
+  "signed": "tacy/relay-auth/v1\nPOST\n/tasks\n0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f\n1795176000\n9f0de3fc95944a9d4d690b535d0492cade5033c96056523e94be3679d11693a3\n17\ncontent-type:application/json\nehbp-encapsulated-key:abababababababababababababababababababababababababababababababab\nx-agent-model:kimi-k3\nx-agent-user:0123456789abcdef\n",
+  "sig": "MLAZw4S6r0NGGugi7hJGUXt8ewk0epUXndrzhFkjvN0svUO3df2axOGy+uMiLYQi5t9EBDFJTYDb/HHZv0KbBA==",
+  "plaintext": "AAABx3sidiI6MSwibSI6IlBPU1QiLCJwIjoiL3Rhc2tzIiwiaCI6eyJDb250ZW50LVR5cGUiOiJhcHBsaWNhdGlvbi9qc29uIiwiRWhicC1FbmNhcHN1bGF0ZWQtS2V5IjoiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYiIsIlgtQWdlbnQtTW9kZWwiOiJraW1pLWszIiwiWC1BZ2VudC1Vc2VyIjoiMDEyMzQ1Njc4OWFiY2RlZiJ9LCJuIjoxNywiYiI6IjlmMGRlM2ZjOTU5NDRhOWQ0ZDY5MGI1MzVkMDQ5MmNhZGU1MDMzYzk2MDU2NTIzZTk0YmUzNjc5ZDExNjkzYTMiLCJub25jZSI6IjBmMGYwZjBmMGYwZjBmMGYwZjBmMGYwZjBmMGYwZjBmIiwidCI6MTc5NTE3NjAwMCwic2lnIjoiTUxBWnc0UzZyME5HR3VnaTdoSkdVWHQ4ZXdrMGVwVVhuZHJ6aEZranZOMHN2VU8zZGYyYXhPR3krdU1pTFlRaTV0OUVCREZKVFlEYi9ISFp2MEtiQkE9PSJ9b3BhcXVlIGlubmVyIGJvZHkAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+  "bucket_sizes": [
+    [
+      0,
+      512
+    ],
+    [
+      1,
+      512
+    ],
+    [
+      512,
+      512
+    ],
+    [
+      513,
+      1024
+    ],
+    [
+      5000,
+      8192
+    ],
+    [
+      70000,
+      131072
+    ]
+  ]
+}

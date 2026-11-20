@@ -27,6 +27,47 @@ type Server struct {
 	OnDocs func()
 	// Secrets passes a secrets op to the vault (gatewayd: vault.Client.Secrets); nil: unavailable.
 	Secrets func(context.Context, *vault.SecretsCall) *vault.SecretsAnswer
+	// Fixed makes calls to the fixed hosts (fixed.go); nil: none.
+	Fixed FixedDoer
+}
+
+// ServeOps accepts connections on l that may make fixed calls and nothing else (vaultd's ops socket: it reaches the
+// key service and the sealed-state API this way). peerUID as in Serve.
+func (s *Server) ServeOps(l net.Listener, peerUID int) error {
+	for {
+		c, err := l.Accept()
+		if err != nil {
+			return err
+		}
+		if peerUID >= 0 {
+			if err := CheckPeer(c, peerUID); err != nil {
+				log.Printf("ops socket: %v", err)
+				c.Close()
+				continue
+			}
+		}
+		go func() {
+			defer c.Close()
+			var open frame
+			c.SetReadDeadline(time.Now().Add(30 * time.Second))
+			if readFrame(c, &open) != nil || open.Version != Version || open.T != tFixed {
+				return
+			}
+			s.fixed(c, &open)
+		}()
+	}
+}
+
+// fixed answers a fixed call frame.
+func (s *Server) fixed(c net.Conn, open *frame) {
+	res := &FixedAnswer{Error: "no_target"}
+	if s.Fixed != nil && open.Fixed != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 70*time.Second)
+		res = s.Fixed.Fixed(ctx, open.Fixed)
+		cancel()
+	}
+	c.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	writeFrame(c, &frame{T: tResult, FixedResult: res})
 }
 
 // apply takes signed documents from agentd: each is checked against gatewayd's own pinned keys and floors.
@@ -134,6 +175,10 @@ func (s *Server) serve(c net.Conn) {
 		}
 		c.SetWriteDeadline(time.Now().Add(10 * time.Second))
 		writeFrame(c, &frame{T: tResult, SecretsResult: res})
+		return
+	}
+	if open.T == tFixed {
+		s.fixed(c, &open)
 		return
 	}
 	if open.T != tOpen || !validID(open.Task) {

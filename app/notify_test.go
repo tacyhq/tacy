@@ -17,13 +17,14 @@ import (
 	"github.com/tacyhq/tacy/harness"
 	"github.com/tacyhq/tacy/proto"
 	"github.com/tacyhq/tacy/runauth"
+	"github.com/tacyhq/tacy/sealstate"
 )
 
 // A hand-off task (a built-in agent) that ends while no stream follows it marks "finished"; a followed one, a chat
 // turn or a scheduled run doesn't (the scheduled run's result says "done" instead).
 func TestHandoffEndedMarksFinished(t *testing.T) {
 	s := &server{}
-	s.notify, _ = openNotifier("")
+	s.notify, _ = openNotifier(nil)
 	s.notify.Set("s_a", true)
 	s.followTask("tk_followed", 1)
 	for _, c := range []struct {
@@ -121,8 +122,8 @@ func TestNotifyGoldenVectors(t *testing.T) {
 // kind; the relay drains only the spaces it names, and every other mark is dropped.
 
 func TestNotifierMarksOnlySpacesTurnedOn(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "notify.json")
-	n, err := openNotifier(path)
+	slot := sealstate.NewSlot(nil) // what the Keeper saves sealed (state.go)
+	n, err := openNotifier(slot)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,13 +147,10 @@ func TestNotifierMarksOnlySpacesTurnedOn(t *testing.T) {
 	if got := n.Drain([]string{"s_a", "s_b"}); len(got) != 0 {
 		t.Fatalf("second drain: %+v", got)
 	}
-	// Turned on is kept across a restart (the file holds space ids only); off drops the space and its marks.
-	b, _ := os.ReadFile(path)
+	// Turned on is kept across a restart (the document holds space ids only); off drops the space and its marks.
+	b, _ := slot.Load()
 	if string(b) != `{"on":["s_a","s_b"]}` {
-		t.Fatalf("file: %s", b)
-	}
-	if fi, _ := os.Stat(path); fi.Mode().Perm() != 0o600 {
-		t.Fatalf("mode %v", fi.Mode())
+		t.Fatalf("kept: %s", b)
 	}
 	n.Mark("s_b", notifyDone)
 	if err := n.Set("s_b", false); err != nil {
@@ -161,7 +159,7 @@ func TestNotifierMarksOnlySpacesTurnedOn(t *testing.T) {
 	if got := n.Drain([]string{"s_b"}); len(got) != 0 {
 		t.Fatalf("after off: %+v", got)
 	}
-	again, err := openNotifier(path)
+	again, err := openNotifier(sealstate.NewSlot(must(slot.Load())))
 	if err != nil || !again.On("s_a") || again.On("s_b") {
 		t.Fatalf("reopened: %v %v", err, again.on)
 	}
@@ -175,7 +173,7 @@ func TestNotifierMarksOnlySpacesTurnedOn(t *testing.T) {
 // Only the space's holder turns notices on, for its own space, with a signature made for this call.
 func TestNotifySetSigned(t *testing.T) {
 	e := newSchedEnv(t)
-	e.s.notify, _ = openNotifier("")
+	e.s.notify, _ = openNotifier(nil)
 	other, _ := runauth.NewAsker()
 	cases := map[string]struct {
 		req  func() notifySetRequest
@@ -223,7 +221,7 @@ func TestNotifySetSigned(t *testing.T) {
 func TestScheduledRunNotifies(t *testing.T) {
 	for _, on := range []bool{false, true} {
 		e := newSchedEnv(t, pText("Today's digest."))
-		e.s.notify, _ = openNotifier("")
+		e.s.notify, _ = openNotifier(nil)
 		if on {
 			if code, out := e.call(e.s.notifySet, notifySetRequest{Where: e.where(e.me, runauth.NotifyLabel, "on"), On: true}); code != 200 {
 				t.Fatalf("on: %d %v", code, out)
@@ -241,7 +239,7 @@ func TestScheduledRunNotifies(t *testing.T) {
 		body, _ := json.Marshal(pendingRequest{Spaces: []string{e.me.Space}})
 		rr := httptest.NewRecorder()
 		r := httptest.NewRequest("POST", "/notify/pending", strings.NewReader(string(body)))
-		r.Header.Set("Authorization", "Bearer tok")
+		r = asRelay(r)
 		e.s.notifyPending(rr, r)
 		want := `{"events":[]}`
 		if on {
@@ -259,7 +257,7 @@ func (e *schedEnv) pendingNotices() string {
 	body, _ := json.Marshal(pendingRequest{Spaces: []string{e.me.Space}})
 	rr := httptest.NewRecorder()
 	r := httptest.NewRequest("POST", "/notify/pending", strings.NewReader(string(body)))
-	r.Header.Set("Authorization", "Bearer tok")
+	r = asRelay(r)
 	e.s.notifyPending(rr, r)
 	if rr.Code != 200 {
 		e.t.Fatalf("pending %d %s", rr.Code, rr.Body)
@@ -286,23 +284,22 @@ func TestResultNotifies(t *testing.T) {
 	}
 }
 
-func TestNotifyPendingNeedsToken(t *testing.T) {
+func TestNotifyPendingNeedsRelay(t *testing.T) {
 	e := newSchedEnv(t)
-	e.s.notify, _ = openNotifier("")
+	e.s.notify, _ = openNotifier(nil)
 	for name, c := range map[string]struct {
 		auth, body string
 		code       int
 	}{
-		"no token":      {"", `{"spaces":[]}`, 401},
-		"wrong token":   {"Bearer nope", `{"spaces":[]}`, 401},
-		"not a space":   {"Bearer tok", `{"spaces":["u_1"]}`, 400},
-		"not JSON":      {"Bearer tok", `spaces`, 400},
-		"empty is fine": {"Bearer tok", `{"spaces":[]}`, 200},
+		"not relayed":   {"", `{"spaces":[]}`, 401},
+		"not a space":   {"relayed", `{"spaces":["u_1"]}`, 400},
+		"not JSON":      {"relayed", `spaces`, 400},
+		"empty is fine": {"relayed", `{"spaces":[]}`, 200},
 	} {
 		rr := httptest.NewRecorder()
 		r := httptest.NewRequest("POST", "/notify/pending", strings.NewReader(c.body))
 		if c.auth != "" {
-			r.Header.Set("Authorization", c.auth)
+			r = asRelay(r)
 		}
 		e.s.notifyPending(rr, r)
 		if rr.Code != c.code {
@@ -314,7 +311,7 @@ func TestNotifyPendingNeedsToken(t *testing.T) {
 // A prompt opening in a task nobody follows marks "waiting"; one in a followed task (the tab is open) doesn't.
 func TestPromptWaitingMarksUnfollowed(t *testing.T) {
 	s := &server{}
-	s.notify, _ = openNotifier("")
+	s.notify, _ = openNotifier(nil)
 	s.notify.Set("s_a", true)
 	var ledger []bool
 	hook := s.onWait(func(_ string, open bool) { ledger = append(ledger, open) }, func(task string) string {
@@ -335,4 +332,11 @@ func TestPromptWaitingMarksUnfollowed(t *testing.T) {
 	if len(ledger) != 4 || s.followed("tk_1") {
 		t.Fatalf("ledger %v", ledger)
 	}
+}
+
+func must[T any](v T, err error) T {
+	if err != nil {
+		panic(err)
+	}
+	return v
 }

@@ -15,22 +15,28 @@ import (
 	jsonv2 "encoding/json/v2"
 
 	"github.com/tacyhq/tacy/activity"
+	"github.com/tacyhq/tacy/identity"
 	"github.com/tacyhq/tacy/runauth"
 	"github.com/tacyhq/tacy/trigger"
 )
 
-// handoff posts a hand-off call with the relay's token.
+// handoff posts a hand-off call; auth "relayed": as from inside the relay's signed envelope, "": not.
 func (e *schedEnv) handoff(auth string, body any) (int, map[string]any) {
 	b, _ := jsonv2.Marshal(body)
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest("POST", "/schedules/handoff", bytes.NewReader(b))
-	if auth != "" {
-		r.Header.Set("Authorization", auth)
+	if auth == "relayed" {
+		r = asRelay(r)
 	}
 	e.s.scheduleHandoff(w, r)
 	var out map[string]any
 	json.Unmarshal(w.Body.Bytes(), &out)
 	return w.Code, out
+}
+
+// collectedBy is a collected entry for task in a's space, signed by a's identity (what the browser makes).
+func collectedBy(a *runauth.Asker, space, task string) collectedResult {
+	return collectedResult{Space: space, Task: task, Identity: a.Identity, Sig: ed25519.Sign(a.Key, collectedMessage(space, a.Identity, task))}
 }
 
 // A scheduled run's sealed result goes to the relay (v0.18.0): only for the spaces it names, signed by the activity
@@ -64,18 +70,18 @@ func TestScheduleHandoff(t *testing.T) {
 		body string
 		code int
 	}{
-		"no token":          {"", `{"spaces":[]}`, 401},
-		"wrong token":       {"Bearer nope", `{"spaces":[]}`, 401},
-		"not a space":       {"Bearer tok", `{"spaces":["u_1"]}`, 400},
-		"bad ack":           {"Bearer tok", `{"spaces":[],"ack":["nope"]}`, 400},
-		"bad collected":     {"Bearer tok", `{"spaces":[],"collected":[{"space":"s_1","task":"x"}]}`, 400},
-		"not JSON":          {"Bearer tok", `spaces`, 400},
-		"nothing asked for": {"Bearer tok", `{"spaces":[]}`, 200},
+		"not relayed":       {"", `{"spaces":[]}`, 401},
+		"not a space":       {"relayed", `{"spaces":["u_1"]}`, 400},
+		"bad ack":           {"relayed", `{"spaces":[],"ack":["nope"]}`, 400},
+		"bad collected":     {"relayed", `{"spaces":[],"collected":[{"space":"s_1","task":"x"}]}`, 400},
+		"no identity":       {"relayed", `{"spaces":[],"collected":[{"space":"s_1","task":"tk_bbbbbbbbbbbbbbbbbbbbbbbbbb"}]}`, 400},
+		"not JSON":          {"relayed", `spaces`, 400},
+		"nothing asked for": {"relayed", `{"spaces":[]}`, 200},
 	} {
 		w := httptest.NewRecorder()
 		req := httptest.NewRequest("POST", "/schedules/handoff", strings.NewReader(c.body))
 		if c.auth != "" {
-			req.Header.Set("Authorization", c.auth)
+			req = asRelay(req)
 		}
 		e.s.scheduleHandoff(w, req)
 		if w.Code != c.code {
@@ -85,10 +91,10 @@ func TestScheduleHandoff(t *testing.T) {
 
 	// Another space only: nothing.
 	other, _ := runauth.NewAsker()
-	if code, out := e.handoff("Bearer tok", map[string]any{"spaces": []string{other.Space}}); code != 200 || len(out["results"].([]any)) != 0 {
+	if code, out := e.handoff("relayed", map[string]any{"spaces": []string{other.Space}}); code != 200 || len(out["results"].([]any)) != 0 {
 		t.Fatalf("another space's hand-off: %d %v", code, out)
 	}
-	code, out := e.handoff("Bearer tok", map[string]any{"spaces": []string{other.Space, e.me.Space}})
+	code, out := e.handoff("relayed", map[string]any{"spaces": []string{other.Space, e.me.Space}})
 	rs, _ := out["results"].([]any)
 	if code != 200 || len(rs) != 1 || out["more"] != false || out["deleted"] != float64(0) {
 		t.Fatalf("hand-off %d %v", code, out)
@@ -117,22 +123,47 @@ func TestScheduleHandoff(t *testing.T) {
 		t.Fatalf("handed result doesn't open: %v", err)
 	}
 	// Not acknowledged: sent again. Acknowledged: not again.
-	if _, out := e.handoff("Bearer tok", map[string]any{"spaces": []string{e.me.Space}}); len(out["results"].([]any)) != 1 {
+	if _, out := e.handoff("relayed", map[string]any{"spaces": []string{e.me.Space}}); len(out["results"].([]any)) != 1 {
 		t.Fatalf("unacknowledged result not sent again: %v", out)
 	}
-	if _, out := e.handoff("Bearer tok", map[string]any{"spaces": []string{e.me.Space}, "ack": []string{task}}); len(out["results"].([]any)) != 0 {
+	if _, out := e.handoff("relayed", map[string]any{"spaces": []string{e.me.Space}, "ack": []string{task}}); len(out["results"].([]any)) != 0 {
 		t.Fatalf("acknowledged result sent again: %v", out)
 	}
 	cs := e.s.results.(trigger.CollectStore)
 	if n, _ := cs.Uncollected(d.Agent); n != 1 {
 		t.Fatalf("count %d before collected", n)
 	}
-	// Collected under another space: nothing deleted. Under its own: deleted, count back to 0.
-	if _, out := e.handoff("Bearer tok", map[string]any{"spaces": []string{}, "collected": []trigger.SpaceTask{{Space: other.Space, Task: task}}}); out["deleted"] != float64(0) {
-		t.Fatalf("another space's collected deleted: %v", out)
+	// A delete needs the space holder's signature (the keys plan §3.4, PX-2): the relay alone (no signature, or a forged
+	// one), someone else's identity, a signature over another task, or the right one under another space: refused and
+	// counted, nothing deleted.
+	unsigned := collectedBy(e.me, e.me.Space, task)
+	unsigned.Sig = nil
+	otherTask := collectedBy(e.me, e.me.Space, "tk_bbbbbbbbbbbbbbbbbbbbbbbbbb")
+	otherTask.Task = task
+	forged := collectedBy(e.me, e.me.Space, task)
+	forged.Sig = bytes.Repeat([]byte{1}, ed25519.SignatureSize)
+	for name, c := range map[string]collectedResult{
+		"unsigned":        unsigned,
+		"forged":          forged,
+		"not the holder":  collectedBy(other, e.me.Space, task),
+		"another task":    otherTask,
+		"another space":   collectedBy(e.me, other.Space, task),
+		"holder's, moved": {Space: e.me.Space, Task: task, Identity: other.Identity, Sig: collectedBy(e.me, e.me.Space, task).Sig},
+	} {
+		code, out := e.handoff("relayed", map[string]any{"spaces": []string{}, "collected": []collectedResult{c}})
+		if code != 200 || out["deleted"] != float64(0) || out["refused"] != float64(1) {
+			t.Fatalf("%s: %d %v", name, code, out)
+		}
+		if n, _ := cs.Uncollected(d.Agent); n != 1 {
+			t.Fatalf("%s: count %d", name, n)
+		}
 	}
-	if _, out := e.handoff("Bearer tok", map[string]any{"spaces": []string{e.me.Space}, "collected": []trigger.SpaceTask{{Space: e.me.Space, Task: task}}}); out["deleted"] != float64(1) {
+	// Signed by the holder: deleted, count back to 0; sending it again deletes nothing more.
+	if _, out := e.handoff("relayed", map[string]any{"spaces": []string{e.me.Space}, "collected": []collectedResult{collectedBy(e.me, e.me.Space, task)}}); out["deleted"] != float64(1) || out["refused"] != float64(0) {
 		t.Fatalf("collected: %v", out)
+	}
+	if _, out := e.handoff("relayed", map[string]any{"spaces": []string{}, "collected": []collectedResult{collectedBy(e.me, e.me.Space, task)}}); out["deleted"] != float64(0) {
+		t.Fatalf("collected again: %v", out)
 	}
 	if n, _ := cs.Uncollected(d.Agent); n != 0 {
 		t.Fatalf("count %d after collected", n)
@@ -149,7 +180,7 @@ func TestScheduleHandoffPages(t *testing.T) {
 		e.s.results.PutResult(trigger.Result{Task: randID("tk"), Space: e.me.Space, Seal: e.me.SealString(), Agent: "a_x", Version: 1,
 			Trigger: "tr_x", State: "succeeded", Enc: []byte{1}, CT: []byte{2}})
 	}
-	_, out := e.handoff("Bearer tok", map[string]any{"spaces": []string{e.me.Space}})
+	_, out := e.handoff("relayed", map[string]any{"spaces": []string{e.me.Space}})
 	first := out["results"].([]any)
 	if len(first) != handoffPage || out["more"] != true {
 		t.Fatalf("first page %d more %v", len(first), out["more"])
@@ -158,7 +189,7 @@ func TestScheduleHandoffPages(t *testing.T) {
 	for _, x := range first {
 		ack = append(ack, x.(map[string]any)["task"].(string))
 	}
-	_, out = e.handoff("Bearer tok", map[string]any{"spaces": []string{e.me.Space}, "ack": ack})
+	_, out = e.handoff("relayed", map[string]any{"spaces": []string{e.me.Space}, "ack": ack})
 	if n := len(out["results"].([]any)); n != 3 || out["more"] != false {
 		t.Fatalf("second page %d more %v", n, out["more"])
 	}
@@ -192,9 +223,21 @@ func TestScheduleHandoffGolden(t *testing.T) {
 		CT     []byte `json:"ct"`
 		Digest string `json:"digest"`
 		Sig    []byte `json:"sig"`
+		// Collected: a collected result's signature by the space holder's identity (the browser makes it).
+		Collected struct {
+			Identity    string `json:"identity"`
+			IdentityKey string `json:"identity_key"`
+			Message     string `json:"message"`
+			Sig         []byte `json:"sig"`
+		} `json:"collected"`
 	}
 	got := vec{Label: handoffLabel, Signer: s.Public(), Space: space, Task: task, Enc: enc, CT: ct, Digest: hex.EncodeToString(dg[:]), Sig: sig}
-	got.Constants.Labels = map[string]string{"handoff": handoffLabel}
+	got.Constants.Labels = map[string]string{"handoff": handoffLabel, "collected": collectedLabel}
+	idKey := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{9}, 32))
+	idName := "i_ccccccccccccccccccccccccca"
+	got.Collected.Identity, got.Collected.IdentityKey = idName, identity.KeyString(idKey.Public().(ed25519.PublicKey))
+	got.Collected.Message = string(collectedMessage(space, idName, task))
+	got.Collected.Sig = ed25519.Sign(idKey, collectedMessage(space, idName, task))
 	path := filepath.Join("testdata", "v2-schedule-handoff.json")
 	if os.Getenv("UPDATE_GOLDEN") == "1" {
 		b, _ := json.MarshalIndent(got, "", "  ")
@@ -210,7 +253,8 @@ func TestScheduleHandoffGolden(t *testing.T) {
 	if err := json.Unmarshal(b, &want); err != nil {
 		t.Fatal(err)
 	}
-	if want.Constants.Labels["handoff"] != handoffLabel || want.Label != got.Label || want.Signer != got.Signer || want.Digest != got.Digest || !bytes.Equal(want.Sig, got.Sig) {
+	if want.Constants.Labels["handoff"] != handoffLabel || want.Constants.Labels["collected"] != collectedLabel || !bytes.Equal(want.Collected.Sig, got.Collected.Sig) ||
+		want.Collected.Message != got.Collected.Message || want.Label != got.Label || want.Signer != got.Signer || want.Digest != got.Digest || !bytes.Equal(want.Sig, got.Sig) {
 		t.Fatalf("golden vector changed: %+v", got)
 	}
 }

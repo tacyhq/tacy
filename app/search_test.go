@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/ecdh"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -319,7 +320,7 @@ func TestSearchTokenEHBPAndSlots(t *testing.T) {
 		mu.Unlock()
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		rec := httptest.NewRecorder()
-		mux.ServeHTTP(rec, r)
+		e.s.relayed(mux).ServeHTTP(rec, r)
 		mu.Lock()
 		wire.Write(rec.Body.Bytes())
 		mu.Unlock()
@@ -330,7 +331,8 @@ func TestSearchTokenEHBPAndSlots(t *testing.T) {
 		w.Write(rec.Body.Bytes())
 	}))
 	defer srv.Close()
-	conn, _ := agentclient.New(srv.URL, "tok", id.MarshalPublicKey())
+	conn, _ := agentclient.New(srv.URL, testRelaySeed, id.MarshalPublicKey())
+	good := conn
 	var got []proto.Event
 	if err := conn.Search(context.Background(), proto.SearchRequest{Query: "private lookup words", Decision: proto.SearchOnce},
 		func(ev proto.Event) { got = append(got, ev) }); err != nil || got[len(got)-1].Type != "done" {
@@ -339,13 +341,13 @@ func TestSearchTokenEHBPAndSlots(t *testing.T) {
 	if bytes.Contains(wire.Bytes(), []byte("private lookup")) || bytes.Contains(wire.Bytes(), []byte("dstack v0.6.1")) {
 		t.Fatal("plaintext on the wire")
 	}
-	conn.Token = "nope"
+	conn, _ = agentclient.New(srv.URL, base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32)), id.MarshalPublicKey())
 	if err := conn.Search(context.Background(), proto.SearchRequest{Query: "q", Decision: proto.SearchOnce}, func(proto.Event) {}); err == nil ||
 		!strings.Contains(err.Error(), "401") {
-		t.Fatalf("wrong token: %v", err)
+		t.Fatalf("another relay key: %v", err)
 	}
 	other, _ := ehbpidentity.NewIdentity()
-	conn, _ = agentclient.New(srv.URL, "tok", other.MarshalPublicKey())
+	conn, _ = agentclient.New(srv.URL, testRelaySeed, other.MarshalPublicKey())
 	if err := conn.Search(context.Background(), proto.SearchRequest{Query: "q", Decision: proto.SearchOnce}, func(proto.Event) {}); err == nil {
 		t.Fatal("a body encrypted to another key ran")
 	}
@@ -357,9 +359,8 @@ func TestSearchTokenEHBPAndSlots(t *testing.T) {
 		},
 	} {
 		r, _ := http.NewRequest("POST", srv.URL+"/search", strings.NewReader(`{"query":"q","decision":"once"}`))
-		r.Header.Set("Authorization", "Bearer tok")
 		mk(r)
-		res, err := http.DefaultClient.Do(r)
+		res, err := good.Plain().Do(r)
 		if err != nil || res.StatusCode != 400 {
 			t.Fatalf("%s: %v %d", name, err, res.StatusCode)
 		}
@@ -375,7 +376,7 @@ func TestSearchTokenEHBPAndSlots(t *testing.T) {
 	h := e.s.searchGuard(inner)
 	do := func() int {
 		r := httptest.NewRequest("POST", "/search", strings.NewReader("x"))
-		r.Header.Set("Authorization", "Bearer tok")
+		r = asRelay(r)
 		r.Header.Set("Ehbp-Encapsulated-Key", "x")
 		r.Header.Set("X-Agent-User", "abcdef0123456789")
 		w := httptest.NewRecorder()

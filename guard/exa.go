@@ -75,10 +75,10 @@ func (e *exa) Search(ctx context.Context, query string, count int) ([]SearchResu
 		return nil, err
 	}
 	defer key.Wipe()
-	// moderation: Exa's "filter unsafe content" (default off). Checked 2026-10-18 with made-up queries: an outright
-	// pornographic query is refused (403 CONTENT_FILTER_ERROR); a milder one ("explicit nude photos") still returns
-	// some adult and erotic sites, fewer than without it. Not as strict as Brave's safesearch.
-	body, _ := json.Marshal(exaRequest{Query: query, NumResults: count, Type: exaType, Moderation: true,
+	// moderation: Exa's "filter unsafe content", off (Exa's default). Tacy adds no content blocking of its own
+	// either. On since v0.8.10, it refused an outright pornographic query (403 CONTENT_FILTER_ERROR)
+	// and thinned adult sites from milder ones (checked 2026-10-18). Sent as false so the body says so.
+	body, _ := json.Marshal(exaRequest{Query: query, NumResults: count, Type: exaType, Moderation: false,
 		Contents: exaContents{Highlights: exaHighlights{MaxCharacters: exaHighlightChars}}})
 	req, _ := http.NewRequestWithContext(ctx, "POST", e.base, strings.NewReader(string(body)))
 	req.Header.Set("Content-Type", "application/json")

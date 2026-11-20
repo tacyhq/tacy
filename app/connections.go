@@ -1,16 +1,20 @@
 package main
 
 import (
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"log"
 	"net/http"
+	"strconv"
 	"time"
 
 	ehbpidentity "github.com/tinfoilsh/encrypted-http-body-protocol/identity"
 
 	"github.com/tacyhq/tacy/guard"
+	"github.com/tacyhq/tacy/identity"
 	"github.com/tacyhq/tacy/runauth"
+	"github.com/tacyhq/tacy/trigger"
 	"github.com/tacyhq/tacy/vault"
 )
 
@@ -23,12 +27,14 @@ import (
 //	POST /connections/list    {where and who} -> {seal_key, connections}
 //	POST /connections/put     {where and who, connection, sealed} -> {connection, state, read_only, provider, address, host, port, security, folders, connected_at}
 //	POST /connections/remove  {where and who, connection} -> {connection, state}
+//	POST /connections/forget  {forgets: [{space, identity, signed_at, sig}]} -> {done: ["s_…"], refused}  (the relay's)
 
-// connectionRoutes serves the routes on mux behind EHBP with id.
+// connectionRoutes serves the routes on mux behind EHBP with id, and the relay's forget (plaintext in its envelope).
 func (s *server) connectionRoutes(mux *http.ServeMux, id *ehbpidentity.Identity) {
 	for path, h := range map[string]http.HandlerFunc{"list": s.connList, "put": s.connPut, "remove": s.connRemove} {
 		mux.Handle("POST /connections/"+path, s.taskGuard(false, false, id.Middleware()(h)))
 	}
+	mux.HandleFunc("POST /connections/forget", s.connForget)
 }
 
 // connView is a connection as the browser gets it: never a password.
@@ -130,6 +136,12 @@ func (s *server) connPut(w http.ResponseWriter, r *http.Request) {
 		fail(w, 503, "unavailable")
 		return
 	}
+	// The identity holds the space (as at a schedule's install): what a deleted account's forget is checked against.
+	if err := s.holders.PutHolder(trigger.Holder{Space: who.Space, Identity: who.Identity, Key: who.Key, Seal: who.Seal,
+		At: time.Now().UTC()}); err != nil {
+		fail(w, 500, "store_unavailable")
+		return
+	}
 	sealed := req.Sealed
 	res := c.Conn(r.Context(), &guard.ConnRequest{Op: "put", Space: who.Space, Connection: req.Connection, Sealed: &sealed})
 	if res.Error != nil {
@@ -176,4 +188,110 @@ func (s *server) connRemove(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("connections: an email account was disconnected")
 	writeJSON(w, 200, map[string]string{"connection": req.Connection, "state": "removed"})
+}
+
+// ---- account deletion: the relay's forget ------------------------------------------------------------------------
+
+// Deleting the account (v0.21.0; the connections contract "Account deletion"). After it nothing can sign a remove,
+// and a connection kept in the sealed state would stay usable on the VM with no expiry. So the browser signs one
+// forget before the account goes, with the space holder's identity key (no VM call: it may be stopped, or agents or
+// email connections switched off), and the Worker keeps it, written in the deletion's own batch, until the VM took
+// it: its cron hands it over in its signed envelope every minute the VM is up (with the VM off, in the next boot's
+// first minute). As with a collected scheduled result (handoff.go), the delete is the person's (the keys plan §3.4): it is
+// checked here against the identity key the space's holder proved (recorded at a connect or a schedule's install),
+// never taken on the relay's word. A relay can withhold a forget, not make one up.
+//
+// The signature: Ed25519 over "tacy/v2/connection-forget\n<space>\n<identity>\n<signed_at>" (decimal ms). It removes
+// every connection of the space connected before signed_at plus a day (a slow browser clock still covers the one it
+// means; a forget kept from a deletion that didn't go through can't remove a connection made more than a day later).
+// A space with no connection is done without a check: nothing is removed, and the relay learns nothing it doesn't see
+// already (it relays the connect calls).
+
+const (
+	connForgetLabel = "tacy/v2/connection-forget"
+	connForgetSlack = 24 * time.Hour
+	maxConnForgets  = 50
+)
+
+// connForgetMessage is what the space holder's identity key signs for a forget.
+func connForgetMessage(space, ident string, signedAt int64) []byte {
+	return []byte(connForgetLabel + "\n" + space + "\n" + ident + "\n" + strconv.FormatInt(signedAt, 10))
+}
+
+type connForgetEntry struct {
+	Space    string `json:"space"`
+	Identity string `json:"identity"`
+	SignedAt int64  `json:"signed_at"`
+	Sig      []byte `json:"sig"`
+}
+
+type connForgetRequest struct {
+	Forgets []connForgetEntry `json:"forgets"`
+}
+
+// connForget: POST /connections/forget, the relay's cron. done: the spaces with no connection from before their
+// forget any more (the relay drops those); the rest it sends again later (refused: a signature that isn't by a holder
+// of the space).
+func (s *server) connForget(w http.ResponseWriter, r *http.Request) {
+	if !s.authorized(r) {
+		fail(w, 401, "unauthorized")
+		return
+	}
+	var req connForgetRequest
+	if !readCall(w, r, 64<<10, &req) {
+		return
+	}
+	bad := len(req.Forgets) > maxConnForgets
+	for _, f := range req.Forgets {
+		bad = bad || !validSpace(f.Space) || !runauth.IsID(f.Identity, "i") || f.SignedAt <= 0 || len(f.Sig) != ed25519.SignatureSize
+	}
+	if bad {
+		failDetail(w, 400, "bad_request", `body must be {"forgets": [{"space", "identity", "signed_at", "sig"}]}, at most 50`)
+		return
+	}
+	c := s.conns()
+	if c == nil || s.holders == nil {
+		fail(w, 503, "unavailable")
+		return
+	}
+	done, refused := []string{}, 0
+	for _, f := range req.Forgets {
+		res := c.Conn(r.Context(), &guard.ConnRequest{Op: "list", Space: f.Space})
+		if res.Error != nil {
+			continue // asked again on the relay's next call
+		}
+		if len(res.Connections) == 0 {
+			done = append(done, f.Space)
+			continue
+		}
+		h, err := s.holders.Holder(f.Space, f.Identity)
+		if err != nil {
+			continue
+		}
+		var key ed25519.PublicKey
+		if h != nil {
+			key, _ = identity.ParseKey(h.Key)
+		}
+		if key == nil || !ed25519.Verify(key, connForgetMessage(f.Space, f.Identity, f.SignedAt), f.Sig) {
+			refused++
+			continue
+		}
+		until := time.UnixMilli(f.SignedAt).Add(connForgetSlack)
+		ok := true
+		for _, ci := range res.Connections {
+			if ci.ConnectedAt.After(until) {
+				continue
+			}
+			if rr := c.Conn(r.Context(), &guard.ConnRequest{Op: "remove", Space: f.Space, Connection: ci.Connection}); rr.Error != nil {
+				ok = false
+			}
+		}
+		if ok {
+			done = append(done, f.Space)
+		}
+	}
+	if len(req.Forgets) > 0 {
+		log.Printf("connections: %d forgets of deleted accounts, %d done, %d refused", len(req.Forgets), len(done), refused) // no ids
+	}
+	writeJSON(w, 200, map[string]any{"done": done, "refused": refused})
 }

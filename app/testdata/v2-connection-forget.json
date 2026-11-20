@@ -1,0 +1,15 @@
+{
+  "format": "tacy-golden-connection-forget",
+  "constants": {
+    "labels": {
+      "forget": "tacy/v2/connection-forget"
+    }
+  },
+  "seed": "DAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAw=",
+  "identity_key": "ed25519:C1E62bSSQBXKCQLtB5BE06xdvsIwbwaUjBDajrbjny0=",
+  "space": "s_aaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "identity": "i_ccccccccccccccccccccccccca",
+  "signed_at": 1795000000123,
+  "message": "tacy/v2/connection-forget\ns_aaaaaaaaaaaaaaaaaaaaaaaaaa\ni_ccccccccccccccccccccccccca\n1795000000123",
+  "sig": "T+DJGanv/uFzMhr1UVsIXMCajJjC4ugqv2LdRq0g0DQpMU8y4RhppJg2BDmu+85GfepEZuksqfD4jX00BwfWBQ=="
+}

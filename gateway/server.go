@@ -14,6 +14,7 @@ import (
 	"github.com/tacyhq/tacy/harness"
 	"github.com/tacyhq/tacy/proto"
 	"github.com/tacyhq/tacy/safety"
+	"github.com/tacyhq/tacy/vault"
 )
 
 // Server is gatewayd's side: it serves task sessions on G, this process's guard (the model gateway and the web
@@ -24,6 +25,8 @@ type Server struct {
 	// here, and OnDocs is told when something changed (gatewayd passes them on to the vault).
 	Safety *safety.State
 	OnDocs func()
+	// Secrets passes a secrets op to the vault (gatewayd: vault.Client.Secrets); nil: unavailable.
+	Secrets func(context.Context, *vault.SecretsCall) *vault.SecretsAnswer
 }
 
 // apply takes signed documents from agentd: each is checked against gatewayd's own pinned keys and floors.
@@ -117,6 +120,20 @@ func (s *Server) serve(c net.Conn) {
 		cancel()
 		c.SetWriteDeadline(time.Now().Add(10 * time.Second))
 		writeFrame(c, &frame{T: tResult, ConnResult: res})
+		return
+	}
+	if open.T == tSecrets {
+		if open.Secrets == nil {
+			return
+		}
+		res := &vault.SecretsAnswer{Error: "unavailable"}
+		if s.Secrets != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			res = s.Secrets(ctx, open.Secrets)
+			cancel()
+		}
+		c.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		writeFrame(c, &frame{T: tResult, SecretsResult: res})
 		return
 	}
 	if open.T != tOpen || !validID(open.Task) {

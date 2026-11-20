@@ -23,7 +23,7 @@ import (
 // the retired images and sets (dstack-0.5.9 and older); TestRetiredImagesRefused shows the default policy refuses
 // them.
 var offline = Policy{AllowStaleTCB: true, VerifyQuote: func(_ context.Context, raw []byte) (*tdx.Quote, error) { return tdx.Parse(raw) },
-	ProdImages: allImages(), Boot: allSets(), KMSRoots: allKMSRoots()}
+	ProdImages: allImages(), Boot: allSets(), KMSRoots: allKMSRoots(), PreLaunch: RetiredPreLaunchScripts, legacy: true}
 
 // allKMSRoots are the pinned and the retired KMS roots (offline accepts both; TestKMSRoots shows the default refuses
 // the retired one).
@@ -318,7 +318,7 @@ func TestRecordedOnline(t *testing.T) {
 	}
 	// The newest recording (dstack-0.6.4, retired since 2026-11-20, so allowed here) until a 0.6.5 one is recorded.
 	a, nonce, compose := load064(t)
-	res, err := Verify(context.Background(), a, nonce, Policy{Compose: compose, ProdImages: allImages(), Boot: allSets()})
+	res, err := Verify(context.Background(), a, nonce, Policy{Compose: compose, ProdImages: allImages(), Boot: allSets(), PreLaunch: RetiredPreLaunchScripts, legacy: true})
 	if err != nil || res.HPKEPublicKey == nil {
 		t.Fatalf("the 0.6.4 recording, online: %v", err)
 	}
@@ -358,7 +358,7 @@ func TestImageComposeOffline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(res.Checks) != 17 || res.Checks[16].Name != ImagesCheck || hex.EncodeToString(res.HPKEPublicKey) != a.HPKEPublicKey {
+	if len(res.Checks) != 18 || res.Checks[17].Name != ImagesCheck || hex.EncodeToString(res.HPKEPublicKey) != a.HPKEPublicKey {
 		t.Fatalf("%d checks, last %q", len(res.Checks), res.Checks[len(res.Checks)-1].Name)
 	}
 	for _, svc := range []string{"setup", "agentd", "runner", "agentvm", "vaultd"} {
@@ -369,8 +369,8 @@ func TestImageComposeOffline(t *testing.T) {
 	// The brain in gVisor (since v0.4.0): the runner's image is pinned like the others, and its sandbox is a fact.
 	if !strings.HasPrefix(res.Facts["image runner"], "ghcr.io/tacyhq/tacy/runnerd@sha256:") || res.Facts["image brain"] != "" ||
 		!strings.HasSuffix(res.Facts["brain sandbox"], "(systrap, rootless runsc), no network") || len(res.Facts["gvisor runsc sha256"]) != 64 ||
-		!strings.Contains(res.Checks[16].Detail, "the brain in gVisor "+res.Facts["gvisor release"]) {
-		t.Errorf("runner facts %v, detail %q", res.Facts, res.Checks[16].Detail)
+		!strings.Contains(res.Checks[17].Detail, "the brain in gVisor "+res.Facts["gvisor release"]) {
+		t.Errorf("runner facts %v, detail %q", res.Facts, res.Checks[17].Detail)
 	}
 	// The same VM with one image's digest swapped for a tag: compose-hash and RTMR3 consistent again, and refused
 	// by the image rule even with that compose expected.
@@ -539,7 +539,7 @@ func TestRelease(t *testing.T) {
 		t.Fatal(err)
 	}
 	if res.Facts["release"] != "v0.3.1" || res.Facts["docker compose sha256"] != hex.EncodeToString(sum[:]) || res.HPKEPublicKey == nil ||
-		len(res.Checks) != 17 || res.Checks[16].Name != ImagesCheck || !strings.HasPrefix(res.Facts["image agentd"], "ghcr.io/tacyhq/tacy/agentd@sha256:") {
+		len(res.Checks) != 18 || res.Checks[17].Name != ImagesCheck || !strings.HasPrefix(res.Facts["image agentd"], "ghcr.io/tacyhq/tacy/agentd@sha256:") {
 		t.Fatalf("facts %v", res.Facts)
 	}
 	// A signed release whose compose builds on the VM (the recording's own, as before v0.2.0): the signature holds,
@@ -636,7 +636,7 @@ func set064(t *testing.T) *BootMeasurement {
 // pinned set (computed with dstack-mr before any VM booted it). It was on Phala's new KMS root (prod5, 2026-11-15).
 func TestRecorded064Offline(t *testing.T) {
 	a, nonce, compose := load064(t)
-	p := Policy{AllowStaleTCB: true, VerifyQuote: offline.VerifyQuote, Compose: compose, ProdImages: allImages(),
+	p := Policy{AllowStaleTCB: true, VerifyQuote: offline.VerifyQuote, Compose: compose, legacy: true, PreLaunch: RetiredPreLaunchScripts, ProdImages: allImages(),
 		Boot: allSets()}
 	res, err := Verify(context.Background(), a, nonce, p)
 	if err != nil {
@@ -836,7 +836,7 @@ func TestKMSRoots(t *testing.T) {
 		}
 	}
 	a, nonce, compose := load064(t)
-	p := Policy{AllowStaleTCB: true, VerifyQuote: offline.VerifyQuote, Compose: compose, ProdImages: allImages(),
+	p := Policy{AllowStaleTCB: true, VerifyQuote: offline.VerifyQuote, Compose: compose, legacy: true, PreLaunch: RetiredPreLaunchScripts, ProdImages: allImages(),
 		Boot: allSets()}
 	res, err := Verify(context.Background(), a, nonce, p)
 	if err != nil || res.Facts["KMS root"] != KMSRoots[newRoot] {
@@ -858,7 +858,7 @@ func TestKMSRoots(t *testing.T) {
 	} {
 		a, nonce, compose := load064(t)
 		rtmr3 := setEvent(t, a, "key-provider", []byte(c.payload))
-		p := Policy{AllowStaleTCB: true, Compose: compose, ProdImages: allImages(), Boot: allSets(),
+		p := Policy{AllowStaleTCB: true, Compose: compose, legacy: true, PreLaunch: RetiredPreLaunchScripts, ProdImages: allImages(), Boot: allSets(),
 			VerifyQuote: changeQuote(func(q *tdx.Quote) { q.Rtmrs[3] = rtmr3 })}
 		res, err := Verify(context.Background(), a, nonce, p)
 		if err == nil || !strings.HasPrefix(err.Error(), KMSCheck+": ") || !strings.Contains(err.Error(), c.want) ||

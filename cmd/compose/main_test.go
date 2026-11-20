@@ -79,19 +79,78 @@ type service struct {
 	MemLimit     string   `yaml:"mem_limit"`
 	MemswapLimit string   `yaml:"memswap_limit"`
 	PidsLimit    int      `yaml:"pids_limit"`
+	Logging      struct {
+		Driver string `yaml:"driver"`
+	} `yaml:"logging"`
+}
+
+type volume struct {
+	DriverOpts map[string]string `yaml:"driver_opts"`
 }
 
 func services(t *testing.T) map[string]service {
+	s, _ := composeDoc(t)
+	return s
+}
+
+func composeDoc(t *testing.T) (map[string]service, map[string]volume) {
 	var doc struct {
 		Services map[string]service `yaml:"services"`
-		Volumes  map[string]any     `yaml:"volumes"`
+		Volumes  map[string]volume  `yaml:"volumes"`
 	}
 	dec := yaml.NewDecoder(bytes.NewReader(readCompose(t)))
 	dec.KnownFields(true)
 	if err := dec.Decode(&doc); err != nil {
 		t.Fatal(err)
 	}
-	return doc.Services
+	return doc.Services, doc.Volumes
+}
+
+// Nothing a provider's key protects (the keys plan, v0.20.0): no environment variable from the deployer (no ${…} at all),
+// no volume on the disk (every volume a tmpfs), no container logs (logging none on every service).
+func TestComposeNothingOnTheDisk(t *testing.T) {
+	out := string(readCompose(t))
+	if strings.Contains(out, "${") {
+		t.Error("compose.yaml takes a variable from the deployer")
+	}
+	svcs, vols := composeDoc(t)
+	for name, s := range svcs {
+		if s.Logging.Driver != "none" {
+			t.Errorf("%s: logging %q", name, s.Logging.Driver)
+		}
+		for k, v := range s.Environment {
+			if k != "HOME" || v != "/tmp" || name != "agentvm" {
+				t.Errorf("%s: env %s", name, k)
+			}
+		}
+		for _, v := range s.Volumes {
+			src := strings.SplitN(v, ":", 2)[0]
+			if strings.HasPrefix(src, "/") {
+				if src != "/var/run/dstack.sock" || name != "agentd" {
+					t.Errorf("%s: host path %s", name, v)
+				}
+			} else if _, ok := vols[src]; !ok {
+				t.Errorf("%s: volume %s isn't declared", name, src)
+			}
+		}
+	}
+	if len(vols) != len(socketVolumes) {
+		t.Errorf("%d volumes, want only the %d socket directories", len(vols), len(socketVolumes))
+	}
+	for name, v := range vols {
+		if v.DriverOpts["type"] != "tmpfs" || v.DriverOpts["device"] != "tmpfs" || !strings.HasPrefix(v.DriverOpts["o"], "size=1m,") {
+			t.Errorf("volume %s isn't a tmpfs: %v", name, v.DriverOpts)
+		}
+	}
+	for _, flag := range []string{"-storage", "-conn-file"} {
+		if strings.Contains(out, `"`+flag+`"`) {
+			t.Errorf("compose.yaml still has %s", flag)
+		}
+	}
+	gw := " " + strings.Join(svcs["agentvm"].Command, " ") + " "
+	if !strings.Contains(gw, " -search-provider "+searchProvider+" ") || !strings.Contains(gw, " -pushed-keys "+strings.Join(pushedKeys, ",")+" ") {
+		t.Errorf("gatewayd: %s", gw)
+	}
 }
 
 // The process layout (docs/21, docs/22): only gatewayd (service agentvm) has a network; agentd, the runner (the
@@ -136,13 +195,10 @@ func TestComposeLayout(t *testing.T) {
 		if (len(s.CapAdd) > 0) != (name == "setup") {
 			t.Errorf("%s: cap_add %v", name, s.CapAdd)
 		}
-		for _, env := range []string{"TINFOIL_API_KEY", "TAVILY_API_KEY", "BRAVE_SEARCH_API_KEY", "EXA_API_KEY"} {
-			if (s.Environment[env] == "${"+env+"}") != (name == "vaultd") {
-				t.Errorf("%s: %s", name, env)
+		for _, env := range []string{"TINFOIL_API_KEY", "TAVILY_API_KEY", "BRAVE_SEARCH_API_KEY", "EXA_API_KEY", "AGENT_VM_TOKEN", "SEARCH_PROVIDER"} {
+			if _, ok := s.Environment[env]; ok {
+				t.Errorf("%s: %s in the env (keys arrive by push)", name, env)
 			}
-		}
-		if (s.Environment["AGENT_VM_TOKEN"] != "") != (name == "agentd") {
-			t.Errorf("%s: AGENT_VM_TOKEN", name)
 		}
 		for _, v := range s.Volumes {
 			if strings.Contains(v, "dstack.sock") && name != "agentd" {
@@ -174,19 +230,16 @@ func TestComposeLayout(t *testing.T) {
 	if strings.Join(agentd.GroupAdd, ",") != gatewaydUID {
 		t.Errorf("agentd's groups %v", agentd.GroupAdd)
 	}
-	// agentd's queue directory and runnerd's socket directory, set by setup.
-	if !strings.Contains(strings.Join(agentd.Command, " "), "-storage /state/agentd ") ||
-		!strings.Contains(strings.Join(agentd.Command, " "), "-runner-socket /run/tacy/runner/runner.sock ") ||
-		!strings.Contains(setup, "-tree /state/agentd="+agentdUID+":"+agentdUID+":0700") ||
+	// The socket directories, set by setup (and by their tmpfs options).
+	if !strings.Contains(strings.Join(agentd.Command, " "), "-runner-socket /run/tacy/runner/runner.sock ") ||
 		!strings.Contains(setup, "-dir /run/tacy/runner="+runnerdUID+":"+agentdUID+":0750") ||
 		!strings.Contains(setup, "-dir /run/tacy/agent="+agentdUID+":"+gatewaydUID+":0770") ||
-		!strings.Contains(setup, "-dir /run/tacy/vault="+vaultdUID+":"+gatewaydUID+":0750") ||
-		!strings.Contains(setup, "-remove /state/queue.db ") {
+		!strings.Contains(setup, "-dir /run/tacy/vault="+vaultdUID+":"+gatewaydUID+":0750") {
 		t.Errorf("setup: %s", setup)
 	}
 	// Each socket directory is mounted only by its two containers (and setup).
 	for vol, who := range map[string]string{"agentsock": "agentd agentvm setup", "vaultsock": "agentvm setup vaultd",
-		"runnersock": "agentd runner setup", "state": "agentd setup"} {
+		"runnersock": "agentd runner setup"} {
 		var got []string
 		for _, name := range []string{"agentd", "agentvm", "runner", "setup", "vaultd"} {
 			for _, v := range byName[name].Volumes {

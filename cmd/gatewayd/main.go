@@ -26,6 +26,7 @@ import (
 	"os"
 	"runtime/debug"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -50,6 +51,8 @@ func main() {
 	// Test only: cmd/e2e's overlay is the only thing that sets it (a release compose never does, and the attested
 	// compose hash covers the command line, so the verifier would see another compose).
 	modelFault := flag.String("e2e-model-fault", "", "e2e test only: <model>=slow|overloaded,... makes calls to those models slow (no byte before the slow threshold) or answer 503 overloaded")
+	searchProvider := flag.String("search-provider", "", "exa | tavily | brave (empty: by the keys set)")
+	pushedKeys := flag.String("pushed-keys", "", "comma-separated names of the keys the chat Worker pushes to vaultd after boot (vault/secrets.go): the search provider is chosen as if they were set")
 	var sf safety.Flags
 	sf.Register(flag.CommandLine)
 	flag.Parse()
@@ -100,7 +103,9 @@ func main() {
 	if len(faults) > 0 {
 		log.Printf("gatewayd: E2E TEST MODEL FAULTS ON (never in a release): %v", faults)
 	}
-	search := guard.NewSearch(os.Getenv("SEARCH_PROVIDER"), func(n string) bool { return slices.Contains(names, n) }, lease)
+	// The keys arrive by push after boot (none is set yet when this runs): the compose names the ones that will.
+	pushed := strings.Split(*pushedKeys, ",")
+	search := guard.NewSearch(*searchProvider, func(n string) bool { return slices.Contains(names, n) || slices.Contains(pushed, n) }, lease)
 	fetcher := guard.NewFetcher(false)
 	lim := guard.DefaultLimits
 	var logMu sync.Mutex
@@ -164,7 +169,7 @@ func main() {
 		}
 		go pullSafety(*safetyURL, *keylogURL, *safetyEvery, *forward)
 	}
-	log.Fatal((&gateway.Server{G: g, Safety: st}).Serve(l, *agentUID))
+	log.Fatal((&gateway.Server{G: g, Safety: st, Secrets: vc.Secrets}).Serve(l, *agentUID))
 }
 
 // forwardPort copies each inbound connection on addr to and from agentd's HTTP socket. The bytes aren't read:

@@ -5,6 +5,7 @@
 //	go run ./cmd/safetysign keygen DIR NAME            # DIR/NAME.key (private, base64 seed), prints the public key
 //	go run ./cmd/safetysign sign -key K policy.json    # a policy (JSON, checked first) -> signed envelope on stdout
 //	go run ./cmd/safetysign sign -key K -kind stop stop.json
+//	go run ./cmd/safetysign sign -key K -kind trust-list list.json   # the agent VM trust list (safety.TrustList)
 //	go run ./cmd/safetysign heartbeat -key K [-ttl 15m] [-all]   # the operator's list: seq = now in ms
 //	go run ./cmd/safetysign stop -key K -firm f_chat [-seq N] [-space s_… | -all]   # the firm's own stop list
 //
@@ -60,7 +61,7 @@ func main() {
 	}
 	fs := flag.NewFlagSet(os.Args[1], flag.ExitOnError)
 	keyPath := fs.String("key", "", "private key file")
-	kind := fs.String("kind", safety.KindPolicy, "sign: policy | stop; keylog-sign: the entry kind of a payload")
+	kind := fs.String("kind", safety.KindPolicy, "sign: policy | stop | trust-list; keylog-sign: the entry kind of a payload")
 	ttl := fs.Duration("ttl", 15*time.Minute, "heartbeat: lifetime (at most 1 h)")
 	all := fs.Bool("all", false, "heartbeat: stop everything; stop: the whole firm")
 	firm := fs.String("firm", "f_chat", "stop: the firm")
@@ -120,6 +121,14 @@ func main() {
 			var l safety.StopList
 			if err := json.Unmarshal(b, &l, json.RejectUnknownMembers(true)); err != nil {
 				die("stop list: %v", err)
+			}
+			if err := l.Validate(); err != nil {
+				die("%v", err)
+			}
+		case safety.KindTrustList:
+			var l safety.TrustList
+			if err := json.Unmarshal(b, &l, json.RejectUnknownMembers(true)); err != nil {
+				die("trust list: %v", err)
 			}
 			if err := l.Validate(); err != nil {
 				die("%v", err)

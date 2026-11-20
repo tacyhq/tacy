@@ -12,6 +12,7 @@ import (
 	"github.com/tacyhq/tacy/harness"
 	"github.com/tacyhq/tacy/proto"
 	"github.com/tacyhq/tacy/safety"
+	"github.com/tacyhq/tacy/vault"
 )
 
 // Client is agentd's side: a guard.Gateway whose guard is gatewayd, over its socket. The runtime calls it for the
@@ -100,6 +101,26 @@ func (c *Client) Conn(ctx context.Context, r *guard.ConnRequest) *guard.ConnResu
 }
 
 var _ guard.Connections = (*Client)(nil)
+
+// Secrets passes a secrets op (vault/secrets.go) to gatewayd, which passes it to vaultd: a connection's only frame.
+func (c *Client) Secrets(ctx context.Context, call *vault.SecretsCall) *vault.SecretsAnswer {
+	fail := &vault.SecretsAnswer{Error: "unavailable"}
+	var d net.Dialer
+	nc, err := d.DialContext(ctx, "unix", c.Path)
+	if err != nil {
+		return fail
+	}
+	defer nc.Close()
+	nc.SetDeadline(time.Now().Add(20 * time.Second))
+	if err := writeFrame(nc, &frame{T: tSecrets, Version: Version, Secrets: call}); err != nil {
+		return fail
+	}
+	var f frame
+	if err := readFrame(nc, &f); err != nil || f.T != tResult || f.SecretsResult == nil {
+		return fail
+	}
+	return f.SecretsResult
+}
 
 // ReplaySafe: as the guard's (it depends on the request only).
 func (c *Client) ReplaySafe(_ *harness.TaskInfo, req any) bool { return guard.ReplaySafe(req) }

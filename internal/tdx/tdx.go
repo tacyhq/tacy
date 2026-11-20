@@ -139,13 +139,32 @@ func runtimeDigest(e Event) ([]byte, error) {
 type Runtime struct {
 	RTMR3  []byte
 	Events []Event
-	Values map[string]string // event name -> payload (hex), last one wins
+	// Values holds the boot-time events only: those dstack's guest measured before "system-ready", name -> payload
+	// (hex), each the one and only event of its name (see bootValues).
+	Values map[string]string
 }
 
-// ReplayRTMR3 replays the imr=3 events from 48 zero bytes. Earlier IMRs come from the host and aren't trusted.
+// SystemReady is the event dstack's guest (dstack-util) measures last, when it has set the system up and before it
+// starts the app. Events after it are the app's: any root process in the CVM can extend RTMR3 and append to the log
+// (dstack-util extend, the TDX guest device), so a value read past it is whatever the app chose.
+const SystemReady = "system-ready"
+
+// systemEvents are the names dstack's guest measures into RTMR3 while it boots (dstack-util system_setup.rs, 0.5 to
+// 0.6.5). Their values are trusted only before SystemReady; one of these names after it is a forgery attempt.
+var systemEvents = map[string]bool{
+	"system-preparing": true, "app-id": true, "compose-hash": true, "init-script-hash": true, "gpu-policy-hash": true,
+	"instance-id": true, "boot-mr-done": true, "mr-kms": true, "os-image-hash": true, "key-provider": true,
+	"gpu-attestation": true, "storage-fs": true, "storage-encrypted": true, "rootfs-hash": true, SystemReady: true,
+}
+
+// repeatable boot events: dstack measures one init-script-hash per init script, in order.
+var repeatable = map[string]bool{"init-script-hash": true}
+
+// ReplayRTMR3 replays the imr=3 events from 48 zero bytes (the whole log: it must equal the quote's RTMR3) and reads
+// the boot-time values. Earlier IMRs come from the host and aren't trusted.
 func ReplayRTMR3(eventLog []Event) (*Runtime, error) {
 	mr := make([]byte, 48)
-	rt := &Runtime{Values: map[string]string{}}
+	rt := &Runtime{}
 	for _, e := range eventLog {
 		if e.IMR != 3 {
 			continue
@@ -162,13 +181,48 @@ func ReplayRTMR3(eventLog []Event) (*Runtime, error) {
 		h.Write(d)
 		mr = h.Sum(nil)
 		rt.Events = append(rt.Events, e)
-		rt.Values[e.Event] = e.EventPayload
 	}
+	v, err := bootValues(rt.Events)
+	if err != nil {
+		return nil, err
+	}
+	rt.Values = v
 	rt.RTMR3 = mr
 	return rt, nil
 }
 
-// CheckApp ties a quote to an app: RTMR3 replays to the quoted value and the compose-hash event equals
+// bootValues reads the RTMR3 events up to and including the first SystemReady, as dstack's own verifier does
+// (dstack-attest attestation.rs find_event: the first match, stopping at system-ready, "events after system-ready are
+// application-controlled"). Stricter than upstream, it refuses a log that has no SystemReady, a boot event measured
+// twice (except init-script-hash) and any system event name after SystemReady, so no reader can take a later value.
+func bootValues(events []Event) (map[string]string, error) {
+	values := map[string]string{}
+	ready := false
+	for _, e := range events {
+		if ready {
+			if systemEvents[e.Event] {
+				return nil, fmt.Errorf("event log: %q after %s (an app-measured event with a system event's name)", e.Event, SystemReady)
+			}
+			continue
+		}
+		if e.Event == SystemReady {
+			ready = true
+			continue
+		}
+		if _, dup := values[e.Event]; dup && !repeatable[e.Event] {
+			return nil, fmt.Errorf("event log: boot event %q measured twice", e.Event)
+		}
+		if _, seen := values[e.Event]; !seen {
+			values[e.Event] = e.EventPayload
+		}
+	}
+	if !ready {
+		return nil, fmt.Errorf("event log: no %s event (the VM hasn't finished booting)", SystemReady)
+	}
+	return values, nil
+}
+
+// CheckApp ties a quote to an app: RTMR3 replays to the quoted value and the boot-time compose-hash event equals
 // sha256(appCompose), where appCompose is dstack's app-compose.json bytes.
 func CheckApp(q *Quote, eventLog []Event, appCompose []byte) (*Runtime, error) {
 	rt, err := ReplayRTMR3(eventLog)

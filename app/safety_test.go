@@ -169,7 +169,7 @@ func newSafeEnvWith(t *testing.T, o safeOpts, replies ...string) *safeEnv {
 	}
 	t.Cleanup(cancel) // before runnertest's cleanup: the brains stop first
 	go sg.enforce(ctx, 200*time.Millisecond)
-	e.s = &server{platform: local{}, id: id, agent: rg, rt: rt, rec: e.rec, token: "tok", booted: time.Now(), sched: newScheduler(lim),
+	e.s = &server{platform: local{}, id: id, agent: rg, rt: rt, rec: e.rec, booted: time.Now(), sched: newScheduler(lim),
 		lim: lim, quotes: make(chan struct{}, 4), safety: st, gw: g, safetySlots: make(chan struct{}, 2)}
 	return e
 }

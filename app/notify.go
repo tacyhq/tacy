@@ -4,8 +4,6 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
-	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -15,6 +13,7 @@ import (
 	"github.com/tacyhq/tacy/guard"
 	"github.com/tacyhq/tacy/harness"
 	"github.com/tacyhq/tacy/runauth"
+	"github.com/tacyhq/tacy/safety"
 )
 
 // Run notifications (v0.15.0; the chat's Web Push relay is the other half): a content-free notice
@@ -53,7 +52,7 @@ const maxPendingSpaces = 10_000
 
 type notifier struct {
 	mu      sync.Mutex
-	path    string // "" in memory
+	persist safety.Persister // nil: memory only
 	on      map[string]bool
 	pending map[string]uint8
 }
@@ -62,18 +61,19 @@ type notifyFile struct {
 	On []string `json:"on"`
 }
 
-// openNotifier loads the spaces turned on from path ("" or missing: none).
-func openNotifier(path string) (*notifier, error) {
-	n := &notifier{path: path, on: map[string]bool{}, pending: map[string]uint8{}}
-	if path == "" {
+// openNotifier loads the spaces turned on from p (nil or nothing kept: none). Sealed and outside the VM on the CVM
+// (sealstate), never a file of its own.
+func openNotifier(p safety.Persister) (*notifier, error) {
+	n := &notifier{persist: p, on: map[string]bool{}, pending: map[string]uint8{}}
+	if p == nil {
 		return n, nil
 	}
-	b, err := os.ReadFile(path)
-	if os.IsNotExist(err) {
-		return n, nil
-	}
+	b, err := p.Load()
 	if err != nil {
 		return nil, err
+	}
+	if len(b) == 0 {
+		return n, nil
 	}
 	var f notifyFile
 	if err := json.Unmarshal(b, &f); err != nil {
@@ -85,9 +85,9 @@ func openNotifier(path string) (*notifier, error) {
 	return n, nil
 }
 
-// save writes the spaces turned on (n.mu held): a temporary file, then a rename.
+// save keeps the spaces turned on (n.mu held).
 func (n *notifier) save() error {
-	if n.path == "" {
+	if n.persist == nil {
 		return nil
 	}
 	f := notifyFile{On: make([]string, 0, len(n.on))}
@@ -99,14 +99,7 @@ func (n *notifier) save() error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(n.path), 0o700); err != nil {
-		return err
-	}
-	tmp := n.path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, n.path)
+	return n.persist.Save(b)
 }
 
 // Set turns notifications on or off for a space. Off drops its marks too.
@@ -269,7 +262,7 @@ type pendingRequest struct {
 	Spaces []string `json:"spaces"`
 }
 
-// notifyPending: POST /notify/pending, the relay's cron. Bearer token; plaintext (space ids the relay already knows,
+// notifyPending: POST /notify/pending, the relay's cron, in its signed envelope; plaintext (space ids the relay already knows,
 // and a kind).
 func (s *server) notifyPending(w http.ResponseWriter, r *http.Request) {
 	if !s.authorized(r) {

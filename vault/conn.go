@@ -2,6 +2,7 @@ package vault
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdh"
 	"crypto/hpke"
 	"crypto/rand"
@@ -11,8 +12,6 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
-	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -20,6 +19,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/tacyhq/tacy/safety"
+	"github.com/tacyhq/tacy/sealstate"
 )
 
 // Connections (v0.19.0): a person's own accounts, the first an email account read by IMAP
@@ -88,27 +88,27 @@ type connState struct {
 	pub     string
 	pending map[string]*conn
 	conns   map[string]*conn // space\x00connection
-	path    string           // "": memory only
+	persist Persister        // nil: memory only
 }
 
 func connKey(space, id string) string { return space + "\x00" + id }
 
-// EnableConns turns connections on: a fresh seal key for this boot, and the accounts kept in path ("": memory only;
-// a missing file is an empty store). A file that can't be read is an error: the vault doesn't start with someone's
-// accounts silently dropped.
-func (v *Vault) EnableConns(path string) error {
+// EnableConns turns connections on: a fresh seal key for this boot, and the accounts p keeps (nil: memory only;
+// never a file: SealedConns on the VM). Accounts that can't be read are an error: the vault doesn't start with
+// someone's accounts silently dropped.
+func (v *Vault) EnableConns(p Persister) error {
 	k, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
 		return err
 	}
-	return v.EnableConnsKey(path, k)
+	return v.EnableConnsKey(p, k)
 }
 
 // EnableConnsKey is EnableConns with a given seal key (the golden vectors' tests; vaultd always makes a fresh one).
-func (v *Vault) EnableConnsKey(path string, k *ecdh.PrivateKey) error {
+func (v *Vault) EnableConnsKey(p Persister, k *ecdh.PrivateKey) error {
 	cs := &connState{key: k, pub: "x25519:" + base64.StdEncoding.EncodeToString(k.PublicKey().Bytes()),
-		pending: map[string]*conn{}, conns: map[string]*conn{}, path: path}
-	if path != "" {
+		pending: map[string]*conn{}, conns: map[string]*conn{}, persist: p}
+	if p != nil {
 		if err := cs.load(); err != nil {
 			return err
 		}
@@ -512,17 +512,17 @@ type connEntry struct {
 }
 
 func (cs *connState) load() error {
-	b, err := os.ReadFile(cs.path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
+	b, err := cs.persist.Load()
 	if err != nil {
-		return fmt.Errorf("vault: connections file: %w", err)
+		return fmt.Errorf("vault: connections: %w", err)
+	}
+	if len(b) == 0 {
+		return nil
 	}
 	defer clear(b)
 	var f connFile
 	if err := json.Unmarshal(b, &f); err != nil || f.Version != 1 {
-		return errors.New("vault: connections file unreadable")
+		return errors.New("vault: connections unreadable")
 	}
 	for _, e := range f.Connections {
 		if !safety.ValidID(e.Space) || e.Connection != ConnEmail || !validHost(e.Host) || len(e.Password) == 0 {
@@ -533,9 +533,10 @@ func (cs *connState) load() error {
 	return nil
 }
 
-// save writes every kept connection (cs.mu held).
+// save keeps every connection (cs.mu held): the whole set, to the Persister (sealed under the key service's conn/v1
+// key and stored outside the VM: SealedConns). No persister: memory only.
 func (cs *connState) save() error {
-	if cs.path == "" {
+	if cs.persist == nil {
 		return nil
 	}
 	f := connFile{Version: 1, Connections: []connEntry{}}
@@ -553,39 +554,36 @@ func (cs *connState) save() error {
 		return err
 	}
 	defer clear(b)
-	tmp, err := os.CreateTemp(filepath.Dir(cs.path), ".connections-*")
-	if err != nil {
-		return err
-	}
-	name := tmp.Name()
-	ok := false
-	defer func() {
-		if !ok {
-			os.Remove(name)
-		}
-	}()
-	if err := tmp.Chmod(0o600); err != nil {
-		tmp.Close()
-		return err
-	}
-	if _, err := tmp.Write(b); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(name, cs.path); err != nil {
-		return err
-	}
-	ok = true
-	if d, err := os.Open(filepath.Dir(cs.path)); err == nil {
-		d.Sync()
-		d.Close()
-	}
-	return nil
+	return cs.persist.Save(b)
 }
+
+// SealedConns is the connections' Persister on the VM (the keys plan Stage D): the "connections" state of a sealstate
+// Store under connKey (the key service's conn/v1 purpose, never a provider's), loaded now, and the Keeper that saves
+// it (run it; flush on SIGTERM). A state there that doesn't open is an error: the vault doesn't start over people's
+// accounts silently.
+func SealedConns(ctx context.Context, b sealstate.Backend, connKey []byte, binding string, reg sealstate.Register) (Persister, *sealstate.Keeper, error) {
+	st, err := sealstate.New(b, connKey, binding)
+	if err != nil {
+		return nil, nil, err
+	}
+	if reg != nil { // the key service's generation register: no older set of accounts opens
+		st.WithRegister(reg)
+	}
+	loaded, err := st.Load(ctx, ConnState)
+	if err != nil {
+		return nil, nil, fmt.Errorf("vault: connections: %w", err)
+	}
+	slot := sealstate.NewSlot(loaded)
+	clear(loaded)
+	k := &sealstate.Keeper{Store: st}
+	if err := k.Add(ConnState, slot); err != nil {
+		return nil, nil, err
+	}
+	return slot, k, nil
+}
+
+// ConnState is the connections' sealed state name.
+const ConnState = "connections"
+
+// Persister keeps the connections across restarts (sealstate.Slot); nil: memory only.
+type Persister = safety.Persister

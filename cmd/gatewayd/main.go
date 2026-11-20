@@ -52,11 +52,26 @@ func main() {
 	// compose hash covers the command line, so the verifier would see another compose).
 	modelFault := flag.String("e2e-model-fault", "", "e2e test only: <model>=slow|overloaded,... makes calls to those models slow (no byte before the slow threshold) or answer 503 overloaded")
 	searchProvider := flag.String("search-provider", "", "exa | tavily | brave (empty: by the keys set)")
-	pushedKeys := flag.String("pushed-keys", "", "comma-separated names of the keys the chat Worker pushes to vaultd after boot (vault/secrets.go): the search provider is chosen as if they were set")
+	expectedKeys := flag.String("expected-keys", "", "comma-separated names of the keys vaultd gets from the key service after boot (vault/secrets.go): the search provider is chosen as if they were set")
+	var kmsURLs multiFlag
+	flag.Var(&kmsURLs, "kms-url", "a Tacy key service replica, https base URL (repeat, in order; the compose pins them): fixed calls from agentd and vaultd (gateway/fixed.go)")
+	stateURL := flag.String("state-url", "", "the chat Worker's https base URL: its sealed-state API for agentd and vaultd (gateway/fixed.go)")
+	opsSocket := flag.String("ops-socket", "", "a unix socket for vaultd's fixed calls (and nothing else)")
+	vaultUID := flag.Int("vault-uid", -1, "the only uid allowed to connect to -ops-socket (vaultd's); -1: no check")
+	devFixedHTTP := flag.Bool("dev-fixed-http", false, "local only: allow http:// fixed hosts (a development key service and Worker)")
+	dnsTLS := flag.String("dns-tls", "", "every DNS lookup over TLS to this resolver, <tls name>@<ip>:<port>[,<ip>:<port>] (gateway/dot.go; the compose pins it); empty: the system's resolver (local only)")
 	var sf safety.Flags
 	sf.Register(flag.CommandLine)
 	flag.Parse()
 	log.Printf("gatewayd: %s", procinfo.Line())
+	if *dnsTLS != "" { // before anything looks a name up
+		d, err := gateway.ParseDoT(*dnsTLS)
+		if err != nil {
+			log.Fatalf("gatewayd: %v", err)
+		}
+		gateway.UseDoT(d)
+		log.Printf("gatewayd: DNS over TLS to %s (%d addresses)", d.Name, len(d.Addrs))
+	}
 	if *socket == "" || *vaultSocket == "" {
 		log.Fatal("gatewayd: --socket and --vault-socket are required")
 	}
@@ -65,6 +80,21 @@ func main() {
 	}
 	if *memLimit > 0 {
 		debug.SetMemoryLimit(int64(*memLimit) << 20)
+	}
+	// The fixed hosts (the key service, the chat Worker's sealed-state API): served first, since vaultd's keys come
+	// through them.
+	fixed, err := gateway.NewFixed(kmsURLs, *stateURL, *devFixedHTTP)
+	if err != nil {
+		log.Fatalf("gatewayd: %v", err)
+	}
+	if *opsSocket != "" {
+		ol, err := gateway.Listen(*opsSocket, 0o660)
+		if err != nil {
+			log.Fatalf("gatewayd: %v", err)
+		}
+		go func() {
+			log.Fatal((&gateway.Server{Fixed: gateway.KMSGate{D: fixed, Holder: "vaultd", Purposes: gateway.VaultKMSPurposes}}).ServeOps(ol, *vaultUID))
+		}()
 	}
 
 	// The vault says which keys are set (names, never values): the search provider depends on it.
@@ -104,8 +134,8 @@ func main() {
 		log.Printf("gatewayd: E2E TEST MODEL FAULTS ON (never in a release): %v", faults)
 	}
 	// The keys arrive by push after boot (none is set yet when this runs): the compose names the ones that will.
-	pushed := strings.Split(*pushedKeys, ",")
-	search := guard.NewSearch(*searchProvider, func(n string) bool { return slices.Contains(names, n) || slices.Contains(pushed, n) }, lease)
+	expected := strings.Split(*expectedKeys, ",")
+	search := guard.NewSearch(*searchProvider, func(n string) bool { return slices.Contains(names, n) || slices.Contains(expected, n) }, lease)
 	fetcher := guard.NewFetcher(false)
 	lim := guard.DefaultLimits
 	var logMu sync.Mutex
@@ -169,7 +199,8 @@ func main() {
 		}
 		go pullSafety(*safetyURL, *keylogURL, *safetyEvery, *forward)
 	}
-	log.Fatal((&gateway.Server{G: g, Safety: st, Secrets: vc.Secrets}).Serve(l, *agentUID))
+	log.Fatal((&gateway.Server{G: g, Safety: st, Secrets: vc.Secrets,
+		Fixed: gateway.KMSGate{D: fixed, Holder: "agentd", Purposes: gateway.AgentKMSPurposes}}).Serve(l, *agentUID))
 }
 
 // forwardPort copies each inbound connection on addr to and from agentd's HTTP socket. The bytes aren't read:
@@ -207,3 +238,9 @@ func randomHex(n int) string {
 	rand.Read(b)
 	return hex.EncodeToString(b)
 }
+
+// multiFlag is a repeatable string flag.
+type multiFlag []string
+
+func (m *multiFlag) String() string     { return strings.Join(*m, ",") }
+func (m *multiFlag) Set(s string) error { *m = append(*m, s); return nil }

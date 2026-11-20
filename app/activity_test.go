@@ -202,7 +202,7 @@ func testActivityChain(t *testing.T, behindRunner bool) {
 		t.Fatalf("GET /activity without the token: %d", w.Code)
 	}
 	r := httptest.NewRequest("GET", "/activity?chain="+activity.ChainID(testSpace, to)+"&after=0", nil)
-	r.Header.Set("Authorization", "Bearer tok")
+	r = asRelay(r)
 	w = httptest.NewRecorder()
 	e.s.activityOut(w, r)
 	var got struct {

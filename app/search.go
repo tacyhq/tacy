@@ -29,7 +29,7 @@ import (
 //	              -> EHBP-encrypted SSE of proto.Event: meta, tool_call, tool_result (the reader's fields with [n]
 //	              sources, citations, quotes), favicon, metrics, activity, then done or error. As /run's.
 //
-// Same bearer token (cost) as /run; X-Agent-User is optional (the relay sends it: the per-user tool caps). It runs
+// Same relay envelope (cost) as /run; X-Agent-User is optional (the relay sends it: the per-user tool caps). It runs
 // no brain: agentd itself makes the task's one action with the person's grant, under the same checks as any search
 // (the policy and stop lists, the run's and the day's budgets reserved before it runs, the tool caps, gatewayd's own
 // permission check, the leak scan, the quarantined reader) and on the activity record (trigger "search"). Nothing
@@ -75,7 +75,7 @@ const picturesTimeout = 45 * time.Second
 //	              (runauth, v0.10.0); optional "X-Agent-User-Prev: <hex>" (the same person's
 //	              tag for the previous UTC day, v0.8.22)
 //	              -> EHBP-encrypted SSE of proto.Event: meta, image (under the run's calls, "for" its item), metrics,
-//	              activity, then done or error. Same token, slots and user tag as /search; nothing is kept.
+//	              activity, then done or error. Same envelope, slots and user tag as /search; nothing is kept.
 func (s *server) pictures(w http.ResponseWriter, r *http.Request) {
 	var req proto.PicturesRequest
 	body, err := io.ReadAll(io.LimitReader(r.Body, 16<<10))
@@ -163,7 +163,7 @@ func (s *server) pictures(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// searchGuard is the checks before EHBP decryption: token, encrypted body, user tag, a slot. Plaintext errors,
+// searchGuard is the checks before EHBP decryption: the relay's envelope, encrypted body, user tag, a slot. Plaintext errors,
 // carrying no request data.
 func (s *server) searchGuard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

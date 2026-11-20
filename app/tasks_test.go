@@ -153,7 +153,7 @@ func bootTasks(t *testing.T, path string, model http.Handler, fs *fakeSearch, ho
 	id, _ := ehbpidentity.NewIdentity()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	s := &server{platform: local{}, id: id, agent: g, rt: rt, token: "tok", booted: time.Now(), sched: newScheduler(lim), lim: lim,
+	s := &server{platform: local{}, id: id, agent: g, rt: rt, booted: time.Now(), sched: newScheduler(lim), lim: lim,
 		quotes: make(chan struct{}, 4), host: &guard.Host{RT: rt, GW: g, IDKey: []byte("the space's task-id key")}}
 	s.resumeTasks(ctx, ids, t.Logf)
 	// The brain connects only once the restored tasks are resumed, as in main.go: a brain already connected would
@@ -178,9 +178,9 @@ func connTo(t *testing.T, s *server, user string) *agentclient.Conn {
 	mux := http.NewServeMux()
 	s.taskRoutes(mux, s.id)
 	mux.Handle("POST /run", s.guard(s.id.Middleware()(http.HandlerFunc(s.run))))
-	srv := httptest.NewServer(mux)
+	srv := httptest.NewServer(s.relayed(mux))
 	t.Cleanup(srv.Close)
-	c, err := agentclient.New(srv.URL, "tok", s.id.MarshalPublicKey())
+	c, err := agentclient.New(srv.URL, testRelaySeed, s.id.MarshalPublicKey())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -719,12 +719,12 @@ func TestRunShimLeavesNothing(t *testing.T) {
 // The task calls need a user tag (the grant doesn't: its MAC is enough), a start needs a run secret (the later calls
 // carry a MAC with it), and one user can hold at most maxUserFollowers event streams of the 64.
 func TestTasksAuthAndStreamCaps(t *testing.T) {
-	s := &server{token: "tok"}
+	s := &server{}
 	reached := false
 	next := http.HandlerFunc(func(http.ResponseWriter, *http.Request) { reached = true })
 	call := func(needTag bool, tag string) int {
 		r := httptest.NewRequest("POST", "/tasks/status", strings.NewReader("x"))
-		r.Header.Set("Authorization", "Bearer tok")
+		r = asRelay(r)
 		r.Header.Set(ehbpproto.EncapsulatedKeyHeader, strings.Repeat("ab", 32))
 		if tag != "" {
 			r.Header.Set("X-Agent-User", tag)
@@ -818,7 +818,7 @@ func TestTasksBillingWitness(t *testing.T) {
 	}
 }
 
-// GET /tasks/open: the relay's bearer token only, and a count only.
+// GET /tasks/open: the relay's signed envelope only, and a count only.
 func TestTasksOpenEndpoint(t *testing.T) {
 	p := bootTasks(t, filepath.Join(t.TempDir(), "queue.db"), newStepModel(t, "block"), &fakeSearch{}, false)
 	mux := http.NewServeMux()
@@ -827,10 +827,10 @@ func TestTasksOpenEndpoint(t *testing.T) {
 		auth string
 		code int
 		body string
-	}{{"", 401, ""}, {"Bearer nope", 401, ""}, {"Bearer tok", 200, `{"open":0,"schedules":0,"next_run":null}`}} {
+	}{{"", 401, ""}, {"relayed", 200, `{"open":0,"schedules":0,"next_run":null}`}} {
 		r := httptest.NewRequest("GET", "/tasks/open", nil)
 		if tc.auth != "" {
-			r.Header.Set("Authorization", tc.auth)
+			r = asRelay(r)
 		}
 		w := httptest.NewRecorder()
 		mux.ServeHTTP(w, r)

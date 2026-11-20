@@ -61,7 +61,7 @@ func TestConnectionGoldenVectors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := vt.EnableConnsKey("", vk); err != nil {
+	if err := vt.EnableConnsKey(nil, vk); err != nil {
 		t.Fatal(err)
 	}
 	if vt.SealKey() != v.Sealed.Key {

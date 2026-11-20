@@ -58,6 +58,6 @@ func newTestServer(t *testing.T, a *testAgent, id *ehbpidentity.Identity, lim Li
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	go localBrain(ctx, rt)
-	return &server{platform: local{}, id: id, agent: g, rt: rt, token: "tok", booted: time.Now(), sched: newScheduler(lim),
+	return &server{platform: local{}, id: id, agent: g, rt: rt, booted: time.Now(), sched: newScheduler(lim),
 		lim: lim, quotes: make(chan struct{}, 4)}
 }

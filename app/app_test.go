@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -109,7 +110,7 @@ func TestRunOverEHBP(t *testing.T) {
 		mu.Unlock()
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		rec := httptest.NewRecorder()
-		mux.ServeHTTP(rec, r)
+		s.relayed(mux).ServeHTTP(rec, r)
 		mu.Lock()
 		wire.Write(rec.Body.Bytes())
 		mu.Unlock()
@@ -125,7 +126,7 @@ func TestRunOverEHBP(t *testing.T) {
 	if err != nil || att.Nonce != hex.EncodeToString(nonce) || att.HPKEPublicKey != id.MarshalPublicKeyHex() {
 		t.Fatalf("attest: %v %+v", err, att)
 	}
-	conn, _ := agentclient.New(srv.URL, "tok", id.MarshalPublicKey())
+	conn, _ := agentclient.New(srv.URL, testRelaySeed, id.MarshalPublicKey())
 	var text string
 	err = conn.Run(context.Background(), proto.RunRequest{Permissions: guard.AllowAll(), Messages: []proto.Message{{Role: "user", Content: "my private question"}}},
 		func(e proto.Event) { text += e.Delta })
@@ -136,21 +137,25 @@ func TestRunOverEHBP(t *testing.T) {
 		t.Fatal("plaintext on the wire")
 	}
 
-	// Wrong token, no token, plaintext body.
-	conn.Token = "nope"
-	if err := conn.Run(context.Background(), proto.RunRequest{Permissions: guard.AllowAll(), Messages: []proto.Message{{Role: "user", Content: "x"}}},
+	// Another relay key, no envelope, a plaintext body in a valid envelope.
+	wrong, _ := agentclient.New(srv.URL, base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32)), id.MarshalPublicKey())
+	if err := wrong.Run(context.Background(), proto.RunRequest{Permissions: guard.AllowAll(), Messages: []proto.Message{{Role: "user", Content: "x"}}},
 		func(proto.Event) {}); err == nil || !strings.Contains(err.Error(), "401") {
-		t.Fatalf("wrong token: %v", err)
+		t.Fatalf("another relay key: %v", err)
 	}
 	req, _ := http.NewRequest("POST", srv.URL+"/run", strings.NewReader(`{"messages":[{"role":"user","content":"x"}]}`))
 	req.Header.Set("Authorization", "Bearer tok")
 	res, err := http.DefaultClient.Do(req)
+	if err != nil || res.StatusCode != 404 {
+		t.Fatalf("outside an envelope: %v %d", err, res.StatusCode)
+	}
+	res, err = conn.Plain().Post(srv.URL+"/run", "application/json", strings.NewReader(`{"messages":[{"role":"user","content":"x"}]}`))
 	if err != nil || res.StatusCode != 400 {
 		t.Fatalf("plaintext request: %v %d", err, res.StatusCode)
 	}
 	// A client that encrypts to another key is refused (the server can't decrypt).
 	other, _ := ehbpidentity.NewIdentity()
-	conn, _ = agentclient.New(srv.URL, "tok", other.MarshalPublicKey())
+	conn, _ = agentclient.New(srv.URL, testRelaySeed, other.MarshalPublicKey())
 	if err := conn.Run(context.Background(), proto.RunRequest{Permissions: guard.AllowAll(), Messages: []proto.Message{{Role: "user", Content: "x"}}},
 		func(proto.Event) {}); err == nil {
 		t.Fatal("request to the wrong key succeeded")

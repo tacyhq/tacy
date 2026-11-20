@@ -15,6 +15,7 @@ import (
 
 	"github.com/tacyhq/tacy/activity"
 	"github.com/tacyhq/tacy/guard"
+	"github.com/tacyhq/tacy/harness"
 	"github.com/tacyhq/tacy/proto"
 	"github.com/tacyhq/tacy/runauth"
 	"github.com/tacyhq/tacy/safety"
@@ -260,6 +261,11 @@ func TestRunAuthMemberBudgetAcrossSpaces(t *testing.T) {
 		if ev, bad := lastError(evs); bad {
 			return false, ev.Code
 		}
+		// A run counts only if it ended (done); an empty stream is neither a run nor a refusal (TestRunRefusedAtTaskStart).
+		if len(evs) == 0 || evs[len(evs)-1].Type != "done" {
+			t.Errorf("a run ended without an outcome: %q", types(evs))
+			return false, ""
+		}
 		return true, ""
 	}
 	alice := strings.Repeat("a", 32)
@@ -286,6 +292,55 @@ func TestRunAuthMemberBudgetAcrossSpaces(t *testing.T) {
 	bob := strings.Repeat("b", 32)
 	if done, _ := run(bob); !done {
 		t.Fatal("alice used up bob's day")
+	}
+}
+
+// startHook is agentd's gateway with a hook that runs before the task's own start (Host.Start's StartFor), after
+// POST /run's check of the same request passed: what parallel runs or an incoming stop do in between.
+type startHook struct {
+	*recGateway
+	before func()
+}
+
+func (h startHook) StartFor(r *proto.RunRequest) (harness.Start, guard.TaskOptions, error) {
+	if h.before != nil {
+		h.before()
+	}
+	return h.recGateway.StartFor(r)
+}
+
+// A /run that POST /run's check admitted but its task's own start refuses (here a stop of the space arriving in
+// between; in TestRunAuthMemberBudgetAcrossSpaces the member's day used up by parallel runs) ends with the refusal,
+// its code and its record in the space's chain, never with an empty stream: before the fix the person got
+// "data: [DONE]" and nothing else, which a caller counting refusals took for a finished run.
+func TestRunRefusedAtTaskStart(t *testing.T) {
+	e := newSafeEnv(t, pText("ok"))
+	e.mustPost(e.policy(1, nil), e.heartbeat())
+	seal, _ := ecdh.X25519().GenerateKey(rand.Reader)
+	a := &runauth.Asker{Space: runauth.NewID("s"), Seal: seal, Identity: testAsker.Identity, Key: testAsker.Key}
+	var once sync.Once
+	e.s.host = &guard.Host{RT: e.s.rt, GW: startHook{recGateway: e.s.agent.(*recGateway), before: func() {
+		once.Do(func() {
+			e.mustPost(e.stop(safety.IssuerFirm, 1, func(l *safety.StopList) {
+				l.Stop = []safety.Target{{Firm: "f_chat", Space: a.Space}}
+			}, e.admin))
+		})
+	}}}
+	r := proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("hi")}
+	if err := a.Authorize(&r, e.vmKey.PublicKey().Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	evs := runParity(t, e.s, r)
+	ev, ok := lastError(evs)
+	if !ok || ev.Code != safety.CodeStopped {
+		t.Fatalf("want the stop's refusal, got %q", types(evs))
+	}
+	runs := openedActivity(t, evs, seal, e.rec.Signer.Public())
+	if len(runs) != 1 || runs[0].Event != activity.EventRefused || runs[0].Member != testAsker.Identity {
+		t.Fatalf("refused record: %+v", runs)
+	}
+	if e.modelReqs.Load() != 0 {
+		t.Fatalf("%d model calls for a refused run", e.modelReqs.Load())
 	}
 }
 

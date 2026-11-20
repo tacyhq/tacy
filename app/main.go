@@ -1,25 +1,34 @@
 // Tacy agent VM: an agent loop with web search, running in a confidential VM (Phala dstack, Intel TDX).
 //
+// The published port answers only GET /attest, its key, /health, the signed safety documents (front) and
+//
+//	POST /v                       one envelope the relay signed (../relay; the keys plan §3.4), EHBP-encrypted to this
+//	                              boot's key: the method, path and headers of one of the routes below and its body;
+//	                              the answer's status, headers and body come back inside it. The provider's gateway,
+//	                              which ends TLS in front of the VM, sees POST /v, padded sizes and timing only. The
+//	                              signature (-relay-auth-key, pinned in the compose) is what the bearer token was.
+//
+// Every route below is reached only from inside an envelope; the headers named are the envelope's.
+//
 //	GET  /attest?nonce=<64 hex>   TDX quote whose report_data binds the nonce and this boot's HPKE key, plus dstack
 //	                              info (app compose, event log). Format: proto.Attestation, proto.ReportData.
 //	POST /tasks, /tasks/status, /tasks/events, /tasks/cancel
 //	                              the task API (tasks.go, docs/27): start a task, see it, follow its events from any
-//	                              point, cancel it. EHBP bodies and the bearer token, as /run. Plaintext billing
-//	                              witness headers for the relay (X-Agent-Task, X-Agent-Bill, X-Agent-Refundable).
-//	GET  /tasks/open              {"open": n}: open tasks, for the relay's idle timer (bearer token; a count only).
+//	                              point, cancel it. EHBP bodies, as /run. Billing witness headers for the relay
+//	                              (X-Agent-Task, X-Agent-Bill, X-Agent-Refundable), inside the envelope.
+//	GET  /tasks/open              {"open": n}: open tasks, for the relay's idle timer (a count only).
 //	POST /run                     EHBP-encrypted proto.RunRequest -> EHBP-encrypted SSE stream of proto.Event: a
 //	                              shim over the task API (start, then follow; cancelled when the tab goes away).
 //	                              Kept one release after the chat moved to /tasks (temporary chats still use it).
-//	                              Needs "Authorization: Bearer <AGENT_VM_TOKEN>" (cost control; the relay holds it).
 //	                              Optional "X-Agent-User: <hex>": the relay's opaque per-user tag, for fairness
 //	                              only (limits.go). Required "X-Agent-Model: <model id>": the run's model in
 //	                              plaintext, so the relay can charge for it; the run is refused (400
 //	                              model_mismatch, encrypted) unless it equals the model in the encrypted body,
 //	                              like Tinfoil's router does with X-Tinfoil-Model. With every slot busy the run is queued (encrypted "queue"
-//	                              events); a full queue is a plaintext 429 {"error":"queue_full"|"user_queue_full"}.
+//	                              events); a full queue is a 429 (inside the envelope) {"error":"queue_full"|"user_queue_full"}.
 //	GET  /.well-known/hpke-keys   the same HPKE key in RFC 9458 form (EHBP discovery). Only trust it after
 //	                              checking it equals the attested key.
-//	GET  /activity?chain=&after=  sealed activity records of one chain (docs/24), for the relay (bearer token).
+//	GET  /activity?chain=&after=  sealed activity records of one chain (docs/24), for the relay.
 //	GET  /health                  "ok" once listening.
 //
 // This is agentd (docs/21-gateway-v0.md): the front door and the runtime. A run is a harness/v1 task
@@ -45,10 +54,8 @@ import (
 	"cmp"
 	"context"
 	"crypto/ecdh"
-	"crypto/hkdf"
+	"crypto/ed25519"
 	"crypto/rand"
-	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -59,10 +66,10 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"regexp"
 	"runtime"
 	"runtime/debug"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -81,9 +88,14 @@ import (
 	"github.com/tacyhq/tacy/identity"
 	"github.com/tacyhq/tacy/internal/procinfo"
 	"github.com/tacyhq/tacy/internal/tinfoil"
+	"github.com/tacyhq/tacy/kms"
+	"github.com/tacyhq/tacy/kms/client"
+	"github.com/tacyhq/tacy/kmsvm"
 	"github.com/tacyhq/tacy/proto"
+	"github.com/tacyhq/tacy/relay"
 	"github.com/tacyhq/tacy/runner"
 	"github.com/tacyhq/tacy/safety"
+	"github.com/tacyhq/tacy/sealstate"
 	"github.com/tacyhq/tacy/trigger"
 	"github.com/tacyhq/tacy/vault"
 )
@@ -93,7 +105,6 @@ type server struct {
 	id       *ehbpidentity.Identity
 	agent    guard.Gateway    // gatewayd over its socket (the CVM), or this process's guard (local development)
 	rt       *harness.Runtime // the harness/v1 runtime the brain connects to
-	token    string
 	booted   time.Time
 	sched    *scheduler // /run slots and queue
 	lim      Limits
@@ -139,10 +150,10 @@ type server struct {
 	taskFollows map[string]int
 	// handed: the results the relay said it stored (POST /schedules/handoff, handoff.go), memory only.
 	handed handedSet
-	// The Worker's push of the API keys (secrets.go): needPush: the routes that need them answer "starting" until
-	// it arrived (the CVM); push: what arrived, with the run token's hash.
-	needPush     bool
-	push         pushed
+	// The API keys vaultd gets from the key service (secrets.go): needKeys: the routes that need them answer
+	// "starting" until vaultd has them (the CVM); keys: whether it does.
+	needKeys     bool
+	keys         keysReady
 	vaultSecrets secretsGateway // nil: s.gw's (gatewayd's); tests set a stand-in
 }
 
@@ -188,10 +199,13 @@ func randomHex(n int) string {
 	return hex.EncodeToString(b)
 }
 
+// writeJSON writes v as one chunk, padded with trailing spaces to its size class (proto.PadJSON: a power of two,
+// at least 512 bytes; the keys plan §3.4), so an answer's size says little about what it holds.
 func writeJSON(w http.ResponseWriter, code int, v any) {
+	b, _ := json.Marshal(v)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(v)
+	w.Write(proto.PadJSON(append(b, '\n')))
 }
 
 func fail(w http.ResponseWriter, code int, msg string) {
@@ -223,20 +237,55 @@ func (s *server) attest(w http.ResponseWriter, r *http.Request) {
 		Quote: quote, Info: info, Booted: s.booted.Format(time.RFC3339)})
 }
 
-// authorized checks the relay's bearer token in constant time. It only guards cost: privacy comes from EHBP.
-func (s *server) authorized(r *http.Request) bool {
-	got, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-	if !ok {
-		return false
+// authorized says the request came in an envelope the relay signed (POST /v, ../relay; the keys plan §3.4). It replaces
+// the bearer token, which crossed the provider's gateway in plaintext: the relay's key never leaves the relay. It
+// only guards cost: privacy comes from EHBP, and what changes a person's data needs that person's signature.
+func (s *server) authorized(r *http.Request) bool { return relay.Relayed(r.Context()) }
+
+// front is the handler the published port reaches: the one request type the relay sends (POST /v, an envelope it
+// signed, encrypted to this boot's key; inner holds every route and serves it), and what needs no relay at all:
+// the attestation and its key, health, and the signed safety documents gatewayd's pull posts here (their signatures
+// are their authorization). Nothing else answers outside an envelope.
+func (s *server) front(inner http.Handler, rs *relay.Server) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /attest", s.attest)
+	mux.HandleFunc("GET "+ehbpproto.KeysPath, s.id.ConfigHandler)
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) { fmt.Fprintln(w, "ok") })
+	if s.safety != nil && s.safety.Keyed() {
+		mux.HandleFunc("POST /safety", s.safetyIn)
 	}
-	if s.token == "" { // the CVM: the token came with the pushed keys (secrets.go), as its hash
-		return s.push.tokenOK(got)
+	if s.safety != nil && s.safety.KeyLogged() {
+		mux.HandleFunc("POST /keylog", s.keylogIn)
 	}
-	return subtle.ConstantTimeCompare([]byte(got), []byte(s.token)) == 1
+	mux.Handle("GET /safety", inner)
+	if s.platform != nil && s.platform.Name() == "local" {
+		mux.HandleFunc("GET /debug/stats", s.stats) // load test only; not served in the CVM
+	}
+	open := s.id.Middleware()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Cache-Control", "no-store")
+		rs.ServeHTTP(w, r)
+	}))
+	mux.Handle("POST "+relay.Path, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// EHBP's middleware passes a plaintext body through: an envelope must be encrypted.
+		if r.Header.Get(ehbpproto.EncapsulatedKeyHeader) == "" || r.ContentLength == 0 {
+			fail(w, 400, "encrypted body required (EHBP)")
+			return
+		}
+		open.ServeHTTP(w, r)
+	}))
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { // anything else: 404, whatever the method
+		if r.URL.Path != "/" || r.Method != "GET" {
+			http.NotFound(w, r)
+			return
+		}
+		fmt.Fprintln(w, "Tacy agent VM: GET /attest?nonce=<hex>, POST /v (a signed EHBP envelope), GET /health")
+	})
+	return mux
 }
 
-// guard runs before EHBP decryption: token, encrypted body required (EHBP's middleware would pass plaintext
-// through), admission (a slot or a place in the queue). Errors here are plaintext and carry no request data.
+// guard runs before EHBP decryption: the relay's envelope, encrypted body required (EHBP's middleware would pass plaintext
+// through), admission (a slot or a place in the queue). Errors here are plaintext inside the envelope and carry no request data.
 func (s *server) guard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !s.authorized(r) {
@@ -315,14 +364,7 @@ func (s *server) run(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Cache-Control", "no-store")
 			w.WriteHeader(200)
 			out := newEventStream(w, keepaliveEvery)
-			code, msg := coded(err)
-			if rg, ok := s.agent.(*recGateway); ok { // the refusal goes on the record too
-				if ev, ok := rg.Refused(&req, err); ok {
-					out.emit(ev)
-				}
-			}
-			out.emit(proto.Event{Type: "error", Error: msg, Code: code})
-			out.done()
+			s.refuseRun(out, &req, err)
 			out.stop()
 			return
 		}
@@ -360,7 +402,31 @@ func (s *server) run(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	s.tasks().Run(r.Context(), userFrom(r.Context()), &req, emit)
+	// The task's own start checks the request again (Host.Start's StartFor): what was admitted above may be refused
+	// there (the day used up by parallel runs meanwhile, a stop that just came in), and then nothing was emitted.
+	// That refusal reaches the person and the record as the one above does, never as an empty stream.
+	var emitted atomic.Bool
+	err = s.tasks().Run(r.Context(), userFrom(r.Context()), &req, func(e proto.Event) error {
+		emitted.Store(true)
+		return emit(e)
+	})
+	if err != nil && !emitted.Load() && r.Context().Err() == nil {
+		s.refuseRun(out, &req, err)
+		return
+	}
+	out.done()
+}
+
+// refuseRun ends a /run stream with a refusal: a safety control's (stopped, no policy, a model it doesn't allow, the
+// day used up) with its code and its record in the space's chain; any other error as a plain error event.
+func (s *server) refuseRun(out *eventStream, req *proto.RunRequest, err error) {
+	code, msg := coded(err)
+	if rg, ok := s.agent.(*recGateway); ok && safety.CodeOf(err) != "" { // the refusal goes on the record too
+		if ev, ok := rg.Refused(req, err); ok {
+			out.emit(ev)
+		}
+	}
+	out.emit(proto.Event{Type: "error", Error: msg, Code: code})
 	out.done()
 }
 
@@ -409,6 +475,11 @@ func main() {
 	platformName := flag.String("platform", "dstack", "dstack | local (no attestation; development only)")
 	sock := flag.String("dstack-sock", "/var/run/dstack.sock", "dstack guest agent socket")
 	schedules := flag.Bool("schedules", false, "local only: schedules in memory (on the CVM they wait for sealed state, the keys plan Stage C)")
+	stateMode := flag.String("state", "memory", "memory (nothing outlives the process) | relay (sealed snapshots at the chat Worker through gatewayd; needs -kms-key) | dir (local only: sealed snapshots in -state-dir)")
+	kmsKey := flag.String("kms-key", "", "the Tacy key service's id, ed25519:<base64> (the compose pins it): agentd's keys come from it through gatewayd")
+	kmsHosts := flag.Int("kms-hosts", 1, "how many key service replicas gatewayd knows (its -kms-url, in order)")
+	stateDir := flag.String("state-dir", "", "-state dir (local only): the directory for the sealed snapshots")
+	devStateKey := flag.String("dev-state-key", "", "-state dir (local only): 64 hex, the seed of local lasting keys")
 	runnerSocket := flag.String("runner-socket", "", "runnerd's socket: the brain runs in a gVisor sandbox it starts (required on dstack); empty: the brain in this process (local only)")
 	lim := defaultLimits
 	flag.IntVar(&lim.MaxRuns, "max-runs", lim.MaxRuns, "runs at once")
@@ -429,10 +500,21 @@ func main() {
 	devModel := flag.String("dev-model", "", "local only: plain OpenAI-compatible chat completions URL instead of Tinfoil")
 	devSearch := flag.String("dev-search", "", "local only: Tavily-compatible search URL")
 	devFetchAny := flag.Bool("dev-fetch-any", false, "local only: let fetch_page reach private addresses")
+	relayAuth := flag.String("relay-auth-key", "", "the relay's request-signing public key, ed25519:<base64> (the compose pins it; required on dstack): every call comes in a POST /v envelope it signed")
 	var sf safety.Flags
 	sf.Register(flag.CommandLine)
 	flag.Parse()
 	log.Printf("agentd: %s", procinfo.Line())
+	var relayKey ed25519.PublicKey
+	if *relayAuth != "" {
+		k, err := safety.ParseKey(*relayAuth)
+		if err != nil {
+			log.Fatalf("-relay-auth-key: %v", err)
+		}
+		relayKey = k
+	} else if *platformName == "dstack" {
+		log.Fatal("-relay-auth-key is required on dstack: nothing but a signed envelope reaches the routes")
+	}
 	if lim.MaxRuns > 256 {
 		log.Fatal("-max-runs is at most 256 (harness/v1 max_tasks)")
 	}
@@ -444,8 +526,8 @@ func main() {
 	switch *platformName {
 	case "dstack":
 		p = newDstack(*sock)
-		if *devModel != "" || *devSearch != "" || *devFetchAny || *schedules {
-			log.Fatal("-dev-* flags are for -platform local only")
+		if *devModel != "" || *devSearch != "" || *devFetchAny || *schedules || *stateDir != "" || *devStateKey != "" {
+			log.Fatal("-dev-*, -schedules and -state-dir flags are for -platform local only")
 		}
 		if *runnerSocket == "" {
 			log.Fatal("-runner-socket is required on dstack: the brain runs in a gVisor sandbox (runnerd)")
@@ -462,11 +544,76 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	// Step 6: the signed controls, in memory (the floors come back from the signed documents gatewayd pulls).
+	// Keys and state (state.go): never the platform's (the keys plan). With -kms-key, the Tacy key service's release of
+	// agentd's own purposes (state, activity signing, task ids), through gatewayd; sealed snapshots of what must
+	// outlive the process at the chat Worker (-state relay), checked against the key service's generation register.
+	// Without it, keys made at boot and everything in memory (the quick path; local runs).
+	var keys KeySource = newBootKeys()
+	var kk *kmsvm.Keys
+	var gwc *gateway.Client
+	if *gatewaySocket != "" {
+		gwc = &gateway.Client{Path: *gatewaySocket}
+	}
+	if *kmsKey != "" {
+		kid, err := kms.ParseID(*kmsKey)
+		if err != nil {
+			log.Fatalf("-kms-key: %v", err)
+		}
+		if gwc == nil {
+			log.Fatal("-kms-key needs -gateway-socket: agentd has no network, gatewayd carries its calls to the key service")
+		}
+		ev := client.Evidence(p.Evidence)
+		if p.Name() == "local" {
+			host, _ := os.Hostname()
+			ev = kmsvm.LocalEvidence("local-" + host)
+		}
+		kk, err = kmsvm.Boot(context.Background(), kmsvm.Config{KMSID: kid, Hosts: *kmsHosts, Platform: p.Name(),
+			Purposes: agentPurposes, Holder: "agentd", Evidence: ev,
+			Transport: func(h int) client.Transport { return gateway.KMSTransport{D: gwc, Host: h} }})
+		if err != nil {
+			log.Fatalf("keys: %v", err)
+		}
+		keys = kmsKeys{kk}
+		go kk.Renew(context.Background(), 0)
+	} else if p.Name() == "dstack" && *stateMode != "memory" {
+		log.Fatal("-state relay needs -kms-key: sealed state needs the key service's lasting keys")
+	}
+	var backend sealstate.Backend
+	var reg sealstate.Register
+	switch *stateMode {
+	case "memory":
+	case "relay":
+		if kk == nil {
+			log.Fatal("-state relay needs -kms-key (the key service's state key, register and store certificate)")
+		}
+		auth, err := kk.StoreAuth(PurposeState)
+		if err != nil {
+			log.Fatalf("state: %v", err)
+		}
+		// The chat Worker's sealed-state API (vm-state.ts) at gatewayd's -state-url: ciphertext only.
+		backend = &sealstate.Relay{Base: "https://state", Client: gateway.StateHTTP{D: gwc}, Auth: auth}
+		reg = kk.Register(PurposeState)
+	case "dir":
+		seed, err := hex.DecodeString(*devStateKey)
+		if p.Name() != "local" || *stateDir == "" || err != nil || len(seed) != 32 {
+			log.Fatal("-state dir is local only, with -state-dir and -dev-state-key <64 hex>")
+		}
+		keys, backend = devKeys{seed: seed}, &sealstate.File{Dir: *stateDir}
+	default:
+		log.Fatalf("unknown -state %q", *stateMode)
+	}
+	boot, err := bootState(context.Background(), keys, backend, reg, sf.Firm)
+	if err != nil {
+		log.Fatalf("state: %v", err)
+	}
+	kept := boot.kept
+	// Step 6: the signed controls; their floors sealed with the rest when the state is kept (else they come back
+	// from the signed documents gatewayd pulls).
 	scfg, err := sf.Config(guard.ReleasePolicy(sf.Firm, p.Secret("TINFOIL_ENCLAVE")), "")
 	if err != nil {
 		log.Fatal(err)
 	}
+	scfg.Persist = kept.safety
 	// agentd takes the pulled lists (gatewayd's pull posts them here every 10 s), so it alone can tell the pull
 	// stopped reaching the VM: then nothing goes out (safety.DefaultMaxSilence).
 	scfg.MaxSilence = safety.DefaultMaxSilence
@@ -502,7 +649,7 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		if err := lv.EnableConns(""); err != nil {
+		if err := lv.EnableConns(nil); err != nil {
 			log.Fatal(err)
 		}
 		gw = guard.New(guard.Config{Up: up, Search: search, Fetcher: fetcher, Reader: &reader,
@@ -510,23 +657,12 @@ func main() {
 			Limits: &lim, CacheSecret: randomHex(32), Now: func() time.Time { return time.Now().UTC() }, Safety: st,
 			Stored: guard.NewStoredConfig(), Mail: &guard.MailConfig{Vault: vault.Local{V: lv}}})
 	}
-	kept := newAgentState()
 	sg := newSafeGateway(gw, st, kept.ledger)
 	sg.firstHeard = 20 * time.Second
 	// Activity records (docs/24): signed with a key for this firm from the KeySource (a key per boot until the Tacy key
-	// service is wired in: a new chain each boot), kept in memory.
-	var keys KeySource = newBootKeys() // TODO(kms): the Tacy key service's client (keysource.go)
-	ikm, err := keys.Key(context.Background(), PurposeActivity)
-	if err != nil {
-		log.Fatalf("activity: signing key: %v", err)
-	}
-	signer, err := activity.DeriveSigner(ikm, st.Firm())
-	clear(ikm)
-	if err != nil {
-		log.Fatalf("activity: %v", err)
-	}
+	// service is wired in: a new chain each boot).
 	astore := kept.activity
-	rec := &activity.Recorder{Signer: signer, Store: astore}
+	rec := boot.rec
 	if n, err := rec.Recover(); err != nil {
 		log.Fatalf("activity: %v", err)
 	} else if n > 0 {
@@ -549,15 +685,7 @@ func main() {
 		log.Fatalf("queue: %v", err)
 	}
 	// Once-only task ids (docs/27): a key from the KeySource, per firm.
-	tk, err := keys.Key(context.Background(), PurposeTaskIDs)
-	if err != nil {
-		log.Fatalf("tasks: id key: %v", err)
-	}
-	idKey, err := hkdf.Key(sha256.New, tk, nil, "tacy/task-ids/v1\x00"+st.Firm(), 32)
-	clear(tk)
-	if err != nil {
-		log.Fatalf("tasks: %v", err)
-	}
+	idKey := boot.idKey
 	host := &guard.Host{RT: rt, GW: rg, IDKey: idKey}
 	// Permission prompts: actions that send data out wait for the person's answer; the policy may cap their settings.
 	// OnWait stops the run's running-time clock while a prompt waits for the person (v0.8.1).
@@ -577,7 +705,7 @@ func main() {
 	var results trigger.ResultStore
 	var memory trigger.MemoryStore
 	var collect trigger.CollectStore
-	if st.PersonalSpaces() && *schedules { // the CVM: off until sealed state (the keys plan Stage C)
+	if st.PersonalSpaces() && (*schedules || kept.schedules) { // the CVM: off until sealed state (the keys plan Stage C)
 		holders, results, memory, collect = side, side, side, side
 		directory = &trigger.HolderDirectory{Firm: st.Firm(), Store: side}
 	}
@@ -602,7 +730,7 @@ func main() {
 			log.Printf("triggers: %d agent definitions loaded", n)
 		}
 	}
-	s := &server{platform: p, id: id, agent: rg, rt: rt, rec: rec, token: p.Secret("AGENT_VM_TOKEN"), needPush: p.Name() != "local", booted: time.Now().UTC(),
+	s := &server{platform: p, id: id, agent: rg, rt: rt, rec: rec, needKeys: p.Name() != "local" || kk != nil, booted: time.Now().UTC(),
 		sched: newScheduler(lim), lim: lim, quotes: make(chan struct{}, 8), safety: st, gw: gw, safetySlots: make(chan struct{}, 4),
 		host: host, prompts: rg.prompts, dir: directory, approvals: rg.approvals, triggers: engine, holders: holders, results: results,
 		memory: memory, ledger: sg.ledger}
@@ -654,6 +782,7 @@ func main() {
 		}()
 	}
 
+	// Every route below is served only from inside an envelope (front): the relay's signed POST /v.
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /attest", s.attest)
 	mux.HandleFunc("GET "+ehbpproto.KeysPath, id.ConfigHandler)
@@ -666,7 +795,7 @@ func main() {
 	s.scheduleRoutes(mux, id)                                    // schedules for personal spaces (schedules.go, the schedules contract)
 	s.connectionRoutes(mux, id)                                  // Settings → Connections (connections.go, the connections contract)
 	s.notifyRoutes(mux, id)                                      // run notifications (notify.go, the schedules contract)
-	s.secretsRoutes(mux, id)                                     // the Worker's push of the API keys (secrets.go)
+	s.secretsRoutes(mux)                                         // whether vaultd has the API keys (secrets.go)
 	mux.HandleFunc("POST /schedules/handoff", s.scheduleHandoff) // sealed results to the relay (handoff.go, the schedules contract)
 	mux.HandleFunc("GET /activity", s.activityOut)               // sealed activity records, for the relay (docs/24)
 	// Signed policies and stop lists; the signature is the authorization. Only served when the compose pins a key
@@ -679,21 +808,36 @@ func main() {
 		mux.HandleFunc("POST /keylog", s.keylogIn)
 	}
 	mux.HandleFunc("GET /safety", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, st.StatusOf("")) }) // the firm's controls
-	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
-			http.NotFound(w, r)
-			return
-		}
-		fmt.Fprintln(w, "Tacy agent VM: GET /attest?nonce=<hex>, POST /run (EHBP), GET /health")
-	})
-	if p.Name() == "local" {
-		mux.HandleFunc("GET /debug/stats", s.stats) // load test only; not served in the CVM
-	}
 	off := quickPathOff
-	if *schedules {
+	if *schedules || kept.schedules {
 		off = nil
 	}
-	srv := &http.Server{Addr: *addr, Handler: s.gate(mux, off), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 2 * time.Minute,
+	if kept.keeper != nil { // the sealed snapshots: within a second of a change, and once more on SIGTERM
+		// Another instance holds the state now (a refused reservation, a conflict at the Worker): stop serving.
+		kept.keeper.OnFatal = func(err error) { log.Fatalf("state: %v", err) }
+		kctx, stop := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() { kept.keeper.Run(kctx); close(done) }()
+		go func() {
+			sig := make(chan os.Signal, 1)
+			signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
+			<-sig
+			stop()
+			<-done
+			if kk != nil {
+				// Free agentd's own lease for the next boot (vaultd drops its own after its last save).
+				dctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				if err := kk.Drop(dctx); err != nil {
+					log.Printf("keys: lease drop: %v (the next boot waits for it to expire)", err)
+				}
+				cancel()
+			}
+			os.Exit(0)
+		}()
+	}
+	rs := &relay.Server{Key: relayKey, Inner: s.gate(mux, off), Now: time.Now, Trusted: st.OperatorTime}
+	front := s.front(mux, rs)
+	srv := &http.Server{Addr: *addr, Handler: front, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 2 * time.Minute,
 		ErrorLog: log.New(io.Discard, "", 0)}
 	where := *addr
 	var l net.Listener
@@ -708,8 +852,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("listen: %v", err)
 	}
-	log.Printf("agent VM listening on %s (platform %s, hpke key %s, run token set: %v, keys pushed: %v, search %s, brain %s, state in memory, limits %+v)",
-		where, p.Name(), id.MarshalPublicKeyHex(), s.token != "", !s.needPush, searchName, cmp.Or(*runnerSocket, "in process"), lim)
+	log.Printf("agent VM listening on %s (platform %s, hpke key %s, relay key set: %v, key service: %v, search %s, brain %s, state %s, limits %+v)",
+		where, p.Name(), id.MarshalPublicKeyHex(), relayKey != nil, kk != nil, searchName, cmp.Or(*runnerSocket, "in process"),
+		*stateMode, lim)
 	log.Fatal(srv.Serve(l))
 }
 

@@ -195,11 +195,11 @@ func TestQueueOverEHBP(t *testing.T) {
 	s := newTestServer(t, a, id, lim)
 	mux := http.NewServeMux()
 	mux.Handle("POST /run", s.guard(id.Middleware()(http.HandlerFunc(s.run))))
-	srv := httptest.NewServer(mux)
+	srv := httptest.NewServer(s.relayed(mux))
 	defer srv.Close()
 
 	run := func(user string, on func(proto.Event)) error {
-		conn, _ := agentclient.New(srv.URL, "tok", id.MarshalPublicKey())
+		conn, _ := agentclient.New(srv.URL, testRelaySeed, id.MarshalPublicKey())
 		conn.User = user
 		return conn.Run(context.Background(), proto.RunRequest{Permissions: guard.AllowAll(), Messages: []proto.Message{{Role: "user", Content: "secret prompt"}}}, on)
 	}

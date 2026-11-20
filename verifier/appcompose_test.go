@@ -334,6 +334,9 @@ func TestNoDiskVolumes(t *testing.T) {
 		"services:\n  a:\n    image: x\n",
 		"services:\n  a:\n    volumes: [\"/var/run/dstack.sock:/var/run/dstack.sock\", \"m:/m\"]\n    tmpfs: [/tmp]\nvolumes:\n  m:\n    driver_opts: {type: tmpfs, device: tmpfs}\n",
 		"services:\n  a:\n    volumes:\n      - {type: tmpfs, target: /t}\n      - {type: volume, source: m, target: /m}\nvolumes:\n  m:\n    driver: local\n    driver_opts: {type: tmpfs, device: tmpfs}\n",
+		// The e2e diag service reads the host's root for its plaintext-disk scan (read-only).
+		"services:\n  e2ediag:\n    volumes: [\"/:/host:ro,rslave\"]\n",
+		"services:\n  e2ediag:\n    volumes:\n      - {type: bind, source: /, target: /host, read_only: true}\n",
 	}
 	bad := []string{
 		"services:\n  a:\n    volumes: [\"d:/d\"]\nvolumes:\n  d:\n",
@@ -343,6 +346,10 @@ func TestNoDiskVolumes(t *testing.T) {
 		"services:\n  a:\n    volumes:\n      - {type: bind, source: /etc, target: /e}\n",
 		"volumes:\n  m:\n    external: true\n    driver_opts: {type: tmpfs, device: tmpfs}\nservices: {}\n",
 		"volumes:\n  m:\n    driver: other\n    driver_opts: {type: tmpfs, device: tmpfs}\nservices: {}\n",
+		"services:\n  e2ediag:\n    volumes: [\"/:/host\"]\n",
+		"services:\n  e2ediag:\n    volumes: [\"/:/host:rslave\"]\n",
+		"services:\n  e2ediag:\n    volumes: [\"/var:/host:ro\"]\n",
+		"services:\n  agentd:\n    volumes: [\"/:/host:ro\"]\n",
 	}
 	for _, c := range ok {
 		if err := noDiskVolumes(c); err != nil {

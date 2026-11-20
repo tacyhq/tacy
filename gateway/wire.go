@@ -53,6 +53,9 @@ const (
 	// agentd → gatewayd, a connection's only frame: a secrets push op for vaultd (vault/secrets.go): its key, its
 	// status, or the sealed push (it stays sealed here; only vaultd opens it).
 	tSecrets = "secrets"
+	// agentd or vaultd → gatewayd, a connection's only frame: a call to a fixed host (the key service, the chat
+	// Worker's sealed-state API; fixed.go).
+	tFixed = "fixed"
 )
 
 type frame struct {
@@ -104,6 +107,9 @@ type frame struct {
 	// secrets: the op; its answer.
 	Secrets       *vault.SecretsCall   `json:"secrets,omitzero"`
 	SecretsResult *vault.SecretsAnswer `json:"secrets_result,omitzero"`
+	// fixed: the call; its answer.
+	Fixed       *FixedCall   `json:"fixed,omitzero"`
+	FixedResult *FixedAnswer `json:"fixed_result,omitzero"`
 }
 
 // record is a journal entry as gatewayd needs it to rebuild a task's state (guard/rebuild.go): actions whole, model

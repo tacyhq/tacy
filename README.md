@@ -66,7 +66,9 @@ Release history is in [CHANGELOG.md](CHANGELOG.md). To report a vulnerability, s
 | `release/` | Checks that a compose is a signed release of this repository (Sigstore). |
 | `wasm/` | The verifier compiled to WebAssembly, for the browser. |
 | `agentclient/` | Attest, verify, then send encrypted runs; used by the service's end-to-end tests. |
-| `cmd/compose/` | Builds the binaries reproducibly, one OCI image each on a pinned distroless base, and generates `compose.yaml` (the VM's definition: every image by digest) and the release manifest. |
+| `cmd/compose/` | Builds the binaries reproducibly, one OCI image each on a pinned distroless base, and generates `compose.yaml` (the VM's definition: every image by digest) and the release manifest; with `--kms --kms-release`, the key service's `kms-compose.yaml`, `kms-app-compose.json` and `kms-release.json`. |
+| `kms/`, `cmd/kmsd/`, `cmd/kmsctl/` | The key service: `kmsd` holds a master key in memory only, in its own TDX VM, and gives an attested agent VM release its per-purpose keys and its API keys; admin-signed policy, genesis with threshold shares, leases, a generation register. `kmsctl` is the offline admin tool (not part of any VM). |
+| `kmsvm/`, `sealstate/`, `relay/` | The agent VM's side of the key service (its keys and leases), state sealed under those keys and kept as ciphertext by the chat's server, and the signed, padded request envelopes agentd takes. |
 | `cmd/setup/` | `setup`, a one-shot step (root, no network) that gives the processes their directories on the shared volumes before they start. |
 | `compose.yaml`, `pins.go` | What the VM runs. Its sha256 is what the attestation measures and what a release signs. `pins.go` embeds it for the browser verifier. |
 | `scripts/` | `build-wasm.sh` (browser verifier), `reproduce.sh` (rebuild a release and compare). |
@@ -112,11 +114,11 @@ scripts/reproduce.sh v0.2.0            # in the pinned Go container (cmd/compose
 scripts/reproduce.sh --native v0.2.0   # with your own Go (must be 1.27.2, e.g. through mise)
 ```
 
-It clones the tag, rebuilds, compares with the release's `release.json` (compose sha256, binary sha256s, image digests), then fetches each image's manifest from ghcr.io anonymously by digest and checks it hashes to that digest and is the rebuilt one. Needs git, curl and jq. `.github/workflows/reproduce.yml` runs both after every release. Releases before v0.2.0 (`tacy-release/v1`) built the binaries on the VM and have no images.
+It clones the tag, rebuilds, compares with the release's `release.json` (compose sha256, binary sha256s, image digests), then fetches each image's manifest from ghcr.io anonymously by digest and checks it hashes to that digest and is the rebuilt one. When the tag has a key service (`kms-compose.yaml`; a `kms-v` tag has only that), it does the same with `go run ./cmd/compose --kms --kms-release --check` and `kms-release.json`. Needs git, curl and jq. `.github/workflows/reproduce.yml` runs both after every release. Releases before v0.2.0 (`tacy-release/v1`) built the binaries on the VM and have no images.
 
 ## Releases and signing
 
-A release is a tag `vMAJOR.MINOR.PATCH` (no suffixes). `.github/workflows/release.yml` builds it, pushes the images to `ghcr.io/tacyhq/tacy/<name>` (tagged with the version for people; the compose uses only the digests) and publishes a GitHub Release with three files:
+An agent VM release is a tag `vMAJOR.MINOR.PATCH` (no suffixes); a key service release is a tag `kms-vMAJOR.MINOR.PATCH`. `.github/workflows/release.yml` builds it, pushes the images to `ghcr.io/tacyhq/tacy/<name>` (tagged with the version for people; the composes use only the digests) and publishes a GitHub Release. An agent VM release has these three files:
 
 | File | What |
 |---|---|
@@ -124,7 +126,18 @@ A release is a tag `vMAJOR.MINOR.PATCH` (no suffixes). `.github/workflows/releas
 | `release.json` | Manifest: `schema` (`tacy-release/v2`), `repository`, `version`, `commit`, `compose_sha256`, `binaries` (name → sha256), `images` (name → `ghcr.io/tacyhq/tacy/<name>@sha256:…`), `base_image`, `go_version`, `build_image`, and since v0.4.0 `gvisor` (release, URL, tarball and binary hashes). (`tacy-release/v1`, before v0.2.0, had no images: the VM built the binaries from source embedded in the compose.) |
 | `compose.sigstore.json` | The Sigstore bundle that signs the files and the images. |
 
-Signing uses GitHub artifact attestations (`actions/attest-build-provenance`) on Sigstore's public-good instance: the release job gets a short-lived Fulcio certificate for its GitHub Actions OIDC identity (no long-lived keys), signs one in-toto statement (SLSA provenance v1) whose subjects are `compose.yaml`, `release.json` and each image (named `ghcr.io/tacyhq/tacy/<name>`, with its manifest digest), and the signature is logged in Rekor. The workflow has two jobs: `build` (read-only token, tests and build, in the pinned Go container and again on the runner, which must agree) and `release` (checks out nothing, runs no repository code; only it can push packages or get the OIDC token), so test or build code can't push or sign anything. Before it signs, the release job pushes the images and pulls each one back **without credentials** (manifest, config and every layer, each checked against its digest), because a VM pulls anonymously; if one doesn't pull (a new ghcr package starts private), nothing is signed or published, an org owner sets the package public, and the job is re-run for the same tag.
+The key service (`kmsd`) is released with them whenever `kms-compose.yaml` is committed at the tag, and alone on a `kms-v` tag. Its files, signed in the same statement:
+
+| File | What |
+|---|---|
+| `kms-compose.yaml` | What the key service's VM runs: one image, `kmsd`, by digest; its flags (admin keys, threshold, the KMS id once there is one) are in the compose, so the attestation covers them. Written by `go run ./cmd/compose --kms --kms-release` from the pins in `cmd/compose/kms.go` (`kmsAdminKeys`) and `verifier.ReleaseKMSID`; no other flag can change it. |
+| `kms-app-compose.json` | The CVM manifest it is deployed with (`server.KMSAppCompose`); its sha256 is what the key service's policy pins. |
+| `kms-release.json` | Manifest: `schema` (`tacy-kms-release/v1`), `repository`, `version` (the tag), `commit`, `kms_compose_sha256`, `kms_app_compose_sha256`, `binaries` (`kmsd`), `images` (`kmsd` → `ghcr.io/tacyhq/tacy/kmsd@sha256:…`), `base_image`, `go_version`, `build_image`. |
+| `kms-compose.sigstore.json` | The same Sigstore bundle. |
+
+A key service release is never an agent VM release: the verifier's identity rule takes only `refs/tags/vX.Y.Z`, and `kms-compose.yaml` fails the agent VM's image rule.
+
+Signing uses GitHub artifact attestations (`actions/attest-build-provenance`) on Sigstore's public-good instance: the release job gets a short-lived Fulcio certificate for its GitHub Actions OIDC identity (no long-lived keys), signs one in-toto statement (SLSA provenance v1) whose subjects are `compose.yaml`, `release.json` (and with the key service `kms-compose.yaml`, `kms-app-compose.json`, `kms-release.json`) and each image (named `ghcr.io/tacyhq/tacy/<name>`, with its manifest digest), and the signature is logged in Rekor. The workflow has two jobs: `build` (read-only token, tests and build, in the pinned Go container and again on the runner, which must agree) and `release` (checks out nothing, runs no repository code; only it can push packages or get the OIDC token), so test or build code can't push or sign anything. Before it signs, the release job pushes the images and pulls each one back **without credentials** (manifest, config and every layer, each checked against its digest), because a VM pulls anonymously; if one doesn't pull (a new ghcr package starts private), nothing is signed or published, an org owner sets the package public, and the job is re-run for the same tag.
 
 The verifier (`release/`) accepts a bundle only if all of these hold:
 

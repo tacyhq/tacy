@@ -91,7 +91,7 @@ func TestTasksOpenScheduledSpend(t *testing.T) {
 	mux := http.NewServeMux()
 	p.s.taskRoutes(mux, p.s.id)
 	r := httptest.NewRequest("GET", "/tasks/open", nil)
-	r.Header.Set("Authorization", "Bearer tok")
+	r = asRelay(r)
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, r)
 	var got struct {

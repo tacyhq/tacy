@@ -54,7 +54,7 @@ func newConnEnv(t *testing.T, replies ...string) (*schedEnv, *imaptest.Server, *
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := v.EnableConns(""); err != nil {
+	if err := v.EnableConns(nil); err != nil {
 		t.Fatal(err)
 	}
 	e := newSchedEnvWith(t, safeOpts{reader: mailReader,

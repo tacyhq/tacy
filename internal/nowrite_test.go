@@ -38,8 +38,8 @@ var writeAllowed = map[string]string{
 	"activity/store.go:OpenStore":  "legacy file store, unused by the mains",
 	"safety/state.go:State.write":  "legacy file store (Config.Dir), the mains pass none",
 	"safety/budget.go:Ledger.save": "legacy file store (Ledger.Dir), the mains set none",
-	"app/notify.go:notifier.save":  "legacy file store (openNotifier path), the mains pass none",
-	"vault/conn.go:connState.save": "legacy file store (EnableConns path), the mains pass none",
+	"queue/queue.go:Open":          "legacy file store (its tests), unused by the mains",
+	"queue/side.go:OpenSide":       "legacy file store (its tests and the rollback tests), unused by the mains (OpenSideMemory)",
 }
 
 // getenvAllowed may read the environment with a name that isn't a literal (local development only).
@@ -295,9 +295,9 @@ func TestMainsOpenNoFileStores(t *testing.T) {
 				case name == "queue.Open" || name == "queue.OpenSide" || name == "activity.OpenStore":
 					t.Errorf("%s: %s opens a file store", fset.Position(x.Pos()), name)
 				case name == "openNotifier" || strings.HasSuffix(name, ".EnableConns") || strings.HasSuffix(name, ".Config") && len(x.Args) == 2:
-					// Only with "" (memory).
+					// Only with "" (no file) or a Persister (sealstate).
 					arg := x.Args[len(x.Args)-1]
-					if lit, ok := arg.(*ast.BasicLit); !ok || lit.Value != `""` {
+					if lit, ok := arg.(*ast.BasicLit); ok && lit.Value != `""` || ok && lit.Kind != token.STRING {
 						t.Errorf("%s: %s with a path (only \"\": memory)", fset.Position(x.Pos()), name)
 					}
 				}

@@ -22,6 +22,7 @@ import (
 
 	"github.com/tacyhq/tacy/guard"
 	"github.com/tacyhq/tacy/proto"
+	"github.com/tacyhq/tacy/relay"
 	"github.com/tacyhq/tacy/runauth"
 	"github.com/tacyhq/tacy/verifier"
 )
@@ -54,8 +55,9 @@ func Attest(ctx context.Context, base string) (*proto.Attestation, []byte, []byt
 
 // Conn sends encrypted requests to one verified agent VM boot.
 type Conn struct {
-	Base  string
-	Token string
+	Base string
+	// Relay sends every call as a signed envelope (POST /v); its Sent hook sees what the gateway would.
+	Relay *relay.Transport
 	// User is the opaque per-user tag sent as X-Agent-User (fairness only); "" sends none.
 	User string
 	// Model, when set, is sent as X-Agent-Model instead of the request's model (tests: the VM must refuse it).
@@ -114,13 +116,20 @@ func (c *Conn) authorize(req *proto.RunRequest) error {
 	return c.Asker.Authorize(req, c.key)
 }
 
-// New makes a connection that encrypts to key (which must come from a verified attestation).
-func New(base, token string, key []byte) (*Conn, error) {
+// New makes a connection that encrypts to key (which must come from a verified attestation) and sends every call
+// as the relay does: in a POST /v envelope signed with relayKey (the relay-auth signing key, a base64 Ed25519 seed;
+// ../relay), encrypted to the same key. The request's own body is EHBP-encrypted to key inside it, as a browser's.
+func New(base, relayKey string, key []byte) (*Conn, error) {
 	id, err := ehbpidentity.FromPublicKeyBytes(key)
 	if err != nil {
 		return nil, err
 	}
-	tr, err := ehbpclient.NewTransportWithIdentity(id)
+	rk, err := relay.ParseKey(relayKey)
+	if err != nil {
+		return nil, err
+	}
+	rt := &relay.Transport{VMKey: key, Key: rk}
+	tr, err := ehbpclient.NewTransportWithIdentity(id, ehbpclient.WithHTTPClient(&http.Client{Transport: rt}))
 	if err != nil {
 		return nil, err
 	}
@@ -128,11 +137,15 @@ func New(base, token string, key []byte) (*Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Conn{Base: strings.TrimSuffix(base, "/"), Token: token, Asker: a, key: key, http: &http.Client{Transport: tr}}, nil
+	return &Conn{Base: strings.TrimSuffix(base, "/"), Relay: rt, Asker: a, key: key, http: &http.Client{Transport: tr}}, nil
 }
 
+// Plain is a client for the relay's own plaintext calls (GET /tasks/open, POST /schedules/handoff …): each in a
+// signed envelope like the encrypted ones, its body not encrypted inside.
+func (c *Conn) Plain() *http.Client { return &http.Client{Transport: c.Relay} }
+
 // Connect attests, verifies and returns a connection to the attested key.
-func Connect(ctx context.Context, base, token string, p verifier.Policy) (*Conn, *verifier.Result, error) {
+func Connect(ctx context.Context, base, relayKey string, p verifier.Policy) (*Conn, *verifier.Result, error) {
 	a, _, nonce, err := Attest(ctx, base)
 	if err != nil {
 		return nil, nil, err
@@ -141,7 +154,7 @@ func Connect(ctx context.Context, base, token string, p verifier.Policy) (*Conn,
 	if err != nil {
 		return nil, res, err
 	}
-	c, err := New(base, token, res.HPKEPublicKey)
+	c, err := New(base, relayKey, res.HPKEPublicKey)
 	return c, res, err
 }
 
@@ -156,7 +169,6 @@ func (c *Conn) Run(ctx context.Context, req proto.RunRequest, on func(proto.Even
 	body, _ := json.Marshal(req)
 	r, _ := http.NewRequestWithContext(ctx, "POST", c.Base+"/run", bytes.NewReader(body))
 	r.Header.Set("Content-Type", "application/json")
-	r.Header.Set("Authorization", "Bearer "+c.Token)
 	r.Header.Set("X-Agent-Model", req.Model)
 	if c.Model != "" {
 		r.Header.Set("X-Agent-Model", c.Model)
@@ -223,7 +235,6 @@ func (c *Conn) stream(ctx context.Context, path string, req any, on func(proto.E
 	body, _ := json.Marshal(req)
 	r, _ := http.NewRequestWithContext(ctx, "POST", c.Base+path, bytes.NewReader(body))
 	r.Header.Set("Content-Type", "application/json")
-	r.Header.Set("Authorization", "Bearer "+c.Token)
 	if c.User != "" {
 		r.Header.Set("X-Agent-User", c.User)
 	}
@@ -318,7 +329,6 @@ func (c *Conn) post(ctx context.Context, path, model string, v any) (*http.Respo
 	body, _ := json.Marshal(v)
 	r, _ := http.NewRequestWithContext(ctx, "POST", c.Base+path, bytes.NewReader(body))
 	r.Header.Set("Content-Type", "application/json")
-	r.Header.Set("Authorization", "Bearer "+c.Token)
 	if model != "" {
 		r.Header.Set("X-Agent-Model", model)
 		c.chargeHeaders(r) // a start: what the relay prices it at

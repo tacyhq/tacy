@@ -90,7 +90,7 @@ func newMailE2EOn(t *testing.T, sm *splitModel, srv *imaptest.Server) *mailE2E {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := v.EnableConns(""); err != nil {
+	if err := v.EnableConns(nil); err != nil {
 		t.Fatal(err)
 	}
 	connect(t, v, testSpace, mailUser, mailPassword)
@@ -507,7 +507,7 @@ func TestConnPutTestsLogin(t *testing.T) {
 	srv.Refuse["blocked@example.com"] = "web_login"
 	srv.Refuse["normal@example.com"] = "app_password"
 	v, _ := vault.New(nil, nil, nil)
-	v.EnableConns("")
+	v.EnableConns(nil)
 	rc := DefaultReader
 	g := New(Config{Up: &plainUpstream{}, Reader: &rc, Mail: &MailConfig{Vault: vault.Local{V: v}, Dial: srv.Dial, TLS: srv.TLSConfig()}})
 	ctx := context.Background()

@@ -626,7 +626,7 @@ func (g *recGateway) Exec(ctx context.Context, ti *harness.TaskInfo, id string, 
 
 // ---- GET /activity: sealed records for the relay ----------------------------------------------------------------
 
-// activityOut serves a chain's sealed records after a sequence number (the relay's bearer token: cost and
+// activityOut serves a chain's sealed records after a sequence number (the relay's signed envelope: cost and
 // metadata, since the records themselves are sealed and signed). The chat's Worker fetches what a browser didn't
 // store, so a record is never lost because a tab closed.
 func (s *server) activityOut(w http.ResponseWriter, r *http.Request) {

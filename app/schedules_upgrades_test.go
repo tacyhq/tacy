@@ -101,7 +101,7 @@ func TestScheduleSearchMemoryAndQuiet(t *testing.T) {
 	shift := e.shiftedEngine()
 	e.wireApprovals()
 	// Run notifications on (notify.go): a run that reports marks the space "done"; a quiet one marks nothing.
-	e.s.notify, _ = openNotifier("")
+	e.s.notify, _ = openNotifier(nil)
 	if code, out := e.call(e.s.notifySet, notifySetRequest{Where: e.where(e.me, runauth.NotifyLabel, "on"), On: true}); code != 200 {
 		t.Fatalf("notify on: %d %v", code, out)
 	}
@@ -215,7 +215,7 @@ func TestScheduleUpgradesUnderOlderPolicy(t *testing.T) {
 	e.withMemory()
 	shift := e.shiftedEngine()
 	e.wireApprovals()
-	e.s.notify, _ = openNotifier("")
+	e.s.notify, _ = openNotifier(nil)
 	if code, out := e.call(e.s.notifySet, notifySetRequest{Where: e.where(e.me, runauth.NotifyLabel, "on"), On: true}); code != 200 {
 		t.Fatalf("notify on: %d %v", code, out)
 	}

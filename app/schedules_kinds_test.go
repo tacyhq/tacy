@@ -36,7 +36,7 @@ func (e *schedEnv) open() map[string]int {
 func (e *schedEnv) openNext() (map[string]int, *time.Time) {
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest("GET", "/tasks/open", nil)
-	r.Header.Set("Authorization", "Bearer tok")
+	r = asRelay(r)
 	e.s.tasksOpen(w, r)
 	var raw map[string]json.RawMessage
 	var out struct {

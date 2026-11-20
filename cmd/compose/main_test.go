@@ -10,6 +10,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -20,6 +22,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/types"
 	"go.yaml.in/yaml/v3"
 
+	"github.com/tacyhq/tacy/gateway"
 	"github.com/tacyhq/tacy/safety"
 	"github.com/tacyhq/tacy/sandbox"
 	"github.com/tacyhq/tacy/verifier"
@@ -30,6 +33,10 @@ import (
 func TestComposeCurrent(t *testing.T) {
 	if testing.Short() {
 		t.Skip("builds the binaries and fetches the base image")
+	}
+	if p := pinned(); p.relayAuthKey == "" || p.kmsID == "" || len(p.kmsURLs) == 0 {
+		t.Skip("RELEASE BLOCKER: relayAuthKey, kmsID and kmsURLs aren't pinned yet (the release's relay key and the key " +
+			"service's genesis); compose.yaml is regenerated with them")
 	}
 	os.Chdir("../..")
 	rel, err := build()
@@ -46,6 +53,13 @@ func TestComposeCurrent(t *testing.T) {
 	}
 }
 
+// devPins are the tests' pins while a release's aren't set: dev keys and hosts that exist nowhere.
+var devPins = releasePins{relayAuthKey: "ed25519:" + strings.Repeat("A", 43) + "=", kmsID: "ed25519:" + strings.Repeat("B", 43) + "=",
+	stateURL: "https://chat.example", kmsURLs: []string{"https://kms-1.example", "https://kms-2.example"}}
+
+// readCompose is what the layout tests check: compose.yaml once the release's pins are set (TestComposeCurrent
+// keeps it what the source generates); until then, the generator's output for compose.yaml's own images and
+// binaries with devPins (the committed file predates the key service and is regenerated with the release).
 func readCompose(t *testing.T) []byte {
 	out, err := os.ReadFile("../../compose.yaml")
 	if err != nil {
@@ -54,7 +68,38 @@ func readCompose(t *testing.T) []byte {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return out
+	if p := pinned(); p.relayAuthKey != "" && p.kmsID != "" && len(p.kmsURLs) > 0 {
+		return out
+	}
+	gen, err := generateWith(releaseOf(t, out), devPins)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return []byte(gen)
+}
+
+// releaseOf reads a compose's images (by service) and binaries (its header) back into a Release.
+func releaseOf(t *testing.T, compose []byte) *Release {
+	t.Helper()
+	var doc struct {
+		Services map[string]struct {
+			Image string `yaml:"image"`
+		} `yaml:"services"`
+	}
+	if err := yaml.Unmarshal(compose, &doc); err != nil {
+		t.Fatal(err)
+	}
+	r := &Release{}
+	for svc, bin := range map[string]string{"setup": "setup", "agentd": "agentd", "runner": "runnerd", "agentvm": "gatewayd", "vaultd": "vaultd"} {
+		r.Images = append(r.Images, Image{Name: bin, Ref: doc.Services[svc].Image})
+	}
+	for _, ln := range strings.Split(string(compose), "\n") {
+		f := strings.Fields(strings.TrimPrefix(ln, "#"))
+		if strings.HasPrefix(ln, "#   ") && len(f) == 2 && len(f[1]) == 64 {
+			r.Binaries = append(r.Binaries, Binary{Name: f[0], SHA256: f[1]})
+		}
+	}
+	return r
 }
 
 type service struct {
@@ -126,7 +171,7 @@ func TestComposeNothingOnTheDisk(t *testing.T) {
 		for _, v := range s.Volumes {
 			src := strings.SplitN(v, ":", 2)[0]
 			if strings.HasPrefix(src, "/") {
-				if src != "/var/run/dstack.sock" || name != "agentd" {
+				if src != "/var/run/dstack.sock" || (name != "agentd" && name != "vaultd") {
 					t.Errorf("%s: host path %s", name, v)
 				}
 			} else if _, ok := vols[src]; !ok {
@@ -148,9 +193,75 @@ func TestComposeNothingOnTheDisk(t *testing.T) {
 		}
 	}
 	gw := " " + strings.Join(svcs["agentvm"].Command, " ") + " "
-	if !strings.Contains(gw, " -search-provider "+searchProvider+" ") || !strings.Contains(gw, " -pushed-keys "+strings.Join(pushedKeys, ",")+" ") {
+	if !strings.Contains(gw, " -search-provider "+searchProvider+" ") || !strings.Contains(gw, " -expected-keys "+strings.Join(expectedKeys, ",")+" ") {
 		t.Errorf("gatewayd: %s", gw)
 	}
+}
+
+// the keys plan §2.4: agentd and vaultd take their keys from the pinned key service only, through gatewayd's fixed calls to
+// the pinned replicas; agentd keeps its state at the chat Worker (sealed); nothing from the provider (no GetKey user,
+// dstack's socket for quotes only). The verifier reads the same flags (checkKMSID).
+func TestComposeKeyService(t *testing.T) {
+	p := pinned()
+	if p.kmsID == "" {
+		p = devPins
+	}
+	svcs := services(t)
+	agentd, vaultd, gw := " "+strings.Join(svcs["agentd"].Command, " ")+" ", " "+strings.Join(svcs["vaultd"].Command, " ")+" ",
+		" "+strings.Join(svcs["agentvm"].Command, " ")+" "
+	hosts := strconv.Itoa(len(p.kmsURLs))
+	for name, cmd := range map[string]string{"agentd": agentd, "vaultd": vaultd} {
+		if !strings.Contains(cmd, " -kms-key "+p.kmsID+" ") || !strings.Contains(cmd, " -kms-hosts "+hosts+" ") || strings.Contains(cmd, "-kms-url") {
+			t.Errorf("%s: %s", name, cmd)
+		}
+	}
+	if !strings.Contains(agentd, " -state relay ") || !strings.Contains(vaultd, " -ops-socket /run/tacy/ops/gateway.sock ") {
+		t.Errorf("agentd %s / vaultd %s", agentd, vaultd)
+	}
+	for _, u := range p.kmsURLs {
+		if !strings.Contains(gw, " -kms-url "+u+" ") || !strings.HasPrefix(u, "https://") {
+			t.Errorf("gatewayd lacks -kms-url %s", u)
+		}
+	}
+	if !strings.Contains(gw, " -state-url "+p.stateURL+" ") || !strings.Contains(gw, " -ops-socket /run/tacy/ops/gateway.sock -vault-uid "+vaultdUID+" ") ||
+		strings.Contains(gw, "-kms-key") || strings.Contains(gw, "-dev-fixed-http") {
+		t.Errorf("gatewayd: %s", gw)
+	}
+	keys, urls, err := composeKMSArgs(string(readCompose(t)))
+	if err != nil || len(keys) != 1 || keys[0] != p.kmsID || len(urls) != len(p.kmsURLs) {
+		t.Errorf("what the verifier reads: %v %v %v", keys, urls, err)
+	}
+	// Without the pins nothing is generated.
+	for _, bad := range []releasePins{{relayAuthKey: devPins.relayAuthKey}, {relayAuthKey: devPins.relayAuthKey, kmsID: devPins.kmsID, stateURL: "x"}} {
+		if _, err := generateWith(releaseOf(t, readCompose(t)), bad); err == nil {
+			t.Errorf("a compose without the key service pins: %+v", bad)
+		}
+	}
+}
+
+// composeKMSArgs reads every -kms-key and -kms-url value, as the verifier does.
+func composeKMSArgs(compose string) (keys, urls []string, err error) {
+	var doc struct {
+		Services map[string]struct {
+			Command []string `yaml:"command"`
+		} `yaml:"services"`
+	}
+	if err := yaml.Unmarshal([]byte(compose), &doc); err != nil {
+		return nil, nil, err
+	}
+	for _, s := range doc.Services {
+		for i := 0; i+1 < len(s.Command); i++ {
+			switch s.Command[i] {
+			case "-kms-key":
+				if !slices.Contains(keys, s.Command[i+1]) {
+					keys = append(keys, s.Command[i+1])
+				}
+			case "-kms-url":
+				urls = append(urls, s.Command[i+1])
+			}
+		}
+	}
+	return keys, urls, nil
 }
 
 // The process layout (docs/21, docs/22): only gatewayd (service agentvm) has a network; agentd, the runner (the
@@ -197,11 +308,11 @@ func TestComposeLayout(t *testing.T) {
 		}
 		for _, env := range []string{"TINFOIL_API_KEY", "TAVILY_API_KEY", "BRAVE_SEARCH_API_KEY", "EXA_API_KEY", "AGENT_VM_TOKEN", "SEARCH_PROVIDER"} {
 			if _, ok := s.Environment[env]; ok {
-				t.Errorf("%s: %s in the env (keys arrive by push)", name, env)
+				t.Errorf("%s: %s in the env (keys come from the key service)", name, env)
 			}
 		}
 		for _, v := range s.Volumes {
-			if strings.Contains(v, "dstack.sock") && name != "agentd" {
+			if strings.Contains(v, "dstack.sock") && name != "agentd" && name != "vaultd" {
 				t.Errorf("%s mounts dstack's socket", name)
 			}
 		}
@@ -564,4 +675,24 @@ func flowArgs(a []string) string {
 		q[i] = fmt.Sprintf("%q", s)
 	}
 	return strings.Join(q, ", ")
+}
+
+// the keys plan §3.4: agentd checks the relay's signatures with the pinned public key (no token in any environment), and
+// gatewayd resolves names over TLS to the pinned resolver. The generator refuses to write a compose without the key.
+func TestTransportArgs(t *testing.T) {
+	a := " " + strings.Join(agentdArgs("ed25519:k", devPins.kmsID, 2), " ") + " "
+	if !strings.Contains(a, " -relay-auth-key ed25519:k ") || !strings.Contains(a, " -listen-unix /run/tacy/agent/http.sock ") {
+		t.Fatalf("agentd: %s", a)
+	}
+	if relayAuthKey != "" {
+		if _, err := safety.ParseKey(relayAuthKey); err != nil {
+			t.Fatalf("relayAuthKey: %v", err)
+		}
+	} else if _, err := generate(&Release{Binaries: []Binary{{Name: "brain", SHA256: "x"}}}); err == nil ||
+		!strings.Contains(err.Error(), "relayAuthKey") {
+		t.Fatalf("a compose was generated without the relay's key: %v", err)
+	}
+	if _, err := gateway.ParseDoT(dnsTLS); err != nil {
+		t.Fatalf("dnsTLS: %v", err)
+	}
 }

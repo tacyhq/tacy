@@ -447,7 +447,7 @@ func TestScheduleCountStopRemove(t *testing.T) {
 	open := func() map[string]int {
 		w := httptest.NewRecorder()
 		r := httptest.NewRequest("GET", "/tasks/open", nil)
-		r.Header.Set("Authorization", "Bearer tok")
+		r = asRelay(r)
 		e.s.tasksOpen(w, r)
 		var out map[string]any
 		if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil || len(out) != 3 {

@@ -84,8 +84,10 @@ type ledgerDay struct {
 // budget is counted for (proto.Verified.Member): a firm's identity, or on the shared chat VM the relay's daily
 // per-user tag. Making a new space gets nothing: the member's and the VM's days are the same whatever the space.
 type Ledger struct {
-	Dir string // where the day counters persist; "": memory only
-	Now func() time.Time
+	Dir string // where the day counters persist; "": memory only (tests; the VM uses Persist)
+	// Persist keeps the day counters sealed across restarts (sealstate, the keys plan §3.2); nil: Dir, or memory.
+	Persist Persister
+	Now     func() time.Time
 
 	mu   sync.Mutex
 	runs map[string]*ledgerRun
@@ -99,7 +101,11 @@ func (l *Ledger) init() {
 			l.Now = time.Now
 		}
 		l.runs, l.days = map[string]*ledgerRun{}, map[string]*ledgerDay{}
-		if l.Dir != "" {
+		if l.Persist != nil {
+			if b, err := l.Persist.Load(); err == nil && len(b) > 0 {
+				json.Unmarshal(b, &l.days)
+			}
+		} else if l.Dir != "" {
 			if b, err := os.ReadFile(filepath.Join(l.Dir, "budget.json")); err == nil {
 				json.Unmarshal(b, &l.days)
 			}
@@ -419,7 +425,7 @@ func (l *Ledger) MembersCost(prefix string) map[string]int64 {
 
 // save writes today's and yesterday's counters (older days are dropped).
 func (l *Ledger) save() error {
-	if l.Dir == "" {
+	if l.Dir == "" && l.Persist == nil {
 		return nil
 	}
 	keep := map[string]*ledgerDay{}
@@ -433,6 +439,9 @@ func (l *Ledger) save() error {
 	b, err := json.Marshal(keep)
 	if err != nil {
 		return err
+	}
+	if l.Persist != nil {
+		return l.Persist.Save(b)
 	}
 	if err := os.MkdirAll(l.Dir, 0o700); err != nil {
 		return err

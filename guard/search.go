@@ -108,7 +108,8 @@ func (b *brave) Search(ctx context.Context, query string, count int) ([]SearchRe
 		return nil, err
 	}
 	defer key.Wipe()
-	q := url.Values{"q": {query}, "count": {fmt.Sprint(count)}, "safesearch": {"moderate"},
+	// safesearch off: Tacy adds no content blocking of its own; "moderate" before.
+	q := url.Values{"q": {query}, "count": {fmt.Sprint(count)}, "safesearch": {"off"},
 		"text_decorations": {"false"}, "result_filter": {"web"}}
 	req, _ := http.NewRequestWithContext(ctx, "GET", b.base+"?"+q.Encode(), nil)
 	req.Header.Set("Accept", "application/json")
@@ -241,6 +242,8 @@ func (t *tavily) Search(ctx context.Context, query string, count int) ([]SearchR
 // title of the page they come from) first, then images extracted from the results (those have their page URL).
 // A top-level image whose URL also appears in a result's images, or whose page title equals a result's title,
 // gets that result's URL as its source. Logos and descriptionless page images are skipped. One search credit.
+// No safe_search: Tavily's adult-content filter is off unless asked for (its default, false), and Tacy adds no
+// content blocking of its own. The same for Search and ImagesFast.
 func (t *tavily) Images(ctx context.Context, query string, count int) ([]ImageCandidate, error) {
 	key, err := searchKey(ctx, t.lease, tavilyKey, t.base)
 	if err != nil {
@@ -439,7 +442,8 @@ func (b *brave) Images(ctx context.Context, query string, count int) ([]ImageCan
 		return nil, err
 	}
 	defer key.Wipe()
-	q := url.Values{"q": {query}, "count": {fmt.Sprint(min(count*2, 50))}, "safesearch": {"strict"}}
+	// safesearch off: Tacy adds no content blocking of its own; "strict" before.
+	q := url.Values{"q": {query}, "count": {fmt.Sprint(min(count*2, 50))}, "safesearch": {"off"}}
 	base := strings.Replace(b.base, "/web/search", "/images/search", 1)
 	req, _ := http.NewRequestWithContext(ctx, "GET", base+"?"+q.Encode(), nil)
 	req.Header.Set("Accept", "application/json")

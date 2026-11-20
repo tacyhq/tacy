@@ -182,7 +182,9 @@ func (ac *appCompose) checkFlags(mode string, kmsRoots map[string]string, ports 
 }
 
 // noDiskVolumes: the docker compose keeps nothing on the data disk. Every top-level volume is memory (driver_opts
-// type tmpfs), and a service mounts only those, tmpfs, or dstack's socket (/var/run/dstack.sock, for quotes).
+// type tmpfs), and a service mounts only those, tmpfs, or dstack's socket (/var/run/dstack.sock, for quotes). The
+// e2e test's diag service may also bind the host's root read-only (its plaintext-disk scan reads the disk, writes
+// nothing): only an e2e verification takes a compose with that service at all (ComposeImagesE2E).
 func noDiskVolumes(compose string) error {
 	var doc struct {
 		Services map[string]struct {
@@ -215,21 +217,27 @@ func noDiskVolumes(compose string) error {
 	sort.Strings(svcs)
 	for _, s := range svcs {
 		for _, v := range doc.Services[s].Volumes {
-			src, typ := "", "volume"
+			src, typ, ro := "", "volume", false
 			switch m := v.(type) {
 			case string:
-				src, _, _ = strings.Cut(m, ":")
+				var rest string
+				src, rest, _ = strings.Cut(m, ":")
 				if strings.HasPrefix(src, "/") || strings.HasPrefix(src, ".") {
 					typ = "bind"
+				}
+				if _, opts, ok := strings.Cut(rest, ":"); ok {
+					ro = slices.Contains(strings.Split(opts, ","), "ro")
 				}
 			case map[string]any:
 				typ, _ = m["type"].(string)
 				src, _ = m["source"].(string)
+				ro, _ = m["read_only"].(bool)
 			}
 			switch {
 			case typ == "tmpfs":
 			case typ == "bind" && src == "/var/run/dstack.sock":
 			case typ == "volume" && mem[src]:
+			case s == E2EDiagService && typ == "bind" && src == "/" && ro:
 			default:
 				return fmt.Errorf("service %s mounts %v, which isn't memory or dstack's socket", s, v)
 			}

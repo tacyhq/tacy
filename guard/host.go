@@ -33,11 +33,11 @@ func NewDevSearch(url string) SearchProvider {
 	return t
 }
 
-// NewFetcher is the client for pages, images and site icons: public addresses only (the CVM), or any address when
-// anyAddress (local development and tests only).
+// NewFetcher is the client for pages, images and site icons: public addresses on 443 over HTTPS only (the CVM:
+// newWebFetcher), or any address and plain http when anyAddress (local development and tests only).
 func NewFetcher(anyAddress bool) *http.Client {
 	if anyAddress {
 		return newFetcher(nil)
 	}
-	return newFetcher(publicOnly)
+	return newWebFetcher()
 }

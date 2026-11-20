@@ -34,7 +34,7 @@ import (
 type Config struct {
 	Up      Upstream       // the model gateway: Tinfoil's router, verified (tinfoilUpstream); required
 	Search  SearchProvider // web.search and web.images (an ImageSearcher for images); nil: none configured
-	Fetcher *http.Client   // web.fetch and image downloads; nil: newFetcher(publicOnly)
+	Fetcher *http.Client   // web.fetch and image downloads; nil: newWebFetcher() (public addresses, HTTPS only)
 	Icons   *http.Client   // the sources' site icons (same guarded client in production); nil: none
 	Limits  *Limits        // per-user and VM-wide tool caps (limits.go); nil: none
 	// PageLinks overrides TaskOptions.PageLinks for every task: "on" (cmd/readereval -page-links) or "off"
@@ -95,7 +95,7 @@ func New(cfg Config) *Guard {
 		cfg.Search = newTavily(nil) // answers "web search isn't configured" without a request
 	}
 	if cfg.Fetcher == nil {
-		cfg.Fetcher = newFetcher(publicOnly)
+		cfg.Fetcher = newWebFetcher()
 	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now

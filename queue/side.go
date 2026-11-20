@@ -12,6 +12,7 @@ import (
 
 	"github.com/tacyhq/tacy/approval"
 	"github.com/tacyhq/tacy/runauth"
+	"github.com/tacyhq/tacy/sealstate"
 	"github.com/tacyhq/tacy/trigger"
 )
 
@@ -21,7 +22,8 @@ import (
 // release before this one refuses a queue newer than its schema, so a rollback must find the queue file at the
 // version it knows; it simply never opens this one. Same durability settings as the queue.
 type Side struct {
-	db *sql.DB
+	db  *sql.DB
+	mem bool // in memory (OpenSideMemory)
 }
 
 var (
@@ -203,6 +205,37 @@ func OpenSide(path string) (*Side, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
+	return newSide(db)
+}
+
+// OpenSideMemory makes the side store in this process's memory (the keys plan: nothing on the CVM's disk), from a
+// snapshot Snapshot made (empty: a new one). Its lasting copy is that snapshot, sealed (sealstate).
+func OpenSideMemory(snapshot []byte) (*Side, error) {
+	db, err := sealstate.OpenMemoryDB(snapshot)
+	if err != nil {
+		return nil, err
+	}
+	s, err := newSide(db)
+	if err != nil {
+		return nil, err
+	}
+	s.mem = true
+	return s, nil
+}
+
+// Snapshot is the whole store (a memory one: OpenSideMemory), for sealstate.
+func (s *Side) Snapshot() ([]byte, error) {
+	if !s.mem {
+		return nil, errors.New("queue side: only a memory store snapshots")
+	}
+	return sealstate.SnapshotDB(s.db)
+}
+
+// Version changes whenever the store's content does (sealstate.Source).
+func (s *Side) Version() uint64 { return sealstate.DBVersion(s.db) }
+
+// newSide migrates db and makes the Side.
+func newSide(db *sql.DB) (*Side, error) {
 	var v int
 	if err := db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
 		db.Close()

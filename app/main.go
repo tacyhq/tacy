@@ -364,14 +364,7 @@ func (s *server) run(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Cache-Control", "no-store")
 			w.WriteHeader(200)
 			out := newEventStream(w, keepaliveEvery)
-			code, msg := coded(err)
-			if rg, ok := s.agent.(*recGateway); ok { // the refusal goes on the record too
-				if ev, ok := rg.Refused(&req, err); ok {
-					out.emit(ev)
-				}
-			}
-			out.emit(proto.Event{Type: "error", Error: msg, Code: code})
-			out.done()
+			s.refuseRun(out, &req, err)
 			out.stop()
 			return
 		}
@@ -409,7 +402,31 @@ func (s *server) run(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	s.tasks().Run(r.Context(), userFrom(r.Context()), &req, emit)
+	// The task's own start checks the request again (Host.Start's StartFor): what was admitted above may be refused
+	// there (the day used up by parallel runs meanwhile, a stop that just came in), and then nothing was emitted.
+	// That refusal reaches the person and the record as the one above does, never as an empty stream.
+	var emitted atomic.Bool
+	err = s.tasks().Run(r.Context(), userFrom(r.Context()), &req, func(e proto.Event) error {
+		emitted.Store(true)
+		return emit(e)
+	})
+	if err != nil && !emitted.Load() && r.Context().Err() == nil {
+		s.refuseRun(out, &req, err)
+		return
+	}
+	out.done()
+}
+
+// refuseRun ends a /run stream with a refusal: a safety control's (stopped, no policy, a model it doesn't allow, the
+// day used up) with its code and its record in the space's chain; any other error as a plain error event.
+func (s *server) refuseRun(out *eventStream, req *proto.RunRequest, err error) {
+	code, msg := coded(err)
+	if rg, ok := s.agent.(*recGateway); ok && safety.CodeOf(err) != "" { // the refusal goes on the record too
+		if ev, ok := rg.Refused(req, err); ok {
+			out.emit(ev)
+		}
+	}
+	out.emit(proto.Event{Type: "error", Error: msg, Code: code})
 	out.done()
 }
 

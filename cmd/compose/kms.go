@@ -40,7 +40,7 @@ import (
 // policies and secrets bundles. Made offline with `go run ./cmd/kmsctl keygen-admin DIR NAME` (it prints the public
 // key for here; the wrapped private key never leaves the admin's machine). They may not be the safety admin keys
 // (adminKeys). Empty: not pinned yet, and --kms-release refuses to write or check a release.
-const kmsAdminKeys = ""
+const kmsAdminKeys = "ed25519:9ZU78UPBF2w6xfjTdSGODr5lQD7kTrt0SuLhTl+kOv8="
 
 // kmsAdminThreshold is how many of kmsAdminKeys an admin document needs (1 while there is one admin key).
 const kmsAdminThreshold = 1

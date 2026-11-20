@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -162,7 +163,7 @@ func TestKMSID(t *testing.T) {
 	_, kms, _ := ed25519.GenerateKey(rand.Reader)
 	id := safety.KeyString(kms.Public().(ed25519.PublicKey))
 	withKMS := func(args string) []byte {
-		c := string(composeYAML(t))
+		c := string(composeNoKMS(t))
 		i := strings.Index(c, `"-runner-socket", "/run/tacy/runner/runner.sock"`) // agentd's command
 		if i < 0 {
 			t.Fatal("agentd's -runner-socket not in compose.yaml")
@@ -209,10 +210,21 @@ func TestNewerVersion(t *testing.T) {
 	}
 }
 
+// composeNoKMS is compose.yaml without the release's own key service flags (-kms-key, -kms-hosts, -kms-url), so a
+// test names only the KMS id it puts in.
+func composeNoKMS(t *testing.T) []byte {
+	t.Helper()
+	c := regexp.MustCompile(`"-kms-(key|url|hosts)", "[^"]*", `).ReplaceAllString(string(composeYAML(t)), "")
+	if strings.Contains(c, `"-kms-`) {
+		t.Fatal("a -kms- flag left in compose.yaml")
+	}
+	return []byte(c)
+}
+
 // composeWithKMS is compose.yaml with args put in agentd's command (a -kms-key and -kms-url, as a release names them).
 func composeWithKMS(t *testing.T, args string) []byte {
 	t.Helper()
-	c := string(composeYAML(t))
+	c := string(composeNoKMS(t))
 	i := strings.Index(c, `"-runner-socket", "/run/tacy/runner/runner.sock"`)
 	if i < 0 {
 		t.Fatal("agentd's -runner-socket not in compose.yaml")

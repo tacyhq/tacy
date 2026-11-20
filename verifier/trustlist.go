@@ -27,7 +27,7 @@ const TrustListThreshold = 1
 // its genesis: kmsctl genesis prints it and writes kms-id.txt). The release step fills it in; cmd/compose's kmsID is
 // this constant, so the compose names exactly the id the verifier accepts. Empty until genesis: KMSIDs is then empty
 // and a compose naming any -kms-key is refused, unless a signed trust list names that id (kms_ids).
-const ReleaseKMSID = ""
+const ReleaseKMSID = "ed25519:1LPZHjHaCjYvuibeGa0PcuFHEIadIxsp8x9EbNNMmEg="
 
 // ReleaseKMSName is how the verifier's facts name ReleaseKMSID.
 const ReleaseKMSName = "Tacy KMS (production)"

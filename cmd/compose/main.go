@@ -119,7 +119,7 @@ const searchProvider = "exa"
 // disagree. Empty: not pinned yet, and the generator refuses to write a compose (the VM would have no keys at all).
 const kmsID = verifier.ReleaseKMSID
 
-var kmsURLs = []string{}
+var kmsURLs = []string{"https://f7064d961aa473c26b6f9a050bb839e0ddb00e36-8000.dstack-pha1-prod5.phala.network"}
 
 // stateURL is the chat Worker, whose sealed-state API (GET/PUT /api/vm/state/<name>, the chat's vm-state.ts) keeps
 // the VM's sealed state: ciphertext only, under the key service's keys (-state-url, gatewayd's fixed calls).
@@ -140,7 +140,7 @@ var socketVolumes = []struct{ name, uid, gid, mode string }{
 // AGENT_VM_RELAY_KEY for now (later the Tacy key service's). Make it offline with
 // `go run ./cmd/safetysign keygen DIR relay-auth` (prints the public key for here; DIR/relay-auth.key is the seed).
 // Empty: not pinned yet, and the generator refuses to write a compose (agentd would take no request).
-const relayAuthKey = ""
+const relayAuthKey = "ed25519:HwAuJy8LJPfmHSB0nECuC9OD2PzXVKVn7+wdm89pWIo="
 
 // uids. Each process has its own; none is root (agentd was until VM release 2). Each socket is 0660, owned by the
 // process that listens, with the group of the one peer (also checked by uid with SO_PEERCRED). agentd needs no

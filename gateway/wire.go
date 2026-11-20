@@ -27,6 +27,7 @@ import (
 	"github.com/tacyhq/tacy/harness"
 	"github.com/tacyhq/tacy/proto"
 	"github.com/tacyhq/tacy/safety"
+	"github.com/tacyhq/tacy/vault"
 )
 
 // Version names this protocol (internal, unfrozen).
@@ -49,6 +50,9 @@ const (
 	tResult = "result" // gatewayd → agentd: request rid's result
 	tSafety = "safety" // agentd → gatewayd, a connection's only frame: signed policies and stop lists (step 6)
 	tConn   = "conn"   // agentd → gatewayd, a connection's only frame: a Settings → Connections call (the connections contract)
+	// agentd → gatewayd, a connection's only frame: a secrets push op for vaultd (vault/secrets.go): its key, its
+	// status, or the sealed push (it stays sealed here; only vaultd opens it).
+	tSecrets = "secrets"
 )
 
 type frame struct {
@@ -97,6 +101,9 @@ type frame struct {
 	// conn: a Settings call (the box of a put stays sealed to the vault); its result.
 	Conn       *guard.ConnRequest `json:"conn,omitzero"`
 	ConnResult *guard.ConnResult  `json:"conn_result,omitzero"`
+	// secrets: the op; its answer.
+	Secrets       *vault.SecretsCall   `json:"secrets,omitzero"`
+	SecretsResult *vault.SecretsAnswer `json:"secrets_result,omitzero"`
 }
 
 // record is a journal entry as gatewayd needs it to rebuild a task's state (guard/rebuild.go): actions whole, model

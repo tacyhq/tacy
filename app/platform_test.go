@@ -90,7 +90,7 @@ func infoOf(t *testing.T, info json.RawMessage) byte {
 // /Info is fetched once per RTMR3, not per /attest; a quote whose RTMR3 moved gets a fresh /Info.
 func TestEvidenceReusesInfoForTheSameRTMR3(t *testing.T) {
 	f := &fakeGuestAgent{rtmr3: 1, ready: true}
-	d := newDstack(f.start(t), "")
+	d := newDstack(f.start(t))
 	ctx := context.Background()
 	rd := make([]byte, 64)
 	for i := range 3 {
@@ -119,7 +119,7 @@ func TestEvidenceReusesInfoForTheSameRTMR3(t *testing.T) {
 // one guest agent call.
 func TestPrefetchInfoUntilSystemReady(t *testing.T) {
 	f := &fakeGuestAgent{rtmr3: 1}
-	d := newDstack(f.start(t), "")
+	d := newDstack(f.start(t))
 	done := make(chan struct{})
 	go func() { d.PrefetchInfo(context.Background(), 10*time.Millisecond, 10*time.Second); close(done) }()
 	for f.infos.Load() < 2 {

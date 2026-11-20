@@ -23,7 +23,20 @@ import (
 // the retired images and sets (dstack-0.5.9 and older); TestRetiredImagesRefused shows the default policy refuses
 // them.
 var offline = Policy{AllowStaleTCB: true, VerifyQuote: func(_ context.Context, raw []byte) (*tdx.Quote, error) { return tdx.Parse(raw) },
-	ProdImages: allImages(), Boot: allSets()}
+	ProdImages: allImages(), Boot: allSets(), KMSRoots: allKMSRoots(), PreLaunch: RetiredPreLaunchScripts, legacy: true}
+
+// allKMSRoots are the pinned and the retired KMS roots (offline accepts both; TestKMSRoots shows the default refuses
+// the retired one).
+func allKMSRoots() map[string]string {
+	m := map[string]string{}
+	for k, v := range KMSRoots {
+		m[k] = v
+	}
+	for k, v := range RetiredKMSRoots {
+		m[k] = v
+	}
+	return m
+}
 
 func allImages() map[string]string {
 	m := map[string]string{}
@@ -40,22 +53,21 @@ func allSets() []BootMeasurement {
 	return append(append([]BootMeasurement{}, BootMeasurements...), RetiredBootMeasurements...)
 }
 
-// Since 2026-11-15 only dstack-0.6.4 is accepted (2026-10-17 to 2026-11-15 only 0.6.1): a policy of only the retired
-// images refuses the 0.6.4 recording at the image check.
+// Since 2026-11-20 only dstack-0.6.5 is accepted (2026-10-17 to 2026-11-15 only 0.6.1, then only 0.6.4): the default
+// policy refuses the 0.6.4 recording at the image check.
 func TestRetiredImagesRefused(t *testing.T) {
 	a, nonce, compose := load064(t)
-	p := Policy{AllowStaleTCB: true, VerifyQuote: offline.VerifyQuote, Compose: compose,
-		ProdImages: RetiredImages, Boot: RetiredBootMeasurements}
+	p := Policy{AllowStaleTCB: true, VerifyQuote: offline.VerifyQuote, Compose: compose}
 	if _, err := Verify(context.Background(), a, nonce, p); err == nil || !strings.Contains(err.Error(), "isn't a known production image") {
-		t.Fatalf("an image outside the policy accepted: %v", err)
+		t.Fatalf("a retired image accepted: %v", err)
 	}
 	for h := range RetiredImages {
 		if _, ok := ProdImages[h]; ok {
 			t.Fatalf("retired image %s still accepted", h)
 		}
 	}
-	if len(ProdImages) != 1 || ProdImages["feff3645893ad910d4f0e06d8f553cf80a7c9fede2ce0698fa63116283260366"] != "dstack-0.6.4" ||
-		len(BootMeasurements) != 1 {
+	if len(ProdImages) != 1 || ProdImages["4771a29e03e93f0e2d5e37174cd8bb1112942c9689deb36b16c5df9e183d8623"] != "dstack-0.6.5" ||
+		len(BootMeasurements) != 1 || BootMeasurements[0].OSImage != "4771a29e03e93f0e2d5e37174cd8bb1112942c9689deb36b16c5df9e183d8623" {
 		t.Fatalf("accepted images %v, %d sets", ProdImages, len(BootMeasurements))
 	}
 }
@@ -304,8 +316,9 @@ func TestRecordedOnline(t *testing.T) {
 	if testing.Short() {
 		t.Skip("needs Intel PCS")
 	}
+	// The newest recording (dstack-0.6.4, retired since 2026-11-20, so allowed here) until a 0.6.5 one is recorded.
 	a, nonce, compose := load064(t)
-	res, err := Verify(context.Background(), a, nonce, Policy{Compose: compose})
+	res, err := Verify(context.Background(), a, nonce, Policy{Compose: compose, ProdImages: allImages(), Boot: allSets(), PreLaunch: RetiredPreLaunchScripts, legacy: true})
 	if err != nil || res.HPKEPublicKey == nil {
 		t.Fatalf("the 0.6.4 recording, online: %v", err)
 	}
@@ -345,7 +358,7 @@ func TestImageComposeOffline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(res.Checks) != 16 || res.Checks[15].Name != ImagesCheck || hex.EncodeToString(res.HPKEPublicKey) != a.HPKEPublicKey {
+	if len(res.Checks) != 18 || res.Checks[17].Name != ImagesCheck || hex.EncodeToString(res.HPKEPublicKey) != a.HPKEPublicKey {
 		t.Fatalf("%d checks, last %q", len(res.Checks), res.Checks[len(res.Checks)-1].Name)
 	}
 	for _, svc := range []string{"setup", "agentd", "runner", "agentvm", "vaultd"} {
@@ -356,8 +369,8 @@ func TestImageComposeOffline(t *testing.T) {
 	// The brain in gVisor (since v0.4.0): the runner's image is pinned like the others, and its sandbox is a fact.
 	if !strings.HasPrefix(res.Facts["image runner"], "ghcr.io/tacyhq/tacy/runnerd@sha256:") || res.Facts["image brain"] != "" ||
 		!strings.HasSuffix(res.Facts["brain sandbox"], "(systrap, rootless runsc), no network") || len(res.Facts["gvisor runsc sha256"]) != 64 ||
-		!strings.Contains(res.Checks[15].Detail, "the brain in gVisor "+res.Facts["gvisor release"]) {
-		t.Errorf("runner facts %v, detail %q", res.Facts, res.Checks[15].Detail)
+		!strings.Contains(res.Checks[17].Detail, "the brain in gVisor "+res.Facts["gvisor release"]) {
+		t.Errorf("runner facts %v, detail %q", res.Facts, res.Checks[17].Detail)
 	}
 	// The same VM with one image's digest swapped for a tag: compose-hash and RTMR3 consistent again, and refused
 	// by the image rule even with that compose expected.
@@ -448,6 +461,9 @@ func TestTamper(t *testing.T) {
 		{"no pinned sets", "no pinned boot measurements", func(_ *proto.Attestation, _ *[]byte, p *Policy) {
 			p.Boot = []BootMeasurement{}
 		}},
+		{"unpinned KMS root", KMSCheck + ": KMS root", func(_ *proto.Attestation, _ *[]byte, p *Policy) {
+			p.KMSRoots = map[string]string{}
+		}},
 		{"unreviewed pre-launch script", "pre-launch script", func(_ *proto.Attestation, _ *[]byte, p *Policy) {
 			p.PreLaunch = map[string]string{"00": "other"}
 		}},
@@ -523,7 +539,7 @@ func TestRelease(t *testing.T) {
 		t.Fatal(err)
 	}
 	if res.Facts["release"] != "v0.3.1" || res.Facts["docker compose sha256"] != hex.EncodeToString(sum[:]) || res.HPKEPublicKey == nil ||
-		len(res.Checks) != 16 || res.Checks[15].Name != ImagesCheck || !strings.HasPrefix(res.Facts["image agentd"], "ghcr.io/tacyhq/tacy/agentd@sha256:") {
+		len(res.Checks) != 18 || res.Checks[17].Name != ImagesCheck || !strings.HasPrefix(res.Facts["image agentd"], "ghcr.io/tacyhq/tacy/agentd@sha256:") {
 		t.Fatalf("facts %v", res.Facts)
 	}
 	// A signed release whose compose builds on the VM (the recording's own, as before v0.2.0): the signature holds,
@@ -607,20 +623,21 @@ func load064(t *testing.T) (*proto.Attestation, []byte, []byte) {
 
 func set064(t *testing.T) *BootMeasurement {
 	t.Helper()
-	for _, s := range BootMeasurements {
+	for _, s := range allSets() {
 		if s.OSImage == "feff3645893ad910d4f0e06d8f553cf80a7c9fede2ce0698fa63116283260366" {
 			return &s
 		}
 	}
-	t.Fatal("dstack-0.6.4 isn't an accepted set")
+	t.Fatal("no dstack-0.6.4 set")
 	return nil
 }
 
-// The 0.6.4 recording passes every check before the images rule with the default image and boot policy, and its
-// registers are the pinned set (computed with dstack-mr before any VM booted it).
+// The 0.6.4 recording passes every check when 0.6.4 is allowed (retired since 2026-11-20), and its registers are the
+// pinned set (computed with dstack-mr before any VM booted it). It was on Phala's new KMS root (prod5, 2026-11-15).
 func TestRecorded064Offline(t *testing.T) {
 	a, nonce, compose := load064(t)
-	p := Policy{AllowStaleTCB: true, VerifyQuote: offline.VerifyQuote, Compose: compose}
+	p := Policy{AllowStaleTCB: true, VerifyQuote: offline.VerifyQuote, Compose: compose, legacy: true, PreLaunch: RetiredPreLaunchScripts, ProdImages: allImages(),
+		Boot: allSets()}
 	res, err := Verify(context.Background(), a, nonce, p)
 	if err != nil {
 		t.Fatalf("0.6.4 recording: %v", err)
@@ -705,5 +722,148 @@ func TestDstack061Refused(t *testing.T) {
 	}
 	if _, ok := RetiredImages["ec43cb8c5e04b6bb6c53b33b16076a01d83d01f7f4b703f2f78a0d947d6247e6"]; !ok {
 		t.Fatal("dstack-0.6.1 isn't in RetiredImages")
+	}
+}
+
+// Since 2026-11-20 dstack-0.6.4 is refused: Phala moved the live CVM to 0.6.5 with its KMS's new root, and only a
+// 0.6.5 guest migrates a disk to a new root epoch. The 0.6.4 recording (TestRecorded064Offline) fails the image check
+// by default, and its boot measurements match no accepted set even with its image label allowed again.
+func TestDstack064Refused(t *testing.T) {
+	a, nonce, compose := load064(t)
+	p := Policy{AllowStaleTCB: true, VerifyQuote: offline.VerifyQuote, Compose: compose}
+	res, err := Verify(context.Background(), a, nonce, p)
+	if err == nil || !strings.Contains(err.Error(), "isn't a known production image") || res.HPKEPublicKey != nil {
+		t.Fatalf("dstack-0.6.4 accepted: %v", err)
+	}
+	p.ProdImages = map[string]string{"feff3645893ad910d4f0e06d8f553cf80a7c9fede2ce0698fa63116283260366": "dstack-0.6.4"}
+	res, err = Verify(context.Background(), a, nonce, p)
+	if err == nil || !strings.Contains(err.Error(), "match no pinned set") || res.HPKEPublicKey != nil {
+		t.Fatalf("dstack-0.6.4's boot measurements accepted: %v", err)
+	}
+	if _, ok := RetiredImages["feff3645893ad910d4f0e06d8f553cf80a7c9fede2ce0698fa63116283260366"]; !ok {
+		t.Fatal("dstack-0.6.4 isn't in RetiredImages")
+	}
+}
+
+func set065(t *testing.T) *BootMeasurement {
+	t.Helper()
+	for _, s := range BootMeasurements {
+		if s.OSImage == "4771a29e03e93f0e2d5e37174cd8bb1112942c9689deb36b16c5df9e183d8623" {
+			return &s
+		}
+	}
+	t.Fatal("dstack-0.6.5 isn't an accepted set")
+	return nil
+}
+
+// cmdline065 is dstack-0.6.5's kernel command line (metadata.json of mkosi-os-v0.6.5), initrd065 the sha384 of its
+// initramfs.cpio.gz (the file its sha256sum.txt lists as 63207bde…).
+const (
+	cmdline065 = "console=ttyS0 init=/init panic=1 net.ifnames=0 biosdevname=0 mce=off oops=panic pci=noearly " +
+		"random.trust_cpu=y random.trust_bootloader=n tsc=reliable no-kvmclock systemd.gpt_auto=0 " +
+		"systemd.import_credentials=no dstack.rootfs_hash=c9092cf746155a85fa6e90737b55641684f3af7fc9d96026790ce3fab627f070 " +
+		"dstack.rootfs_size=605732864"
+	initrd065 = "c50a56afeddda17f5b0582e280bb2c7ebd836e795a1df2946806a3c2fc37fcb554874ea1a86a73e7566ffb6ed4a4aebe"
+)
+
+// The pinned 0.6.5 RTMR2 is OVMF's two RTMR2 events, recomputed here without dstack-mr: the command line with
+// " initrd=initrd" appended (UTF-16LE with a terminating NUL), which keeps the GHSA-c79w-3x5w-gmm5 fix
+// (systemd.gpt_auto=0 systemd.import_credentials=no) and names 0.6.5's root filesystem by its dm-verity hash, then
+// the initramfs.
+func TestDstack065CmdlineFix(t *testing.T) {
+	for _, f := range []string{"systemd.gpt_auto=0", "systemd.import_credentials=no"} {
+		if !strings.Contains(cmdline065, " "+f+" ") {
+			t.Fatalf("cmdline lacks %s", f)
+		}
+	}
+	u := utf16.Encode([]rune(cmdline065 + " initrd=initrd"))
+	b := make([]byte, 0, 2*len(u)+2)
+	for _, c := range u {
+		b = append(b, byte(c), byte(c>>8))
+	}
+	cmd := sha512.Sum384(append(b, 0, 0))
+	initrd, _ := hex.DecodeString(initrd065)
+	rtmr := make([]byte, 48)
+	for _, d := range [][]byte{cmd[:], initrd} {
+		h := sha512.Sum384(append(append([]byte{}, rtmr...), d...))
+		rtmr = h[:]
+	}
+	if got := hex.EncodeToString(rtmr); got != set065(t).RTMR2 {
+		t.Fatalf("RTMR2 from the 0.6.5 command line and initramfs is %s, not the pinned set's", got)
+	}
+}
+
+// setEvent sets the payload of a's runtime event name and returns the RTMR3 the edited log replays to.
+func setEvent(t *testing.T, a *proto.Attestation, name string, payload []byte) []byte {
+	t.Helper()
+	var q map[string]any
+	json.Unmarshal(a.Quote, &q)
+	ev, err := tdx.ParseEventLog(json.RawMessage(mustJSON(q["event_log"])))
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for i := range ev {
+		if ev[i].IMR == 3 && ev[i].Event == name {
+			ev[i].EventPayload, ev[i].Digest, found = hex.EncodeToString(payload), "", true
+		}
+	}
+	if !found {
+		t.Fatalf("no %s event", name)
+	}
+	rt, err := tdx.ReplayRTMR3(ev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := json.Marshal(ev)
+	q["event_log"] = string(b)
+	a.Quote, _ = json.Marshal(q)
+	return rt.RTMR3
+}
+
+// The VM's keys must come from a pinned KMS root (KMSRoots): the 0.6.4 recording (prod5, 2026-11-15) is on Phala's
+// root since its 2026-11-06 rotation and passes with the default roots; the 0.6.1 recording (2026-10-17) is on the
+// root before, retired, and is refused even with its image and boot measurements allowed; a key-provider event naming
+// another root, or no KMS, is refused (the event log made consistent with the edit, so only this rule can fail).
+func TestKMSRoots(t *testing.T) {
+	newRoot := "3059301306072a8648ce3d020106082a8648ce3d03010703420004e8e325a477b0bf22800dc927a46c68638938d283fe73d1f9028eeac7028193f3470122193875f598b7addc503e534712ab437b4120776bbac32ddf8897f844ee"
+	if len(KMSRoots) != 1 || KMSRoots[newRoot] == "" {
+		t.Fatalf("KMS roots %v", KMSRoots)
+	}
+	for k := range RetiredKMSRoots {
+		if _, ok := KMSRoots[k]; ok {
+			t.Fatalf("root %s is both pinned and retired", short(k))
+		}
+	}
+	a, nonce, compose := load064(t)
+	p := Policy{AllowStaleTCB: true, VerifyQuote: offline.VerifyQuote, Compose: compose, legacy: true, PreLaunch: RetiredPreLaunchScripts, ProdImages: allImages(),
+		Boot: allSets()}
+	res, err := Verify(context.Background(), a, nonce, p)
+	if err != nil || res.Facts["KMS root"] != KMSRoots[newRoot] {
+		t.Fatalf("0.6.4 recording on the new root: %v %v", err, res.Facts["KMS root"])
+	}
+
+	a, nonce, compose = load061(t)
+	p.Compose = compose
+	res, err = Verify(context.Background(), a, nonce, p)
+	if err == nil || !strings.HasPrefix(err.Error(), KMSCheck+": ") || !strings.Contains(err.Error(), "is retired") ||
+		res.HPKEPublicKey != nil {
+		t.Fatalf("the old KMS root accepted: %v", err)
+	}
+
+	for _, c := range []struct{ payload, want string }{
+		{`{"name":"kms","id":"3059301306072a8648ce3d020106082a8648ce3d03010703420004` + strings.Repeat("ab", 64) + `"}`, "isn't a pinned one"},
+		{`{"name":"local-sgx","id":"` + newRoot + `"}`, "want a dstack KMS"},
+		{`not json`, "no key-provider event"},
+	} {
+		a, nonce, compose := load064(t)
+		rtmr3 := setEvent(t, a, "key-provider", []byte(c.payload))
+		p := Policy{AllowStaleTCB: true, Compose: compose, legacy: true, PreLaunch: RetiredPreLaunchScripts, ProdImages: allImages(), Boot: allSets(),
+			VerifyQuote: changeQuote(func(q *tdx.Quote) { q.Rtmrs[3] = rtmr3 })}
+		res, err := Verify(context.Background(), a, nonce, p)
+		if err == nil || !strings.HasPrefix(err.Error(), KMSCheck+": ") || !strings.Contains(err.Error(), c.want) ||
+			res.HPKEPublicKey != nil {
+			t.Fatalf("key provider %s: %v", c.payload, err)
+		}
 	}
 }

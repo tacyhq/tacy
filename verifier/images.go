@@ -36,13 +36,25 @@ const E2EDiagService = "e2ediag"
 // ComposeImagesE2E.
 const E2EModelFaultFlag = "e2e-model-fault"
 
-func ComposeImages(compose string) (map[string]string, error) { return composeImages(compose, false) }
+func ComposeImages(compose string) (map[string]string, error) {
+	return composeImages(compose, false, nil)
+}
 
 // ComposeImagesE2E is ComposeImages that also accepts the e2e overlay's diag service with its pid setting (test
 // tools only, never the browser's verifier).
-func ComposeImagesE2E(compose string) (map[string]string, error) { return composeImages(compose, true) }
+func ComposeImagesE2E(compose string) (map[string]string, error) {
+	return composeImages(compose, true, nil)
+}
 
-func composeImages(compose string, e2e bool) (map[string]string, error) {
+// ComposeImagesFor is ComposeImages for another release's services (the key service's compose: kmsd).
+func ComposeImagesFor(compose string, services []string) (map[string]string, error) {
+	return composeImages(compose, false, services)
+}
+
+func composeImages(compose string, e2e bool, allowed []string) (map[string]string, error) {
+	if allowed == nil {
+		allowed = ReleaseServices
+	}
 	dec := yaml.NewDecoder(strings.NewReader(compose))
 	var doc map[string]any
 	if err := dec.Decode(&doc); err != nil {
@@ -71,8 +83,8 @@ func composeImages(compose string, e2e bool) (map[string]string, error) {
 			return nil, fmt.Errorf("service %s isn't a mapping", n)
 		}
 		diag := e2e && n == E2EDiagService
-		if !slices.Contains(ReleaseServices, n) && !diag {
-			return nil, fmt.Errorf("service %s isn't one of the release's (%s)", n, strings.Join(ReleaseServices, ", "))
+		if !slices.Contains(allowed, n) && !diag {
+			return nil, fmt.Errorf("service %s isn't one of the release's (%s)", n, strings.Join(allowed, ", "))
 		}
 		if p, ok := svc["privileged"]; ok && p != false {
 			return nil, fmt.Errorf("service %s is privileged", n)
@@ -160,8 +172,8 @@ func SandboxFacts(compose string) map[string]string {
 
 // checkImages runs ComposeImages on the attested compose, records each service's image as the fact
 // "image <service>" and the brain's sandbox (SandboxFacts), and adds the check.
-func (r *Result) checkImages(compose string, e2e bool) bool {
-	images, err := composeImages(compose, e2e)
+func (r *Result) checkImages(compose string, e2e bool, services []string) bool {
+	images, err := composeImages(compose, e2e, services)
 	for svc, img := range images {
 		r.Facts["image "+svc] = img
 	}

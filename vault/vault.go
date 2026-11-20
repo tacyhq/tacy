@@ -15,7 +15,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -56,6 +55,8 @@ type Request struct {
 	Conn    string  `json:"conn,omitzero"`
 	Pending string  `json:"pending,omitzero"`
 	Sealed  *Sealed `json:"sealed,omitzero"`
+	// Push is a secrets push (op "secrets_put", secrets.go).
+	Push *SecretsPush `json:"push,omitzero"`
 }
 
 // Record is what the vault writes for every request: names and ids, never the value. Later these go to the
@@ -100,6 +101,7 @@ type Vault struct {
 	now     func() time.Time
 	safety  *safety.State // nil: no step 6 checks
 	conns   *connState    // nil: connections off (conn.go)
+	push    *pushState    // nil: secrets pushes off (secrets.go)
 	rates   safety.Limiter
 }
 
@@ -175,7 +177,7 @@ func (v *Vault) Lease(r Request) ([]byte, string, error) {
 
 func (v *Vault) lease(r Request) ([]byte, string, error) {
 	if !validName(r.Secret) || !validConnector(r.Connector) || !validHost(r.Host) || !validID(r.Task) || !validID(r.Action) ||
-		r.Space != "" && !safety.ValidID(r.Space) || len(r.Docs) > 0 || r.Pending != "" || r.Sealed != nil {
+		r.Space != "" && !safety.ValidID(r.Space) || len(r.Docs) > 0 || r.Pending != "" || r.Sealed != nil || r.Push != nil {
 		return nil, "", ErrBadRequest
 	}
 	if r.Secret == ConnSecret { // only through a connection (leaseConn)
@@ -332,19 +334,4 @@ func ChatGrants(tinfoilHost string) []Grant {
 		{Secret: "BRAVE_SEARCH_API_KEY", Connector: "web", SendOnlyTo: []string{"api.search.brave.com"}},
 		{Secret: "EXA_API_KEY", Connector: "web", SendOnlyTo: []string{"api.exa.ai"}},
 	}
-}
-
-// FromEnv takes the granted secrets out of the environment (dstack's encrypted env vars, which only the vault's
-// container is given) and unsets them, so a child process or a later os.Environ can't see them.
-func FromEnv(grants []Grant) map[string][]byte {
-	out := map[string][]byte{}
-	for _, g := range grants {
-		if v, ok := os.LookupEnv(g.Secret); ok {
-			if v != "" {
-				out[g.Secret] = []byte(v)
-			}
-			os.Unsetenv(g.Secret)
-		}
-	}
-	return out
 }

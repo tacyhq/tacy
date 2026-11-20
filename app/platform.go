@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -17,34 +16,28 @@ import (
 	"time"
 )
 
-// Platform is everything host-specific: where secrets come from, how attestation evidence is produced, and where
-// (encrypted) scratch storage lives. Moving to Google TDX (dstack too: same adapter) or Tinfoil Containers (their
-// attestation document and secrets) means one more implementation of this, nothing else.
+// Platform is everything host-specific: how attestation evidence is produced, and (local development only) where
+// secrets come from. Moving to Google TDX (dstack too: same adapter) or Tinfoil Containers (their attestation
+// document) means one more implementation of this, nothing else.
+//
+// What a platform does NOT give ("Keys: never a provider's", the keys plan): keys (dstack's GetKey derives
+// them from Phala's KMS root), secrets (Phala's encrypted env is under Phala's keys) or storage (its disk is under
+// Phala's disk key). Keys come from a KeySource (keysource.go), secrets by the Worker's push (secrets.go), and
+// nothing is kept on a disk.
 type Platform interface {
 	Name() string
-	// Secret returns a named secret, or "" when it isn't set.
+	// Secret returns a named secret, or "" when it isn't set: local development only (dstack: always "").
 	Secret(name string) string
 	// Evidence returns attestation evidence whose report_data is exactly reportData (64 bytes), plus platform
 	// info the verifier needs (for dstack: the app compose and event log).
 	Evidence(ctx context.Context, reportData []byte) (quote, info json.RawMessage, err error)
-	// StoragePath is a directory on the platform's encrypted disk for later tools, or "" when there's none.
-	// Nothing uses it yet: the service is stateless.
-	StoragePath() string
-	// ActivityKey is key material only this attested app gets, for the activity signing key (docs/24): dstack's
-	// KMS-derived key for a fixed path, the same after a restart. Locally, random per boot.
-	ActivityKey(ctx context.Context) ([]byte, error)
-	// TaskIDKey is key material for once-only task ids (docs/27 section 1): dstack's KMS-derived key at
-	// "tacy/task-ids/v1", the same after a restart, so a repeated start finds its task across restarts. Locally,
-	// random per boot.
-	TaskIDKey(ctx context.Context) ([]byte, error)
 }
 
-// dstack: Phala Cloud, or open-source dstack on Google Cloud. Secrets are dstack's encrypted environment
-// variables (encrypted to the CVM by the deployer, decrypted inside it); evidence comes from the guest agent socket.
+// dstack: Phala Cloud, or open-source dstack on Google Cloud. Evidence comes from the guest agent socket (GetQuote
+// and Info only: never GetKey).
 type dstack struct {
-	sock    string
-	storage string
-	http    *http.Client
+	sock string
+	http *http.Client
 
 	// info is the guest agent's /Info, kept for the boot (vm-speed): the guest agent answers one request at a
 	// time and /Info takes about as long as a quote (~1 s each on tdx.small, measured 2026-10-18), so fetching it
@@ -55,17 +48,16 @@ type dstack struct {
 	infoRTMR3 []byte
 }
 
-func newDstack(sock, storage string) *dstack {
-	return &dstack{sock: sock, storage: storage, http: &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{
+func newDstack(sock string) *dstack {
+	return &dstack{sock: sock, http: &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "unix", sock)
 		},
 	}}}
 }
 
-func (d *dstack) Name() string              { return "dstack" }
-func (d *dstack) Secret(name string) string { return os.Getenv(name) }
-func (d *dstack) StoragePath() string       { return d.storage }
+func (d *dstack) Name() string         { return "dstack" }
+func (d *dstack) Secret(string) string { return "" }
 
 func (d *dstack) call(ctx context.Context, method, path string, body any) (json.RawMessage, error) {
 	var rd io.Reader
@@ -213,50 +205,12 @@ func infoRTMR3(info json.RawMessage) ([]byte, bool) {
 	return rtmr3, ready
 }
 
-// ActivityKey asks the guest agent for the app's key at path "tacy/activity/v1" (dstack derives it from the KMS
-// root, the app id and the path; it never leaves the CVM). The response's key is hex; its signature chain (which
-// proves the key to dstack's KMS) isn't needed here: the browser learns the derived public key over EHBP from the
-// attested VM (meta.activity).
-func (d *dstack) ActivityKey(ctx context.Context) ([]byte, error) {
-	return d.appKey(ctx, "tacy/activity/v1", "signing")
-}
-
-// TaskIDKey asks the guest agent for the app's key at path "tacy/task-ids/v1" (as ActivityKey).
-func (d *dstack) TaskIDKey(ctx context.Context) ([]byte, error) {
-	return d.appKey(ctx, "tacy/task-ids/v1", "task-ids")
-}
-
-func (d *dstack) appKey(ctx context.Context, path, purpose string) ([]byte, error) {
-	b, err := d.call(ctx, "POST", "/GetKey", map[string]string{"path": path, "purpose": purpose})
-	if err != nil {
-		return nil, err
-	}
-	var r struct {
-		Key string `json:"key"`
-	}
-	if err := json.Unmarshal(b, &r); err != nil {
-		return nil, err
-	}
-	k, err := hex.DecodeString(strings.TrimPrefix(r.Key, "0x"))
-	if err != nil || len(k) < 32 {
-		return nil, errors.New("dstack GetKey: no usable key")
-	}
-	return k, nil
-}
-
 // local is for development on a laptop: secrets from the environment, no attestation. The verifier refuses it
 // unless told to skip attestation.
 type local struct{}
 
 func (local) Name() string              { return "local" }
 func (local) Secret(name string) string { return os.Getenv(name) }
-func (local) StoragePath() string       { return "" }
-func (local) ActivityKey(context.Context) ([]byte, error) {
-	k := make([]byte, 32)
-	_, err := rand.Read(k)
-	return k, err
-}
-func (local) TaskIDKey(ctx context.Context) ([]byte, error) { return local{}.ActivityKey(ctx) }
 func (local) Evidence(context.Context, []byte) (json.RawMessage, json.RawMessage, error) {
 	return nil, nil, nil
 }

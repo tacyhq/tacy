@@ -8,7 +8,8 @@
 // linked only by unix sockets in volumes shared by exactly two containers:
 //
 //   - agentd (./app, service "agentd"): the front door and the runtime (journal and queue, the harness to the
-//     brain). No network at all (network_mode none) and no keys: it gets only AGENT_VM_TOKEN, which it checks.
+//     brain). No network at all (network_mode none) and no keys: it checks the relay's token against the hash
+//     vaultd gives it after the Worker's push.
 //   - runnerd (./cmd/runnerd, service "runner"): runs the brain (./cmd/brain, our agent loop, untrusted) in a gVisor
 //     sandbox for agentd: no network, no keys, no capabilities, rootless runsc, Docker's seccomp profile off (runsc
 //     brings its own), memory and process limits on the container. The brain's sandbox has a root holding only its
@@ -19,11 +20,19 @@
 //     published port to agentd's HTTP socket. The service keeps the name "agentvm" because it owns port 8080, as
 //     the old single container did: an update or a rollback recreates it in place, whatever dstack does with
 //     services a compose no longer names.
-//   - vaultd (./cmd/vaultd): holds the keys (the only container given TINFOIL_API_KEY and the search keys), no
-//     network, releases one key per call to gatewayd's uid only, for a granted connector and exact host.
+//   - vaultd (./cmd/vaultd): holds the keys (the only process the Worker's push opens for: TINFOIL_API_KEY and the
+//     search keys), no network, releases one key per call to gatewayd's uid only, for a granted connector and exact
+//     host.
 //
 // A one-shot "setup" container (./cmd/setup: root, no network, three capabilities) gives the processes their
 // directories on the shared volumes first; every other container waits for it to exit cleanly.
+//
+// Nothing a provider's key protects ("Keys: never a provider's", the keys plan): no environment variables at
+// all (Phala's encrypted env is under its keys; the API keys arrive by the Worker's push, vault/secrets.go), no
+// volume on the disk (the only volumes are the socket directories, each a tmpfs), and no container logs (logging
+// none on every service: Docker's json-file driver writes to the disk; cmd/e2e's overlay may turn them back on for
+// a throwaway). The app-compose fields that go with it (allowed_envs [], swap_size 0, key_provider none with
+// an ephemeral data disk where Phala takes it) are set at deploy (the keys plan §3.3, §3.5).
 //
 // gVisor (runsc and the sidecars it runs from gvisor-bin/) is Google's release tarball, downloaded once into the
 // user's cache and checked against the tarball's sha256 and each binary's (sandbox/gvisor.go) before it goes into
@@ -91,14 +100,27 @@ const Registry = "ghcr.io/tacyhq/tacy"
 
 const modulePath = "github.com/tacyhq/tacy"
 
-// The CVM's Phala encrypted environment variables (names only; values never touch the compose), by the one
-// container each goes to: the keys to vaultd only, the run token to agentd (it checks it, never sends it), the
-// search provider choice (not a secret) to gatewayd. runnerd, the brain and setup get none.
-var (
-	vaultEnv   = []string{"TINFOIL_API_KEY", "BRAVE_SEARCH_API_KEY", "TAVILY_API_KEY", "EXA_API_KEY"}
-	agentEnv   = []string{"AGENT_VM_TOKEN"}
-	gatewayEnv = []string{"SEARCH_PROVIDER"}
-)
+// The keys the chat Worker pushes to vaultd after it verified the VM (vault/secrets.go; with them the relay's run
+// token, which only agentd checks, as its hash). gatewayd picks its search provider as if they were set, since none
+// is when it starts. No container gets an environment variable from the deployer (allowed_envs is empty).
+var pushedKeys = []string{"TINFOIL_API_KEY", "EXA_API_KEY", "TAVILY_API_KEY"}
+
+// searchProvider is gatewayd's search provider (it was the SEARCH_PROVIDER env variable before v0.20.0).
+const searchProvider = "exa"
+
+// secretsSigner is the only key whose secrets pushes vaultd takes (vault/secrets.go): its private half is the chat
+// Worker's VM_SECRETS_SIGNING_KEY (and, for throwaways on a release compose, the e2e keys file's). Empty: vaultd
+// takes the operator key's (-operator-key, the Worker's SAFETY_OPERATOR_KEY). Public key only; changing it is a
+// release.
+const secretsSigner = ""
+
+// socketVolumes are the only volumes: a tmpfs each (nothing on the disk), owned and moded for the two containers
+// that share it (as setup's -dir sets them too).
+var socketVolumes = []struct{ name, uid, gid, mode string }{
+	{"runnersock", runnerdUID, agentdUID, "0750"},
+	{"agentsock", agentdUID, gatewaydUID, "0770"},
+	{"vaultsock", vaultdUID, gatewaydUID, "0750"},
+}
 
 // uids. Each process has its own; none is root (agentd was until VM release 2). Each socket is 0660, owned by the
 // process that listens, with the group of the one peer (also checked by uid with SO_PEERCRED). agentd needs no
@@ -643,12 +665,6 @@ func generate(r *Release) (string, error) {
 	for _, f := range sandbox.GVisorFiles {
 		fmt.Fprintf(&b, "#   %-8s %s (gVisor %s)\n", "", f[1], f[0])
 	}
-	env := func(names []string) {
-		b.WriteString("    environment:\n")
-		for _, s := range names {
-			b.WriteString("      " + s + ": ${" + s + "}\n")
-		}
-	}
 	// args writes the command (the image's entrypoint is the binary) as a flow list.
 	args := func(a ...string) {
 		q := make([]string, len(a))
@@ -668,6 +684,8 @@ func generate(r *Release) (string, error) {
 			sec += `, "` + o + `"`
 		}
 		b.WriteString(`    restart: unless-stopped
+    logging:
+      driver: none
     depends_on:
       setup:
         condition: service_completed_successfully
@@ -680,14 +698,15 @@ func generate(r *Release) (string, error) {
 	// setup: root, no network, only the capabilities chown, chmod and rm on others' files need. Socket directories,
 	// each in a volume only its two containers mount: agentd's HTTP socket and gatewayd's gateway/v0 socket (agentd,
 	// gatewayd by group); vaultd's socket (gatewayd may only enter); runnerd's socket (runnerd listens, agentd may
-	// only enter). agentd's queue on the encrypted disk is its uid's only; the queue a root agentd kept (before VM
-	// release 2, or after a rollback) is removed: its runs ended with that process.
+	// only enter). Nothing else: no process keeps anything on a disk (v0.20.0).
 	b.WriteString(`services:
   setup:
     image: ` + ref["setup"] + `
     entrypoint: ["/tacy/setup"]
     network_mode: none
     restart: "no"
+    logging:
+      driver: none
     user: "0:0"
     read_only: true
     cap_drop: [ALL]
@@ -697,28 +716,18 @@ func generate(r *Release) (string, error) {
       - agentsock:/run/tacy/agent
       - vaultsock:/run/tacy/vault
       - runnersock:/run/tacy/runner
-      - state:/state
-      - vaultstate:/vault
 `)
 	args("-dir", "/run/tacy/agent="+agentdUID+":"+gatewaydUID+":0770",
 		"-dir", "/run/tacy/vault="+vaultdUID+":"+gatewaydUID+":0750",
-		"-dir", "/run/tacy/runner="+runnerdUID+":"+agentdUID+":0750",
-		"-remove", "/state/queue.db", "-remove", "/state/queue.db-wal", "-remove", "/state/queue.db-shm",
-		"-remove", "/state/queue.db-journal",
-		"-tree", "/state/agentd="+agentdUID+":"+agentdUID+":0700",
-		// v0.19.0: vaultd's own volume on the encrypted disk (the people's connections, the connections contract), its uid only;
-		// no other long-running container mounts it.
-		"-tree", "/vault="+vaultdUID+":"+vaultdUID+":0700")
+		"-dir", "/run/tacy/runner="+runnerdUID+":"+agentdUID+":0750")
 	service("agentd", "agentd", agentdUID+":"+agentdUID, false)
 	b.WriteString(`    group_add: ["` + gatewaydUID + `"]
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
-      - state:/state
       - runnersock:/run/tacy/runner
       - agentsock:/run/tacy/agent
 `)
-	env(agentEnv)
-	args(append([]string{"-storage", "/state/agentd", "-runner-socket", "/run/tacy/runner/runner.sock",
+	args(append([]string{"-runner-socket", "/run/tacy/runner/runner.sock",
 		"-gateway-socket", "/run/tacy/agent/gateway.sock", "-listen-unix", "/run/tacy/agent/http.sock", "-listen-uid", gatewaydUID,
 		"-listen-gid", gatewaydUID, "-mem-limit-mib", "600"}, safetyArgs()...)...)
 	// runner: rootless runsc needs no capabilities, only Docker's seccomp profile off (it refuses the user and mount
@@ -745,27 +754,26 @@ func generate(r *Release) (string, error) {
       - agentsock:/run/tacy/agent
       - vaultsock:/run/tacy/vault
 `)
-	env(gatewayEnv)
-	b.WriteString("      HOME: /tmp\n")
+	b.WriteString("    environment:\n      HOME: /tmp\n")
 	gw := append([]string{"-socket", "/run/tacy/agent/gateway.sock", "-agent-uid", agentdUID, "-vault-socket", "/run/tacy/vault/vault.sock",
-		"-listen", ":8080", "-forward", "/run/tacy/agent/http.sock"}, safetyArgs()...)
+		"-listen", ":8080", "-forward", "/run/tacy/agent/http.sock", "-search-provider", searchProvider,
+		"-pushed-keys", strings.Join(pushedKeys, ",")}, safetyArgs()...)
 	gw = append(gw, pullArgs(keylogGenesis)...)
 	args(gw...)
 	service("vaultd", "vaultd", vaultdUID+":"+gatewaydUID, false) // primary group: gatewayd's, so its socket is the gateway's to open
 	b.WriteString(`    volumes:
       - vaultsock:/run/tacy/vault
-      - vaultstate:/vault
 `)
-	env(vaultEnv)
-	args(append([]string{"-socket", "/run/tacy/vault/vault.sock", "-gateway-uid", gatewaydUID, "-group-mode",
-		"-conn-file", "/vault/connections.json"}, safetyArgs()...)...)
-	b.WriteString(`volumes:
-  state:
-  runnersock:
-  agentsock:
-  vaultsock:
-  vaultstate:
-`)
+	va := []string{"-socket", "/run/tacy/vault/vault.sock", "-gateway-uid", gatewaydUID, "-group-mode"}
+	if secretsSigner != "" {
+		va = append(va, "-secrets-signer", secretsSigner)
+	}
+	args(append(va, safetyArgs()...)...)
+	b.WriteString("volumes:\n")
+	for _, v := range socketVolumes {
+		b.WriteString("  " + v.name + ":\n    driver_opts:\n      type: tmpfs\n      device: tmpfs\n      o: \"size=1m,uid=" + v.uid +
+			",gid=" + v.gid + ",mode=" + v.mode + "\"\n")
+	}
 	// The verifier's rule (every image by digest, no tag, no build:), on what it will see.
 	if _, err := verifier.ComposeImages(b.String()); err != nil {
 		return "", err
@@ -794,17 +802,20 @@ func writeLayout(dir string, img v1.Image) error {
 // Manifest describes one release (release.json, a release asset). Everything in it can be recomputed from the
 // tagged source with scripts/reproduce.sh.
 type Manifest struct {
-	Schema        string            `json:"schema"` // tacy-release/v2 (v1 had no images: the CVM built the binaries)
-	Repository    string            `json:"repository"`
-	Version       string            `json:"version"`
-	Commit        string            `json:"commit"`
-	ComposeSHA256 string            `json:"compose_sha256"` // sha256(compose.yaml), the signed subject and the attested value
-	Binaries      map[string]string `json:"binaries"`       // name -> sha256 of the binary (linux/amd64)
-	Images        map[string]string `json:"images"`         // name -> Registry/<name>@sha256:<digest>, as compose.yaml names them
-	BaseImage     string            `json:"base_image"`     // every image's base, by digest
-	GoVersion     string            `json:"go_version"`
-	BuildImage    string            `json:"build_image"`      // the toolchain image the release builds in
-	GVisor        *GVisor           `json:"gvisor,omitempty"` // the gVisor release in runnerd's image (since v0.4.0)
+	Schema        string `json:"schema"` // tacy-release/v2 (v1 had no images: the CVM built the binaries)
+	Repository    string `json:"repository"`
+	Version       string `json:"version"`
+	Commit        string `json:"commit"`
+	ComposeSHA256 string `json:"compose_sha256"` // sha256(compose.yaml), the signed subject and the attested value
+	// sha256(app-compose.json): the exact CVM manifest the release deploys, which the verifier requires (since the
+	// app-compose pin; absent in earlier releases).
+	AppComposeSHA256 string            `json:"app_compose_sha256,omitempty"`
+	Binaries         map[string]string `json:"binaries"`   // name -> sha256 of the binary (linux/amd64)
+	Images           map[string]string `json:"images"`     // name -> Registry/<name>@sha256:<digest>, as compose.yaml names them
+	BaseImage        string            `json:"base_image"` // every image's base, by digest
+	GoVersion        string            `json:"go_version"`
+	BuildImage       string            `json:"build_image"`      // the toolchain image the release builds in
+	GVisor           *GVisor           `json:"gvisor,omitempty"` // the gVisor release in runnerd's image (since v0.4.0)
 }
 
 // GVisor is the third-party release an image carries: Google's tarball and the binaries taken from it.
@@ -815,6 +826,13 @@ type GVisor struct {
 	Files         map[string]string `json:"files"` // path under the image's /tacy/gvisor -> sha256
 	Image         string            `json:"image"` // the image holding it
 }
+
+// AppComposeFile is the app-compose.json the release's CVM attests (verifier.ReleaseAppCompose of compose.yaml, no
+// pre-launch script), next to it; AppComposeDeployFile what the deploy sends Phala for it (verifier.DeployAppCompose).
+const (
+	AppComposeFile       = "app-compose.json"
+	AppComposeDeployFile = "app-compose.deploy.json"
+)
 
 // Schema is release.json's schema.
 const Schema = "tacy-release/v2"
@@ -830,6 +848,8 @@ func main() {
 	manifest := flag.String("manifest", "", "also write the release manifest (JSON) to this path")
 	version := flag.String("version", "", "release version for the manifest (vX.Y.Z)")
 	commit := flag.String("commit", "", "release commit for the manifest")
+	kmsFallback := flag.Bool("kms-fallback", true, "app-compose.json takes keys from the pinned KMS root (key_provider kms) "+
+		"instead of making them in the VM (key_provider none); set pins.go KMSFallback with it")
 	flag.Parse()
 	if *manifest != "" && (*version == "" || *commit == "") {
 		fail(fmt.Errorf("--manifest needs --version and --commit"))
@@ -843,23 +863,47 @@ func main() {
 		fail(err)
 	}
 	h := sha256.Sum256([]byte(out))
+	appCompose, err := verifier.ReleaseAppCompose([]byte(out), nil, *kmsFallback)
+	if err != nil {
+		fail(err)
+	}
+	deploy, err := verifier.DeployAppCompose(appCompose)
+	if err != nil {
+		fail(err)
+	}
+	ah := sha256.Sum256(appCompose)
 	if *check {
 		cur, _ := os.ReadFile("compose.yaml")
 		if string(cur) != out {
 			fmt.Println("compose.yaml is stale or was edited: run go run ./cmd/compose")
 			os.Exit(1)
 		}
-		fmt.Printf("compose.yaml matches the source, the reproducible binaries and their images\n")
+		if cur, _ := os.ReadFile(AppComposeFile); !bytes.Equal(cur, appCompose) {
+			fmt.Println(AppComposeFile + " is stale or was edited: run go run ./cmd/compose")
+			os.Exit(1)
+		}
+		if cur, _ := os.ReadFile(AppComposeDeployFile); !bytes.Equal(cur, deploy) {
+			fmt.Println(AppComposeDeployFile + " is stale or was edited: run go run ./cmd/compose")
+			os.Exit(1)
+		}
+		fmt.Printf("compose.yaml and %s match the source, the reproducible binaries and their images\n", AppComposeFile)
 	} else {
 		if err := os.WriteFile("compose.yaml", []byte(out), 0o644); err != nil {
 			fail(err)
 		}
-		fmt.Printf("wrote compose.yaml (%d bytes)\n", len(out))
+		if err := os.WriteFile(AppComposeFile, appCompose, 0o644); err != nil {
+			fail(err)
+		}
+		if err := os.WriteFile(AppComposeDeployFile, deploy, 0o644); err != nil {
+			fail(err)
+		}
+		fmt.Printf("wrote compose.yaml (%d bytes) and %s (%d bytes)\n", len(out), AppComposeFile, len(appCompose))
 	}
 	fmt.Printf("compose sha256 %x (%d bytes)\n", h, len(out))
+	fmt.Printf("app-compose sha256 %x (%d bytes)\n", ah, len(appCompose))
 	m := Manifest{Schema: Schema, Repository: "https://" + modulePath, Version: *version, Commit: *commit,
-		ComposeSHA256: hex.EncodeToString(h[:]), Binaries: map[string]string{}, Images: map[string]string{},
-		BaseImage: baseImage, GoVersion: goVersion(), BuildImage: image}
+		ComposeSHA256: hex.EncodeToString(h[:]), AppComposeSHA256: hex.EncodeToString(ah[:]), Binaries: map[string]string{},
+		Images: map[string]string{}, BaseImage: baseImage, GoVersion: goVersion(), BuildImage: image}
 	for _, b := range rel.Binaries {
 		m.Binaries[b.Name] = b.SHA256
 		fmt.Printf("%-8s binary sha256 %s\n", b.Name, b.SHA256)

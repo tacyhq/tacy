@@ -173,7 +173,8 @@ type Policy struct {
 	RequireUnlockd bool
 	// KeepOverlap (the chat Worker's own check of the v0.20.0 target only, before it pushes that VM its API keys for
 	// the app builds that can verify nothing else): a signed end of the overlap (safety/overlapend.go) doesn't apply,
-	// so those builds keep it until KMSOverlapUntil. No client sets it: an ended overlap ends there.
+	// nor does the rule that the overlap needs a trust list in force, so those builds keep it until KMSOverlapUntil.
+	// No client sets it: an ended overlap, or one with no list, ends there.
 	KeepOverlap bool
 	// ReleaseFloor (vX.Y.Z) is the oldest signed VM release the release mode accepts on top of Release's minimum
 	// (a trust list's vm_release_floor); unused by the exact mode.
@@ -469,7 +470,7 @@ func Verify(ctx context.Context, att *proto.Attestation, nonce []byte, p Policy)
 			allowKMS := p.KMSFallback
 			if overlapAllowed(p) {
 				var o *KMSOverlapRelease
-				if o, pinErr = kmsOverlap(pinned, pinnedBytes, p.now(), p.trust.OverlapEnded() && !p.KeepOverlap); o != nil {
+				if o, pinErr = kmsOverlap(pinned, pinnedBytes, p.now(), overlapStateOf(p)); o != nil {
 					allowKMS, overlap = true, o
 				}
 			}

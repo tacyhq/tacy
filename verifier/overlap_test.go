@@ -2,6 +2,8 @@ package verifier
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -67,9 +69,26 @@ func loadR0200(t *testing.T, name string, at time.Time) r0200Rec {
 	return r0200Rec{a: &a, nonce: nonce, attested: []byte(tcb.AppCompose), compose: attestedCompose(t, &a), vq: vq}
 }
 
-// fixbPolicy is what a Fix B client build checks a VM against in the exact mode: the KMS fallback off.
+// fixbPolicy is what a Fix B client build checks a VM against in the exact mode: the KMS fallback off. No trust
+// list is in force, so the overlap release is refused (TestOverlapNeedsTrustList); listed adds one.
 func (r r0200Rec) fixbPolicy() Policy {
 	return Policy{VerifyQuote: r.vq, Compose: []byte(r.compose), AppCompose: r.attested}
+}
+
+// listed is p with a signed trust list in force (one that adds nothing and doesn't end the overlap), as a client that
+// took the Worker's list has: the overlap applies only then (route2 review H1). at is when it is applied.
+func listed(t *testing.T, p Policy, at time.Time) Policy {
+	t.Helper()
+	s := &TrustState{}
+	l := safety.TrustList{Seq: 1, IssuedAt: r0200Now.Add(-48 * time.Hour)}
+	if info := s.Take(signedList(t, testAdmin(t), l), 0, at); !info.OK {
+		t.Fatalf("take: %s", info.Error)
+	}
+	q, info := s.Apply(p, at)
+	if info == nil || !info.OK || q.trust == nil {
+		t.Fatalf("apply: %+v", info)
+	}
+	return q
 }
 
 // The recorded v0.20.0 quote and compose pass a Fix B build (KMS fallback off): the whole Intel chain with the
@@ -82,7 +101,7 @@ func TestOverlapV020Passes(t *testing.T) {
 	if sha256Hex(r.attested) != o.AppComposeSHA256 || sha256Hex([]byte(r.compose)) != o.ComposeSHA256 || o.Version != "v0.20.0" {
 		t.Fatalf("the recording isn't the pinned v0.20.0: app-compose %s, compose %s", sha256Hex(r.attested), sha256Hex([]byte(r.compose)))
 	}
-	res, err := Verify(context.Background(), r.a, r.nonce, r.fixbPolicy())
+	res, err := Verify(context.Background(), r.a, r.nonce, listed(t, r.fixbPolicy(), r0200Now))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,7 +132,7 @@ func TestOverlapV020Passes(t *testing.T) {
 	saved := KMSOverlapReleases
 	KMSOverlapReleases = nil
 	defer func() { KMSOverlapReleases = saved }()
-	if _, err := Verify(context.Background(), r.a, r.nonce, r.fixbPolicy()); err == nil || !strings.HasPrefix(err.Error(), KMSCheck+": ") ||
+	if _, err := Verify(context.Background(), r.a, r.nonce, listed(t, r.fixbPolicy(), r0200Now)); err == nil || !strings.HasPrefix(err.Error(), KMSCheck+": ") ||
 		!strings.Contains(err.Error(), "allowed only in the explicit KMS fallback") {
 		t.Fatalf("no overlap: %v", err)
 	}
@@ -278,6 +297,12 @@ func TestOverlapMixesRefused(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			a, nonce, p := c.run(t)
+			// With a trust list in force (the overlap's precondition), so each refusal is the mix's own.
+			at := r0200Now
+			if !p.Now.IsZero() {
+				at = p.Now
+			}
+			p = listed(t, p, at)
 			res, err := Verify(context.Background(), a, nonce, p)
 			if err == nil || !strings.HasPrefix(err.Error(), c.check) || !strings.Contains(err.Error(), c.want) || res.HPKEPublicKey != nil {
 				t.Fatalf("want %s (%s): %v", c.check, c.want, err)
@@ -389,6 +414,101 @@ func TestOverlapEndedBySignedList(t *testing.T) {
 		t.Fatalf("KeepOverlap: %v", err)
 	}
 	// KeepOverlap never stretches the date.
+	p.Now = KMSOverlapUntil
+	if _, err := Verify(context.Background(), r.a, r.nonce, p); err == nil || !strings.Contains(err.Error(), "accepted only until") {
+		t.Fatalf("KeepOverlap after the date: %v", err)
+	}
+}
+
+// The overlap applies only while a signed trust list is in force (route2 review H1): a hostile Cloudflare can't keep
+// v0.20.0 open at a v1 build by serving no list, a junk one, or one the device can't read back, whether or not the
+// device kept the end. Each case is a verifier as a client builds it (TrustState.Apply on the Fix B policy).
+func TestOverlapNeedsTrustList(t *testing.T) {
+	admin := testAdmin(t)
+	r := loadR0200(t, "r0200", r0200Now)
+	list := func(l safety.TrustList) []byte {
+		if l.IssuedAt.IsZero() {
+			l.IssuedAt = r0200Now.Add(-time.Hour)
+		}
+		return signedList(t, admin, l)
+	}
+	ended := safety.TrustList{Seq: 2}
+	ended.SetOverlapEnded()
+	endInfo := (&TrustState{}).TakeSeen(list(ended), 1, r0200Now, nil)
+	if !endInfo.OK || !endInfo.OverlapEnded {
+		t.Fatalf("take the end: %+v", endInfo)
+	}
+	kept := []byte(endInfo.Seen) // the device's record after it took the end
+	junk := [][]byte{[]byte("not json"), []byte(`{"kind":"trust-list"}`), list(safety.TrustList{Seq: 1, IssuedAt: r0200Now.Add(-48 * time.Hour), Expires: r0200Now.Add(-time.Hour)})}
+	_, other, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	junk = append(junk, signedList(t, other, safety.TrustList{Seq: 1, IssuedAt: r0200Now.Add(-time.Hour)})) // not the pinned admin key
+
+	noList := func(what string, p Policy) {
+		t.Helper()
+		res, err := Verify(context.Background(), r.a, r.nonce, p)
+		if err == nil || !strings.HasPrefix(err.Error(), KMSCheck+": ") || res.HPKEPublicKey != nil || res.Facts[KMSOverlapFact] != "" ||
+			!(strings.Contains(err.Error(), "only while a signed trust list is in force") || strings.Contains(err.Error(), "a signed trust list ended the overlap")) {
+			t.Fatalf("%s: want v0.20.0 refused at the key check: %v", what, err)
+		}
+	}
+	apply := func(s *TrustState) Policy {
+		p, _ := s.Apply(r.fixbPolicy(), r0200Now)
+		return p
+	}
+
+	// A fresh install: nothing taken, or the Worker serves nothing (the client clears the list: TakeSeen "").
+	noList("a fresh verifier, nothing taken", apply(&TrustState{}))
+	noList("the bare Fix B policy", r.fixbPolicy())
+	s := &TrustState{}
+	s.TakeSeen(nil, 0, r0200Now, nil)
+	noList("a withheld list", apply(s))
+	// The reviewer's probe: the kept end, no list (the saved list text unreadable, or withheld).
+	f := &TrustState{}
+	f.TakeSeen(nil, 0, r0200Now, kept)
+	noList("the kept end and no list", apply(f))
+	// A junk list (unparsable, unsigned, expired, signed by another key), with and without the kept end.
+	for i, env := range junk {
+		for _, seen := range [][]byte{nil, kept} {
+			j := &TrustState{}
+			if info := j.TakeSeen(env, 0, r0200Now, seen); info.OK {
+				t.Fatalf("junk %d taken: %+v", i, info)
+			}
+			noList("a junk list", apply(j))
+		}
+	}
+	// A list in force that doesn't end it: v0.20.0 passes; the same verifier with its list cleared refuses it again.
+	open := &TrustState{}
+	if info := open.Take(list(safety.TrustList{Seq: 1}), 0, r0200Now); !info.OK || info.OverlapEnded {
+		t.Fatalf("take 1: %+v", info)
+	}
+	if res, err := Verify(context.Background(), r.a, r.nonce, apply(open)); err != nil || res.Facts[KMSOverlapFact] == "" {
+		t.Fatalf("v0.20.0 with a list in force: %v", err)
+	}
+	open.TakeSeen(nil, 0, r0200Now, nil)
+	noList("the list cleared", apply(open))
+	// A list in force that has since expired: it no longer holds (Apply), so no list.
+	exp := &TrustState{}
+	if info := exp.Take(list(safety.TrustList{Seq: 1, Expires: r0200Now.Add(time.Hour)}), 0, r0200Now); !info.OK {
+		t.Fatalf("take expiring: %+v", info)
+	}
+	if p, info := exp.Apply(r.fixbPolicy(), r0200Now.Add(2*time.Hour)); info == nil || info.OK {
+		t.Fatalf("an expired list applied: %+v", info)
+	} else {
+		p.Now = r0200Now.Add(2 * time.Hour)
+		if _, err := Verify(context.Background(), r.a, r.nonce, p); err == nil || !strings.Contains(err.Error(), "only while a signed trust list is in force") {
+			t.Fatalf("an expired list: %v", err)
+		}
+	}
+
+	// The chat Worker's own check of the v0.20.0 target (KeepOverlap) needs no list, as before; the date still applies.
+	p := r.fixbPolicy()
+	p.KeepOverlap = true
+	if res, err := Verify(context.Background(), r.a, r.nonce, p); err != nil || res.Facts[KMSOverlapFact] == "" {
+		t.Fatalf("KeepOverlap with no list: %v", err)
+	}
 	p.Now = KMSOverlapUntil
 	if _, err := Verify(context.Background(), r.a, r.nonce, p); err == nil || !strings.Contains(err.Error(), "accepted only until") {
 		t.Fatalf("KeepOverlap after the date: %v", err)

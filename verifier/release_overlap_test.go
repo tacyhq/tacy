@@ -15,8 +15,9 @@ import (
 // Release mode in a Fix B build (KMSFallback off, as the browser's, the apps' and the chat Worker's WebAssembly): the
 // recorded v0.20.0 VM (testdata/attest-r0200.json, overlap_test.go) passes with a bundle for its compose signed as
 // v0.20.0, by its exact pins; the same compose signed as another version, the same compose under another app-compose
-// (r0200-inplace), or a KMS-mode Fix B compose are refused. The bundles are the test signer's (releasetest), so only
-// the signature's root differs from production's.
+// (r0200-inplace), or a KMS-mode Fix B compose are refused. The overlap needs a signed trust list in force (overlap.go):
+// with none, the same bundle and quote are refused. The bundles are the test signer's (releasetest), so only the
+// signature's root differs from production's.
 func TestReleaseModeOverlap(t *testing.T) {
 	s, err := releasetest.New()
 	if err != nil {
@@ -31,11 +32,18 @@ func TestReleaseModeOverlap(t *testing.T) {
 		}
 		return b
 	}
-	policy := func(r r0200Rec, bundle []byte) Policy {
+	bare := func(r r0200Rec, bundle []byte) Policy {
 		return Policy{VerifyQuote: r.vq, Bundle: bundle, Release: release.Policy{Trusted: s.Trusted()}, Now: r0200Now}
 	}
+	policy := func(r r0200Rec, bundle []byte) Policy { return listed(t, bare(r, bundle), r0200Now) }
 
 	r := loadR0200(t, "r0200", r0200Now)
+	// No trust list in force (a fresh install, a list withheld or refused): refused, fail closed.
+	if _, err := Verify(context.Background(), r.a, r.nonce, bare(r, sign(t, r.compose, "v0.20.0"))); err == nil || !strings.HasPrefix(err.Error(), KMSCheck+": ") ||
+		!strings.Contains(err.Error(), "only while a signed trust list is in force") {
+		t.Fatalf("release mode, no list: %v", err)
+	}
+	r = loadR0200(t, "r0200", r0200Now)
 	res, err := Verify(context.Background(), r.a, r.nonce, policy(r, sign(t, r.compose, "v0.20.0")))
 	if err != nil {
 		t.Fatal(err)

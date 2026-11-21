@@ -1,6 +1,8 @@
 // Package verifier checks an agent VM's attestation (proto.Attestation) before anything is sent to it:
 //
-//   - genuine Intel TDX quote: Intel signature chain, PCS collateral, revocation, debug off, TCB status
+//   - genuine Intel TDX quote: Intel signature chain, PCS collateral, revocation, TD attributes (no debug, not
+//     migratable, SEPT_VE_DISABLE, no PERFMON), no Revoked TCB part
+//   - TCB: the platform's and the TDX module's level (the worse of the two) and the quoting enclave's are UpToDate
 //   - report_data = proto.ReportData(our nonce, the HPKE key in the response): the key requests get encrypted to
 //     was generated inside this TD for this boot
 //   - dstack's event log replays to RTMR3, and its compose-hash event equals sha256(app-compose.json)
@@ -278,21 +280,28 @@ func Verify(ctx context.Context, att *proto.Attestation, nonce []byte, p Policy)
 	quote, err := vq(ctx, raw)
 	if quote != nil {
 		r.Facts["TCB"] = quote.TcbStatus + " (QE " + quote.QeStatus + ", TCB date " + quote.TcbDate + ")"
+		if quote.PlatformStatus != "" {
+			r.Facts["TCB levels"] = "platform " + quote.PlatformStatus + ", TDX module " + orNone(quote.ModuleStatus) + ", QE " + quote.QeStatus
+		}
+		if quote.TdAttributes != "" {
+			r.Facts["TD attributes"] = quote.TdAttributes
+		}
 		r.Facts["MRTD"] = hex.EncodeToString(quote.MrTd)
 		for i := 0; i < 4; i++ {
 			r.Facts[fmt.Sprintf("RTMR%d", i)] = hex.EncodeToString(quote.Rtmrs[i])
 		}
 	}
-	if !r.add("genuine Intel TDX quote (signature chain, collateral, revocation, debug off)", err, "") {
+	// The check names stay as they were (clients match them); the TD attribute and TCB rules are in the details.
+	if !r.add("genuine Intel TDX quote (signature chain, collateral, revocation, debug off)", err, "TD attributes "+tdAttrs(quote)) {
 		return failed()
 	}
 	err = nil
 	if quote.Debug {
 		err = errors.New("TD debug attribute set")
-	} else if quote.TcbStatus != "UpToDate" && !p.AllowStaleTCB {
-		err = fmt.Errorf("TCB status %s", quote.TcbStatus)
+	} else {
+		err = tcbPolicy(quote, p.AllowStaleTCB)
 	}
-	if !r.add("TCB up to date, debug off", err, quote.TcbStatus) {
+	if !r.add("TCB up to date, debug off", err, quote.TcbStatus+" (platform and TDX module), QE "+quote.QeStatus) {
 		return failed()
 	}
 	err = nil
@@ -629,6 +638,35 @@ func emptyInitScript(raw json.RawMessage) bool {
 		}
 	}
 	return true
+}
+
+// tcbPolicy is the TCB rule: the TD's status (the worse of the platform's and the TDX module's) and the quoting
+// enclave's must be UpToDate. AllowStaleTCB (tests, and a holder's signed TCB grace, which then checks the statuses
+// itself) accepts the others, never Revoked.
+func tcbPolicy(q *tdx.Quote, allowStale bool) error {
+	for _, c := range []struct{ what, st string }{{"TCB", q.TcbStatus}, {"QE TCB", q.QeStatus}} {
+		if c.st == "Revoked" {
+			return fmt.Errorf("%s status Revoked", c.what)
+		}
+		if c.st != "UpToDate" && !allowStale {
+			return fmt.Errorf("%s status %s", c.what, c.st)
+		}
+	}
+	return nil
+}
+
+func tdAttrs(q *tdx.Quote) string {
+	if q == nil || q.TdAttributes == "" {
+		return "not read"
+	}
+	return q.TdAttributes + " (no debug, not migratable, SEPT_VE_DISABLE, no PERFMON)"
+}
+
+func orNone(s string) string {
+	if s == "" {
+		return "(covered by the platform level)"
+	}
+	return s
 }
 
 func short(s string) string {

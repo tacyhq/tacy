@@ -446,18 +446,18 @@ func Verify(ctx context.Context, att *proto.Attestation, nonce []byte, p Policy)
 	}
 	// The key mode is the release's (its pinned app-compose.json), as far as the policy allows it.
 	mode, pinErr := KeyProviderKMS, error(nil)
+	var overlap *KMSOverlapRelease // the KMS-fallback release a Fix B build takes by its exact pins (overlap.go)
+	var releaseOverlap *KMSOverlapRelease // the same, as release mode's pin for the attested docker compose
 	if !p.legacy {
 		// Release mode: the pin is the app-compose.json a release of the attested docker compose is deployed with
 		// (ReleaseAppCompose: this verifier's own settings, in the policy's key mode, with the memory-root pre-launch
 		// script for a release with unlockd in the KMS fallback, as cmd/compose writes it). The bundle check below
 		// proves that docker compose is a signed release, so the whole app-compose.json is that release's, byte for byte.
+		// In a Fix B build an overlap release's exact docker compose gets its exact KMS-mode app-compose, and a release
+		// without unlockd that isn't one gets none (ReleaseModeAppCompose, overlap.go).
 		var releasePinErr error
 		if p.Compose == nil && len(p.AppCompose) == 0 && len(p.AppComposeSHA256) == 0 {
-			var pre []byte
-			if p.KMSFallback && HasUnlockd(ac.DockerComposeFile) {
-				pre = []byte(MemoryRootScript)
-			}
-			p.AppCompose, releasePinErr = ReleaseAppCompose([]byte(ac.DockerComposeFile), pre, p.KMSFallback)
+			p.AppCompose, releaseOverlap, releasePinErr = ReleaseModeAppCompose(ac.DockerComposeFile, p.KMSFallback, p.now())
 		}
 		var pinned *appCompose
 		pinnedBytes := p.AppCompose
@@ -469,7 +469,18 @@ func Verify(ctx context.Context, att *proto.Attestation, nonce []byte, p Policy)
 		} else if len(pinnedBytes) == 0 {
 			pinErr = errors.New("no pinned app-compose.json (the release's) to check against")
 		} else if pinned, pinErr = parseAppCompose(pinnedBytes); pinErr == nil {
-			mode, pinErr = pinnedMode(pinned, p.KMSFallback)
+			// The Fix B switch-over (overlap.go, the no-downtime plan row 27): a Fix B build takes the KMS mode only for
+			// an overlap release's exact app-compose.json, and only where nothing is released to the VM.
+			allowKMS := p.KMSFallback
+			if overlapAllowed(p) {
+				var o *KMSOverlapRelease
+				if o, pinErr = kmsOverlap(pinned, pinnedBytes, p.now()); o != nil {
+					allowKMS, overlap = true, o
+				}
+			}
+			if pinErr == nil {
+				mode, pinErr = pinnedMode(pinned, allowKMS)
+			}
 		} else {
 			pinErr = fmt.Errorf("the pinned app-compose.json doesn't parse: %w", pinErr)
 		}
@@ -513,6 +524,10 @@ func Verify(ctx context.Context, att *proto.Attestation, nonce []byte, p Policy)
 		keysDetail = roots[id]
 		r.Facts["KMS root"] = keysDetail
 		r.Facts["keys"] = "from a pinned KMS root (fallback): " + keysDetail
+		if overlap != nil {
+			keysDetail += "; the KMS-fallback release " + overlap.Version + " by its exact pins, until " + KMSOverlapUntil.Format(time.DateOnly)
+			r.Facts[KMSOverlapFact] = overlap.Version + " (app-compose " + short(overlap.AppComposeSHA256) + ", until " + KMSOverlapUntil.Format(time.DateOnly) + "; the no-downtime plan row 27)"
+		}
 	}
 	if !r.add(KMSCheck, err, keysDetail) {
 		return failed()
@@ -678,6 +693,10 @@ func Verify(ctx context.Context, att *proto.Attestation, nonce []byte, p Policy)
 				err = fmt.Errorf("the trust list's release for this compose: %w", e)
 			}
 		}
+		// The overlap release's compose: the signed release must be the one the overlap pins.
+		if err == nil && releaseOverlap != nil {
+			err = releaseOverlap.CheckVersion(rel.Version)
+		}
 		detail := ""
 		if rel != nil {
 			detail = rel.Version + " (commit " + short(rel.Commit) + "), compose sha256 " + short(rel.ComposeSHA256)
@@ -715,6 +734,14 @@ func Verify(ctx context.Context, att *proto.Attestation, nonce []byte, p Policy)
 	}
 	r.HPKEPublicKey = key
 	return r, nil
+}
+
+// now is when the policy checks dates: Now, else the clock.
+func (p Policy) now() time.Time {
+	if p.Now.IsZero() {
+		return time.Now()
+	}
+	return p.Now
 }
 
 // emptyInitScript: app-compose's init_script is absent, null, "" or a list of only "".

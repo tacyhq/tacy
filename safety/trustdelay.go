@@ -160,6 +160,9 @@ type TrustSeen struct {
 	// revoked here until a newer list has left it out for TrustDelay (item unrevoke:vX). Bounded by
 	// MaxRevokedReleasesKept; past it, a list's own revocations still apply (only the delay on un-revoking is lost).
 	RevokedReleases []string `json:"revoked_releases,omitzero"`
+	// OverlapEnded: a list this verifier took ended the KMS-fallback overlap (overlapend.go). Kept for good, from
+	// any verified list, older ones too: no later list, and no missing one, brings the overlap back.
+	OverlapEnded bool `json:"overlap_ended,omitzero"`
 }
 
 // MaxTrustSeen bounds a record (a list has at most a few hundred items; withdrawn ones are kept TrustDelay).
@@ -191,6 +194,9 @@ func ParseTrustSeen(b []byte) TrustSeen {
 			s.RevokedMachines = s.RevokedMachines[:MaxRevokedKept]
 		}
 	}
+	if v, ok := raw["overlap_ended"]; ok {
+		_ = json.Unmarshal(v, &s.OverlapEnded)
+	}
 	if v, ok := raw["revoked_releases"]; ok && json.Unmarshal(v, &releases) == nil {
 		releases = slices.DeleteFunc(releases, func(r string) bool { return !versionRe.MatchString(r) })
 		slices.Sort(releases)
@@ -214,7 +220,7 @@ func (s TrustSeen) Marshal() []byte {
 // Withdrawn items are forgotten after TrustDelay (listed again, they are new).
 func (s TrustSeen) Observe(l *TrustList, expedite []string, now time.Time) TrustSeen {
 	out := TrustSeen{Seq: s.Seq, Items: make(map[string]TrustItemState, len(s.Items)), RevokedMachines: slices.Clone(s.RevokedMachines),
-		RevokedReleases: slices.Clone(s.RevokedReleases)}
+		RevokedReleases: slices.Clone(s.RevokedReleases), OverlapEnded: s.OverlapEnded || l.OverlapEnded()}
 	for k, v := range s.Items {
 		out.Items[k] = v
 	}
@@ -298,7 +304,7 @@ type TrustPending struct {
 // InForce is l with only its additions that count at now (Ripe), and the ones that don't yet. Withdrawals and the
 // fields that only narrow or are only parsed are l's own, plus every release s kept revoked whose un-revocation
 // (unrevoke:vX) doesn't count yet. The vm_release_floor is l's, raised to any floor s saw withdrawn less than
-// TrustDelay ago (a lowered floor keeps the old one in force).
+// TrustDelay ago (a lowered floor keeps the old one in force). The overlap's end is l's or s's (OverlapEnded).
 func (s TrustSeen) InForce(l *TrustList, now time.Time) (*TrustList, []TrustPending) {
 	in := *l
 	var pending []TrustPending
@@ -379,6 +385,10 @@ func (s TrustSeen) InForce(l *TrustList, now time.Time) (*TrustList, []TrustPend
 				pending = append(pending, TrustPending{Item: TrustItemFloor + lowered, From: st.Withdrawn.Add(TrustDelay).UTC()})
 			}
 		}
+	}
+	// The overlap's end (overlapend.go): l's, or any this verifier kept, at once.
+	if s.OverlapEnded && !in.OverlapEnded() {
+		in.SetOverlapEnded()
 	}
 	sort.Slice(pending, func(i, j int) bool { return pending[i].Item < pending[j].Item })
 	return &in, pending

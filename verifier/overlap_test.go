@@ -12,6 +12,7 @@ import (
 
 	"github.com/tacyhq/tacy/internal/tdx"
 	"github.com/tacyhq/tacy/proto"
+	"github.com/tacyhq/tacy/safety"
 )
 
 // The Fix B switch-over (overlap.go, the no-downtime plan row 27) on real quotes.
@@ -306,5 +307,90 @@ func TestOverlapEntryWithUnlockdRefused(t *testing.T) {
 	}
 	if _, _, err := ReleaseModeAppCompose(string(compose), false, r0200Now); err == nil || !strings.Contains(err.Error(), "v9.9.9") {
 		t.Fatalf("release mode, an entry with unlockd: %v", err)
+	}
+}
+
+// The signed end of the overlap (safety/overlapend.go; routing re-review M1): a Fix B build that verified a
+// trust list with "overlap_ended": true refuses v0.20.0 at once (no 24 h delay), before KMSOverlapUntil, and for
+// good: a later list without the member, the same record given to a fresh verifier, or an older list replayed, never
+// bring the overlap back, and a list can't sign it back on.
+func TestOverlapEndedBySignedList(t *testing.T) {
+	admin := testAdmin(t)
+	r := loadR0200(t, "r0200", r0200Now)
+	list := func(seq uint64, ended bool) []byte {
+		l := safety.TrustList{Seq: seq, IssuedAt: r0200Now.Add(-time.Hour)}
+		if ended {
+			l.SetOverlapEnded()
+		}
+		return signedList(t, admin, l)
+	}
+	verify := func(s *TrustState) (*Result, error) {
+		p, info := s.Apply(r.fixbPolicy(), r0200Now)
+		if info != nil && !info.OK {
+			t.Fatalf("list not applied: %s", info.Error)
+		}
+		return Verify(context.Background(), r.a, r.nonce, p)
+	}
+	refused := func(what string, res *Result, err error) {
+		t.Helper()
+		if err == nil || !strings.HasPrefix(err.Error(), KMSCheck+": ") || !strings.Contains(err.Error(), "a signed trust list ended the overlap") || res.HPKEPublicKey != nil {
+			t.Fatalf("%s: want v0.20.0 refused at the key check (overlap ended): %v", what, err)
+		}
+	}
+
+	// A list without the member: v0.20.0 still passes (the overlap is open until its date).
+	s := &TrustState{}
+	if info := s.Take(list(1, false), 0, r0200Now); !info.OK || info.OverlapEnded {
+		t.Fatalf("take 1: %+v", info)
+	}
+	if res, err := verify(s); err != nil || res.Facts[KMSOverlapFact] == "" {
+		t.Fatalf("v0.20.0 before the end: %v", err)
+	}
+
+	// The list that ends it: refused at once, at the same instant it was first seen (an ending isn't delayed).
+	info := s.TakeSeen(list(2, true), 1, r0200Now, nil)
+	if !info.OK || !info.OverlapEnded || len(info.Pending) != 0 {
+		t.Fatalf("take 2: %+v", info)
+	}
+	res, err := verify(s)
+	refused("the list that ends it", res, err)
+	seen := []byte(info.Seen)
+
+	// A later list without it, with the record kept: still ended.
+	info3 := s.TakeSeen(list(3, false), 2, r0200Now.Add(time.Minute), seen)
+	if !info3.OK || !info3.OverlapEnded {
+		t.Fatalf("take 3: %+v", info3)
+	}
+	res, err = verify(s)
+	refused("a later list without the member", res, err)
+
+	// A fresh verifier (an app restart) with the device's record, given the later list or the older one: ended.
+	for _, env := range [][]byte{list(3, false), list(1, false)} {
+		f := &TrustState{}
+		if i := f.TakeSeen(env, 0, r0200Now.Add(time.Minute), []byte(info3.Seen)); !i.OK || !i.OverlapEnded {
+			t.Fatalf("fresh take: %+v", i)
+		}
+		res, err = verify(f)
+		refused("a fresh verifier with the kept record", res, err)
+	}
+
+	// No way to sign it back on: a list naming overlap_ended false (or anything but true) is refused whole.
+	l := safety.TrustList{Seq: 4, IssuedAt: r0200Now.Add(-time.Hour)}
+	l.SetOverlapEnded()
+	l.Optional[safety.TrustOverlapEndedMember] = []byte("false")
+	if i := s.TakeSeen(signedList(t, admin, l), 3, r0200Now, []byte(info3.Seen)); i.OK || !strings.Contains(i.Error, "overlap_ended must be true") {
+		t.Fatalf("overlap_ended false: %+v", i)
+	}
+
+	// The chat Worker's own check of the v0.20.0 target (KeepOverlap, for the old app builds' key push) still passes.
+	p, _ := s.Apply(r.fixbPolicy(), r0200Now)
+	p.KeepOverlap = true
+	if res, err := Verify(context.Background(), r.a, r.nonce, p); err != nil || res.Facts[KMSOverlapFact] == "" {
+		t.Fatalf("KeepOverlap: %v", err)
+	}
+	// KeepOverlap never stretches the date.
+	p.Now = KMSOverlapUntil
+	if _, err := Verify(context.Background(), r.a, r.nonce, p); err == nil || !strings.Contains(err.Error(), "accepted only until") {
+		t.Fatalf("KeepOverlap after the date: %v", err)
 	}
 }

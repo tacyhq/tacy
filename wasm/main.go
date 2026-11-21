@@ -6,7 +6,7 @@
 //
 // It registers globalThis.sealedAgentVM (name kept from before the rename; clients look it up) and stays running:
 //
-//	verifyRelease(attestationJSON, nonceHex, bundleJSON, fetchCollateral, nowISO?, lastSeenVersion?) -> Promise<string>
+//	verifyRelease(attestationJSON, nonceHex, bundleJSON, fetchCollateral, nowISO?, lastSeenVersion?, keepOverlap?) -> Promise<string>
 //	    Every check, and the VM's docker compose must be a signed release (package release): bundleJSON is the
 //	    Sigstore bundle for sha256(docker compose), as JSON: one "bundle" of GitHub's attestations API response for
 //	    that digest (an entry with only a bundle_url must be fetched and Snappy-decoded first, e.g. by a relay;
@@ -17,6 +17,9 @@
 //	    JSON {ok, error?, release?: {version, commit, compose_sha256, identity, run_url, log_index, signed_at}}.
 //	lastSeenVersion ("vX.Y.Z", optional, "" or undefined = none) is the newest release this client accepted
 //	    before (keep release.version / facts.release): an older release is refused (rollback protection).
+//	keepOverlap (optional, true only): the chat Worker's own check of the KMS-fallback release's VM, which it pushes
+//	    its API keys to for the app builds that can verify nothing else (verifier.Policy.KeepOverlap): a signed end of
+//	    the overlap doesn't apply to that check. Clients never pass it.
 //	verify(attestationJSON, nonceHex, fetchCollateral, nowISO?) -> Promise<string>
 //	    Deprecated: the older exact mode, against the compose.yaml embedded in this binary (tacy.Compose).
 //	releaseIdentity, minVersion, composeSha256: the pinned signer prefix, minimum version, embedded compose hash.
@@ -145,7 +148,7 @@ func appComposeSum() string {
 }
 
 // run verifies an attestation. bundle nil = the deprecated exact mode against the embedded compose.
-func run(attJSON, nonceHex string, bundle []byte, fetch js.Value, now, lastSeen string) output {
+func run(attJSON, nonceHex string, bundle []byte, fetch js.Value, now, lastSeen string, keepOverlap bool) output {
 	out := output{Checks: []verifier.Check{}, Facts: map[string]string{}, ComposeSHA256: composeSum(), AppComposeSHA256: appComposeSum()}
 	fail := func(err error) output {
 		out.OK, out.Error, out.HPKEPublicKey = false, err.Error(), ""
@@ -160,7 +163,7 @@ func run(attJSON, nonceHex string, bundle []byte, fetch js.Value, now, lastSeen 
 		return fail(errors.New("nonce must be 32 bytes of hex"))
 	}
 	p := verifier.Policy{Bundle: bundle, Getter: jsGetter{fetch}, Release: release.Policy{LastSeen: lastSeen},
-		KMSFallback: tacy.KMSFallback}
+		KMSFallback: tacy.KMSFallback, KeepOverlap: keepOverlap}
 	if bundle == nil {
 		p.Compose, p.AppCompose = tacy.Compose, tacy.AppCompose
 	}
@@ -224,16 +227,17 @@ func main() {
 			return reject("verify(attestationJSON, nonceHex, fetchCollateral, nowISO?)")
 		}
 		att, nonce, fetch, now := a[0].String(), a[1].String(), a[2], optString(a, 3)
-		return promise(func() output { return run(att, nonce, nil, fetch, now, "") })
+		return promise(func() output { return run(att, nonce, nil, fetch, now, "", false) })
 	})
 	verifyRelease := js.FuncOf(func(_ js.Value, a []js.Value) any {
 		if len(a) < 4 || a[0].Type() != js.TypeString || a[1].Type() != js.TypeString || a[2].Type() != js.TypeString ||
 			a[3].Type() != js.TypeFunction {
-			return reject("verifyRelease(attestationJSON, nonceHex, bundleJSON, fetchCollateral, nowISO?, lastSeenVersion?)")
+			return reject("verifyRelease(attestationJSON, nonceHex, bundleJSON, fetchCollateral, nowISO?, lastSeenVersion?, keepOverlap?)")
 		}
 		att, nonce, bundle, fetch, now := a[0].String(), a[1].String(), []byte(a[2].String()), a[3], optString(a, 4)
 		lastSeen := optString(a, 5)
-		return promise(func() output { return run(att, nonce, bundle, fetch, now, lastSeen) })
+		keepOverlap := len(a) > 6 && a[6].Type() == js.TypeBoolean && a[6].Bool()
+		return promise(func() output { return run(att, nonce, bundle, fetch, now, lastSeen, keepOverlap) })
 	})
 	verifyReleaseBundle := js.FuncOf(func(_ js.Value, a []js.Value) any {
 		type out struct {

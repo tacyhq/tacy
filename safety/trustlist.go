@@ -249,6 +249,9 @@ func (l *TrustList) Validate() error {
 			return fmt.Errorf("trust list: bad optional member %q (a lowercase name, valid JSON of at most 8 KiB)", k)
 		}
 	}
+	if err := l.checkOverlapEnded(); err != nil {
+		return err
+	}
 	for name, keys := range map[string][]string{"next admin": l.NextAdminKeys, "start-ticket": l.StartTicketKeys} {
 		seenKey := map[string]bool{}
 		for _, k := range keys {

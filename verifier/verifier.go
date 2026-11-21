@@ -171,6 +171,10 @@ type Policy struct {
 	// RequireUnlockd (a split-key holder, review L3): the compose must have unlockd, the only service with dstack's
 	// socket. kmsd's release check doesn't set it (the KMS releases before v1 have no unlockd).
 	RequireUnlockd bool
+	// KeepOverlap (the chat Worker's own check of the v0.20.0 target only, before it pushes that VM its API keys for
+	// the app builds that can verify nothing else): a signed end of the overlap (safety/overlapend.go) doesn't apply,
+	// so those builds keep it until KMSOverlapUntil. No client sets it: an ended overlap ends there.
+	KeepOverlap bool
 	// ReleaseFloor (vX.Y.Z) is the oldest signed VM release the release mode accepts on top of Release's minimum
 	// (a trust list's vm_release_floor); unused by the exact mode.
 	ReleaseFloor string
@@ -465,7 +469,7 @@ func Verify(ctx context.Context, att *proto.Attestation, nonce []byte, p Policy)
 			allowKMS := p.KMSFallback
 			if overlapAllowed(p) {
 				var o *KMSOverlapRelease
-				if o, pinErr = kmsOverlap(pinned, pinnedBytes, p.now()); o != nil {
+				if o, pinErr = kmsOverlap(pinned, pinnedBytes, p.now(), p.trust.OverlapEnded() && !p.KeepOverlap); o != nil {
 					allowKMS, overlap = true, o
 				}
 			}

@@ -302,6 +302,9 @@ type TrustInfo struct {
 	// them, else the build's own), and MachinesRevoked how many certificate hashes this verifier refuses for good.
 	Machines        []string `json:"machines,omitempty"`
 	MachinesRevoked int      `json:"machinesRevoked"`
+	// OverlapEnded: the KMS-fallback overlap is over at this verifier (the list's overlap_ended, or one it took
+	// before: safety/overlapend.go); the overlap release is refused.
+	OverlapEnded bool `json:"overlapEnded,omitempty"`
 }
 
 // TrustInfoOf summarizes a taken list; withReleases adds its release entries.
@@ -310,7 +313,7 @@ func TrustInfoOf(l *safety.TrustList, withReleases bool) TrustInfo {
 		OSImages: len(l.OSImages), BootMeasurements: len(l.BootMeasurements), PreLaunch: len(l.PreLaunch), KMSIDs: len(l.KMSIDs),
 		Releases: len(l.Releases), ReleaseFloor: l.VMReleaseFloor, RevokedReleases: slices.Clone(l.RevokedReleases),
 		Services: len(l.Services), KMSRoots: len(l.KMSRoots), AdminKeys: slices.Clone(l.NextAdminKeys),
-		StartTicketKeys: len(l.StartTicketKeys), Platforms: slices.Clone(l.Platforms)}
+		StartTicketKeys: len(l.StartTicketKeys), Platforms: slices.Clone(l.Platforms), OverlapEnded: l.OverlapEnded()}
 	if !l.Expires.IsZero() {
 		i.Expires = l.Expires.UTC().Format(time.RFC3339)
 	}
@@ -394,6 +397,7 @@ func (s *TrustState) TakeSeen(env []byte, minSeq uint64, now time.Time, seen []b
 	// The releases in force, and the revocations in force: the list's own and every one this verifier keeps whose
 	// un-revocation doesn't count yet (review2 H1; verifier-core.ts refuses a VM running one).
 	i.ReleaseEntries, i.RevokedReleases, i.Pending, i.Seen = slices.Clone(in.Releases), slices.Clone(in.RevokedReleases), pending, string(s.seen.Marshal())
+	i.OverlapEnded = in.OverlapEnded()
 	if em != nil {
 		i.Emergency = em.Reason
 	}
@@ -449,7 +453,7 @@ func (s *TrustState) Apply(p Policy, now time.Time) (Policy, *TrustInfo) {
 			// this verifier took (no delay: each certificate needs the KMS id; revocations narrow).
 			q.Machines = ms
 			i := TrustInfoOf(l, false)
-			i.RevokedReleases, i.Pending = slices.Clone(in.RevokedReleases), pending
+			i.RevokedReleases, i.Pending, i.OverlapEnded = slices.Clone(in.RevokedReleases), pending, in.OverlapEnded()
 			i.Machines, i.MachinesRevoked = machineSummary(ms), len(ms.Revoked)
 			return q.WithTCBGrace(now), &i
 		}

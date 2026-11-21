@@ -41,6 +41,9 @@ package main
 //	    never re-allow (a revoked machine needs a new certificate). With only these (nothing else changed), the next
 //	    seq of both documents carries the change. With -trust-base, the trust list always carries the policy's
 //	    machine_certs and the union of both documents' machines_revoked.
+//	    -end-overlap (needs -trust-base): the trust list ends the KMS-fallback overlap ("overlap_ended": true,
+//	    safety/overlapend.go): a Fix B client that verified it refuses v0.20.0 at once and for good. With only it, the
+//	    next seq of both documents carries it. A trust base that has it keeps it: there is no flag to turn it off.
 //	kmsctl machine-cert -kms-id ID -share S -key pass -share S -key pass (-builtin prod5|prod9 | -ppid HEX -fmspc HEX
 //	        -label "phala prodN") [-issued-at T] -out F
 //	    a machine certificate (V1-DESIGN §3.2) signed by the KMS id (M from two passphrase shares; -dev-master for
@@ -154,6 +157,7 @@ func splitMain(cmd string, args []string) {
 	var machineCerts, revokeMachines multi
 	fs.Var(&machineCerts, "machine-cert", "unlock-policy, approve: a machine certificate file (machine-cert's output), repeat")
 	fs.Var(&revokeMachines, "revoke-machine", "approve: a machine certificate's hash (or its file) to revoke for good, repeat")
+	endOverlap := fs.Bool("end-overlap", false, "approve: the trust list ends the KMS-fallback overlap (needs -trust-base; for good)")
 	builtin := fs.String("builtin", "", "machine-cert: prod5 or prod9, the document this build has built in")
 	ppid := fs.String("ppid", "", "machine-cert: the machine's PPID (16 bytes, hex)")
 	fmspc := fs.String("fmspc", "", "machine-cert: its FMSPC (6 bytes, hex)")
@@ -292,13 +296,20 @@ func splitMain(cmd string, args []string) {
 		switch {
 		case expediteOnly(*emergency, emergencyItems, adds, removes, sets, grace):
 			np, err = nextSeq(p, now) // the override alone: a release pinned earlier unlocks at once from this seq
-		case len(adds) == 0 && len(removes) == 0 && len(sets) == 0 && grace == nil && (len(mAdd) > 0 || len(mRevoke) > 0):
-			np, ntl, err = nextSeqs(p, tl, now) // a machine change alone
+		case len(adds) == 0 && len(removes) == 0 && len(sets) == 0 && grace == nil && (len(mAdd) > 0 || len(mRevoke) > 0 || *endOverlap):
+			np, ntl, err = nextSeqs(p, tl, now) // a machine change, or the overlap's end, alone
 		default:
 			np, ntl, err = approve(p, tl, adds, removes, entry, sets, certs, grace, now)
 		}
 		if err == nil {
 			err = changeMachines(np, ntl, mAdd, mRevoke)
+		}
+		if err == nil && *endOverlap {
+			if ntl == nil {
+				die("approve: -end-overlap needs -trust-base (it is a trust-list member)")
+			}
+			ntl.SetOverlapEnded()
+			err = ntl.Validate()
 		}
 		if err != nil {
 			die("%v", err)

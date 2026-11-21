@@ -31,6 +31,9 @@ import (
 //     vm_release_floor) must stay at or below it, or the overlap ends there (fails closed).
 //   - Until KMSOverlapUntil, the removal date (kms.KMSFallbackRemoveBy): from then a client refuses it, whatever it
 //     was built with. The Worker answers app builds older than the overlap with the update text from the same date.
+//   - Or until a signed trust list ends it: "overlap_ended": true (safety/overlapend.go). A build
+//     that has verified one refuses the overlap release from then on, at once and for good (its own record keeps it);
+//     routing alone can't keep v1 builds off v0.20.0 against a hostile Cloudflare, this can.
 //
 // In release mode (tacyhq/tacy verifier.go) the pin comes from ReleaseModeAppCompose: a Fix B build pins the overlap
 // release's exact KMS app-compose for its exact docker compose, the none-mode app-compose for a release with unlockd,
@@ -73,8 +76,9 @@ func overlapAllowed(p Policy) bool {
 }
 
 // kmsOverlap is the overlap release pinned exactly as pinnedBytes, or nil when pinnedBytes isn't one (no error). An
-// error when it is one but can't be taken: after KMSOverlapUntil, or an entry that doesn't meet the rules.
-func kmsOverlap(pinned *appCompose, pinnedBytes []byte, now time.Time) (*KMSOverlapRelease, error) {
+// error when it is one but can't be taken: after KMSOverlapUntil, once a signed trust list ended the overlap (ended:
+// the policy's list in force, safety.TrustList.OverlapEnded), or an entry that doesn't meet the rules.
+func kmsOverlap(pinned *appCompose, pinnedBytes []byte, now time.Time, ended bool) (*KMSOverlapRelease, error) {
 	sum := sha256Hex(pinnedBytes)
 	for i := range KMSOverlapReleases {
 		o := &KMSOverlapReleases[i]
@@ -90,6 +94,8 @@ func kmsOverlap(pinned *appCompose, pinnedBytes []byte, now time.Time) (*KMSOver
 			return nil, fmt.Errorf("the overlap release %s's app-compose.json has key provider %q, want kms", o.Version, pinned.keyMode())
 		case !now.Before(KMSOverlapUntil):
 			return nil, fmt.Errorf("the KMS-fallback release %s was accepted only until %s (the no-downtime plan row 27)", o.Version, KMSOverlapUntil.Format(time.DateOnly))
+		case ended:
+			return nil, fmt.Errorf("the KMS-fallback release %s is no longer accepted: a signed trust list ended the overlap", o.Version)
 		}
 		return o, nil
 	}
@@ -139,7 +145,7 @@ func ReleaseModeAppCompose(compose string, kmsFallback bool, now time.Time) ([]b
 		if err != nil {
 			return nil, nil, err
 		}
-		if _, err := kmsOverlap(parsed, pin, now); err != nil {
+		if _, err := kmsOverlap(parsed, pin, now, false); err != nil { // the list's end: Verify's own kmsOverlap call
 			return nil, nil, err
 		}
 		return pin, o, nil

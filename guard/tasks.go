@@ -71,6 +71,10 @@ type Host struct {
 	FlushEvery time.Duration
 	// MaxOpen caps the tasks one user may have open through POST /tasks (not ended); 0: 8.
 	MaxOpen int
+	// Boot names the queue RT runs on (queue.OpenTmpfs, queue.NewBoot): the same across container restarts while the
+	// queue lives, new after a real boot. A task's state carries it, so its starter can tell a task lost to a restart
+	// from one that never was (app/tasks.go, task_unknown_after_restart). "": not said.
+	Boot string
 	// Forgotten, when set, is told each task Prune deleted (agentd deletes its approval records with it).
 	Forgotten func(id string)
 	// TriggeredDone, when set, is told when an unattended task (ViaTrigger) ended, once its last event is in the
@@ -782,6 +786,8 @@ type TaskState struct {
 	// Tainted: the task received outside content (web pages, search results); what it proposes from then on is
 	// marked tainted, and a tainted change or send will need a person's approval (docs/27 sections 4 and 5).
 	Tainted bool `json:"tainted,omitempty"`
+	// Boot is the queue's boot (Host.Boot): send it back with later calls on the task.
+	Boot string `json:"boot,omitempty"`
 }
 
 // Status is the task's state for its starter.
@@ -793,7 +799,8 @@ func (h *Host) Status(id, user string) (TaskState, error) {
 	if err != nil {
 		return TaskState{}, ErrNoTask
 	}
-	out := TaskState{Task: id, State: st.State, Sub: st.Sub, Attempt: st.Attempt, Held: len(st.Held), Tainted: st.Taint != ""}
+	out := TaskState{Task: id, State: st.State, Sub: st.Sub, Attempt: st.Attempt, Held: len(st.Held), Tainted: st.Taint != "",
+		Boot: h.Boot}
 	if st.Outcome != nil {
 		out.Outcome = st.Outcome.State
 	}

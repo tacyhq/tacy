@@ -84,7 +84,7 @@ func (g *Guard) Action(ctx context.Context, ti *harness.TaskInfo, id string, req
 	}
 	// The person's files never leave the VM (files_guard.go): a search or page read whose arguments carry a passage
 	// of them is refused before the person is asked and before anything is sent.
-	if t.fileTextInArgs(req.Args) {
+	if t.fileTextInArgs(req.Args) || attachmentTextInArgs(ti, req.Args) { // and of an attachment (private.go)
 		g.record(Egress{Task: ti.ID, Action: id, Op: req.Name, Decision: "denied", Rule: FileTextDenied})
 		return fileTextDenial(req.Name), nil
 	}

@@ -34,6 +34,7 @@ import (
 	"github.com/tacyhq/tacy/guard"
 	"github.com/tacyhq/tacy/internal/procinfo"
 	"github.com/tacyhq/tacy/internal/tinfoil"
+	"github.com/tacyhq/tacy/kms"
 	"github.com/tacyhq/tacy/safety"
 	"github.com/tacyhq/tacy/vault"
 )
@@ -44,6 +45,14 @@ func main() {
 	vaultSocket := flag.String("vault-socket", "", "vaultd's unix socket")
 	listen := flag.String("listen", "", "TCP address of the published port to forward to -forward (empty: none)")
 	forward := flag.String("forward", "", "agentd's HTTP unix socket")
+	// The cloudflared spike (gateway/cftunnel; branch vm-fix-b-cloudflared): the compose pins all four.
+	cfdBin := flag.String("cloudflared", "", "spike: run this cloudflared as a child, its only origin gatewayd's ingress socket (forwarding to -forward)")
+	cfdSHA := flag.String("cloudflared-sha256", "", "spike: the cloudflared binary's pinned sha256")
+	cfdConfig := flag.String("cloudflared-config", "", "spike: the pinned locally-managed config")
+	tunnelSecret := flag.String("tunnel-secret", "", "spike: the vault secret name of the tunnel token (leased for each start)")
+	tunnelConfined := flag.String("tunnel-confined", "", "spike, confined variant: the volume shared with the cftunnel container (ingress socket and token file)")
+	tunnelConfinedGID := flag.Int("tunnel-confined-gid", 10006, "spike, confined variant: cloudflared's gid (it may connect and read the token)")
+	tunnelSpike := flag.Bool("tunnel-spike-routes", false, "spike: the /spike/* test routes on the ingress socket (throwaways only)")
 	memLimit := flag.Int("mem-limit-mib", 900, "Go soft memory limit (GOMEMLIMIT), MiB; 0 = none")
 	safetyURL := flag.String("safety-url", "", "https URL to pull the signed stop lists and policies from (empty: agentd's pushes only)")
 	safetyEvery := flag.Duration("safety-every", 10*time.Second, "how often to pull -safety-url (and -keylog-url)")
@@ -53,11 +62,15 @@ func main() {
 	modelFault := flag.String("e2e-model-fault", "", "e2e test only: <model>=slow|overloaded,... makes calls to those models slow (no byte before the slow threshold) or answer 503 overloaded")
 	searchProvider := flag.String("search-provider", "", "exa | tavily | brave (empty: by the keys set)")
 	expectedKeys := flag.String("expected-keys", "", "comma-separated names of the keys vaultd gets from the key service after boot (vault/secrets.go): the search provider is chosen as if they were set")
-	var kmsURLs multiFlag
-	flag.Var(&kmsURLs, "kms-url", "a Tacy key service replica, https base URL (repeat, in order; the compose pins them): fixed calls from agentd and vaultd (gateway/fixed.go)")
-	stateURL := flag.String("state-url", "", "the chat Worker's https base URL: its sealed-state API for agentd and vaultd (gateway/fixed.go)")
+	stateURL := flag.String("state-url", "", "the chat Worker's https base URL: its sealed-state API for agentd and vaultd, the unlock policy and secrets.sealed for unlockd (gateway/fixed.go)")
 	opsSocket := flag.String("ops-socket", "", "a unix socket for vaultd's fixed calls (and nothing else)")
 	vaultUID := flag.Int("vault-uid", -1, "the only uid allowed to connect to -ops-socket (vaultd's); -1: no check")
+	kmsKey := flag.String("kms-key", "", "the pinned KMS id, ed25519:<base64>: the unlock policy's share sets must be signed by it (its holders' URLs are unlockd's only hosts)")
+	unlockDomain := flag.String("unlock-domain", "", "every holder URL (url and alt_urls) must be https on one of these comma-separated domains or under it (the compose pins it)")
+	unlockAdminKeys := flag.String("unlock-admin-keys", "", "the admin keys the unlock policy must be signed by, comma-separated ed25519:<base64> (the compose pins them, as unlockd's)")
+	unlockAdminThreshold := flag.Int("unlock-admin-threshold", 1, "how many of -unlock-admin-keys must sign the unlock policy")
+	unlockSocket := flag.String("unlock-socket", "", "a unix socket for unlockd's fixed calls (holders, the Worker's unlock routes; nothing else)")
+	unlockdUID := flag.Int("unlockd-uid", -1, "the only uid allowed to connect to -unlock-socket (unlockd's); -1: no check")
 	devFixedHTTP := flag.Bool("dev-fixed-http", false, "local only: allow http:// fixed hosts (a development key service and Worker)")
 	dnsTLS := flag.String("dns-tls", "", "every DNS lookup over TLS to this resolver, <tls name>@<ip>:<port>[,<ip>:<port>] (gateway/dot.go; the compose pins it); empty: the system's resolver (local only)")
 	var sf safety.Flags
@@ -75,17 +88,40 @@ func main() {
 	if *socket == "" || *vaultSocket == "" {
 		log.Fatal("gatewayd: --socket and --vault-socket are required")
 	}
-	if (*listen == "") != (*forward == "") {
-		log.Fatal("gatewayd: --listen and --forward go together")
+	// --forward alone is the cloudflared spike's no-listen form (go-condition 3): the tunnel is the only way in.
+	if *listen != "" && *forward == "" || *forward != "" && *listen == "" && *cfdBin == "" && *tunnelConfined == "" {
+		log.Fatal("gatewayd: --listen and --forward go together (--forward alone only with the tunnel)")
 	}
 	if *memLimit > 0 {
 		debug.SetMemoryLimit(int64(*memLimit) << 20)
 	}
-	// The fixed hosts (the key service, the chat Worker's sealed-state API): served first, since vaultd's keys come
-	// through them.
-	fixed, err := gateway.NewFixed(kmsURLs, *stateURL, *devFixedHTTP)
+	// The fixed hosts (the chat Worker's sealed-state API and unlock routes, the split key's holders): served first,
+	// since every process's keys come through them (the keys plan §11.2). No key service (kmsd): the holders are named by
+	// the newest unlock policy, checked against -kms-key, on -unlock-domain only.
+	fixed, err := gateway.NewFixed(nil, *stateURL, *devFixedHTTP)
 	if err != nil {
 		log.Fatalf("gatewayd: %v", err)
+	}
+	if *unlockSocket != "" {
+		id, err := kms.ParseID(*kmsKey)
+		if err != nil {
+			log.Fatalf("gatewayd: -unlock-socket needs -kms-key: %v", err)
+		}
+		if *unlockDomain == "" && !*devFixedHTTP {
+			log.Fatal("gatewayd: -unlock-socket needs -unlock-domain (the holders are on our domains only)")
+		}
+		admin, err := safety.ParseKeys(*unlockAdminKeys)
+		if (err != nil || len(admin) == 0) && !*devFixedHTTP {
+			log.Fatal("gatewayd: -unlock-socket needs -unlock-admin-keys (the unlock policy's signers)")
+		}
+		fixed.NewUnlockHosts(id, kms.AdminKeys{Keys: admin, Threshold: *unlockAdminThreshold}, *unlockDomain)
+		ul, err := gateway.Listen(*unlockSocket, 0o660)
+		if err != nil {
+			log.Fatalf("gatewayd: %v", err)
+		}
+		go func() {
+			log.Fatal((&gateway.Server{Fixed: gateway.FixedGate{D: fixed, Allow: gateway.UnlockCalls}}).ServeOps(ul, *unlockdUID))
+		}()
 	}
 	if *opsSocket != "" {
 		ol, err := gateway.Listen(*opsSocket, 0o660)
@@ -93,7 +129,7 @@ func main() {
 			log.Fatalf("gatewayd: %v", err)
 		}
 		go func() {
-			log.Fatal((&gateway.Server{Fixed: gateway.KMSGate{D: fixed, Holder: "vaultd", Purposes: gateway.VaultKMSPurposes}}).ServeOps(ol, *vaultUID))
+			log.Fatal((&gateway.Server{Fixed: gateway.FixedGate{D: fixed, Allow: gateway.VaultCalls}}).ServeOps(ol, *vaultUID))
 		}()
 	}
 
@@ -175,6 +211,18 @@ func main() {
 	if *listen != "" {
 		go forwardPort(*listen, *forward)
 	}
+	if *tunnelConfined != "" {
+		if *forward == "" || *tunnelSecret == "" || *cfdBin != "" {
+			log.Fatal("gatewayd: -tunnel-confined needs -forward and -tunnel-secret, and no -cloudflared")
+		}
+		go runConfined(vc, *tunnelConfined, *tunnelConfinedGID, *tunnelSecret, *forward, *tunnelSpike)
+	}
+	if *cfdBin != "" {
+		if *forward == "" || *cfdConfig == "" || *tunnelSecret == "" {
+			log.Fatal("gatewayd: -cloudflared needs -forward, -cloudflared-config and -tunnel-secret")
+		}
+		go runTunnel(vc, *cfdBin, *cfdSHA, *cfdConfig, *tunnelSecret, *forward, *tunnelSpike)
+	}
 	log.Printf("gatewayd %s on %s (search %s, keys set %v, forwarding %s to %s)", gateway.Version, *socket,
 		search.Name(), names, *listen, *forward)
 	go func() { // the vault gets gatewayd's documents on every change and every 10 s (a restarted vault starts empty)
@@ -200,7 +248,7 @@ func main() {
 		go pullSafety(*safetyURL, *keylogURL, *safetyEvery, *forward)
 	}
 	log.Fatal((&gateway.Server{G: g, Safety: st, Secrets: vc.Secrets,
-		Fixed: gateway.KMSGate{D: fixed, Holder: "agentd", Purposes: gateway.AgentKMSPurposes}}).Serve(l, *agentUID))
+		Fixed: gateway.FixedGate{D: fixed, Allow: gateway.AgentCalls}}).Serve(l, *agentUID))
 }
 
 // forwardPort copies each inbound connection on addr to and from agentd's HTTP socket. The bytes aren't read:

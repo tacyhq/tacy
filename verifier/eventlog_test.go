@@ -117,12 +117,18 @@ type recording struct {
 	load func(t *testing.T) (*proto.Attestation, []byte, Policy)
 }
 
-// The 0.6.4 recording passes every check under its policy, so a refusal at the event log check is the new rule.
+// The 0.6.4 recording passes every check under its policy; the 0.6.5 one (the live dstack) every check up to the KMS
+// fallback's volume rule, so a refusal at the event log check is the new rule.
 var recordings = []recording{
 	{"0.6.4", func(t *testing.T) (*proto.Attestation, []byte, Policy) {
 		a, nonce, compose := load064(t)
 		return a, nonce, Policy{AllowStaleTCB: true, VerifyQuote: offline.VerifyQuote, Compose: compose, legacy: true,
 			PreLaunch: RetiredPreLaunchScripts, ProdImages: allImages(), Boot: allSets()}
+	}},
+	{"0.6.5", func(t *testing.T) (*proto.Attestation, []byte, Policy) {
+		a, nonce, attested, compose := load065(t)
+		return a, nonce, Policy{AllowStaleTCB: true, VerifyQuote: offline.VerifyQuote, Compose: []byte(compose),
+			AppCompose: []byte(attested), KMSFallback: true, AllowE2EDiag: true}
 	}},
 }
 
@@ -131,8 +137,11 @@ func TestEventLogUnchangedPasses(t *testing.T) {
 		a, nonce, p := rec.load(t)
 		p.VerifyQuote = forge(t, a, func(ev []tdx.Event) []tdx.Event { return ev })
 		_, err := Verify(context.Background(), a, nonce, p)
-		if err != nil {
+		if rec.name == "0.6.4" && err != nil {
 			t.Fatalf("%s unchanged: %v", rec.name, err)
+		}
+		if rec.name == "0.6.5" && (err == nil || !strings.HasPrefix(err.Error(), AppComposeFlagsCheck+": KMS fallback: volume")) {
+			t.Fatalf("%s unchanged: want the volume rule, got %v", rec.name, err)
 		}
 		// An app's own event after system-ready, under a name that isn't dstack's, changes nothing.
 		a, nonce, p = rec.load(t)

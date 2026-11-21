@@ -73,6 +73,24 @@ type Conn struct {
 
 	mu      sync.Mutex
 	secrets map[string]string // task -> its run secret (StartTask): status, events and cancel carry a MAC with it
+	boots   map[string]string // task -> the queue's boot its last state said (Task.Boot): sent back with each call
+}
+
+// TaskBoot is the queue boot this connection last saw for task id ("" when none).
+func (c *Conn) TaskBoot(id string) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.boots[id]
+}
+
+// SetTaskBoot sets the queue boot sent with task id's calls (a tab that saw it on another connection).
+func (c *Conn) SetTaskBoot(id, boot string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.boots == nil {
+		c.boots = map[string]string{}
+	}
+	c.boots[id] = boot
 }
 
 // TaskSecret is the run secret this connection started task id with ("" when it didn't).
@@ -98,6 +116,9 @@ func (c *Conn) ref(op, id string, extra map[string]any) map[string]any {
 	m := map[string]any{"task": id}
 	if s := c.TaskSecret(id); s != "" {
 		m["mac"] = guard.TaskMAC(s, op, id)
+	}
+	if b := c.TaskBoot(id); b != "" {
+		m["boot"] = b
 	}
 	for k, v := range extra {
 		m[k] = v
@@ -282,6 +303,9 @@ type Task struct {
 	Held     int    `json:"held,omitempty"`
 	Outcome  string `json:"outcome,omitempty"`
 	Existing bool   `json:"existing,omitempty"`
+	// Boot is the queue's boot (app/tasks.go): a later call on the task sends it back, so the VM can tell a task lost
+	// to a restart (404 task_unknown_after_restart) from one that never was.
+	Boot string `json:"boot,omitempty"`
 	// Billing is what the VM told the relay in plaintext headers on this call (app/tasks.go): not in the body.
 	Billing TaskBilling `json:"-"`
 }
@@ -357,6 +381,9 @@ func (c *Conn) taskCall(ctx context.Context, path, model string, v any) (*Task, 
 	var t Task
 	if err := json.NewDecoder(io.LimitReader(res.Body, 64<<10)).Decode(&t); err != nil {
 		return nil, err
+	}
+	if t.Task != "" && t.Boot != "" {
+		c.SetTaskBoot(t.Task, t.Boot)
 	}
 	t.Billing = TaskBilling{Bill: res.Header.Get("X-Agent-Bill"), Start: res.Header.Get("X-Agent-Task"),
 		Refundable: res.Header.Get("X-Agent-Refundable") == "1", Priced: res.Header.Get("X-Agent-Priced") == "1"}

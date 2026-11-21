@@ -6,12 +6,15 @@
 //   - report_data = proto.ReportData(our nonce, the HPKE key in the response): the key requests get encrypted to
 //     was generated inside this TD for this boot
 //   - dstack's event log replays to RTMR3, and its compose-hash event equals sha256(app-compose.json)
-//   - the OS image (os-image-hash event) is a production dstack image, not a dev one (dev allows debug access)
+//   - the OS image (os-image-hash event) is a production dstack image, not a dev one (dev allows debug access); with
+//     key provider none, which measures no os-image-hash, the image of the pinned boot set the measurements match
 //   - the boot measurements (MRTD, RTMR0-2: firmware, its configuration and the VM shape, kernel, command line
 //     with the root filesystem hash, initramfs) are one of the pinned sets (BootMeasurements), for that OS image
+//   - on Google Cloud (only with Policy.WithGCP): the MRTD is a Google build we reviewed (pinned per set) that
+//     Google's signed firmware endorsement (gcetcb) also lists, and RTMR0-2 are a pinned GCP set whose firmware log
+//     holds the dstack UKI; Phala quotes never get this check
 //   - the VM's keys are made inside it at boot (key provider none), or in the explicit KMS fallback come from a
 //     pinned dstack KMS root (KMSRoots, the attested key-provider event): never keys a provider can derive at will
-//   - app-compose.json: a reviewed pre-launch script, the docker-compose runner, no deployer env
 //   - app-compose.json is exactly the release's, after a check of each setting on its own (appcompose.go: no
 //     deployer env, no swap, nothing public, only port 8080, secure time, ephemeral data disk). In release mode the
 //     pin is ReleaseAppCompose of the docker compose the VM runs, so it is the signed release's app-compose.json
@@ -88,6 +91,15 @@ var RetiredKMSRoots = map[string]string{
 	"3059301306072a8648ce3d020106082a8648ce3d030107034200048844eb42ccdf8c52fd4f174f362fcb9bbd19c45fd48f1edec2d8f1ca23536ec1a74021b4cee610c074f8294d431b2b7fee2c39e5333fdaf0a4522d43fb159d9f": "Phala KMS, root until 2026-11-06",
 }
 
+// The OS image check's two names. Clients map the "production dstack OS image" prefix to "os_image". With a KMS the
+// guest measures the image's label (the os-image-hash event, from the KMS's answer); with key provider none it
+// measures none, and the label is the one of the pinned boot set MRTD and RTMR0-2 match: nothing attests the label
+// itself, the measurements do (review L4).
+const (
+	OSImageCheck     = "production dstack OS image (attested os-image-hash)"
+	OSImageBootCheck = "production dstack OS image (the label of the pinned boot set the measurements match; key provider none measures no os-image-hash)"
+)
+
 // KMSCheck is the name of the key-provider check (the chat maps its "keys made inside the VM" prefix to "kms").
 const KMSCheck = "keys made inside the VM, or in the KMS fallback from a pinned dstack KMS root (attested key-provider event)"
 
@@ -128,7 +140,7 @@ type Policy struct {
 	Compose []byte
 	// AppCompose is the release's app-compose.json (ReleaseAppCompose); the CVM's must be these bytes. In release
 	// mode, when neither it nor AppComposeSHA256 is set, it is ReleaseAppCompose of the attested docker compose (in
-	// the KMSFallback mode), which the bundle then proves is a signed release.
+	// the KMSFallback mode, with its pre-launch script), which the bundle then proves is a signed release.
 	AppCompose []byte
 	// AppComposeSHA256 are pinned app-compose.json hashes (hex), accepted besides AppCompose's: kmsd pins its releases
 	// by hash (its admin-signed policy). The key mode is then read from the attested file.
@@ -140,10 +152,22 @@ type Policy struct {
 	AllowStaleTCB    bool              // accept a TCB status other than UpToDate
 	SkipAttestation  bool              // development only: accept platform "local" with no quote
 	AllowE2EDiag     bool              // test tools only: accept the e2e overlay's diag service (ComposeImagesE2E)
-	PreLaunch        map[string]string // allowed pre-launch script sha256s; nil = PreLaunchScripts
-	Boot             []BootMeasurement // allowed MRTD/RTMR0-2 sets; nil = BootMeasurements
-	KMSRoots         map[string]string // allowed key-provider ids (KMS root CA keys); nil = KMSRoots
-	KMSIDs           map[string]string // allowed Tacy KMS ids a compose may name (-kms-key); nil = KMSIDs
+	// AllowE2EDiagRoot (cmd/e2e fixb only, with AllowE2EDiag): the diag service may also have the named exception
+	// E2EDiagRootException (root in the host's namespaces). No key service, holder or client sets it, and kms.Policy
+	// has no field for it, so no signed policy can turn it on (TestE2EDiagRootOnlyInTestTools).
+	AllowE2EDiagRoot bool
+	// AllowStorageDiscard accepts app-compose storage_discard true (TRIM tells the host which blocks are free).
+	// Nothing sets it: every release writes false.
+	AllowStorageDiscard bool
+	PreLaunch           map[string]string // allowed pre-launch script sha256s; nil = PreLaunchScripts
+	Boot                []BootMeasurement // allowed MRTD/RTMR0-2 sets; nil = BootMeasurements
+	KMSRoots            map[string]string // allowed key-provider ids (KMS root CA keys); nil = KMSRoots
+	KMSIDs              map[string]string // allowed Tacy KMS ids a compose may name (-kms-key); nil = KMSIDs
+	// KeyRelease: the attestation asks for keys (kmsd's release check, a split-key holder's unlock check): its
+	// report_data must be proto.ReportData (never VersionAgent's, which only agentd's attestations carry). Off (a
+	// browser, the chat Worker): a release with unlockd must attest agentd's key under proto.VersionAgent, so no
+	// unlock attestation passes as agentd's and no quote unlockd makes for agentd can ask a holder for a share.
+	KeyRelease bool
 	// ReleaseFloor (vX.Y.Z) is the oldest signed VM release the release mode accepts on top of Release's minimum
 	// (a trust list's vm_release_floor); unused by the exact mode.
 	ReleaseFloor string
@@ -156,6 +180,10 @@ type Policy struct {
 	// Getter fetches Intel PCS collateral; nil = net/http straight to Intel. The browser (WebAssembly) build passes
 	// one that goes through the chat's same-origin relay; Intel's signatures on the collateral are still checked.
 	Getter trust.HTTPSGetter
+	// GoogleGetter fetches Google's firmware launch endorsements (internal/gcetcb), only for a quote whose RTMR0-2
+	// match a Google Cloud set (WithGCP); nil = net/http straight to Google's bucket. Google's signature is checked
+	// against the compiled-in root, so a relay or cache can withhold an endorsement but can't forge one.
+	GoogleGetter trust.HTTPSGetter
 	// Now is when certificates and collateral must be valid; zero = now. Only tests set it (recorded collateral).
 	Now time.Time
 	// legacy (tests only) checks recordings from before app-compose pinning: keys from a pinned KMS root, the old
@@ -226,7 +254,7 @@ func Verify(ctx context.Context, att *proto.Attestation, nonce []byte, p Policy)
 		return r, fmt.Errorf("%s: %s", f[0].Name, f[0].Detail)
 	}
 	var err error
-	if att.Version != proto.Version {
+	if att.Version != proto.Version && att.Version != proto.VersionAgent {
 		err = fmt.Errorf("version %q, want %q", att.Version, proto.Version)
 	}
 	if !r.add("attestation format", err, att.Version) {
@@ -311,11 +339,15 @@ func Verify(ctx context.Context, att *proto.Attestation, nonce []byte, p Policy)
 		return failed()
 	}
 	err = nil
-	if !bytes.Equal(quote.ReportData, proto.ReportData(nonce, key)) {
+	label, want := proto.Version, proto.ReportData(nonce, key)
+	if att.Version == proto.VersionAgent && !p.KeyRelease { // a release with unlockd (the keys plan §11.2); see checkUnlockd
+		label, want = proto.VersionAgent, proto.AgentReportData(nonce, key)
+	}
+	if !bytes.Equal(quote.ReportData, want) {
 		err = errors.New("report_data doesn't bind our nonce and this HPKE key")
 	}
 	if !r.add("quote binds our nonce and the HPKE key (report_data)", err,
-		`sha512("`+proto.Version+`" || 0x00 || nonce || hpke_key)`) {
+		`sha512("`+label+`" || 0x00 || nonce || hpke_key)`) {
 		return failed()
 	}
 
@@ -351,30 +383,56 @@ func Verify(ctx context.Context, att *proto.Attestation, nonce []byte, p Policy)
 	if images == nil {
 		images = ProdImages
 	}
-	osHash := rt.Values["os-image-hash"]
-	r.Facts["OS image hash"] = osHash
-	name, ok := images[osHash]
-	err = nil
-	if !ok {
-		err = fmt.Errorf("OS image %s isn't a known production image (dev images allow debug access)", short(osHash))
-	}
-	if !r.add("production dstack OS image (attested os-image-hash)", err, name) {
-		return failed()
-	}
-	r.Facts["OS image"] = name
-
 	sets := p.Boot
 	if sets == nil {
 		sets = BootMeasurements
 	}
+	osHash, hasOSEvent := rt.Values["os-image-hash"]
+	// Google Cloud (WithGCP): a quote whose RTMR0-2 match a GCP set gets one more check, and that set's MRTD becomes
+	// the quote's once Google's signed endorsement lists it. A quote that matches no GCP set (every Phala quote) skips
+	// this: no fetch, no extra check, the same checks as before.
+	sets, gcpSet, gcpDetail, err := gcpBoot(ctx, quote, ev, sets, kp, hasOSEvent, p.GoogleGetter, p.Now)
+	if gcpSet != nil {
+		// What the measurements show, not where the VM runs: any TDX host loading Google's firmware with the same
+		// inputs measures the same (review L2). Nothing should decide on it.
+		r.Facts["boot chain"] = "Google's TDX firmware and the dstack UKI (a GCP set; the host itself isn't attested)"
+		r.Facts[FactPlatformSet] = PlatformDstackGCP
+		if err == nil {
+			r.Facts["firmware"] = gcpDetail
+		}
+		if !r.add(GCPBootCheck, err, gcpDetail) {
+			return failed()
+		}
+	}
+	err = nil
+	osDetail, osCheck := "", OSImageCheck
+	if !hasOSEvent && keysMadeInVM(kp) {
+		// Key provider none (Fix B): dstack measures os-image-hash only from a KMS's answer (dstack-util
+		// system_setup.rs), so there is no such event. The label was never what binds the image: the boot set
+		// (MRTD, RTMR0-2: firmware, kernel, the command line with the root filesystem's dm-verity hash, initramfs)
+		// is. So the OS image is the one of the pinned set these measurements match, and the label check below runs
+		// on it. Only before system-ready counts (bootValues), so an app can't add an os-image-hash of its choice.
+		osHash, err = osImageFromBoot(quote, sets)
+		osDetail, osCheck = " (from the pinned boot set: key provider none measures no os-image-hash)", OSImageBootCheck
+	}
+	r.Facts["OS image hash"] = osHash
+	name, ok := images[osHash]
+	if err == nil && !ok {
+		err = fmt.Errorf("OS image %s isn't a known production image (dev images allow debug access)", short(osHash))
+	}
+	if !r.add(osCheck, err, name+osDetail) {
+		return failed()
+	}
+	r.Facts["OS image"] = name
+
 	bm, err := matchBoot(quote, osHash, sets)
-	detail := ""
+	bootDetail := ""
 	if bm != nil {
-		detail = bm.Name
+		bootDetail = bm.Name
 		r.Facts["boot measurements"] = bm.Name
 	}
 	if !r.add("boot measurements (MRTD, RTMR0-2) are a pinned set: firmware, kernel, initramfs, root filesystem, VM size",
-		err, detail) {
+		err, bootDetail) {
 		return failed()
 	}
 
@@ -390,11 +448,16 @@ func Verify(ctx context.Context, att *proto.Attestation, nonce []byte, p Policy)
 	mode, pinErr := KeyProviderKMS, error(nil)
 	if !p.legacy {
 		// Release mode: the pin is the app-compose.json a release of the attested docker compose is deployed with
-		// (ReleaseAppCompose: this verifier's own settings, in the policy's key mode). The bundle check below proves
-		// that docker compose is a signed release, so the whole app-compose.json is that release's, byte for byte.
+		// (ReleaseAppCompose: this verifier's own settings, in the policy's key mode, with the memory-root pre-launch
+		// script for a release with unlockd in the KMS fallback, as cmd/compose writes it). The bundle check below
+		// proves that docker compose is a signed release, so the whole app-compose.json is that release's, byte for byte.
 		var releasePinErr error
 		if p.Compose == nil && len(p.AppCompose) == 0 && len(p.AppComposeSHA256) == 0 {
-			p.AppCompose, releasePinErr = ReleaseAppCompose([]byte(ac.DockerComposeFile), nil, p.KMSFallback)
+			var pre []byte
+			if p.KMSFallback && HasUnlockd(ac.DockerComposeFile) {
+				pre = []byte(MemoryRootScript)
+			}
+			p.AppCompose, releasePinErr = ReleaseAppCompose([]byte(ac.DockerComposeFile), pre, p.KMSFallback)
 		}
 		var pinned *appCompose
 		pinnedBytes := p.AppCompose
@@ -429,6 +492,10 @@ func Verify(ctx context.Context, att *proto.Attestation, nonce []byte, p Policy)
 	case mode == KeyProviderNone:
 		if provider.Name != KeyProviderNone || provider.ID != "" {
 			err = fmt.Errorf("key provider %q, want none (keys made inside the VM at boot, never a provider's)", provider.Name)
+		} else if enc := rt.Values["storage-encrypted"]; enc != hex.EncodeToString([]byte("1")) {
+			// The data disk under the key made in the TD (dm-crypt): dstack measures storage-encrypted 1. The kernel
+			// command line could turn encryption off, but it's in RTMR2 (the boot set); this is defense in depth.
+			err = fmt.Errorf("storage-encrypted event %q, want \"1\" (the data disk encrypted under the key made in the VM)", enc)
 		} else {
 			keysDetail = "made inside the VM at boot (key provider none)"
 			r.Facts["keys"] = keysDetail
@@ -508,7 +575,7 @@ func Verify(ctx context.Context, att *proto.Attestation, nonce []byte, p Policy)
 			ports = append(ports, extra...)
 		}
 		if err == nil {
-			err = ac.checkFlags(mode, roots, ports)
+			err = ac.checkFlags(mode, roots, ports, p.AllowStorageDiscard)
 		}
 		detail := fmt.Sprintf("key provider %s; no swap; nothing public; only port %d; secure time", mode, port)
 		if mode == KeyProviderNone {
@@ -548,14 +615,18 @@ func Verify(ctx context.Context, att *proto.Attestation, nonce []byte, p Policy)
 		pin = m[1]
 		r.Facts["service binary sha256"] = pin
 	}
+	binaries := "" // the other binaries' pins, for the check's detail
 	if m := brainPin.FindStringSubmatch(ac.DockerComposeFile); m != nil {
 		r.Facts["brain binary sha256"] = m[1]
+		binaries = ", brain " + short(m[1])
 	}
 	if m := gatewayPin.FindStringSubmatch(ac.DockerComposeFile); m != nil {
 		r.Facts["gateway binary sha256"] = m[1]
+		binaries += ", gateway " + short(m[1])
 	}
 	if m := vaultPin.FindStringSubmatch(ac.DockerComposeFile); m != nil {
 		r.Facts["vault binary sha256"] = m[1]
+		binaries += ", vault " + short(m[1])
 	}
 	sum := sha256.Sum256([]byte(ac.DockerComposeFile))
 	r.Facts["docker compose sha256"] = hex.EncodeToString(sum[:])
@@ -568,9 +639,9 @@ func Verify(ctx context.Context, att *proto.Attestation, nonce []byte, p Policy)
 			err = errors.New("no expected compose given")
 		}
 		h := sha256.Sum256(p.Compose)
-		detail := ""
+		detail := binaries
 		if pin != "" {
-			detail = ", binary " + short(pin)
+			detail = ", binary " + short(pin) + binaries
 		}
 		if !r.add("runs exactly our compose.yaml", err, "compose.yaml sha256 "+short(hex.EncodeToString(h[:]))+detail) {
 			return failed()
@@ -613,6 +684,7 @@ func Verify(ctx context.Context, att *proto.Attestation, nonce []byte, p Policy)
 			if pin != "" {
 				detail += ", binary " + short(pin)
 			}
+			detail += binaries
 			r.Facts["release"] = rel.Version
 			r.Facts["release commit"] = rel.Commit
 			r.Facts["release signer"] = rel.Identity
@@ -628,7 +700,17 @@ func Verify(ctx context.Context, att *proto.Attestation, nonce []byte, p Policy)
 	if !r.checkKMSID(ac.DockerComposeFile, cmpOr(p.KMSIDs, KMSIDs)) {
 		return failed()
 	}
-	if !r.checkImages(ac.DockerComposeFile, p.AllowE2EDiag, p.Services) {
+	level := diagNone
+	if p.AllowE2EDiag {
+		level = diagE2E
+		if p.AllowE2EDiagRoot {
+			level = diagRoot
+		}
+	}
+	if !r.checkImages(ac.DockerComposeFile, level, p.Services) {
+		return failed()
+	}
+	if !r.checkUnlockd(ac.DockerComposeFile, ac.PreLaunchScript, mode, att.Version, p.KeyRelease) {
 		return failed()
 	}
 	r.HPKEPublicKey = key

@@ -46,7 +46,11 @@ func TestReleaseModeAppComposePin(t *testing.T) {
 	if res.Facts["release"] != "v0.20.0" || !ok[AppComposePinCheck] || !ok[AppComposeFlagsCheck] || res.Facts["key mode"] != KeyProviderKMS {
 		t.Fatalf("release mode: %v %v", res.Checks, res.Facts)
 	}
-	want, _ := ReleaseAppCompose(compose, nil, true)
+	var pre []byte // a release with unlockd in the KMS fallback runs the memory-root pre-launch script
+	if HasUnlockd(string(compose)) {
+		pre = []byte(MemoryRootScript)
+	}
+	want, _ := ReleaseAppCompose(compose, pre, true)
 	if h := sha256.Sum256(want); res.Facts["app-compose sha256"] != strings.ToLower(hexOf(h[:])) {
 		t.Fatalf("app-compose sha256 %s", res.Facts["app-compose sha256"])
 	}
@@ -59,7 +63,7 @@ func TestReleaseModeAppComposePin(t *testing.T) {
 		{"re-encoded (same settings)", AppComposePinCheck, "the release pins", edited(func(map[string]any) {}), nil},
 		{"one trailing space", AppComposePinCheck, "the release pins", func(b []byte) []byte { return append(append([]byte{}, b...), ' ') }, nil},
 		{"another app name", AppComposePinCheck, "the release pins", edited(func(ac map[string]any) { ac["name"] = "tacy-agent-vm-2" }), nil},
-		{"storage_discard on", AppComposePinCheck, "the release pins", edited(func(ac map[string]any) { ac["storage_discard"] = true }), nil},
+		{"storage_discard on", AppComposeFlagsCheck, "storage_discard", edited(func(ac map[string]any) { ac["storage_discard"] = true }), nil},
 		{"a second port", AppComposeFlagsCheck, "want only 8080", edited(func(ac map[string]any) {
 			ac["port_policy"] = map[string]any{"ports": []map[string]any{{"port": 8080, "pp": false}, {"port": 8082, "pp": false}}, "restrict_mode": true}
 		}), nil},
@@ -92,7 +96,8 @@ func TestReleaseModeAppComposePin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	drc := bootWith(t, disk, false, nil, keyEvent(false))
+	// (The VM attests the disk compose in a release's app-compose.json: bootWith can't make a release of it.)
+	drc := bootWith(t, composeYAML(t), false, edited(func(ac map[string]any) { ac["docker_compose_file"] = string(disk) }), keyEvent(false))
 	drc.p.Compose, drc.p.AppCompose, drc.p.KMSFallback = nil, nil, true
 	drc.p.Bundle, drc.p.Release = dbundle, release.Policy{Trusted: s.Trusted()}
 	if _, err := Verify(context.Background(), drc.a, drc.nonce, drc.p); err == nil || !strings.Contains(err.Error(), "no release app-compose.json") {

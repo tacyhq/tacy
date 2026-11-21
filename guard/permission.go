@@ -348,14 +348,17 @@ func (g *Guard) permit(ctx context.Context, t *task, ti *harness.TaskInfo, id st
 	if ComposedFetch(req.Name, req.Args, sources, t.opts.Links, t.taintFor(ti, req.Call)) {
 		return nil, PermissionDenial(kind, PermNotFromResults)
 	}
-	if setting == safety.PermAlways {
+	// After private content (an attachment, the person's mail or files) a search goes out only on the person's
+	// approval of that one query (private.go): Always allow and an "always" grant don't cover it.
+	private := PrivateSearch(kind, ti)
+	if setting == safety.PermAlways && !private {
 		return args, nil
 	}
 	gr := GrantFrom(ctx)
 	switch {
 	case gr == nil || gr.Task != ti.ID || gr.Kind != kind || !gr.Verify(t.opts.RunSecret):
 		return nil, PermissionDenial(kind, "")
-	case gr.Decision == DecideOnce && gr.Request == id, gr.Decision == DecideAlways:
+	case gr.Decision == DecideOnce && gr.Request == id, gr.Decision == DecideAlways && !private:
 	default:
 		return nil, PermissionDenial(kind, "")
 	}

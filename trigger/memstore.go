@@ -94,6 +94,13 @@ func (m *MemStore) See(trigger, delivery string, until time.Time) (bool, error) 
 	return true, nil
 }
 
+func (m *MemStore) Unsee(trigger, delivery string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.seen, trigger+"\x00"+delivery)
+	return nil
+}
+
 func (m *MemStore) Seen(trigger, delivery string) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

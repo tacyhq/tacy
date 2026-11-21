@@ -732,6 +732,30 @@ func (e *Engine) Delivered(f Fire) error {
 	return err
 }
 
+// Claim records an event's delivery as used before its task starts (V1-DESIGN §6.3): fresh is false when another
+// call claimed it first (a replay). The caller makes the claim lasting (a synchronous save of the side state) before
+// it starts the task, and gives it back (Unclaim) if the task then doesn't start, so the sender may deliver it again.
+func (e *Engine) Claim(f Fire) (fresh bool, err error) {
+	if f.Trigger.Kind != Event {
+		return false, errors.New("trigger: not an event")
+	}
+	return e.cfg.Store.See(f.Trigger.ID, f.Delivery, f.SentAt.Add(2*EventWindow))
+}
+
+// Unseer is a Store that can give a claimed delivery back (Unclaim).
+type Unseer interface {
+	Unsee(trigger, delivery string) error
+}
+
+// Unclaim gives back a delivery Claim recorded whose task didn't start.
+func (e *Engine) Unclaim(f Fire) error {
+	u, ok := e.cfg.Store.(Unseer)
+	if !ok {
+		return errors.New("trigger: this store can't give a delivery back")
+	}
+	return u.Unsee(f.Trigger.ID, f.Delivery)
+}
+
 // Event checks an inbound event: the envelope's shape, the trigger installed as an event trigger, the sender's
 // signature with the key the definition pins, sent within EventWindow of the VM's clock, the clock trusted, the
 // sponsor still current, and the delivery not used before (Delivered records it once its task started). It returns the task to start; its id is

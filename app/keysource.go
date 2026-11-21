@@ -8,14 +8,14 @@ import (
 	"errors"
 	"sync"
 
-	"github.com/tacyhq/tacy/kmsvm"
+	"github.com/tacyhq/tacy/unlock"
 )
 
 // KeySource gives agentd its lasting keys. Nothing it keeps may be protected by a provider's keys ("Keys:
-// never a provider's", the keys plan): no dstack GetKey, no Phala KMS, no cloud KMS. On the CVM the keys come from the
-// Tacy key service (kmsKeys: kms/, an attested release of its own, reached through gatewayd), so
-// activity records and task ids keep their keys across restarts, releases and app ids, and sealed state opens again
-// on any instance that holds the lease. Without it (-kms-key unset: local runs and the memory-only quick path) the
+// never a provider's", the keys plan): no dstack GetKey, no Phala KMS, no cloud KMS. On the CVM the keys come from
+// unlockd (unlockKeys: the split-key unlock's epoch root R_e, the keys plan §11.2), so activity records and task ids keep
+// their keys across restarts, releases and app ids, and sealed state opens again on any VM the holders unlock.
+// Without it (-unlock-socket unset: local runs and the memory-only quick path) the
 // keys are made fresh at each boot in this TD and never stored (bootKeys): a new activity chain each boot, and task
 // ids that are once-only within a boot.
 type KeySource interface {
@@ -39,11 +39,14 @@ const (
 // agentPurposes is agentd's whole release.
 var agentPurposes = []string{PurposeState, PurposeActivity, PurposeTaskIDs}
 
-// kmsKeys is the key service's release (kmsvm).
-type kmsKeys struct{ *kmsvm.Keys }
+// unlockKeys are agentd's keys from unlockd (the split-key unlock, the keys plan §11.2).
+type unlockKeys struct{ *unlock.Keys }
 
-func (k kmsKeys) Binding() string { return k.App() }
-func (kmsKeys) Lasting() bool     { return true }
+func (k unlockKeys) Binding() string { return k.App }
+func (unlockKeys) Lasting() bool     { return true }
+
+// floors are the lowest generations of agentd's sealed states the witnesses' head names (privacy review #9).
+func (k unlockKeys) floors() map[string]uint64 { return k.Floors }
 
 // bootKeys is the KeySource without a key service: random keys made at first use, in memory only.
 type bootKeys struct {

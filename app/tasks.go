@@ -31,7 +31,13 @@ import (
 //	POST /tasks          {model, messages, run_secret, ..., key?} -> {task, state, existing}. key makes the start
 //	                     once-only: the same user and key always name the same task (a retry finds it; nothing runs
 //	                     twice). X-Agent-Model as for /run. Refusals: 403 {error, code, activity?}; 429 too_many_tasks.
-//	POST /tasks/status   {task, mac} -> {task, state, sub, attempt, events, held, outcome}
+//	POST /tasks/status   {task, mac, boot?} -> {task, state, sub, attempt, events, held, outcome, boot}
+//	                     boot (every task's state carries it) names the queue the task is in: the same across
+//	                     container restarts (the queue is in a host tmpfs, queue.OpenTmpfs), new after a real boot.
+//	                     A call on a task this queue doesn't know, with a boot that isn't this one, answers 404
+//	                     {"error": "task_unknown_after_restart", "boot": <this one>}: the task was lost to a restart.
+//	                     The client asks the person whether to run it again; nothing re-runs by itself. Without
+//	                     boot (or with this one) it is 404 no_such_task, as before. Status, events, cancel, delete.
 //	POST /tasks/events   {task, after, mac} -> SSE: "id: <seq>" and "data: <proto.Event>" per event after seq after,
 //	                     as they come, then "data: [DONE]" once the task ended; reconnect with the last id seen.
 //	                     At most 8 streams at once per user, 64 in all.
@@ -76,6 +82,7 @@ type taskRef struct {
 	Task  string `json:"task"`
 	After int    `json:"after,omitempty"`
 	MAC   string `json:"mac"`
+	Boot  string `json:"boot,omitempty"` // the queue's boot the caller last saw for this task (guard.TaskState.Boot)
 }
 
 // maxFollowers bounds the event streams open at once (each is a long request); maxUserFollowers those of one user
@@ -333,8 +340,17 @@ func readRef(w http.ResponseWriter, r *http.Request) (taskRef, bool) {
 	return ref, true
 }
 
-func taskFail(w http.ResponseWriter, err error) {
+// errTaskUnknownAfterRestart: a task call on a task this queue doesn't know, from a caller who saw it in another
+// queue boot (V1-DESIGN §6.2).
+const errTaskUnknownAfterRestart = "task_unknown_after_restart"
+
+func (s *server) taskFail(w http.ResponseWriter, ref taskRef, err error) {
 	if errors.Is(err, guard.ErrNoTask) {
+		// Only the boot decides (never whether some task has this id), so the answer says nothing about other tasks.
+		if boot := s.tasks().Boot; boot != "" && ref.Boot != "" && ref.Boot != boot {
+			writeJSON(w, 404, map[string]string{"error": errTaskUnknownAfterRestart, "boot": boot})
+			return
+		}
 		fail(w, 404, "no_such_task")
 		return
 	}
@@ -344,7 +360,7 @@ func taskFail(w http.ResponseWriter, err error) {
 // authorized checks a task call's MAC (guard.Host.Authorize); false: it answered 404.
 func (s *server) authorizedTask(w http.ResponseWriter, r *http.Request, ref taskRef, op string) bool {
 	if err := s.tasks().Authorize(ref.Task, userFrom(r.Context()), op, ref.MAC); err != nil {
-		taskFail(w, err)
+		s.taskFail(w, ref, err)
 		return false
 	}
 	return true
@@ -358,7 +374,7 @@ func (s *server) taskStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	st, err := s.tasks().Status(ref.Task, userFrom(r.Context()))
 	if err != nil {
-		taskFail(w, err)
+		s.taskFail(w, ref, err)
 		return
 	}
 	writeJSON(w, 200, st)
@@ -373,7 +389,7 @@ func (s *server) taskCancel(w http.ResponseWriter, r *http.Request) {
 	user := userFrom(r.Context())
 	refundable, err := s.tasks().Cancel(ref.Task, user)
 	if err != nil {
-		taskFail(w, err)
+		s.taskFail(w, ref, err)
 		return
 	}
 	w.Header().Set(billHeader, s.tasks().Bill(ref.Task))
@@ -383,7 +399,7 @@ func (s *server) taskCancel(w http.ResponseWriter, r *http.Request) {
 	// The cancel is in; the task ends within the brain's grace period.
 	st, err := s.tasks().Status(ref.Task, user)
 	if err != nil {
-		taskFail(w, err)
+		s.taskFail(w, ref, err)
 		return
 	}
 	writeJSON(w, 200, st)
@@ -397,7 +413,7 @@ func (s *server) taskDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	refundable, err := s.tasks().Delete(ref.Task, userFrom(r.Context()))
 	if err != nil {
-		taskFail(w, err)
+		s.taskFail(w, ref, err)
 		return
 	}
 	w.Header().Set(billHeader, s.tasks().Bill(ref.Task))

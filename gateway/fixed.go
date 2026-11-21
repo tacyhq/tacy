@@ -28,10 +28,12 @@ import (
 // Over the socket a call is a connection's only frame (agentd on gatewayd's socket; vaultd on the ops socket,
 // which serves nothing else).
 
-// Targets.
+// Targets. TargetKMS is kmsd's (the v0.21.0 line; no compose from the split-key unlock names it); TargetUnlock is
+// unlockd's holders (unlock/v0, unlock.go): a host the signed unlock policy names, never one a call names.
 const (
-	TargetKMS   = "kms"
-	TargetState = "state"
+	TargetKMS    = "kms"
+	TargetState  = "state"
+	TargetUnlock = "unlock"
 )
 
 // MaxFixedBody bounds a fixed call's body either way: a sealed state blob as a frame's base64 fits MaxFrame.
@@ -40,7 +42,8 @@ const MaxFixedBody = 11 << 20
 // FixedCall is one call to a fixed host.
 type FixedCall struct {
 	Target string            `json:"target"`
-	Host   int               `json:"host,omitzero"` // kms: the replica's index in -kms-url's order
+	Host   int               `json:"host,omitzero"`   // kms: the replica's index in -kms-url's order
+	Holder string            `json:"holder,omitzero"` // unlock: the holder's id in the unlock policy
 	Method string            `json:"method"`
 	Path   string            `json:"path"` // with its query
 	Header map[string]string `json:"header,omitzero"`
@@ -64,7 +67,14 @@ type FixedDoer interface {
 
 var (
 	stateName = regexp.MustCompile(`^/api/vm/state/[a-z0-9][a-z0-9_-]{0,63}$`)
-	kmsCalls  = map[string]string{ // path (without query) -> method
+	// ownerName: a schedule ownership row (unlock/owner.go): POST only.
+	ownerName = regexp.MustCompile(`^/api/vm/owner/[a-z0-9][a-z0-9_-]{0,63}$`)
+	// unlockState: what unlockd reads from and tells the chat Worker (the newest unlock policy, secrets.sealed, its
+	// unlock report): path -> method.
+	unlockState = map[string]string{UnlockPolicyPath: "GET", UnlockSecretsPath: "GET", UnlockReportPath: "POST", StartTicketPath: "GET"}
+	// unlockCalls: a holder's tacy-split/v1 routes the VM uses (path -> method).
+	unlockCalls = map[string]string{"/v1/challenge": "GET", "/v1/unlock": "POST", "/v1/status": "GET"}
+	kmsCalls    = map[string]string{ // path (without query) -> method
 		"/v1/status": "GET", "/v1/challenge": "GET", "/v1/release": "POST", "/v1/lease/renew": "POST",
 		"/v1/lease/drop": "POST", "/v1/gen/commit": "POST", "/v1/gen": "GET",
 	}
@@ -103,8 +113,20 @@ func CheckFixed(call *FixedCall) error {
 			return err
 		}
 	case TargetState:
-		if !stateName.MatchString(path) || query != "" || (call.Method != "GET" && call.Method != "PUT") || call.Host != 0 {
+		m, unlock := unlockState[path]
+		switch {
+		case query != "" || call.Host != 0 || call.Holder != "":
 			return fmt.Errorf("%s %s isn't a sealed-state call", call.Method, path)
+		case stateName.MatchString(path) && (call.Method == "GET" || call.Method == "PUT"):
+		case ownerName.MatchString(path) && call.Method == "POST":
+		case unlock && call.Method == m:
+		default:
+			return fmt.Errorf("%s %s isn't a sealed-state call", call.Method, path)
+		}
+	case TargetUnlock:
+		m, ok := unlockCalls[path]
+		if !ok || m != call.Method || query != "" || call.Host != 0 || !validHolderID(call.Holder) {
+			return fmt.Errorf("%s %s isn't a holder call", call.Method, path)
 		}
 	default:
 		return fmt.Errorf("unknown target %q", call.Target)
@@ -125,6 +147,8 @@ type Fixed struct {
 	// AllowHTTP: tests only (an httptest server). A release's hosts are https, which the verifier also checks
 	// for -kms-url.
 	AllowHTTP bool
+	// Unlock is where the holders are (the unlock policy's URLs, unlock.go); nil: no unlock target.
+	Unlock *UnlockHosts
 }
 
 // NewFixed checks the hosts.
@@ -146,16 +170,25 @@ func NewFixed(kmsURLs []string, stateURL string, allowHTTP bool) (*Fixed, error)
 	return f, nil
 }
 
-func (f *Fixed) base(call *FixedCall) string {
+// bases are the base URLs a call may go to, in order: one, except a holder's (its url, then its alt_urls, each tried
+// when the one before didn't answer).
+func (f *Fixed) bases(ctx context.Context, call *FixedCall) []string {
 	switch call.Target {
+	case TargetUnlock:
+		if f.Unlock != nil {
+			u, _ := f.Unlock.URLs(ctx, call.Holder)
+			return u
+		}
 	case TargetKMS:
 		if call.Host >= 0 && call.Host < len(f.KMS) {
-			return f.KMS[call.Host]
+			return []string{f.KMS[call.Host]}
 		}
 	case TargetState:
-		return f.State
+		if f.State != "" {
+			return []string{f.State}
+		}
 	}
-	return ""
+	return nil
 }
 
 var defaultFixedClient = &http.Client{Timeout: 60 * time.Second, Transport: &http.Transport{
@@ -171,10 +204,21 @@ func (f *Fixed) Fixed(ctx context.Context, call *FixedCall) *FixedAnswer {
 		}
 		return &FixedAnswer{Error: "bad_call"}
 	}
-	base := f.base(call)
-	if base == "" {
+	bases := f.bases(ctx, call)
+	if len(bases) == 0 {
 		return &FixedAnswer{Error: "no_target"}
 	}
+	var a *FixedAnswer
+	for _, base := range bases { // the next one only when this one didn't answer (a refusal is an answer)
+		if a = f.fixedTo(ctx, base, call); a.Error != "unreachable" {
+			return a
+		}
+	}
+	return a
+}
+
+// fixedTo sends call to base.
+func (f *Fixed) fixedTo(ctx context.Context, base string, call *FixedCall) *FixedAnswer {
 	var rd io.Reader
 	if call.Body != nil {
 		rd = bytes.NewReader(call.Body)

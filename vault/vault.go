@@ -30,7 +30,13 @@ type Grant struct {
 	Secret     string
 	Connector  string
 	SendOnlyTo []string
+	// Infra (the cloudflared spike, branch vm-fix-b-cloudflared): the VM's own infrastructure credential (the tunnel
+	// token), leased to gatewayd itself, not for any person's task: the per-space safety controls don't apply.
+	Infra bool
 }
+
+// TunnelSecrets are the cloudflared spike's tunnel tokens (one per blue/green slot); the compose names one.
+var TunnelSecrets = []string{"CF_TUNNEL_TOKEN_VMA", "CF_TUNNEL_TOKEN_VMB"}
 
 // Request is the gateway's ask: one secret, for one connector, to one host, for one action of one task. Task and
 // action are the harness/v1 ids (docs/20), so the record ties the lease to the journaled action.
@@ -130,7 +136,7 @@ func New(secrets map[string][]byte, grants []Grant, record func(Record)) (*Vault
 				return nil, fmt.Errorf("vault: invalid host %q in the grant for %s", h, g.Secret)
 			}
 		}
-		v.grants = append(v.grants, Grant{g.Secret, g.Connector, slices.Clone(g.SendOnlyTo)})
+		v.grants = append(v.grants, Grant{g.Secret, g.Connector, slices.Clone(g.SendOnlyTo), g.Infra})
 	}
 	for name, val := range secrets {
 		if !validName(name) {
@@ -193,8 +199,10 @@ func (v *Vault) lease(r Request) ([]byte, string, error) {
 			if !ok {
 				return nil, "", ErrNotSet
 			}
-			if err := v.checkSafety(r); err != nil {
-				return nil, "", err
+			if !g.Infra {
+				if err := v.checkSafety(r); err != nil {
+					return nil, "", err
+				}
 			}
 			return slices.Clone(val), newLease(), nil
 		}
@@ -330,5 +338,7 @@ func ChatGrants(tinfoilHost string) []Grant {
 		{Secret: "TAVILY_API_KEY", Connector: "web", SendOnlyTo: []string{"api.tavily.com"}},
 		{Secret: "BRAVE_SEARCH_API_KEY", Connector: "web", SendOnlyTo: []string{"api.search.brave.com"}},
 		{Secret: "EXA_API_KEY", Connector: "web", SendOnlyTo: []string{"api.exa.ai"}},
+		{Secret: TunnelSecrets[0], Connector: "tunnel", SendOnlyTo: []string{"argotunnel.com"}, Infra: true},
+		{Secret: TunnelSecrets[1], Connector: "tunnel", SendOnlyTo: []string{"argotunnel.com"}, Infra: true},
 	}
 }

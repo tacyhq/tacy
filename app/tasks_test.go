@@ -125,6 +125,17 @@ func (h holdSearch) Hold(_ *harness.TaskInfo, _ string, req any) string {
 // bootTasks starts an agentd process on the queue at path, taking up what an earlier one left there.
 func bootTasks(t *testing.T, path string, model http.Handler, fs *fakeSearch, hold bool) *taskProc {
 	t.Helper()
+	q, err := queue.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { q.Close() })
+	return bootTasksOn(t, q, "", model, fs, hold)
+}
+
+// bootTasksOn is bootTasks on the queue q, whose boot is boot (guard.Host.Boot).
+func bootTasksOn(t *testing.T, q harness.Store, boot string, model http.Handler, fs *fakeSearch, hold bool) *taskProc {
+	t.Helper()
 	srv := httptest.NewServer(model)
 	t.Cleanup(func() {
 		if m, ok := model.(*stepModel); ok {
@@ -132,11 +143,6 @@ func bootTasks(t *testing.T, path string, model http.Handler, fs *fakeSearch, ho
 		}
 		srv.Close()
 	})
-	q, err := queue.Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { q.Close() })
 	dq := &deadQueue{Store: q}
 	lim := defaultLimits
 	g := guard.New(guard.Config{Up: guard.NewPlainUpstream(srv.URL, srv.Client()), Search: fs, Fetcher: guard.NewFetcher(true),
@@ -154,7 +160,7 @@ func bootTasks(t *testing.T, path string, model http.Handler, fs *fakeSearch, ho
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	s := &server{platform: local{}, id: id, agent: g, rt: rt, booted: time.Now(), sched: newScheduler(lim), lim: lim,
-		quotes: make(chan struct{}, 4), host: &guard.Host{RT: rt, GW: g, IDKey: []byte("the space's task-id key")}}
+		quotes: make(chan struct{}, 4), host: &guard.Host{RT: rt, GW: g, IDKey: []byte("the space's task-id key"), Boot: boot}}
 	s.resumeTasks(ctx, ids, t.Logf)
 	// The brain connects only once the restored tasks are resumed, as in main.go: a brain already connected would
 	// take a restored task up before its stream was open, and its events would go nowhere.

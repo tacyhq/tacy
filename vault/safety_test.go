@@ -210,6 +210,9 @@ func TestVaultRateLimits(t *testing.T) {
 func TestChatGrantsHostsInReleaseCeiling(t *testing.T) {
 	rel := safety.ChatRelease("f_chat", "", []string{"gpt-oss-120b"}, 300)
 	for _, g := range ChatGrants("") {
+		if g.Infra { // the tunnel token: gatewayd's own credential, no person's task, no ceiling (the cloudflared spike)
+			continue
+		}
 		c, ok := rel.Connectors[g.Connector]
 		if !ok {
 			t.Fatalf("%s: connector %q not in the release ceiling", g.Secret, g.Connector)

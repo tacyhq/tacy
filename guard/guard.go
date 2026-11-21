@@ -403,6 +403,9 @@ func (g *Guard) TaintedAtStart(s *harness.Start) string { return StartTaint(s) }
 // earlier answer in a chat may carry web-derived text (docs/27 section 5), and no person typed it; the VM
 // can't tell which turns came from the web, so any one counts.
 func StartTaint(s *harness.Start) string {
+	if hasAttachment(s.Input) { // attachment text is outside content (private.go)
+		return "attachment"
+	}
 	for _, m := range s.Input {
 		if m.Role == "assistant" || m.Role == "tool" {
 			return "history"

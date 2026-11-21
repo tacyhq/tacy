@@ -19,7 +19,7 @@ import (
 const module = "github.com/tacyhq/tacy"
 
 // vmBinaries are the packages built into the CVM's images (cmd/compose bins).
-var vmBinaries = []string{"./app", "./cmd/brain", "./cmd/gatewayd", "./cmd/runnerd", "./cmd/setup", "./cmd/vaultd"}
+var vmBinaries = []string{"./app", "./cmd/brain", "./cmd/gatewayd", "./cmd/runnerd", "./cmd/setup", "./cmd/unlockd", "./cmd/vaultd"}
 
 // writeAllowed are the only functions in the CVM's code that may write a file, each with why. A key is
 // "<file relative to the module>:<function>" (a method as Type.Method). Anything else that writes fails the test: lasting
@@ -33,14 +33,33 @@ var writeAllowed = map[string]string{
 	"sandbox/cgroup_linux.go:DelegateCgroups": "cgroupfs (kernel interface)",
 	"runner/profiles.go:copyFile":             "the brain's binary into its root on the runner's tmpfs",
 	"vault/wipe.go:wipeFile":                  "overwrites the pre-v0.20.0 connections file with zeros before removing it",
+	// unlockd's keyring across container restarts (the keys plan §11.2): only into the host tmpfs mounted into unlockd alone
+	// (Cache.check refuses a directory statfs doesn't call tmpfs: TD memory, gone at the next boot).
+	"unlock/cache.go:Cache.Save": "unlockd's keyring into its host tmpfs (TD memory), checked to be tmpfs first",
+	// The cloudflared spike (branch vm-fix-b-cloudflared): the tunnel token for the few seconds cloudflared takes to
+	// read it, in gatewayd's private tmpfs (/tmp in its container: TD memory), checked to be tmpfs first; then zeroed.
+	"gateway/cftunnel/cftunnel.go:writeToken":   "the tunnel token file in gatewayd's tmpfs, checked to be tmpfs first",
+	"gateway/cftunnel/cftunnel.go:wipe":         "zeroes the tunnel token file before removing it",
+	"gateway/cftunnel/confined.go:PublishToken": "the confined variant: the tunnel token for cloudflared's uid in the shared tmpfs volume, checked to be tmpfs first",
+	// agentd's task queue across container restarts (V1-DESIGN §6.2): only into the host tmpfs setup makes for agentd
+	// alone (verifier.TasksDir); OpenTmpfs refuses a directory statfs doesn't call tmpfs, or one other uids can read,
+	// before it writes. TD memory, gone at every real boot (TestNoWriteExceptionTasksTmpfs).
+	tasksTmpfsKey: "agentd's task queue (its boot marker) into its host tmpfs (TD memory), checked to be tmpfs first",
 	// Before v0.20.0 these kept state on the CVM's disk. Since the quick path nothing in the mains opens them
 	// (TestMainsOpenNoFileStores); they move onto sealstate's snapshots (the keys plan §3.2, Stage C) and leave this list.
 	"activity/store.go:OpenStore":  "legacy file store, unused by the mains",
 	"safety/state.go:State.write":  "legacy file store (Config.Dir), the mains pass none",
 	"safety/budget.go:Ledger.save": "legacy file store (Ledger.Dir), the mains set none",
-	"queue/queue.go:Open":          "legacy file store (its tests), unused by the mains",
+	tasksQueueKey:                  "the task queue's SQLite file: from the mains only through queue.OpenTmpfs, into the host tmpfs (TestNoWriteExceptionTasksTmpfs); else its tests",
 	"queue/side.go:OpenSide":       "legacy file store (its tests and the rollback tests), unused by the mains (OpenSideMemory)",
 }
+
+// The task queue's exception (V1-DESIGN §6.2): OpenTmpfs writes its boot marker and opens the queue (Open) in agentd's
+// host tmpfs.
+const (
+	tasksTmpfsKey = "queue/tmpfs.go:OpenTmpfs"
+	tasksQueueKey = "queue/queue.go:Open"
+)
 
 // getenvAllowed may read the environment with a name that isn't a literal (local development only).
 var getenvAllowed = map[string]string{
@@ -272,7 +291,7 @@ func call(string, string) {}
 // they stay unused until they move onto sealstate.
 func TestMainsOpenNoFileStores(t *testing.T) {
 	fset := token.NewFileSet()
-	for _, rel := range []string{"app/main.go", "app/state.go", "cmd/vaultd/main.go", "cmd/gatewayd/main.go"} {
+	for _, rel := range []string{"app/main.go", "app/state.go", "cmd/vaultd/main.go", "cmd/gatewayd/main.go", "cmd/unlockd/main.go"} {
 		f, err := parser.ParseFile(fset, filepath.Join("..", rel), nil, parser.SkipObjectResolution)
 		if err != nil {
 			t.Fatal(err)
@@ -315,5 +334,86 @@ func TestMainsOpenNoFileStores(t *testing.T) {
 			}
 			return true
 		})
+	}
+}
+
+// TestNoWriteExceptionTasksTmpfs (V1-DESIGN §6.2, §6.5): the task queue's write exception is the only one for tasks,
+// and it holds only for the host tmpfs. The mains open no queue but through queue.OpenTmpfs, once (agentState's
+// useTasksQueue, -tasks-dir); OpenTmpfs checks the directory is memory before it writes anything or opens the queue;
+// and no other code the CVM runs calls the queue's openers.
+func TestNoWriteExceptionTasksTmpfs(t *testing.T) {
+	for _, k := range []string{tasksTmpfsKey, tasksQueueKey} {
+		if why := writeAllowed[k]; !strings.Contains(why, "tmpfs") {
+			t.Errorf("writeAllowed[%s] = %q: the task queue's exception must say it is the host tmpfs", k, why)
+		}
+	}
+	for k := range writeAllowed {
+		if strings.HasPrefix(k, "queue/") && k != tasksTmpfsKey && k != tasksQueueKey && k != "queue/side.go:OpenSide" {
+			t.Errorf("writeAllowed has %s: the task queue's only exception is OpenTmpfs (and the Open it calls)", k)
+		}
+	}
+	// Who calls the queue's openers, among the files the CVM runs (the queue package aside).
+	fset := token.NewFileSet()
+	calls := map[string][]string{} // opener -> where
+	for _, rel := range vmFiles(t) {
+		if strings.HasPrefix(rel, "queue/") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, filepath.Join("..", rel), nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ast.Inspect(f, func(n ast.Node) bool {
+			if c, ok := n.(*ast.CallExpr); ok {
+				if sel, ok := c.Fun.(*ast.SelectorExpr); ok {
+					if id, ok := sel.X.(*ast.Ident); ok && id.Name == "queue" && (sel.Sel.Name == "Open" || sel.Sel.Name == "OpenTmpfs") {
+						calls[sel.Sel.Name] = append(calls[sel.Sel.Name], rel)
+					}
+				}
+			}
+			return true
+		})
+	}
+	if len(calls["Open"]) != 0 {
+		t.Errorf("queue.Open called from %v: only through queue.OpenTmpfs", calls["Open"])
+	}
+	if got := calls["OpenTmpfs"]; len(got) != 1 || got[0] != "app/state.go" {
+		t.Errorf("queue.OpenTmpfs called from %v, want once from app/state.go (useTasksQueue)", got)
+	}
+	// In OpenTmpfs, the memory check comes before the first write and before Open.
+	f, err := parser.ParseFile(fset, filepath.Join("..", "queue", "tmpfs.go"), nil, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var check, write, open token.Pos
+	for _, d := range f.Decls {
+		fn, ok := d.(*ast.FuncDecl)
+		if !ok || fn.Name.Name != "OpenTmpfs" {
+			continue
+		}
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			c, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			switch fun := c.Fun.(type) {
+			case *ast.Ident:
+				if fun.Name == "isMem" && !check.IsValid() {
+					check = c.Pos()
+				}
+				if fun.Name == "Open" && !open.IsValid() {
+					open = c.Pos()
+				}
+			case *ast.SelectorExpr:
+				if id, ok := fun.X.(*ast.Ident); ok && id.Name == "os" && (fun.Sel.Name == "WriteFile" || fun.Sel.Name == "Remove") && !write.IsValid() {
+					write = c.Pos()
+				}
+			}
+			return true
+		})
+	}
+	if !check.IsValid() || !write.IsValid() || !open.IsValid() || check > write || check > open {
+		t.Errorf("queue.OpenTmpfs must check the directory is memory (isMem) before it removes, writes or opens: check %v, write %v, open %v",
+			fset.Position(check), fset.Position(write), fset.Position(open))
 	}
 }

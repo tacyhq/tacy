@@ -31,7 +31,7 @@
 // release. The deprecated exact mode checks the compose.yaml and app-compose.json embedded here (tacy.Compose,
 // tacy.AppCompose).
 //
-//	setTrustList(envelopeJSON, minSeq, nowISO?) -> string
+//	setTrustList(envelopeJSON, minSeq, nowISO?, seenJSON?) -> string
 //	    Takes a signed trust list (admin keys pinned in package verifier) for later checks: JSON verifier.TrustInfo,
 //	    with releaseEntries (the list's VM releases and their Sigstore bundles) for a client's bundle lookup. Each
 //	    later check applies the list again (it may have expired): its OS images, boot sets, pre-launch scripts and
@@ -160,7 +160,7 @@ func run(attJSON, nonceHex string, bundle []byte, fetch js.Value, now, lastSeen 
 		return fail(errors.New("nonce must be 32 bytes of hex"))
 	}
 	p := verifier.Policy{Bundle: bundle, Getter: jsGetter{fetch}, Release: release.Policy{LastSeen: lastSeen},
-		KMSFallback: tacy.KMSFallback}
+		KMSFallback: tacy.KMSFallback, GoogleGetter: jsGetter{fetch}} // Google's endorsements: only with a trust list's dstack-gcp
 	if bundle == nil {
 		p.Compose, p.AppCompose = tacy.Compose, tacy.AppCompose
 	}
@@ -261,12 +261,15 @@ func main() {
 	api.Set("releaseIdentity", release.Policy{}.Identity())
 	api.Set("minVersion", release.Policy{}.Minimum())
 	api.Set("appComposeSha256", appComposeSum())
-	// setTrustList(envelopeJSON, minSeq, nowISO?) -> JSON verifier.TrustInfo: takes a signed trust list for later
-	// checks if it is signed by the pinned admin keys, not expired and its seq is at least minSeq ("" clears it). Its
-	// releaseEntries are the list's VM releases (with their Sigstore bundles) for a release-mode client's lookup.
+	// setTrustList(envelopeJSON, minSeq, nowISO?, seenJSON?) -> JSON verifier.TrustInfo: takes a signed trust list for
+	// later checks if it is signed by the pinned admin keys, not expired and its seq is at least minSeq ("" clears it).
+	// seenJSON is the caller's record of the list's items (the last answer's seen; none: every addition waits): only
+	// what has been listed for 24 h counts (safety/trustdelay.go); the answer's seen is the record to keep, its
+	// pending what doesn't count yet, its releaseEntries the list's VM releases that count (with their Sigstore
+	// bundles) for a release-mode client's lookup.
 	api.Set("setTrustList", js.FuncOf(func(_ js.Value, a []js.Value) any {
 		if len(a) < 2 || a[0].Type() != js.TypeString || a[1].Type() != js.TypeNumber {
-			b, _ := json.Marshal(verifier.TrustInfo{Error: "setTrustList(envelopeJSON, minSeq, nowISO?)"})
+			b, _ := json.Marshal(verifier.TrustInfo{Error: "setTrustList(envelopeJSON, minSeq, nowISO?, seenJSON?)"})
 			return string(b)
 		}
 		now := time.Now()
@@ -282,7 +285,11 @@ func main() {
 		if minSeq < 0 || minSeq > 1<<53 {
 			minSeq = 1 << 53
 		}
-		b, _ := json.Marshal(trust.Take([]byte(a[0].String()), uint64(minSeq), now))
+		var seen []byte
+		if len(a) > 3 && a[3].Type() == js.TypeString {
+			seen = []byte(a[3].String())
+		}
+		b, _ := json.Marshal(trust.TakeSeen([]byte(a[0].String()), uint64(minSeq), now, seen))
 		return string(b)
 	}))
 	js.Global().Set("sealedAgentVM", api)

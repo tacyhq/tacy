@@ -72,6 +72,7 @@ import (
 	"github.com/tacyhq/tacy/kms/client"
 	"github.com/tacyhq/tacy/kms/passshare"
 	"github.com/tacyhq/tacy/kms/server"
+	"github.com/tacyhq/tacy/kms/split"
 	"github.com/tacyhq/tacy/safety"
 )
 
@@ -87,9 +88,13 @@ func (m *multi) Set(s string) error { *m = append(*m, s); return nil }
 
 func main() {
 	if len(os.Args) < 2 {
-		die("usage: keygen-admin | wrap-admin | keygen-recipient | sign | status | attest | genesis | unlock | secret-put | secret-load | policy-push | gen-snapshot | gen-doc | gen-confirm | log (see the source)")
+		die("usage: keygen-admin | wrap-admin | keygen-recipient | sign | status | attest | genesis | unlock | secret-put | secret-load | policy-push | gen-snapshot | gen-doc | gen-confirm | log; split key: resplit | holder-keygen | unlock-policy | approve | holder-push | split-dev | break-glass (see the source)")
 	}
 	cmd, args := os.Args[1], os.Args[2:]
+	if slices.Contains(splitCommands, cmd) {
+		splitMain(cmd, args) // split.go: the split-key commands
+		return
+	}
 	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
 	url := fs.String("url", "", "replica URL")
 	policyPath := fs.String("policy", "", "admin-signed kms-policy envelope")
@@ -155,6 +160,18 @@ func main() {
 				die("policy: %v", err)
 			}
 			if err := p.Validate(); err != nil {
+				die("%v", err)
+			}
+			if err := kms.CheckKMSFallbackRemoval(p.KMSFallback, latest(p.IssuedAt, time.Now())); err != nil {
+				die("%v", err)
+			}
+		}
+		if *kind == split.KindUnlockPolicy {
+			var p split.UnlockPolicy
+			if err := kms.Strict(doc, &p); err != nil {
+				die("unlock policy: %v", err)
+			}
+			if err := checkUnlockPolicy(&p); err != nil {
 				die("%v", err)
 			}
 		}

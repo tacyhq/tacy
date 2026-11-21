@@ -69,7 +69,7 @@ func TestCheckAppBootLog(t *testing.T) {
 	}
 }
 
-// A VM that booted another compose, then measured the approved compose's hash after system-ready.
+// The review probe: the VM booted another compose, then measured the approved compose's hash after system-ready.
 func TestForgedComposeAfterSystemReady(t *testing.T) {
 	approved := []byte(`{"approved":"compose"}`)
 	want := sha256.Sum256(approved)

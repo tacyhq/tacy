@@ -1,10 +1,14 @@
 package verifier
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -55,8 +59,8 @@ func signedList(t *testing.T, k ed25519.PrivateKey, l safety.TrustList) []byte {
 	return env
 }
 
-// newOSVM is the release on newImage: its boot registers are the 0.6.4 recording's (set064), the policy the
-// built-in one (only dstack-0.6.5).
+// newOSVM is the release on newImage: MRTD and RTMR0 are the 0.6.4 recording's (set064), RTMR1 and RTMR2 its own;
+// the policy the built-in one (only dstack-0.6.5).
 func newOSVM(t *testing.T, compose []byte) (releaseCase, safety.TrustBoot) {
 	t.Helper()
 	rc := bootWith(t, compose, false, nil, keyEvent(false))
@@ -65,11 +69,18 @@ func newOSVM(t *testing.T, compose []byte) (releaseCase, safety.TrustBoot) {
 		img[i] = 0x66
 	}
 	rtmr3 := setEvent(t, rc.a, "os-image-hash", img)
-	rc.p.VerifyQuote = changeQuote(func(q *tdx.Quote) { q.Rtmrs[3] = rtmr3 })
+	// A new image's own kernel and command line (a trust list refuses a retired image's under a new label).
+	rtmr1, rtmr2 := bytes.Repeat([]byte{0x61}, 48), bytes.Repeat([]byte{0x62}, 48)
+	rc.p.VerifyQuote = changeQuote(func(q *tdx.Quote) {
+		q.Rtmrs[1], q.Rtmrs[2], q.Rtmrs[3] = rtmr1, rtmr2, rtmr3
+		if rc.rd != nil {
+			q.ReportData = rc.rd
+		}
+	})
 	rc.p.ProdImages, rc.p.Boot = nil, nil
 	s := set064(t)
 	return rc, safety.TrustBoot{Name: "dstack-0.6.6 (test), tdx.small", OSImage: newImage, MRTD: s.MRTD, RTMR0: s.RTMR0,
-		RTMR1: s.RTMR1, RTMR2: s.RTMR2, Source: "test"}
+		RTMR1: hex.EncodeToString(rtmr1), RTMR2: hex.EncodeToString(rtmr2), Source: "test"}
 }
 
 func TestTrustListAddsOS(t *testing.T) {
@@ -143,6 +154,37 @@ func TestTrustListRefuses(t *testing.T) {
 			t.Errorf("%s: accepted", name)
 		}
 	}
+	// Review L2: a retired image's measurements under a current label (in key provider none the label is the matching
+	// set's): the whole 0.6.1 set, its kernel alone, its command line and initramfs alone (another VM size).
+	cur := BootMeasurements[0]
+	for _, r := range RetiredBootMeasurements {
+		for what, b := range map[string]safety.TrustBoot{
+			"whole set":  {MRTD: r.MRTD, RTMR0: r.RTMR0, RTMR1: r.RTMR1, RTMR2: r.RTMR2},
+			"RTMR1 only": {MRTD: cur.MRTD, RTMR0: cur.RTMR0, RTMR1: r.RTMR1, RTMR2: strings.Repeat("11", 48)},
+			"RTMR2 only": {MRTD: cur.MRTD, RTMR0: strings.Repeat("22", 48), RTMR1: strings.Repeat("33", 48), RTMR2: r.RTMR2},
+		} {
+			b.Name, b.OSImage, b.Source = "dstack-0.6.5 (really "+r.Name+")", cur.OSImage, "t"
+			parsed, err := ParseTrustList(signedList(t, admin, safety.TrustList{Seq: 1, BootMeasurements: []safety.TrustBoot{b}}), 0, listNow)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := (Policy{}).WithTrustList(parsed); err == nil || !strings.Contains(err.Error(), "retired "+r.Name) {
+				t.Errorf("%s, %s: %v", r.Name, what, err)
+			}
+		}
+	}
+	// A new set (another VM size of 0.6.5: other RTMR0 and RTMR1, the same RTMR2) is still accepted.
+	parsedNew, _ := ParseTrustList(signedList(t, admin, safety.TrustList{Seq: 1, BootMeasurements: []safety.TrustBoot{{Name: "0.6.5, 2 vCPU",
+		OSImage: cur.OSImage, MRTD: cur.MRTD, RTMR0: strings.Repeat("44", 48), RTMR1: strings.Repeat("55", 48), RTMR2: cur.RTMR2, Source: "t"}}}), 0, listNow)
+	if _, err := (Policy{}).WithTrustList(parsedNew); err != nil {
+		t.Fatalf("a new VM size: %v", err)
+	}
+	// No built-in set shares a kernel or command line with a retired one (so the rule refuses no current image).
+	for _, b := range BootMeasurements {
+		if why := retiredBoot(b.RTMR1, b.RTMR2); why != "" {
+			t.Errorf("built-in %s has %s", b.Name, why)
+		}
+	}
 	// It only adds: a name for a built-in image doesn't rename it, and the release floor only goes up.
 	parsed, _ := ParseTrustList(signedList(t, admin, safety.TrustList{Seq: 2, VMReleaseFloor: "v0.20.1",
 		OSImages: map[string]string{"4771a29e03e93f0e2d5e37174cd8bb1112942c9689deb36b16c5df9e183d8623": "renamed"}}), 0, listNow)
@@ -162,7 +204,7 @@ func TestKMSID(t *testing.T) {
 	_, kms, _ := ed25519.GenerateKey(rand.Reader)
 	id := safety.KeyString(kms.Public().(ed25519.PublicKey))
 	withKMS := func(args string) []byte {
-		c := string(composeYAML(t))
+		c := string(composeNoKMS(t))
 		i := strings.Index(c, `"-runner-socket", "/run/tacy/runner/runner.sock"`) // agentd's command
 		if i < 0 {
 			t.Fatal("agentd's -runner-socket not in compose.yaml")
@@ -209,10 +251,21 @@ func TestNewerVersion(t *testing.T) {
 	}
 }
 
+// composeNoKMS is compose.yaml without the release's own key service flags (-kms-key, -kms-hosts, -kms-url), so a
+// test names only the KMS id it puts in.
+func composeNoKMS(t *testing.T) []byte {
+	t.Helper()
+	c := regexp.MustCompile(`"-kms-(key|url|hosts)", "[^"]*", `).ReplaceAllString(string(composeYAML(t)), "")
+	if strings.Contains(c, `"-kms-`) {
+		t.Fatal("a -kms- flag left in compose.yaml")
+	}
+	return []byte(c)
+}
+
 // composeWithKMS is compose.yaml with args put in agentd's command (a -kms-key and -kms-url, as a release names them).
 func composeWithKMS(t *testing.T, args string) []byte {
 	t.Helper()
-	c := string(composeYAML(t))
+	c := string(composeNoKMS(t))
 	i := strings.Index(c, `"-runner-socket", "/run/tacy/runner/runner.sock"`)
 	if i < 0 {
 		t.Fatal("agentd's -runner-socket not in compose.yaml")
@@ -348,7 +401,7 @@ func TestTrustState(t *testing.T) {
 	}
 	env := signedList(t, admin, safety.TrustList{Seq: 5, KMSIDs: map[string]string{id: "Tacy KMS (test)"}, VMReleaseFloor: "v0.21.0",
 		Releases: []safety.TrustRelease{trustRelease("v0.21.0", strings.Repeat("a", 64), fakeBundle(5))}})
-	info := s.Take(env, 0, listNow)
+	info := ripen(t, &s, env, 0)
 	if !info.OK || info.Seq != 5 || info.KMSIDs != 1 || info.Releases != 1 || len(info.ReleaseEntries) != 1 ||
 		info.ReleaseEntries[0].Version != "v0.21.0" || info.ReleaseFloor != "v0.21.0" {
 		t.Fatalf("taken: %+v", info)
@@ -389,4 +442,221 @@ func TestTrustState(t *testing.T) {
 	if r := s.Take(signedList(t, other, safety.TrustList{Seq: 9}), 0, listNow); r.OK || !strings.Contains(r.Error, "signed by 0") {
 		t.Fatalf("other signer: %+v", r)
 	}
+}
+
+// composeWithService is compose.yaml with one more service, its image pinned by digest.
+func composeWithService(t *testing.T, name string) []byte {
+	t.Helper()
+	c := string(composeYAML(t))
+	i := strings.Index(c, "\nvolumes:\n")
+	if i < 0 {
+		t.Fatal("no top-level volumes: in compose.yaml")
+	}
+	svc := "\n  " + name + ":\n    image: ghcr.io/tacyhq/tacy/" + name + "@sha256:" + strings.Repeat("a", 64) + "\n    network_mode: none" +
+		"\n    ulimits:\n      core: 0"
+	return []byte(c[:i] + svc + c[i:])
+}
+
+// What a later VM release may need without an app rebuild (clients ship first): unlockd is a
+// built-in service; any other new one is accepted once a signed list names it; another provider's dstack KMS root
+// once listed (a retired one never); a TCB grace window lets a host whose TCB isn't UpToDate pass only while open.
+func TestTrustListForLaterReleases(t *testing.T) {
+	admin := testAdmin(t)
+	withUnlockd := composeYAML(t) // compose.yaml has unlockd since slice 4 (split-unlockd), with its rules
+	if !HasUnlockd(string(withUnlockd)) {
+		withUnlockd = composeWithService(t, "unlockd")
+	}
+	if rc := bootWith(t, withUnlockd, false, nil, keyEvent(false)); true {
+		if _, err := Verify(context.Background(), rc.a, rc.nonce, rc.p); err != nil {
+			t.Fatalf("unlockd, built in: %v", err)
+		}
+	}
+	rc := bootWith(t, composeWithService(t, "holderprobe"), false, nil, keyEvent(false))
+	if _, err := Verify(context.Background(), rc.a, rc.nonce, rc.p); err == nil || !strings.Contains(err.Error(), "holderprobe") {
+		t.Fatalf("an unlisted service: %v", err)
+	}
+	var s TrustState
+	if info := ripen(t, &s, signedList(t, admin, safety.TrustList{Seq: 2, Services: []string{"holderprobe"}}), 0); !info.OK || info.Services != 1 {
+		t.Fatalf("taken: %+v", info)
+	}
+	p, _ := s.Apply(rc.p, listNow)
+	if _, err := Verify(context.Background(), rc.a, rc.nonce, p); err != nil {
+		t.Fatalf("a listed service: %v", err)
+	}
+	// The tunnel is in-container (vm-v1): the confined variant's cftunnel isn't a release service.
+	if !slices.Equal(ReleaseServices, []string{"setup", "agentd", "runner", "agentvm", "vaultd", "unlockd"}) {
+		t.Fatalf("built-in services changed: %v", ReleaseServices)
+	}
+
+	// KMS roots: added; a retired one refuses the list.
+	root := strings.Repeat("3059", 40)
+	l, err := ParseTrustList(signedList(t, admin, safety.TrustList{Seq: 3, KMSRoots: map[string]string{root: "dstack KMS (test provider)"}}), 0, listNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if q, err := (Policy{}).WithTrustList(l); err != nil || q.KMSRoots[root] == "" || len(q.KMSRoots) != len(KMSRoots)+1 {
+		t.Fatalf("kms roots %v %v", err, q.KMSRoots)
+	}
+	for old := range RetiredKMSRoots {
+		l, err := ParseTrustList(signedList(t, admin, safety.TrustList{Seq: 4, KMSRoots: map[string]string{old: "again"}}), 0, listNow)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := (Policy{}).WithTrustList(l); err == nil || !strings.Contains(err.Error(), "retired") {
+			t.Fatalf("a retired root: %v", err)
+		}
+	}
+
+	// TCB grace: refused without one, passes while open, refused once it closed.
+	staleVM := func(status, date string) releaseCase {
+		rc := bootWith(t, composeYAML(t), false, nil, keyEvent(false))
+		inner := rc.p.VerifyQuote
+		rc.p.AllowStaleTCB = false // the recordings' policy allows it; production's doesn't
+		rc.p.VerifyQuote = func(ctx context.Context, raw []byte) (*tdx.Quote, error) {
+			q, err := inner(ctx, raw)
+			if q != nil {
+				q.TcbStatus, q.QeStatus, q.TcbDate = status, "UpToDate", date
+			}
+			return q, err
+		}
+		return rc
+	}
+	stale := staleVM("OutOfDate", "2026-08-01T00:00:00Z")
+	if _, err := Verify(context.Background(), stale.a, stale.nonce, stale.p); err == nil || !strings.Contains(err.Error(), "OutOfDate") {
+		t.Fatalf("a stale TCB without grace: %v", err)
+	}
+	grace := &safety.TCBGrace{Until: listNow.Add(7 * 24 * time.Hour), Statuses: []string{"OutOfDate"}, MinTCBDate: "2026-06-01"}
+	var g TrustState
+	if info := ripen(t, &g, signedList(t, admin, safety.TrustList{Seq: 5, TCBGrace: grace}), 0); !info.OK || info.TCBGraceUntil == "" ||
+		!slices.Equal(info.TCBGraceStatuses, []string{"OutOfDate"}) {
+		t.Fatalf("grace taken: %+v", info)
+	}
+	open, _ := g.Apply(stale.p, listNow)
+	if _, err := Verify(context.Background(), stale.a, stale.nonce, open); err != nil {
+		t.Fatalf("a stale TCB in the grace window: %v", err)
+	}
+	closed, _ := g.Apply(stale.p, grace.Until.Add(time.Minute))
+	if _, err := Verify(context.Background(), stale.a, stale.nonce, closed); err == nil {
+		t.Fatal("a stale TCB after the grace window")
+	}
+	// Only the statuses it names, never Revoked; not below its minimum TCB date.
+	for name, rc := range map[string]releaseCase{
+		"a status it doesn't name": staleVM("SWHardeningNeeded", "2026-08-01T00:00:00Z"),
+		"Revoked":                  staleVM("Revoked", "2026-08-01T00:00:00Z"),
+		"an older TCB level":       staleVM("OutOfDate", "2026-01-01T00:00:00Z"),
+	} {
+		p, _ := g.Apply(rc.p, listNow)
+		if _, err := Verify(context.Background(), rc.a, rc.nonce, p); err == nil {
+			t.Errorf("%s: passed in the grace window", name)
+		}
+	}
+	// A minimum evaluation number this build can't read: the grace doesn't apply (fail closed).
+	var e TrustState
+	evalGrace := *grace
+	evalGrace.MinTCBEval = 17
+	ripen(t, &e, signedList(t, admin, safety.TrustList{Seq: 6, TCBGrace: &evalGrace}), 0)
+	if p, _ := e.Apply(stale.p, listNow); p.AllowStaleTCB {
+		t.Fatal("a grace with min_tcb_eval applied")
+	}
+}
+
+// Withdrawn releases leave the policy's releases and are reported to the client, which refuses a
+// VM running one (Policy.Revoked, verifier-core.ts); a release for a platform this verifier doesn't check is dropped.
+func TestTrustListRevokedAndPlatform(t *testing.T) {
+	admin := testAdmin(t)
+	a, b, c := strings.Repeat("a", 64), strings.Repeat("b", 64), strings.Repeat("c", 64)
+	sev := trustRelease("v0.22.0", c, fakeBundle(5))
+	sev.Platform = "sev-snp"
+	l, err := ParseTrustList(signedList(t, admin, safety.TrustList{Seq: 6, RevokedReleases: []string{"v0.20.0"},
+		Releases: []safety.TrustRelease{trustRelease("v0.21.0", a, fakeBundle(5)), sev}}), 0, listNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := (Policy{Releases: []safety.TrustRelease{trustRelease("v0.20.0", b, fakeBundle(5))}}).WithTrustList(l)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Releases) != 1 || p.Releases[0].Version != "v0.21.0" || p.ReleaseBundles(b) != nil || p.ReleaseBundles(c) != nil {
+		t.Fatalf("releases %+v", p.Releases)
+	}
+	if !p.Revoked("v0.20.0") || p.Revoked("v0.21.0") || (Policy{}).Revoked("v0.20.0") {
+		t.Fatal("Revoked")
+	}
+	if i := TrustInfoOf(l, false); len(i.RevokedReleases) != 1 || i.RevokedReleases[0] != "v0.20.0" {
+		t.Fatalf("info %+v", i)
+	}
+}
+
+// Admin key rotation with no app rebuild: a list signed by the pinned key names a new key; a client
+// keeps that rotation and puts it before every later list, which only the new key then signs. A list signed only by
+// the rotated-out key is refused once the rotation is in the chain; without it, only the pinned key counts.
+func TestTrustListKeyRotation(t *testing.T) {
+	admin := testAdmin(t)
+	_, next, _ := ed25519.GenerateKey(rand.Reader)
+	nextKey := safety.KeyString(next.Public().(ed25519.PublicKey))
+	rotation := signedList(t, admin, safety.TrustList{Seq: 3, NextAdminKeys: []string{nextKey}})
+	byNew := signedList(t, next, safety.TrustList{Seq: 4, KMSIDs: map[string]string{kmsKey(t): "Tacy KMS (test)"}})
+	byOld := signedList(t, admin, safety.TrustList{Seq: 5})
+	chain := func(envs ...[]byte) []byte {
+		parts := make([]string, len(envs))
+		for i, e := range envs {
+			parts[i] = string(e)
+		}
+		return []byte("[" + strings.Join(parts, ",") + "]")
+	}
+	if _, err := ParseTrustList(byNew, 0, listNow); err == nil {
+		t.Fatal("the new key's list without the rotation")
+	}
+	if l, err := ParseTrustList(chain(rotation, byNew), 0, listNow); err != nil || l.Seq != 4 {
+		t.Fatalf("rotation then the new key's list: %v", err)
+	}
+	if _, err := ParseTrustList(chain(rotation, byOld), 0, listNow); err == nil {
+		t.Fatal("the old key's list after the rotation")
+	}
+	// The rotation itself, as the list (a client given it again): verified with the keys before it.
+	if l, err := ParseTrustList(chain(rotation, rotation), 0, listNow); err != nil || l.Seq != 3 {
+		t.Fatalf("the rotation as the list: %v", err)
+	}
+	// A list at or below the rotation's seq after it: refused (it can't predate the keys that signed it).
+	if _, err := ParseTrustList(chain(rotation, signedList(t, next, safety.TrustList{Seq: 3})), 0, listNow); err == nil {
+		t.Fatal("a list at the rotation's seq")
+	}
+	// A server can't swap the chain: an attacker's rotation after the real one is signed by the old key only.
+	_, evil, _ := ed25519.GenerateKey(rand.Reader)
+	swap := signedList(t, admin, safety.TrustList{Seq: 6, NextAdminKeys: []string{safety.KeyString(evil.Public().(ed25519.PublicKey))}})
+	if _, err := ParseTrustList(chain(rotation, swap, signedList(t, evil, safety.TrustList{Seq: 7})), 0, listNow); err == nil {
+		t.Fatal("a swapped rotation after the real one")
+	}
+	// Through TrustState (the WASM's setTrustList): taken and applied with the chain, and reported as a rotation.
+	var s TrustState
+	if info := s.Take(chain(rotation, byNew), 4, listNow); !info.OK || info.Seq != 4 || info.KMSIDs != 1 {
+		t.Fatalf("taken: %+v", info)
+	}
+	if info := s.Take(rotation, 0, listNow); !info.OK || len(info.AdminKeys) != 1 || info.AdminKeys[0] != nextKey {
+		t.Fatalf("the rotation alone: %+v", info)
+	}
+	// No expiry: a list that names none holds until a newer seq, the rotation chain included.
+	forever := signedList(t, next, safety.TrustList{Seq: 8, IssuedAt: listNow.Add(-time.Hour)})
+	if info := s.Take(chain(rotation, forever), 0, listNow); !info.OK || info.Expires != "" {
+		t.Fatalf("no expiry: %+v", info)
+	}
+	if _, info := s.Apply(Policy{}, listNow.Add(2*365*24*time.Hour)); info == nil || !info.OK || info.Seq != 8 {
+		t.Fatalf("a list with no expiry, two years on: %+v", info)
+	}
+}
+
+// ripen takes env as a verifier that has listed its items for the whole delay already (first seen a day before
+// listNow), so a test of what a list adds sees it in force (TestTrustDelay tests the delay itself).
+func ripen(t *testing.T, s *TrustState, env []byte, minSeq uint64) TrustInfo {
+	t.Helper()
+	first := s.Take(env, minSeq, listNow)
+	if !first.OK {
+		return first
+	}
+	seen := safety.ParseTrustSeen([]byte(first.Seen))
+	for k, v := range seen.Items {
+		v.First = listNow.Add(-safety.TrustDelay)
+		seen.Items[k] = v
+	}
+	return s.TakeSeen(env, minSeq, listNow, seen.Marshal())
 }

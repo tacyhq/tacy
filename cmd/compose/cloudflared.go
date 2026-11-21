@@ -62,6 +62,16 @@ func accessPinned() bool {
 	return releaseAccessTeam != "unpinned" && releaseAccessAUD != strings.Repeat("0", 64)
 }
 
+// manifestPins refuses a release manifest (what a tag needs) while the release's Access app is a placeholder. The key
+// service's compose (--kms) has no tunnel, so it isn't held to it.
+func manifestPins(manifest string, kmsMode bool) error {
+	if manifest != "" && !kmsMode && !accessPinned() {
+		return fmt.Errorf("--manifest: the release's Access app isn't pinned yet (cmd/compose/cloudflared.go releaseAccessTeam, " +
+			"releaseAccessAUD: set at the Cloudflare setup); a release can't be cut with the placeholders")
+	}
+	return nil
+}
+
 // setReleaseTunnel sets the release's tunnel: the pinned binary (releaseCloudflared), the config for the release's
 // Access app, slot vm-a's token, no -listen. listen (development composes only) keeps gatewayd's -listen :8080 and
 // the published port for harnesses that still reach the VM through Phala's gateway.

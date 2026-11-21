@@ -1129,6 +1129,10 @@ func main() {
 	if *listen && (*devOut == "" || *cfdBin != "") {
 		fail(fmt.Errorf("--listen is for development composes of the release's tunnel (--dev-out, no --cloudflared)"))
 	}
+	// First, before anything is fetched or built: no release manifest with the Access placeholders.
+	if err := manifestPins(*manifest, *kmsMode); err != nil {
+		fail(err)
+	}
 	if err := setCloudflared(*cfdBin, *cfdSum, *cfdAccess, *cfdSecret, *cfdSpike, *cfdConfined); err != nil {
 		fail(err)
 	}
@@ -1139,10 +1143,6 @@ func main() {
 		if err := setReleaseTunnel(*listen); err != nil {
 			fail(err)
 		}
-	}
-	if *manifest != "" && !*kmsMode && !accessPinned() {
-		fail(fmt.Errorf("--manifest: the release's Access app isn't pinned yet (cmd/compose/cloudflared.go releaseAccessTeam, " +
-			"releaseAccessAUD: set at the Cloudflare setup); a release can't be cut with the placeholders"))
 	}
 	if (*devPins != "" || *devRegistry != "") && *devOut == "" {
 		fail(fmt.Errorf("--dev-pins and --dev-registry need --dev-out (a development compose never replaces the repo's)"))

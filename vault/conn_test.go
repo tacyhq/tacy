@@ -253,3 +253,42 @@ func sealedOnly(t *testing.T, dir string) {
 		}
 	}
 }
+
+// Per-account caps on shared VM limits: one space holds at most maxSpacePending test
+// logins at once, so one account can't fill the VM's maxPending; other spaces aren't affected, and a discarded one
+// frees its slot.
+func TestConnPutPerSpaceCap(t *testing.T) {
+	r := newConnRig(t, t.TempDir())
+	ctx := context.Background()
+	key, _ := r.c.SealKey(ctx)
+	put := func(space string) (string, error) {
+		box, err := SealConn(key, space, ConnEmail, emailJSON(nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		pid, _, err := r.c.ConnPut(ctx, space, ConnEmail, box)
+		return pid, err
+	}
+	var first string
+	for i := range maxSpacePending {
+		pid, err := put("s_me")
+		if err != nil {
+			t.Fatalf("test login %d: %v", i+1, err)
+		}
+		if i == 0 {
+			first = pid
+		}
+	}
+	if _, err := put("s_me"); !errors.Is(err, ErrRateLimited) {
+		t.Fatalf("one more than %d for one space: %v", maxSpacePending, err)
+	}
+	if _, err := put("s_other"); err != nil {
+		t.Fatalf("another space: %v", err)
+	}
+	if err := r.c.ConnDiscard(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := put("s_me"); err != nil {
+		t.Fatalf("after a discard: %v", err)
+	}
+}

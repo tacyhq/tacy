@@ -167,6 +167,17 @@ func gatewaydRole() {
 	out["pid"] = ch.PID()
 	out["exit"] = fmt.Sprint(ch.Wait())
 	ch.Wipe()
+	// TACY_TEST_STARTS=2: a restart after the exit, as the supervisor does (the config memfd must be a fresh one).
+	if os.Getenv("TACY_TEST_STARTS") == "2" {
+		ch2, err := st.Start(context.Background(), []byte("tacy-test-token-"+os.Getenv("TACY_TEST_NONCE")))
+		if err != nil {
+			out["start2_error"] = err.Error()
+			return
+		}
+		out["pid2"] = ch2.PID()
+		out["exit2"] = fmt.Sprint(ch2.Wait())
+		ch2.Wipe()
+	}
 }
 
 func sh(t *testing.T, cred *syscall.Credential, env []string, args ...string) *exec.Cmd {
@@ -447,6 +458,112 @@ func TestLauncherAccessConfig(t *testing.T) {
 	}
 	if left, ok := noneLeft(); !ok {
 		t.Errorf("processes of cloudflared's uid outlive the launcher: %v", left)
+	}
+}
+
+// Review lows: cloudflared gets fds 0-2, the token (3) and the config (4), nothing
+// else; its config memfd is sealed (a write through /proc/self/fd/4 is refused), and each start gets a fresh one (a
+// restart reads its own copy, a new inode, exactly Config(team, aud)). The stand-in records each start in
+// cfd-starts.txt (scripts/cftunnel-confine-test.sh).
+func TestLauncherFdsSealedFreshConfig(t *testing.T) {
+	root := launchRoot(t)
+	socks := startServices(t, root)
+	aud := strings.Repeat("cd", 32)
+	os.Remove(filepath.Join(root, "out", "cfd-starts.txt"))
+	g, _, err := runLauncherCfg(t, root, socks, func(c *LaunchConfig) { c.Config, c.Access = "", "gate-team,"+aud }, "TACY_TEST_STARTS=2")
+	if err != nil || len(g["pid"]) == 0 || len(g["pid2"]) == 0 || len(g["start_error"]) > 0 || len(g["start2_error"]) > 0 {
+		t.Fatalf("two starts with an Access pin: %v %v", err, g)
+	}
+	b, err := os.ReadFile(filepath.Join(root, "out", "cfd-starts.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	starts := strings.Split(strings.TrimSpace(string(b)), "\n---\n")
+	if len(starts) != 2 {
+		t.Fatalf("starts recorded: %d\n%s", len(starts), b)
+	}
+	want, _ := Config("gate-team", aud)
+	bin := filepath.Join(root, "cfd.sh")
+	var inodes []string
+	for i, st := range starts {
+		lines := map[string]string{}
+		for _, l := range strings.Split(st, "\n") {
+			if k, v, ok := strings.Cut(l, "="); ok {
+				lines[k] = v
+			}
+		}
+		fds := strings.Split(strings.TrimPrefix(lines["fds"], "|"), "|")
+		t.Logf("start %d: fds %v, config inode %s, tamper %s", i+1, fds, lines["config_inode"], lines["tamper"])
+		got := map[string]bool{}
+		for _, f := range fds {
+			n, target, _ := strings.Cut(f, ":")
+			got[n] = true
+			switch n {
+			case "0", "1", "2":
+			case "3":
+				if !strings.HasPrefix(target, "/memfd:cloudflared-token") {
+					t.Errorf("start %d: fd 3 is %s", i+1, target)
+				}
+			case "4":
+				if !strings.HasPrefix(target, "/memfd:cloudflared-config") {
+					t.Errorf("start %d: fd 4 is %s", i+1, target)
+				}
+			default:
+				if target != bin { // the shell's own copy of the script it runs (the stand-in is a script)
+					t.Errorf("start %d: an fd beyond 3 and 4 reached cloudflared: %s", i+1, f)
+				}
+			}
+		}
+		if !got["3"] || !got["4"] {
+			t.Errorf("start %d: fds %v", i+1, fds)
+		}
+		if lines["tamper"] != "refused" {
+			t.Errorf("start %d: a write to the config through /proc/self/fd/4: %q (want refused: sealed)", i+1, lines["tamper"])
+		}
+		if lines["config"] != strings.ReplaceAll(string(want), "\n", " ") {
+			t.Errorf("start %d: config %q, want %q", i+1, lines["config"], want)
+		}
+		inodes = append(inodes, lines["config_inode"])
+	}
+	if inodes[0] == "" || inodes[0] == inodes[1] {
+		t.Errorf("the restart's config memfd isn't a fresh one: inodes %v", inodes)
+	}
+	if left, ok := noneLeft(); !ok {
+		t.Errorf("processes of cloudflared's uid outlive the launcher: %v", left)
+	}
+}
+
+// configSealsOf reports f's seals (F_GET_SEALS).
+func configSealsOf(f *os.File) (int, error) {
+	r, _, e := syscall.Syscall(syscall.SYS_FCNTL, f.Fd(), 1034, 0)
+	if e != 0 {
+		return 0, e
+	}
+	return int(r), nil
+}
+
+// The config memfd on its own (any Linux, no root): sealed against write, grow, shrink and further seals, at offset 0,
+// and holding exactly the config.
+func TestConfigMemfdSealed(t *testing.T) {
+	aud := strings.Repeat("ab", 32)
+	mf, err := configMemfd("gate-team," + aud)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mf.Close()
+	if s, err := configSealsOf(mf); err != nil || s != configSeals {
+		t.Fatalf("seals %#x %v, want %#x", s, err, configSeals)
+	}
+	if _, err := mf.WriteAt([]byte("x"), 0); err == nil {
+		t.Error("a write to the sealed config went through")
+	}
+	if err := mf.Truncate(0); err == nil {
+		t.Error("the sealed config was truncated")
+	}
+	got, err := io.ReadAll(mf)
+	want, _ := Config("gate-team", aud)
+	if err != nil || string(got) != string(want) {
+		t.Fatalf("config %q %v", got, err)
 	}
 }
 

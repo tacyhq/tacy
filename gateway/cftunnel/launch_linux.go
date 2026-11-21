@@ -41,9 +41,13 @@ import (
 // gatewayd can't make it run anything else: the binary, its arguments and the uid are its own flags.
 
 const (
-	sysPRSetDumpable = 4 // PR_SET_DUMPABLE
-	sysPRGetDumpable = 3 // PR_GET_DUMPABLE
-	mfdCloexec       = 1 // MFD_CLOEXEC
+	sysPRSetDumpable = 4    // PR_SET_DUMPABLE
+	sysPRGetDumpable = 3    // PR_GET_DUMPABLE
+	mfdCloexec       = 1    // MFD_CLOEXEC
+	mfdAllowSealing  = 2    // MFD_ALLOW_SEALING
+	fAddSeals        = 1033 // F_ADD_SEALS
+	// configSeals: F_SEAL_SEAL, F_SEAL_SHRINK, F_SEAL_GROW, F_SEAL_WRITE: the config can't change after it is written.
+	configSeals = 1 | 2 | 4 | 8
 )
 
 func prctl(op, arg uintptr) (uintptr, error) {
@@ -936,19 +940,24 @@ func accessConfig(access string) ([]byte, error) {
 }
 
 // configMemfd is a fresh memfd (TD memory, no file) holding the config for access, at offset 0: one for each start,
-// so nothing a previous cloudflared did to its copy carries over.
+// so nothing a previous cloudflared did to its copy carries over. It is sealed once written (no write, grow or shrink,
+// and no more seals changed; review low): cloudflared, which can reopen its fd 4 by /proc/self/fd/4, can't change it.
 func configMemfd(access string) (*os.File, error) {
 	c, err := accessConfig(access)
 	if err != nil {
 		return nil, err
 	}
-	mf, err := memfd("cloudflared-config")
+	mf, err := memfdFlags("cloudflared-config", mfdCloexec|mfdAllowSealing)
 	if err != nil {
 		return nil, err
 	}
 	if _, err := mf.Write(c); err != nil {
 		mf.Close()
 		return nil, err
+	}
+	if _, _, e := syscall.Syscall(syscall.SYS_FCNTL, mf.Fd(), fAddSeals, configSeals); e != 0 {
+		mf.Close()
+		return nil, fmt.Errorf("seal the config: %w", e)
 	}
 	if _, err := mf.Seek(0, 0); err != nil {
 		mf.Close()
@@ -958,12 +967,14 @@ func configMemfd(access string) (*os.File, error) {
 }
 
 // memfd is an anonymous in-memory file (memfd_create, close-on-exec).
-func memfd(name string) (*os.File, error) {
+func memfd(name string) (*os.File, error) { return memfdFlags(name, mfdCloexec) }
+
+func memfdFlags(name string, flags uintptr) (*os.File, error) {
 	p, err := syscall.BytePtrFromString(name)
 	if err != nil {
 		return nil, err
 	}
-	fd, _, e := syscall.Syscall(sysMemfdCreate, uintptr(unsafe.Pointer(p)), mfdCloexec, 0)
+	fd, _, e := syscall.Syscall(sysMemfdCreate, uintptr(unsafe.Pointer(p)), flags, 0)
 	if e != 0 {
 		return nil, fmt.Errorf("memfd_create: %w", e)
 	}

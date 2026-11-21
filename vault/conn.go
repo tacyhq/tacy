@@ -69,6 +69,8 @@ const (
 	MailConnector = "mail"
 	pendingTTL    = 3 * time.Minute
 	maxPending    = 64
+	// maxSpacePending bounds one space's pending test logins, so one account can't take every slot of the VM's.
+	maxSpacePending = 4
 )
 
 // Errors of the connection ops (the gateway maps them to the person's words).
@@ -297,7 +299,13 @@ func (v *Vault) ConnPut(space, id string, s Sealed) (string, ConnInfo, error) {
 			delete(cs.pending, k)
 		}
 	}
-	if len(cs.pending) >= maxPending {
+	mine := 0
+	for _, c := range cs.pending {
+		if c.info.Space == space {
+			mine++
+		}
+	}
+	if len(cs.pending) >= maxPending || mine >= maxSpacePending {
 		cs.mu.Unlock()
 		clear(c.password)
 		return "", ConnInfo{}, ErrRateLimited

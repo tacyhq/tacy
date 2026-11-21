@@ -371,7 +371,7 @@ func TestImageComposeOffline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(res.Checks) != 19 || res.Checks[17].Name != ImagesCheck || res.Checks[18].Name != UnlockdCheck || hex.EncodeToString(res.HPKEPublicKey) != a.HPKEPublicKey {
+	if len(res.Checks) != 20 || res.Checks[18].Name != ImagesCheck || res.Checks[19].Name != UnlockdCheck || hex.EncodeToString(res.HPKEPublicKey) != a.HPKEPublicKey {
 		t.Fatalf("%d checks, last %q", len(res.Checks), res.Checks[len(res.Checks)-1].Name)
 	}
 	for _, svc := range []string{"setup", "agentd", "runner", "agentvm", "vaultd", "unlockd"} {
@@ -382,8 +382,8 @@ func TestImageComposeOffline(t *testing.T) {
 	// The brain in gVisor (since v0.4.0): the runner's image is pinned like the others, and its sandbox is a fact.
 	if !strings.HasPrefix(res.Facts["image runner"], "ghcr.io/tacyhq/tacy/runnerd@sha256:") || res.Facts["image brain"] != "" ||
 		!strings.HasSuffix(res.Facts["brain sandbox"], "(systrap, rootless runsc), no network") || len(res.Facts["gvisor runsc sha256"]) != 64 ||
-		!strings.Contains(res.Checks[17].Detail, "the brain in gVisor "+res.Facts["gvisor release"]) {
-		t.Errorf("runner facts %v, detail %q", res.Facts, res.Checks[17].Detail)
+		!strings.Contains(res.Checks[18].Detail, "the brain in gVisor "+res.Facts["gvisor release"]) {
+		t.Errorf("runner facts %v, detail %q", res.Facts, res.Checks[18].Detail)
 	}
 	// The same VM with one image's digest swapped for a tag: compose-hash and RTMR3 consistent again, and refused
 	// by the image rule even with that compose expected.
@@ -820,7 +820,7 @@ func TestRelease(t *testing.T) {
 		t.Fatal(err)
 	}
 	if res.Facts["release"] != "v0.3.1" || res.Facts["docker compose sha256"] != hex.EncodeToString(sum[:]) || res.HPKEPublicKey == nil ||
-		len(res.Checks) != 19 || res.Checks[17].Name != ImagesCheck || res.Checks[18].Name != UnlockdCheck || !strings.HasPrefix(res.Facts["image agentd"], "ghcr.io/tacyhq/tacy/agentd@sha256:") {
+		len(res.Checks) != 20 || res.Checks[18].Name != ImagesCheck || res.Checks[19].Name != UnlockdCheck || !strings.HasPrefix(res.Facts["image agentd"], "ghcr.io/tacyhq/tacy/agentd@sha256:") {
 		t.Fatalf("facts %v", res.Facts)
 	}
 	// A signed release whose compose builds on the VM (the recording's own, as before v0.2.0): the signature holds,

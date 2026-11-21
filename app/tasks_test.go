@@ -122,6 +122,10 @@ func (h holdSearch) Hold(_ *harness.TaskInfo, _ string, req any) string {
 	return ""
 }
 
+// bootTemporaryKeep is the guard.Host.TemporaryKeep a booted process starts with (0: the default hour), so a test can
+// see what its start does with it.
+var bootTemporaryKeep time.Duration
+
 // bootTasks starts an agentd process on the queue at path, taking up what an earlier one left there.
 func bootTasks(t *testing.T, path string, model http.Handler, fs *fakeSearch, hold bool) *taskProc {
 	t.Helper()
@@ -160,7 +164,8 @@ func bootTasksOn(t *testing.T, q harness.Store, boot string, model http.Handler,
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	s := &server{platform: local{}, id: id, agent: g, rt: rt, booted: time.Now(), sched: newScheduler(lim), lim: lim,
-		quotes: make(chan struct{}, 4), host: &guard.Host{RT: rt, GW: g, IDKey: []byte("the space's task-id key"), Boot: boot}}
+		quotes: make(chan struct{}, 4), host: &guard.Host{RT: rt, GW: g, IDKey: []byte("the space's task-id key"), Boot: boot,
+			TemporaryKeep: bootTemporaryKeep}}
 	s.resumeTasks(ctx, ids, t.Logf)
 	// The brain connects only once the restored tasks are resumed, as in main.go: a brain already connected would
 	// take a restored task up before its stream was open, and its events would go nowhere.
@@ -875,5 +880,166 @@ func TestTasksBillingWitnessAfterRestart(t *testing.T) {
 	got, err := c2.CancelTask(context.Background(), tk.Task)
 	if err != nil || got.Billing.Refundable {
 		t.Fatalf("cancel after a restart, with output before it: %+v %v", got, err)
+	}
+}
+
+// A temporary chat's task (2026-11-21) stays in the VM at most TemporaryKeep (an hour) after its tab stopped
+// following it, running or ended, not its agent's day: one nobody follows is cancelled and deleted, one followed is
+// kept while the stream is open and deleted that long after it closed. A normal task is kept as before. After a
+// restart, Prune deletes an ended temporary task an hour after its end.
+func TestTasksTemporaryChatKeptAnHour(t *testing.T) {
+	if guard.DefaultTemporaryKeep != time.Hour {
+		t.Fatalf("a temporary chat's task is kept %v after its tab, want an hour", guard.DefaultTemporaryKeep)
+	}
+	const keep = 300 * time.Millisecond
+	path := filepath.Join(t.TempDir(), "queue.db")
+	m := newStepModel(t, "block", "block", pText("followed"), pText("normal"), pText("ended"))
+	p := bootTasks(t, path, m, &fakeSearch{}, false)
+	p.s.tasks().TemporaryKeep = keep
+	tmp := p.conn(t, tasksUser)
+	tmp.Temporary = true
+	plain := p.conn(t, tasksUser)
+	req := proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("hi")}
+	gone := func(c *agentclient.Conn, id string) bool {
+		_, err := c.TaskStatus(context.Background(), id)
+		return err != nil
+	}
+
+	// Its tab closed before it followed: the running task is cancelled and deleted once the hour passed.
+	a, err := tmp.StartTask(context.Background(), req, "t-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitCalls(t, m, 1)
+	time.Sleep(keep / 3)
+	if gone(tmp, a.Task) {
+		t.Fatal("deleted before its hour")
+	}
+	for deadline := time.Now().Add(10 * time.Second); !gone(tmp, a.Task); time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("a temporary task nobody follows wasn't deleted")
+		}
+	}
+
+	// Followed while it runs: kept as long as its stream is open, then deleted an hour after the stream closed.
+	f, err := tmp.StartTask(context.Background(), req, "t-f")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitCalls(t, m, 2)
+	fctx, stop := context.WithCancel(context.Background())
+	followed := make(chan struct{})
+	go func() {
+		defer close(followed)
+		tmp.FollowTask(fctx, f.Task, 0, func(int, proto.Event) {})
+	}()
+	time.Sleep(3 * keep)
+	if gone(tmp, f.Task) {
+		t.Fatal("a temporary task was deleted while its tab followed it")
+	}
+	stop()
+	<-followed
+	for deadline := time.Now().Add(10 * time.Second); !gone(tmp, f.Task); time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("a temporary task wasn't deleted after its tab left")
+		}
+	}
+
+	// Followed to its end: kept while followed, deleted an hour after the stream closed.
+	b, err := tmp.StartTask(context.Background(), req, "t-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if evs := followAll(t, tmp, b.Task, 0); evs[len(evs)-1].ev.Type != "done" {
+		t.Fatalf("events %s", evTypes(evs))
+	}
+	// A normal task beside it: kept its day.
+	c, err := plain.StartTask(context.Background(), req, "n-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	followAll(t, plain, c.Task, 0)
+	if gone(tmp, b.Task) {
+		t.Fatal("deleted at once after its stream closed")
+	}
+	time.Sleep(3 * keep)
+	if !gone(tmp, b.Task) {
+		t.Fatal("a temporary task was kept past its hour after its stream closed")
+	}
+	if gone(plain, c.Task) {
+		t.Fatal("a normal task was deleted")
+	}
+
+	// After a restart (no timers), Prune deletes an ended temporary task an hour after its end (nobody collected it),
+	// and keeps a normal one its day.
+	p.s.tasks().TemporaryKeep = time.Hour
+	d, err := tmp.StartTask(context.Background(), req, "t-3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, err := plain.StartTask(context.Background(), req, "n-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ended := func(st *agentclient.Task) bool { return st.Outcome != "" }
+	waitTask(t, tmp, d.Task, ended)
+	waitTask(t, plain, e.Task, ended)
+	p.s.tasks().Prune(time.Now().Add(30 * time.Minute))
+	if gone(tmp, d.Task) {
+		t.Fatal("pruned within its hour")
+	}
+	p.s.tasks().Prune(time.Now().Add(61 * time.Minute))
+	if !gone(tmp, d.Task) || gone(plain, e.Task) {
+		t.Fatalf("Prune an hour on: temporary gone %v, normal gone %v", gone(tmp, d.Task), gone(plain, e.Task))
+	}
+}
+
+// Final review L4: a temporary chat's task that ended before an agentd restart is deleted at its end plus its keep
+// (an hour; shortened here) by the new process, not left to the next hourly Prune (up to about two hours after its
+// end). A normal task beside it is kept its day.
+func TestTasksTemporaryEndedBeforeRestart(t *testing.T) {
+	const keep = 1500 * time.Millisecond
+	path := filepath.Join(t.TempDir(), "queue.db")
+	m := newStepModel(t, pText("temporary"), pText("normal"))
+	p1 := bootTasks(t, path, m, &fakeSearch{}, false) // the default hour: its own timers don't fire in this test
+	tmp := p1.conn(t, tasksUser)
+	tmp.Temporary = true
+	plain := p1.conn(t, tasksUser)
+	req := proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("hi")}
+	a, err := tmp.StartTask(context.Background(), req, "t-r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ended := func(st *agentclient.Task) bool { return st.Outcome != "" }
+	waitTask(t, tmp, a.Task, ended)
+	b, err := plain.StartTask(context.Background(), req, "n-r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitTask(t, plain, b.Task, ended)
+	endedBy := time.Now()
+	secret := tmp.TaskSecret(a.Task)
+	p1.kill()
+
+	bootTemporaryKeep = keep
+	t.Cleanup(func() { bootTemporaryKeep = 0 })
+	p2 := bootTasks(t, path, m, &fakeSearch{}, false)
+	c2 := p2.conn(t, tasksUser)
+	c2.SetTaskSecret(a.Task, secret)
+	c2.SetTaskSecret(b.Task, plain.TaskSecret(b.Task))
+	gone := func(id string) bool {
+		_, err := c2.TaskStatus(context.Background(), id)
+		return err != nil
+	}
+	if time.Since(endedBy) < keep/2 && gone(a.Task) {
+		t.Fatal("deleted at the restart, before its end plus its keep")
+	}
+	for deadline := endedBy.Add(keep + 5*time.Second); !gone(a.Task); time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("an ended temporary task outlived its keep after a restart (left to the hourly Prune)")
+		}
+	}
+	if gone(b.Task) {
+		t.Fatal("a normal task was deleted")
 	}
 }

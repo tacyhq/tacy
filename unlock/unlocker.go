@@ -274,7 +274,6 @@ func (u *Unlocker) unlockOnce(ctx context.Context) error {
 	var set, epoch uint32
 	var holders map[string]string
 	var floor uint64
-	var head *split.StateHead
 	if u.cfg.DevRoot != nil {
 		r, gr, err := u.cfg.DevRoot()
 		if err != nil {
@@ -319,7 +318,7 @@ func (u *Unlocker) unlockOnce(ctx context.Context) error {
 			u.set(classify(err, rep), err.Error(), holders)
 			return err
 		}
-		root, set, epoch, floor, head = r, rep.Set, r.Epoch, pol.SecretsFloor, r.Head
+		root, set, epoch, floor = r, rep.Set, r.Epoch, pol.SecretsFloor
 	}
 	defer root.Drop() // R_e lives no longer than this function
 	k, err := Derive(root, kms.IDString(u.cfg.KMSID), epoch, set, g, u.cfg.Now())
@@ -327,7 +326,6 @@ func (u *Unlocker) unlockOnce(ctx context.Context) error {
 		u.set(StateRefused, err.Error(), holders)
 		return err
 	}
-	k.Floors = headFloors(head)       // the witnesses' newest head: no older sealed state opens (privacy review #9)
 	if d, ok := root.(*devRoot); ok { // a development VM: its dev API keys came with the root
 		k.Secrets, k.NeedsSecrets = d.secrets, false
 	}
@@ -568,17 +566,4 @@ func (u *Unlocker) report(ctx context.Context) bool {
 	a := u.cfg.Fixed.Fixed(c, &gateway.FixedCall{Target: gateway.TargetState, Method: http.MethodPost, Path: gateway.UnlockReportPath,
 		Header: map[string]string{"Content-Type": "application/json"}, Body: body})
 	return a.Error == "" && a.Status/100 == 2 // best effort: the Worker's holder probe alerts too
-}
-
-// headFloors are the generations a witness head names ("<tag>/<name>" -> gen): each process's sealed state below
-// them is refused (sealstate.Store.Floor).
-func headFloors(h *split.StateHead) map[string]uint64 {
-	if h == nil || len(h.Names) == 0 {
-		return nil
-	}
-	out := map[string]uint64{}
-	for n, e := range h.Names {
-		out[n] = e.Gen
-	}
-	return out
 }

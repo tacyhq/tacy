@@ -182,14 +182,12 @@ func TestNothingPlaintextOnDiskSealed(t *testing.T) {
 	}
 	v, _ := vault.New(nil, vault.ChatGrants(""), nil)
 	v.EnableConns(p)
-	box, _ := vault.SealConn(v.SealKey(), "s_canary_space", vault.ConnEmail, []byte(`{"type":"`+vault.EmailType+
+	exp := time.Now().Add(time.Hour).UnixMilli()
+	box, _ := vault.SealRunCred(v.SealKey(), "s_canary_space", vault.ConnEmail, vault.KeyHash("k1"), exp, []byte(`{"type":"`+vault.MailLoginType+
 		`","provider":"other","host":"imap.canary.example","port":993,"security":"tls","address":"me@canary.example","username":"me@canary.example","password":"`+
 		string(canaries[2])+`"}`))
-	pid, _, err := v.ConnPut("s_canary_space", vault.ConnEmail, box)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := v.ConnCommit(pid); err != nil {
+	if _, err := v.RunCredPut(vault.RunGrant{Task: "tk_1", Space: "s_canary_space", Connection: vault.ConnEmail, KeyHash: vault.KeyHash("k1"),
+		Expires: exp, Sealed: box}); err != nil {
 		t.Fatal(err)
 	}
 	if err := k.Flush(ctx); err != nil {
@@ -199,8 +197,8 @@ func TestNothingPlaintextOnDiskSealed(t *testing.T) {
 	for _, p := range problems {
 		t.Error(p)
 	}
-	if files != 4 { // side, activity, notify (budget and safety unchanged), connections
-		t.Errorf("only %d sealed files", files)
+	if files != 3 { // side, activity, notify (budget and safety unchanged); v1: no connections file (the login is in memory)
+		t.Errorf("%d sealed files", files)
 	}
 }
 
@@ -250,7 +248,7 @@ func TestNothingPlaintextOnDiskSealedRelay(t *testing.T) {
 		t.Errorf("the sealed VM left %d files on the disk: %v", files, problems)
 	}
 	held := w.state.Blobs()
-	if len(held) != 4 { // side, activity, notify (budget and safety unchanged), connections
+	if len(held) != 3 { // side, activity, notify (budget and safety unchanged); v1: no connections state
 		t.Errorf("the Worker holds %d states", len(held))
 	}
 	for k, blob := range held {

@@ -139,15 +139,17 @@ type MailConfig struct {
 	TLS *tls.Config
 }
 
-// MailVault is the vault's side of connections (vault.Client).
+// MailVault is the vault's side of connections (vault.Client). v1: no account is kept; a task's login comes with
+// it (RunPut) and is forgotten at its end (RunEnd); Settings' test login is a pending box (ConnPut, ConnDiscard).
 type MailVault interface {
 	SealKey(ctx context.Context) (string, error)
 	ConnPut(ctx context.Context, space, id string, s vault.Sealed) (string, vault.ConnInfo, error)
-	ConnCommit(ctx context.Context, pending string) (vault.ConnInfo, error)
 	ConnDiscard(ctx context.Context, pending string) error
-	ConnGet(ctx context.Context, space, id string) (vault.ConnInfo, error)
 	ConnList(ctx context.Context, space string) ([]vault.ConnInfo, string, error)
 	ConnRemove(ctx context.Context, space, id string) error
+	RunPut(ctx context.Context, g vault.RunGrant) (vault.ConnInfo, error)
+	RunInfo(ctx context.Context, task, space string) (vault.ConnInfo, error)
+	RunEnd(ctx context.Context, task string) error
 	Lease(ctx context.Context, r vault.Request) (*vault.Secret, error)
 }
 
@@ -387,6 +389,32 @@ func noMailDenial() *harness.ActionResult {
 	return &harness.ActionResult{Status: harness.ActionDenied, Error: noMailConnected}
 }
 
+// MailLoginNeeded opens the denial of a mail call whose task has no login in the vault (none came with the task, it
+// was forgotten, or vaultd restarted): agentd holds the call and asks the person's app for it (need_credential,
+// app/credentials.go), then runs it again; the model sees this only when no app sent it in time.
+const MailLoginNeeded = "mail_login_needed"
+
+// mailLoginNeeded is that denial: nothing was sent to the mail server.
+func mailLoginNeeded() *harness.ActionResult {
+	return &harness.ActionResult{Status: harness.ActionDenied, Error: MailLoginNeeded + ": Tacy doesn't have the person's mail login " +
+		"for this task (their app sends it with the task, and it is forgotten when the task ends), so nothing was read. " +
+		"Say so; they can ask again from their app."}
+}
+
+// IsMailLoginNeeded: res is that denial.
+func IsMailLoginNeeded(res *harness.ActionResult) bool {
+	return res != nil && res.Status == harness.ActionDenied && strings.HasPrefix(res.Error, MailLoginNeeded+":")
+}
+
+// MailBackgroundLater opens the denial of a mail call in an unattended run: v1 schedules can't read mail
+// (the v1 design §5.1; background email comes later with per-user keys).
+const MailBackgroundLater = "mail_background_later"
+
+func mailBackgroundDenial() *harness.ActionResult {
+	return &harness.ActionResult{Status: harness.ActionDenied, Error: MailBackgroundLater + ": scheduled runs can't read the " +
+		"person's email in this version of Tacy; nothing was read. Say so in one line."}
+}
+
 // mailAction runs one mail action: the checks every outbound action gets (policy, the person's permission, the agent's caps,
 // the leak scan), then one IMAP session with the password leased for it, then the quarantined reader.
 func (g *Guard) mailAction(ctx context.Context, ti *harness.TaskInfo, id string, req *harness.Action) (*harness.ActionResult, error) {
@@ -395,6 +423,11 @@ func (g *Guard) mailAction(ctx context.Context, ti *harness.TaskInfo, id string,
 	if t.def.NoEgress {
 		g.record(Egress{Task: ti.ID, Action: id, Op: req.Name, Decision: "denied", Rule: NoEgressDenied})
 		return noEgressDenial(req.Name), nil
+	}
+	// v1: an unattended run never reads mail (the login stays with the person's app, which isn't there).
+	if t.opts.Via == ViaTrigger && !backgroundMail {
+		g.record(Egress{Task: ti.ID, Action: id, Op: req.Name, Decision: "denied", Rule: MailBackgroundLater})
+		return mailBackgroundDenial(), nil
 	}
 	if err := t.searchOnly(req); err != nil {
 		return nil, err
@@ -414,6 +447,18 @@ func (g *Guard) mailAction(ctx context.Context, ti *harness.TaskInfo, id string,
 	if g.cfg.Mail == nil || g.cfg.Reader == nil {
 		// No vault to read from, or no reader: mail never reaches the model raw.
 		return &harness.ActionResult{Status: harness.ActionDenied, Error: "mail_unavailable: reading mail isn't available on this VM; nothing was read."}, nil
+	}
+	// The task's own login (vault, runcred.go), before anything else counts or goes out: without it the call is
+	// answered at once, and agentd asks the person's app for it and runs the call again.
+	lctx, cancel := context.WithTimeout(ctx, mailConnectTimeout)
+	info, err := g.cfg.Mail.Vault.RunInfo(lctx, ti.ID, t.opts.Space)
+	cancel()
+	switch {
+	case errors.Is(err, vault.ErrLoginNeeded), errors.Is(err, vault.ErrNotSet):
+		g.record(Egress{Task: ti.ID, Action: id, Op: req.Name, Decision: "denied", Rule: MailLoginNeeded})
+		return mailLoginNeeded(), nil
+	case err != nil:
+		return &harness.ActionResult{Status: harness.ActionDenied, Error: "mail_unavailable: the vault didn't answer; nothing was read."}, nil
 	}
 	args, denied := g.permit(ctx, t, ti, id, req)
 	if denied != nil {
@@ -435,7 +480,7 @@ func (g *Guard) mailAction(ctx context.Context, ti *harness.TaskInfo, id string,
 		FactsFrom(ctx).leak(true, ids)
 		out = leakRefused(ids, "")
 	} else {
-		out = g.runMail(ctx, t, ti, id, step, req.Name, args)
+		out = g.runMail(ctx, t, ti, id, step, req.Name, args, info)
 	}
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
@@ -506,14 +551,14 @@ func (g *Guard) mailSession(ctx context.Context, info vault.ConnInfo, pending, t
 		if errors.Is(err, vault.ErrPolicy) || errors.Is(err, vault.ErrPolicyMissing) {
 			return nil, errMailPolicy
 		}
-		if errors.Is(err, vault.ErrNotSet) {
+		if errors.Is(err, vault.ErrNotSet) || errors.Is(err, vault.ErrLoginNeeded) {
 			return nil, errNoMail
 		}
 		return nil, leaseError(err, "the mail password couldn't be leased")
 	}
 	rec.Lease = sec.Lease
 	f.lease(rec)
-	err = cl.Login(info.Username, string(sec.Bytes()))
+	err = cl.LoginBytes(info.Username, sec.Bytes()) // no string copy (review 2, L7); Wipe zeroes the lease's bytes
 	sec.Wipe()
 	if err != nil {
 		cl.Close()
@@ -566,7 +611,7 @@ func mailFailure(err error) toolOutcome {
 		o.ran, o.failed = true, "refused"
 		return o
 	case errors.As(err, &le):
-		return mailError("the mail server refused the saved app password (" + le.Code + "); nothing was read. Tell the person to reconnect their email in Settings → Connections.")
+		return mailError("the mail server refused the app password (" + le.Code + "); nothing was read. Tell the person to connect their email again in Settings → Connections.")
 	case errors.Is(err, imapro.ErrNoSuchMail):
 		return mailError("no such folder or message on the mail server; use mail_folders for the folder names, and ids from mail_search.")
 	case errors.Is(err, imapro.ErrUnreachable), errors.Is(err, context.DeadlineExceeded):
@@ -582,8 +627,9 @@ func mailFailure(err error) toolOutcome {
 	return mailError("the mail server failed this request; nothing was read.")
 }
 
-// runMail runs a checked mail action against the space's account.
-func (g *Guard) runMail(ctx context.Context, t *task, ti *harness.TaskInfo, id string, step int, action string, args []byte) toolOutcome {
+// runMail runs a checked mail action against the task's account (info: its login's server and user, from the
+// vault; the password is leased for the session).
+func (g *Guard) runMail(ctx context.Context, t *task, ti *harness.TaskInfo, id string, step int, action string, args []byte, info vault.ConnInfo) toolOutcome {
 	select {
 	case mailSlots <- struct{}{}:
 		defer func() { <-mailSlots }()
@@ -592,13 +638,7 @@ func (g *Guard) runMail(ctx context.Context, t *task, ti *harness.TaskInfo, id s
 	}
 	ctx, cancel := context.WithTimeout(ctx, mailCallTimeout)
 	defer cancel()
-	info, err := g.cfg.Mail.Vault.ConnGet(ctx, t.opts.Space, vault.ConnEmail)
-	if err != nil {
-		if errors.Is(err, vault.ErrNoConn) {
-			return mailFailure(errNoMail)
-		}
-		return mailError("the connected account couldn't be looked up; nothing was read.")
-	}
+	var err error
 	var (
 		search *mailSearch
 		readID string
@@ -1127,12 +1167,16 @@ If nothing in the document bears on the question, say briefly what the message (
 
 // ---- connections (Settings → Connections) ------------------------------------------------------------------------
 
-// ConnRequest is a Settings call agentd passes on (the connections contract): list, put (test login, then keep) or remove.
+// ConnRequest is a call agentd passes on (the connections contract): Settings' list, test (a test login; nothing
+// kept) or remove, and v1's per-task logins: run_put (Run: a task's sealed login, passed to the vault unopened)
+// and run_end (Task: forget its login). put is gone (v1 keeps no account): it answers per_request.
 type ConnRequest struct {
-	Op         string        `json:"op"`
-	Space      string        `json:"space"`
-	Connection string        `json:"connection,omitzero"`
-	Sealed     *vault.Sealed `json:"sealed,omitzero"`
+	Op         string          `json:"op"`
+	Space      string          `json:"space,omitzero"`
+	Connection string          `json:"connection,omitzero"`
+	Sealed     *vault.Sealed   `json:"sealed,omitzero"`
+	Task       string          `json:"task,omitzero"`
+	Run        *vault.RunGrant `json:"run,omitzero"`
 }
 
 // ConnResult is its answer.
@@ -1168,7 +1212,19 @@ func (g *Guard) Conn(ctx context.Context, r *ConnRequest) *ConnResult {
 	if mc == nil {
 		return fail("unavailable", "connections aren't available on this VM")
 	}
-	if !safety.ValidID(r.Space) {
+	switch r.Op {
+	case "run_put":
+		return g.runPut(ctx, r)
+	case "run_end":
+		if r.Task == "" || r.Run != nil || r.Sealed != nil {
+			return fail("bad_request", "task")
+		}
+		if err := mc.Vault.RunEnd(ctx, r.Task); err != nil {
+			return fail("unavailable", "the vault didn't answer")
+		}
+		return &ConnResult{}
+	}
+	if !safety.ValidID(r.Space) || r.Task != "" || r.Run != nil {
 		return fail("bad_request", "space")
 	}
 	switch r.Op {
@@ -1190,17 +1246,53 @@ func (g *Guard) Conn(ctx context.Context, r *ConnRequest) *ConnResult {
 		}
 		return &ConnResult{}
 	case "put":
+		return fail("per_request", "the VM keeps no mail login: the person's app keeps it and sends it with each task")
+	case "test":
 		if r.Connection != vault.ConnEmail || r.Sealed == nil {
 			return fail("bad_request", "connection")
 		}
-		return g.connPut(ctx, r)
+		return g.connTest(ctx, r)
 	}
 	return fail("bad_request", "op")
 }
 
-// connPut has the vault open the box (pending), tests a login with it through the read-only client, and keeps it
-// only if that worked.
-func (g *Guard) connPut(ctx context.Context, r *ConnRequest) *ConnResult {
+// runPut passes a task's sealed login to the vault (it opens and checks it: runcred.go).
+func (g *Guard) runPut(ctx context.Context, r *ConnRequest) *ConnResult {
+	fail := func(code, detail string) *ConnResult {
+		return &ConnResult{Error: &ConnError{Code: code, Detail: detail}}
+	}
+	if r.Run == nil || r.Sealed != nil || r.Task != "" || r.Space != "" || r.Run.Connection != vault.ConnEmail {
+		return fail("bad_request", "credential")
+	}
+	if st := g.cfg.Safety; st != nil {
+		if e, err := st.Check(r.Run.Space, false); err != nil || !e.AllowsConnector("mail") {
+			return fail("policy_denied", "the VM's signed policy doesn't allow the mail connector")
+		}
+	}
+	info, err := g.cfg.Mail.Vault.RunPut(ctx, *r.Run)
+	var ce *vault.ConnError
+	switch {
+	case errors.Is(err, vault.ErrStaleKey):
+		return fail("stale_key", "sealed to another boot's key: list again and seal again")
+	case errors.Is(err, vault.ErrBadSealed):
+		detail := "the box didn't open"
+		if errors.As(err, &ce) && ce.Detail != "" {
+			detail = ce.Detail
+		}
+		return fail("bad_credential", detail)
+	case errors.Is(err, vault.ErrBadRequest):
+		return fail("bad_credential", "the credential's fields")
+	case errors.Is(err, vault.ErrRateLimited):
+		return fail("busy", "too many tasks hold a mail login")
+	case err != nil:
+		return fail("unavailable", "the vault didn't take it")
+	}
+	return &ConnResult{Info: &info}
+}
+
+// connTest has the vault open the box (pending), tests a login with it through the read-only client, and drops it
+// whatever the outcome: v1 keeps nothing (the person's app saves the login once the test worked).
+func (g *Guard) connTest(ctx context.Context, r *ConnRequest) *ConnResult {
 	fail := func(code, detail string) *ConnResult {
 		return &ConnResult{Error: &ConnError{Code: code, Detail: detail}}
 	}
@@ -1224,12 +1316,7 @@ func (g *Guard) connPut(ctx context.Context, r *ConnRequest) *ConnResult {
 	case err != nil:
 		return fail("unavailable", "the vault didn't take it")
 	}
-	kept := false
-	defer func() {
-		if !kept {
-			mc.Vault.ConnDiscard(context.WithoutCancel(ctx), pid)
-		}
-	}()
+	defer mc.Vault.ConnDiscard(context.WithoutCancel(ctx), pid)
 	tctx, cancel := context.WithTimeout(ctx, mailCallTimeout)
 	defer cancel()
 	cl, err := g.mailSession(tctx, info, pid, "connect", "login")
@@ -1258,10 +1345,5 @@ func (g *Guard) connPut(ctx context.Context, r *ConnRequest) *ConnResult {
 		return fail("not_imap", "the server didn't list the folders")
 	}
 	cl.Logout()
-	kinfo, err := mc.Vault.ConnCommit(ctx, pid)
-	if err != nil {
-		return fail("unavailable", "the vault couldn't keep it")
-	}
-	kept = true
-	return &ConnResult{Info: &kinfo, Folders: len(folders)}
+	return &ConnResult{Info: &info, Folders: len(folders)}
 }

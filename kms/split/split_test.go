@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/tacyhq/tacy/kms"
+	"github.com/tacyhq/tacy/safety"
 )
 
 func master(t *testing.T) ([]byte, string, ed25519.PublicKey) {
@@ -200,10 +201,12 @@ func TestBindAndNonces(t *testing.T) {
 
 func TestPolicyValidate(t *testing.T) {
 	now := time.Now()
-	_, idStr, _ := master(t)
+	m, idStr, _ := master(t)
+	mc := testMachineCert(t, m, idStr, "3e306e133b7fdaa7bb79f67634cb520c", now)
 	base := func() UnlockPolicy {
 		return UnlockPolicy{Policy: kms.Policy{KMSID: idStr, Epoch: 1, Seq: 1, IssuedAt: now, Floor: "v0.21.0"},
-			Holders: []HolderURL{{Holder: "cloudflare", URL: "https://keys-cf.tacy.io"}, {Holder: "vercel", URL: "https://x.vercel.app"}}}
+			Holders:      []HolderURL{{Holder: "cloudflare", URL: "https://keys-cf.tacy.io"}, {Holder: "vercel", URL: "https://x.vercel.app"}},
+			MachineCerts: []safety.SignedMachineCert{mc}}
 	}
 	p := base()
 	if err := p.Validate(); err != nil {

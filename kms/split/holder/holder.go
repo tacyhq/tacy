@@ -4,7 +4,8 @@
 // later Google Cloud Run) and, compiled to WebAssembly, the holders Worker. A holder keeps its sealed shares (one per
 // share set it is in: two while a re-split overlaps the old set) and the key that opens them; its state is its
 // PolicyStore (per admin-key generation: the highest policy seq and its hash, and when each item a policy allows was
-// first seen and withdrawn), its used nonces and, for a witness, the VM's highest state head. None is secret.
+// first seen and withdrawn) and its used nonces. None is secret. (The legacy rollback witness, POST /v1/witness and a
+// state head in the unlock reply, is removed before the genesis ceremony: V1-DESIGN §2.5 step 1.)
 //
 // Order of the checks (cheap and verifiable first, state last): the nonce's MAC and expiry, the policy's signatures
 // and form, the share set, the attestation (quote, compose pin, floors, TCB), the start ticket's signature; then the
@@ -102,8 +103,9 @@ type PolicyStore interface {
 	// Apply is a policy's one step, atomic: with top the gen's seq and topHash its policy hash, it refuses a seq
 	// below top (a *SeqRefusal wrapping ErrStale), above top+split.MaxSeqJump (ErrJump), or equal to top with
 	// another hash (ErrEquivocation); else it sets (seq, hash), records each item not recorded or recorded as
-	// withdrawn as first seen now (returned as added), marks each recorded item not in items withdrawn now, prunes
-	// items withdrawn over 30 days, and returns every recorded item. ErrUninitialized when gen has no seq (the deploy
+	// withdrawn as first seen now (returned as added), marks each recorded item not in items withdrawn now (except
+	// a Permanent one: a revoked machine certificate stays recorded for good), prunes items withdrawn over 30 days,
+	// and returns every recorded item. ErrUninitialized when gen has no seq (the deploy
 	// initializes it at the floor, never lazily).
 	Apply(ctx context.Context, gen string, seq uint64, hash string, items []string, now time.Time) (map[string]ItemState, []string, error)
 	// Expedite sets a present item's first-seen time to t when t is earlier (an emergency override).
@@ -128,19 +130,12 @@ type SeqRefusal struct {
 func (e *SeqRefusal) Error() string { return fmt.Sprintf("%v (this holder's seq %d)", e.Err, e.Top) }
 func (e *SeqRefusal) Unwrap() error { return e.Err }
 
-// WitnessStore keeps a witness holder's highest state head per app: Put keeps head only when counter is higher and
-// returns the counter kept; Get returns the head kept (empty: none). Atomic.
-type WitnessStore interface {
-	Put(ctx context.Context, key string, counter uint64, head []byte) (uint64, error)
-	Get(ctx context.Context, key string) ([]byte, error)
-}
-
-// Event is one unlock attempt that got past the nonce check, one policy push, one witness push, or a policy change
+// Event is one unlock attempt that got past the nonce check, one policy push, or a policy change
 // the holder first saw, for the holder's alerts and audit log (never key material).
 type Event struct {
 	Time   time.Time
 	Holder string
-	// Kind: "unlock", "policy", "witness"; "pin" (a release pin first seen: it counts from Time + PinDelay), "change"
+	// Kind: "unlock", "policy"; "pin" (a release pin first seen: it counts from Time + PinDelay), "change"
 	// (any other newly allowed item: OS image, boot set, pre-launch, KMS root, platform, TCB grace, a floor), or
 	// "emergency" (an override expedited an item: it counts at once). Alert on pin, change and emergency.
 	Kind        string
@@ -153,9 +148,13 @@ type Event struct {
 	Instance    string
 	ComposeHash string
 	TCB         string
-	PolicySeq   uint64
-	Set         uint32
-	Epoch       uint32
+	// PPID and Machine: the platform that signed the VM's quote and the machine certificate it passed by (its
+	// label), on every unlock whose attestation passed (V1-DESIGN §3.1: detection of a host forgery, not prevention).
+	PPID      string
+	Machine   string
+	PolicySeq uint64
+	Set       uint32
+	Epoch     uint32
 }
 
 // DefaultPinDelay is how long after a holder first sees a policy item it counts.
@@ -188,8 +187,6 @@ type Config struct {
 	NonceKey []byte
 	Nonces   NonceStore  // required
 	Store    PolicyStore // required
-	// Witness, when set, makes this holder a rollback witness (the policy names it in witnesses).
-	Witness WitnessStore
 	// Build is this holder's build (the sha256 its reproducible build records), reported in /v1/status and compared
 	// with the policy's pin for it: a mismatch is a "change" event (alert).
 	Build string
@@ -282,6 +279,9 @@ func New(cfg Config) (*Holder, error) {
 	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
+	}
+	if m, ok := cfg.Nonces.(*MemoryNonces); ok {
+		m.bind(cfg.Now) // one clock: the store's expiries and the holder's decisions
 	}
 	if cfg.Rand == nil {
 		cfg.Rand = rand.Reader
@@ -413,17 +413,20 @@ func (h *Holder) unlock(ctx context.Context, req split.UnlockRequest, ev *Event)
 		return nil, refuse(http.StatusForbidden, "attestation platform %q isn't one this holder checks under this policy", head.Platform)
 	}
 	o := h.cfg.Check
-	// The Google Cloud fallback (vm-v1): only when the signed policy names verifier.PlatformDstackGCP beside
-	// "dstack" (the VM's attestation says "dstack" on either host). Off otherwise, whatever the holder's settings;
-	// the policy item counts only after the pin delay (relied).
-	o.GCP = head.Platform == "dstack" && pol.AllowsPlatform(verifier.PlatformDstackGCP)
+	// Shares go only to a release with unlockd, the only service with dstack's socket (review L3): an older release
+	// where another service holds the socket could quote for any key.
+	o.RequireUnlockd = true
 	grace := pol.TCBGrace != nil && now.Before(pol.TCBGrace.Until)
 	o.AllowStaleTCB = o.AllowStaleTCB || grace
+	// The machine allowlist: the policy's KMS-signed certificates only (never a built-in list), minus its
+	// revocations; the ones this holder's store kept for good are refused after the store step (5).
+	o.Machines = pp.machines
 	a, err := verify(ctx, req.Attestation, bound, &pol.Policy, o)
 	if err != nil {
 		return nil, refuse(http.StatusForbidden, "%v", err)
 	}
 	ev.App, ev.Release, ev.Instance, ev.ComposeHash, ev.TCB = a.Pin.App, a.Pin.Version, a.Instance, a.ComposeHash, a.Facts["TCB"]
+	ev.PPID, ev.Machine = a.Facts["PPID"], a.Facts[verifier.FactMachine]
 	graceUsed := false
 	if grace && !h.cfg.Check.AllowStaleTCB {
 		st, qe, date := tcbFacts(a.Facts["TCB"])
@@ -483,6 +486,13 @@ func (h *Holder) unlock(ctx context.Context, req split.UnlockRequest, ev *Event)
 	if err != nil {
 		return nil, err
 	}
+	// Revocations are permanent (second review N8): a machine whose certificate any earlier policy revoked stays
+	// refused here, even when a newer policy (the admin key alone) lists the same certificate again.
+	if hash := a.Facts["machine certificate"]; hash == "" {
+		return nil, refuse(http.StatusForbidden, "the attestation names no machine certificate")
+	} else if _, ok := states[split.ItemMachineRevoked+hash]; ok {
+		return nil, refuse(http.StatusForbidden, "machine %s: its certificate was revoked at this holder (permanent; re-allowing needs a new certificate)", ev.Machine)
+	}
 	if err := h.delayed(pol, a, head.Platform, graceUsed, states, now); err != nil {
 		return nil, err
 	}
@@ -499,7 +509,7 @@ func (h *Holder) unlock(ctx context.Context, req split.UnlockRequest, ev *Event)
 			return nil, err
 		}
 		defer clear(root)
-		box, err := kms.Seal(a.Key, split.LabelBreakGlass, split.ReplyAAD(bound, h.cfg.KMSID, pol.Epoch, 0, h.cfg.ID, 0, pp.hash, nil), root)
+		box, err := kms.Seal(a.Key, split.LabelBreakGlass, split.ReplyAAD(bound, h.cfg.KMSID, pol.Epoch, 0, h.cfg.ID, 0, pp.hash), root)
 		if err != nil {
 			return nil, err
 		}
@@ -507,13 +517,7 @@ func (h *Holder) unlock(ctx context.Context, req split.UnlockRequest, ev *Event)
 		return &split.UnlockReply{Holder: h.cfg.ID, KMSID: h.cfg.KMSID, Epoch: pol.Epoch, Sealed: box}, nil
 	}
 
-	// 6. Our share, checked against its commitment, sealed to the attested key with our witness head (if any).
-	var witnessHead []byte
-	if h.cfg.Witness != nil && slices.Contains(pol.Witnesses, h.cfg.ID) {
-		if witnessHead, err = h.cfg.Witness.Get(ctx, witnessKey(h.cfg.KMSID, a.Pin.App)); err != nil {
-			return nil, refuse(http.StatusServiceUnavailable, "witness store: %v", err)
-		}
-	}
+	// 6. Our share, checked against its commitment, sealed to the attested key.
 	y, err := h.cfg.Opener.Open(ctx, share)
 	if err != nil {
 		return nil, refuse(http.StatusInternalServerError, "this holder's share of set %d doesn't open", share.Set)
@@ -522,12 +526,11 @@ func (h *Holder) unlock(ctx context.Context, req split.UnlockRequest, ev *Event)
 	if split.Commitment(share.KMSID, share.Epoch, share.Set, share.Holder, share.Index, y) != entry.Commitment {
 		return nil, refuse(http.StatusInternalServerError, "this holder's share of set %d doesn't match its commitment", share.Set)
 	}
-	box, err := kms.Seal(a.Key, split.LabelReply, split.ReplyAAD(bound, share.KMSID, share.Epoch, share.Set, share.Holder, share.Index, pp.hash, witnessHead), y)
+	box, err := kms.Seal(a.Key, split.LabelReply, split.ReplyAAD(bound, share.KMSID, share.Epoch, share.Set, share.Holder, share.Index, pp.hash), y)
 	if err != nil {
 		return nil, err
 	}
-	return &split.UnlockReply{Holder: h.cfg.ID, Index: share.Index, KMSID: share.KMSID, Epoch: share.Epoch, Set: share.Set, Sealed: box,
-		WitnessHead: witnessHead}, nil
+	return &split.UnlockReply{Holder: h.cfg.ID, Index: share.Index, KMSID: share.KMSID, Epoch: share.Epoch, Set: share.Set, Sealed: box}, nil
 }
 
 // delayed refuses if anything this verified VM relies on was newly allowed less than PinDelay ago, or if a floor was
@@ -606,10 +609,6 @@ func relied(pol *split.UnlockPolicy, a *server.Attested, platform string, graceU
 	if len(pol.Platforms) > 0 {
 		out = append(out, split.ItemPlatform+platform)
 	}
-	if f[verifier.FactPlatformSet] == verifier.PlatformDstackGCP {
-		// A Google Cloud boot set: the policy's dstack-gcp item, under the pin delay like any widening.
-		out = append(out, split.ItemPlatform+verifier.PlatformDstackGCP)
-	}
 	if graceUsed {
 		out = append(out, split.ItemTCBGrace+split.TCBGraceItem(pol))
 	}
@@ -673,10 +672,11 @@ var tcbFactRe = regexp.MustCompile(`^(\S+) \(QE (\S*), TCB date (\S*)\)$`)
 
 // parsedPolicy is a policy whose signatures and form checked, before the store.
 type parsedPolicy struct {
-	pol  *split.UnlockPolicy
-	sets []*split.ShareSet
-	hash string
-	em   *split.Emergency
+	pol      *split.UnlockPolicy
+	sets     []*split.ShareSet
+	hash     string
+	em       *split.Emergency
+	machines *safety.MachineSet
 }
 
 // parsePolicy opens and checks the unlock policy, its share sets and its emergency override, without state.
@@ -695,6 +695,14 @@ func (h *Holder) parsePolicy(raw json.RawMessage, now time.Time) (*parsedPolicy,
 	if pol.KMSID != h.cfg.KMSID {
 		return nil, refuse(http.StatusForbidden, "policy is for another KMS id")
 	}
+	// Fail closed on platforms (the v1 Google host removal): a policy naming one this holder has no checks for (Config.Platforms;
+	// "dstack" by default) is refused whole, never read as "the rest of it applies". So "dstack-gcp", the Google Cloud
+	// host fallback taken out of v1, is refused as unknown.
+	for _, pl := range pol.Platforms {
+		if _, ok := h.cfg.Platforms[pl]; !ok {
+			return nil, refuse(http.StatusForbidden, "policy names platform %q, which this holder has no checks for", pl)
+		}
+	}
 	if pol.Seq < h.cfg.PolicyFloor {
 		return nil, refuse(http.StatusForbidden, "policy seq %d is below this holder's floor %d", pol.Seq, h.cfg.PolicyFloor)
 	}
@@ -709,7 +717,11 @@ func (h *Holder) parsePolicy(raw json.RawMessage, now time.Time) (*parsedPolicy,
 	if err != nil {
 		return nil, refuse(http.StatusForbidden, "%v", err)
 	}
-	pp := &parsedPolicy{pol: &pol, sets: sets, hash: split.PolicyHash(env.Payload)}
+	machines, err := pol.OpenMachines(id)
+	if err != nil {
+		return nil, refuse(http.StatusForbidden, "%v", err)
+	}
+	pp := &parsedPolicy{pol: &pol, sets: sets, hash: split.PolicyHash(env.Payload), machines: machines}
 	if pol.Emergency != nil {
 		if pp.em, err = pol.Emergency.Open(id, &pol); err != nil {
 			return nil, refuse(http.StatusForbidden, "%v", err)
@@ -758,11 +770,21 @@ func (h *Holder) applyPolicy(ctx context.Context, pp *parsedPolicy, now time.Tim
 		}
 	}
 	for _, it := range added {
-		kind := "change"
+		kind, why := "change", "newly allowed; it counts here after "+h.cfg.PinDelay.String()
 		if _, ok := cutPrefix(it, split.ItemRelease); ok {
 			kind = "pin"
 		}
-		h.alert(now, kind, it, pol, "newly allowed; it counts here after "+h.cfg.PinDelay.String())
+		if Permanent(it) {
+			why = "machine certificate revoked: refused here for good, whatever a later policy lists"
+		}
+		h.alert(now, kind, it, pol, why)
+	}
+	// A newer policy that leaves out a revocation this holder kept (only an admin key's doing): it stays revoked, and
+	// the operator hears of it.
+	for it := range states {
+		if Permanent(it) && !slices.Contains(pol.MachinesRevoked, it[len(split.ItemMachineRevoked):]) {
+			h.alert(now, "change", it, pol, "this policy leaves out a machine revocation this holder keeps: still revoked")
+		}
 	}
 	return states, nil
 }
@@ -782,39 +804,6 @@ func (h *Holder) alert(now time.Time, kind, item string, pol *split.UnlockPolicy
 	h.cfg.Notify(ev)
 }
 
-// PushWitness is POST /v1/witness (a witness holder): the VM's new state head, signed by its epoch's witness key
-// (certified by the KMS id), kept if its counter is higher.
-func (h *Holder) PushWitness(ctx context.Context, wp split.WitnessPush) (*split.WitnessReply, error) {
-	now := h.cfg.Now()
-	if h.cfg.Witness == nil {
-		return nil, refuse(http.StatusNotFound, "this holder isn't a witness")
-	}
-	id, _ := kms.ParseID(h.cfg.KMSID)
-	cert, err := wp.Cert.Open(id)
-	if err != nil {
-		return nil, refuse(http.StatusForbidden, "%v", err)
-	}
-	head, err := wp.Head.Open(cert)
-	if err != nil {
-		return nil, refuse(http.StatusForbidden, "%v", err)
-	}
-	if !h.take(now) {
-		return nil, refuse(http.StatusTooManyRequests, "too many witness pushes; try again later")
-	}
-	raw, _ := json.Marshal(wp.Head)
-	kept, err := h.cfg.Witness.Put(ctx, witnessKey(h.cfg.KMSID, head.App), head.Counter, raw)
-	if err != nil {
-		return nil, refuse(http.StatusServiceUnavailable, "witness store: %v", err)
-	}
-	if h.cfg.Notify != nil {
-		h.cfg.Notify(Event{Time: now, Holder: h.cfg.ID, Kind: "witness", OK: kept == head.Counter, App: head.App, Epoch: head.Epoch,
-			Reason: fmt.Sprintf("head %d pushed, %d kept", head.Counter, kept)})
-	}
-	return &split.WitnessReply{Counter: kept}, nil
-}
-
-func witnessKey(kmsID, app string) string { return kmsID + "\x00" + app }
-
 func (h *Holder) take(now time.Time) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -831,7 +820,7 @@ func (h *Holder) take(now time.Time) bool {
 	return true
 }
 
-// Handler serves GET /v1/status, GET /v1/challenge, POST /v1/unlock, POST /v1/policy and POST /v1/witness.
+// Handler serves GET /v1/status, GET /v1/challenge, POST /v1/unlock and POST /v1/policy (nothing else: 404).
 func (h *Holder) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/status", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, h.Status(r.Context())) })
@@ -867,18 +856,6 @@ func (h *Holder) Handler() http.Handler {
 			return
 		}
 		writeJSON(w, map[string]uint64{"policy_seq": seq})
-	})
-	mux.HandleFunc("POST /v1/witness", func(w http.ResponseWriter, r *http.Request) {
-		var wp split.WitnessPush
-		if !readStrict(w, r, &wp) {
-			return
-		}
-		rep, err := h.PushWitness(r.Context(), wp)
-		if err != nil {
-			writeErr(w, err)
-			return
-		}
-		writeJSON(w, rep)
 	})
 	return mux
 }

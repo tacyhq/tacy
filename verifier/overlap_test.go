@@ -95,6 +95,9 @@ func TestOverlapV020Passes(t *testing.T) {
 		res.Facts["OS image"] != "dstack-0.6.5" || res.Facts["app-compose sha256"] != o.AppComposeSHA256 {
 		t.Fatalf("facts %v", res.Facts)
 	}
+	if m := res.Facts[FactMachine]; !strings.Contains(m, "phala prod5") {
+		t.Fatalf("machine %q", m)
+	}
 	var keys Check
 	for _, c := range res.Checks {
 		if c.Name == KMSCheck {
@@ -244,6 +247,12 @@ func TestOverlapMixesRefused(t *testing.T) {
 			r := loadR0200(t, "r0200", r0200Now)
 			p := r.fixbPolicy()
 			p.KeyRelease = true
+			return r.a, r.nonce, p
+		}},
+		{"v0.20.0 at a holder", KMSCheck, "allowed only in the explicit KMS fallback", func(t *testing.T) (*proto.Attestation, []byte, Policy) {
+			r := loadR0200(t, "r0200", r0200Now)
+			p := r.fixbPolicy()
+			p.KeyRelease, p.RequireUnlockd = true, true
 			return r.a, r.nonce, p
 		}},
 		{"v0.20.0 pinned by hash (a signed policy without kms_fallback)", KMSCheck, "allowed only in the explicit KMS fallback", func(t *testing.T) (*proto.Attestation, []byte, Policy) {

@@ -45,7 +45,7 @@ type unlockKeys struct{ *unlock.Keys }
 func (k unlockKeys) Binding() string { return k.App }
 func (unlockKeys) Lasting() bool     { return true }
 
-// floors are the lowest generations of agentd's sealed states the witnesses' head names (privacy review #9).
+// floors are the lowest generations of agentd's sealed states unlockd hands on (none since the legacy witness went).
 func (k unlockKeys) floors() map[string]uint64 { return k.Floors }
 
 // bootKeys is the KeySource without a key service: random keys made at first use, in memory only.

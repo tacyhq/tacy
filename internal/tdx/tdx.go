@@ -10,6 +10,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -40,6 +41,13 @@ type Quote struct {
 	TcbDate      string // the older of the platform's and the module's TCB dates
 	Debug        bool
 	TdAttributes string // TD_ATTRIBUTES as in the quote (hex, little-endian)
+	// PPID and FMSPC are the signing platform's ids from the SGX extension of the quote's PCK certificate (lowercase
+	// hex: 16 and 6 bytes). Verify reads them from the certificate whose chain to Intel it checked, so they name the
+	// machine whose PCK key signed the quote (the machine allowlist, verifier machines.go). Empty: not read.
+	PPID  string
+	FMSPC string
+	// MrOwner is the quote's MR_OWNER (hex): Google Cloud writes sha384 of its PZID JSON there, Phala zero.
+	MrOwner string
 }
 
 // Verify checks the quote's Intel signature chain against fresh PCS collateral and revocation lists, the TD's
@@ -127,6 +135,8 @@ func VerifyWith(ctx context.Context, raw []byte, o Options) (*Quote, error) {
 	out.MrTd = body.GetMrTd()
 	out.Debug = body.GetTdAttributes()[0]&1 == 1
 	out.TdAttributes = hex.EncodeToString(body.GetTdAttributes())
+	out.PPID, out.FMSPC = strings.ToLower(exts.PPID), strings.ToLower(exts.FMSPC)
+	out.MrOwner = hex.EncodeToString(body.GetMrOwner())
 	for i, r := range body.GetRtmrs() {
 		out.Rtmrs[i] = r
 	}
@@ -502,9 +512,86 @@ func Parse(raw []byte) (*Quote, error) {
 	}
 	body := v4.GetTdQuoteBody()
 	out := &Quote{ReportData: body.GetReportData(), MrTd: body.GetMrTd(), TcbStatus: "not checked (parsed only)",
-		Debug: body.GetTdAttributes()[0]&1 == 1}
+		Debug: body.GetTdAttributes()[0]&1 == 1, MrOwner: hex.EncodeToString(body.GetMrOwner())}
 	for i, r := range body.GetRtmrs() {
 		out.Rtmrs[i] = r
 	}
+	if ppid, fmspc, err := pckIDs(q); err == nil {
+		out.PPID, out.FMSPC = ppid, fmspc
+	}
 	return out, nil
+}
+
+// PCKIdentity reads the PPID and FMSPC from a quote's PCK certificate (lowercase hex) without checking anything: the
+// holders' pre-gate refuses a machine that isn't allowed before it spends a store read or an Intel call on the quote
+// (the v1 design §2.4). Never a reason to trust the quote: the verifier reads them again from the checked chain.
+func PCKIdentity(raw []byte) (ppid, fmspc string, err error) {
+	defer func() {
+		if recover() != nil {
+			ppid, fmspc, err = "", "", errors.New("quote doesn't parse")
+		}
+	}()
+	q, err := abi.QuoteToProto(raw)
+	if err != nil {
+		return "", "", err
+	}
+	return pckIDs(q)
+}
+
+func pckIDs(q any) (string, string, error) {
+	chain, err := verify.ExtractChainFromQuote(q)
+	if err != nil {
+		return "", "", fmt.Errorf("PCK chain: %w", err)
+	}
+	if chain == nil || chain.PCKCertificate == nil {
+		return "", "", errors.New("no PCK certificate")
+	}
+	exts, err := pcs.PckCertificateExtensions(chain.PCKCertificate)
+	if err != nil {
+		return "", "", fmt.Errorf("PCK certificate extensions: %w", err)
+	}
+	return strings.ToLower(exts.PPID), strings.ToLower(exts.FMSPC), nil
+}
+
+// VerifySignature checks a quote's signatures offline, with go-tdx-guest's own chain code (the library VerifyWith
+// runs, with collateral off): the PCK certificate chain up to Intel's SGX root CA (the library's embedded root:
+// pinned, never the quote's own root), the QE report's signature by the PCK key, the QE report data binding the
+// attestation key, and the quote's header and body signed by that key. No collateral, no revocation lists, no TCB
+// level and no network call: the holders' pre-gate runs it before any store read or Intel call (second keys review
+// M2), so a quote forged with a listed machine's public PCK chain is refused there. The PPID and FMSPC returned are
+// from the certificate whose chain it checked. Never enough to trust a quote: the full check (VerifyWith) follows.
+func VerifySignature(raw []byte, now time.Time) (q *Quote, err error) {
+	defer func() {
+		if recover() != nil {
+			q, err = nil, errors.New("quote doesn't parse")
+		}
+	}()
+	pq, err := abi.QuoteToProto(raw)
+	if err != nil {
+		return nil, fmt.Errorf("parse quote: %w", err)
+	}
+	if _, ok := pq.(*pb.QuoteV4); !ok {
+		return nil, fmt.Errorf("quote %T not handled (v4 only)", pq)
+	}
+	opts := &verify.Options{GetCollateral: false, CheckRevocations: false, Getter: noCollateral{},
+		Now: &verify.TimeSet{PckCertChain: now, TcbInfo: now, QeIdentity: now, PckCrl: now, RootCaCrl: now}}
+	if err := verify.TdxQuote(pq, opts); err != nil {
+		return nil, fmt.Errorf("quote signature: %w", err)
+	}
+	out, err := Parse(raw)
+	if err != nil {
+		return nil, err
+	}
+	out.TcbStatus = "not checked (signature only)"
+	if out.PPID == "" || out.FMSPC == "" {
+		return nil, errors.New("quote signature: no PPID and FMSPC in the PCK certificate")
+	}
+	return out, nil
+}
+
+// noCollateral refuses every fetch: VerifySignature must never reach the network.
+type noCollateral struct{}
+
+func (noCollateral) Get(url string) (map[string][]string, []byte, error) {
+	return nil, nil, fmt.Errorf("no collateral fetch here (%s)", url)
 }

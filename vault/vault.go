@@ -61,6 +61,9 @@ type Request struct {
 	Conn    string  `json:"conn,omitzero"`
 	Pending string  `json:"pending,omitzero"`
 	Sealed  *Sealed `json:"sealed,omitzero"`
+	// Run (op run_put): a task's sealed mail login (runcred.go). run_info and run_end name the task (Task) and,
+	// for run_info, its space.
+	Run *RunGrant `json:"run,omitzero"`
 }
 
 // Record is what the vault writes for every request: names and ids, never the value. Later these go to the
@@ -94,7 +97,7 @@ var (
 
 // known are the errors that cross the wire by their text.
 var known = []error{ErrNoGrant, ErrHost, ErrNotSet, ErrBadRequest, ErrStopped, ErrStale, ErrPolicyMissing, ErrPolicy, ErrRateLimited,
-	ErrStaleKey, ErrBadSealed, ErrNoConn, ErrConnStore}
+	ErrStaleKey, ErrBadSealed, ErrNoConn, ErrConnStore, ErrLoginNeeded}
 
 // Vault holds the secrets and grants. Safe for concurrent use.
 type Vault struct {
@@ -180,7 +183,7 @@ func (v *Vault) Lease(r Request) ([]byte, string, error) {
 
 func (v *Vault) lease(r Request) ([]byte, string, error) {
 	if !validName(r.Secret) || !validConnector(r.Connector) || !validHost(r.Host) || !validID(r.Task) || !validID(r.Action) ||
-		r.Space != "" && !safety.ValidID(r.Space) || len(r.Docs) > 0 || r.Pending != "" || r.Sealed != nil {
+		r.Space != "" && !safety.ValidID(r.Space) || len(r.Docs) > 0 || r.Pending != "" || r.Sealed != nil || r.Run != nil {
 		return nil, "", ErrBadRequest
 	}
 	if r.Secret == ConnSecret { // only through a connection (leaseConn)

@@ -66,6 +66,20 @@ func loadReplay(t *testing.T) *replay {
 	return r
 }
 
+// missingPrivate: name is the recorded prod9 VM (attest-v1.json), which names the live CVM's app id and so stays out
+// of the public repo, and this tree hasn't got it: the tests that list it go on without it.
+func missingPrivate(t *testing.T, name string) bool {
+	t.Helper()
+	if name != "attest-v1.json" {
+		return false
+	}
+	if _, err := os.Stat("../../testdata/" + name); err != nil {
+		t.Logf("no %s in this tree: skipped", name)
+		return true
+	}
+	return false
+}
+
 func recordedQuote(t *testing.T, name string) []byte {
 	t.Helper()
 	raw, err := os.ReadFile("../../testdata/" + name)

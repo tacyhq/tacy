@@ -104,3 +104,14 @@ func NewTrustEmergency(master []byte, kmsID string, seq uint64, items []string, 
 	defer clear(id)
 	return safety.SignTrustEmergency(id, safety.TrustEmergency{ListSeq: seq, Items: items, Reason: reason, IssuedAt: issuedAt})
 }
+
+// NewMachineCert signs a machine certificate (safety.SignedMachineCert, V1-DESIGN §3.2) with the KMS id M derives
+// (M from two passphrase shares: kmsctl machine-cert). Only the KMS id makes one; an admin key can't.
+func NewMachineCert(master []byte, kmsID string, d safety.MachineDoc) (*safety.SignedMachineCert, error) {
+	id, err := checkMaster(master, kmsID)
+	if err != nil {
+		return nil, err
+	}
+	defer clear(id)
+	return safety.SignMachineCert(id, d)
+}

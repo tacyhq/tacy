@@ -66,7 +66,7 @@ type Keys struct {
 	Keys    map[string][]byte        `json:"keys"`
 	Certs   map[string]kms.StoreCert `json:"certs,omitempty"`
 	Secrets map[string]string        `json:"secrets,omitempty"`
-	// Floors: this process's sealed state names and the lowest generation of each it may open (the witnesses' head).
+	// Floors: this process's sealed state names and the lowest generation of each it may open (none set yet: Keyring.Floors).
 	Floors map[string]uint64 `json:"floors,omitempty"`
 }
 

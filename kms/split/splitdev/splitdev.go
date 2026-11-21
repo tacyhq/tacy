@@ -96,7 +96,29 @@ func New(holders []string, threshold int, now time.Time) (*Dev, error) {
 	for _, h := range holders {
 		d.Policy.Holders = append(d.Policy.Holders, split.HolderURL{Holder: h, URL: "https://" + h + ".holders.invalid"})
 	}
+	// The machine allowlist: Phala's prod5 and prod9 (the nodes throwaways and the recordings run on), certified
+	// by the dev KMS id (production's are the KMS ceremony's).
+	for _, m := range []struct{ ppid, label string }{{PPIDProd5, "phala prod5"}, {PPIDProd9, "phala prod9"}} {
+		c, err := d.MachineCert(safety.MachineDoc{Type: safety.MachineType, Platform: safety.PlatformDstack, Host: safety.MachineHostPhala,
+			Mode: safety.MachineModePPID, PPID: m.ppid, FMSPC: FMSPCPhala, Label: m.label, IssuedAt: now})
+		if err != nil {
+			return nil, err
+		}
+		d.Policy.MachineCerts = append(d.Policy.MachineCerts, *c)
+	}
 	return d, nil
+}
+
+// Phala's two workspace nodes (Intel PCK PPIDs) and their FMSPC, as verifier.MachineDocs has them.
+const (
+	PPIDProd5  = "3e306e133b7fdaa7bb79f67634cb520c"
+	PPIDProd9  = "62d54040cb9dfc08bb13006fa75ece56"
+	FMSPCPhala = "20a06f000000"
+)
+
+// MachineCert is a machine certificate signed by the dev KMS id.
+func (d *Dev) MachineCert(doc safety.MachineDoc) (*safety.SignedMachineCert, error) {
+	return split.NewMachineCert(d.Master, d.KMSID, doc)
 }
 
 // AddRelease pins a release of App by its whole app-compose.json sha256 (and its docker compose's, optional).

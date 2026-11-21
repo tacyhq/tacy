@@ -211,6 +211,6 @@ func (f fakeGlass) Do(ctx context.Context, method, path string, body []byte) ([]
 	other := make([]byte, kms.MasterSize)
 	rand.Read(other)
 	bound, _ := split.Bind(req.Nonces)
-	rep.Sealed, _ = kms.Seal(pub, split.LabelBreakGlass, split.ReplyAAD(bound, rep.KMSID, rep.Epoch, 0, rep.Holder, 0, policyHashOf(req.Policy), nil), other)
+	rep.Sealed, _ = kms.Seal(pub, split.LabelBreakGlass, split.ReplyAAD(bound, rep.KMSID, rep.Epoch, 0, rep.Holder, 0, policyHashOf(req.Policy)), other)
 	return json.Marshal(rep)
 }

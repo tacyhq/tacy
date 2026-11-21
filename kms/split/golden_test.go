@@ -51,7 +51,6 @@ type golden struct {
 		Holder     string `json:"holder"`
 		Index      byte   `json:"index"`
 		PolicyHash string `json:"policy_hash"`
-		Head       string `json:"head_hex"`
 		AAD        string `json:"aad_hex"`
 	} `json:"reply_aad"`
 	Commitment struct {
@@ -115,10 +114,9 @@ func makeGolden(t *testing.T) *golden {
 		{Holder: "vercel", Nonce: hex.EncodeToString(seed("nonce vercel"))}}
 	b, _ := Bind(g.Nonces)
 	g.Bound = hex.EncodeToString(b)
-	head := []byte(`{"doc":"","sig":""}`)
 	g.ReplyAAD.KMSID, g.ReplyAAD.Epoch, g.ReplyAAD.Set, g.ReplyAAD.Holder, g.ReplyAAD.Index = g.KMSID, 1, 2, "vercel", 2
-	g.ReplyAAD.PolicyHash, g.ReplyAAD.Head = g.PolicyHash, hex.EncodeToString(head)
-	g.ReplyAAD.AAD = hex.EncodeToString(ReplyAAD(b, g.KMSID, 1, 2, "vercel", 2, g.PolicyHash, head))
+	g.ReplyAAD.PolicyHash = g.PolicyHash
+	g.ReplyAAD.AAD = hex.EncodeToString(ReplyAAD(b, g.KMSID, 1, 2, "vercel", 2, g.PolicyHash))
 	g.Commitment.Share = hex.EncodeToString(seed("share"))
 	g.Commitment.Value = Commitment(g.KMSID, 1, 2, "vercel", 2, seed("share"))
 

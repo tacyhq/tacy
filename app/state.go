@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/tacyhq/tacy/activity"
 	"github.com/tacyhq/tacy/approval"
@@ -47,6 +48,8 @@ type agentState struct {
 	// keeper saves the sealed snapshots (nil: memory only); schedules: the side store is kept, so schedules run.
 	keeper    *sealstate.Keeper
 	schedules bool
+	// tasksTmpfs is the host tmpfs the queue is in (nil: memory), for its heartbeat (beatTasks).
+	tasksTmpfs *queue.Tmpfs
 }
 
 // sideStore is what the side store holds: approvals, triggers' definitions and their marks, personal spaces'
@@ -171,8 +174,29 @@ func (k *agentState) useTasksQueue(t queue.Tmpfs) error {
 	if err != nil {
 		return err
 	}
-	k.queue, k.queueBoot = q, boot
+	k.queue, k.queueBoot, k.tasksTmpfs = q, boot, &t
 	return nil
+}
+
+// beatTasks keeps the tmpfs queue's heartbeat (queue.Tmpfs.Beat, review 2 M3) every queue.HeartbeatEvery until ctx
+// ends; nothing with the queue in memory. A queue another agentd finds with no heartbeat for queue.StaleAfter isn't
+// resumed.
+func (k *agentState) beatTasks(ctx context.Context, logf func(string, ...any)) {
+	if k.tasksTmpfs == nil {
+		return
+	}
+	t := time.NewTicker(queue.HeartbeatEvery)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if err := k.tasksTmpfs.Beat(k.queueBoot); err != nil {
+				logf("tasks: the queue's heartbeat: %v", err)
+			}
+		}
+	}
 }
 
 // booted is what agentd's keys and state are after boot (bootState).

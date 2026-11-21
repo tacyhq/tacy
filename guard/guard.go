@@ -175,6 +175,9 @@ type TaskOptions struct {
 	// built-in agent; an unattended task runs on AgentScheduled's limits.)
 	DefAgent string `json:"def_agent,omitzero"`
 	Digest   string `json:"digest,omitzero"`
+	// MailDef: the definition lists a mail tool. v1 runs leave mail out (the v1 design §5.1), and such a run never
+	// gets the web either (RuleOfTwo).
+	MailDef bool `json:"mail_def,omitzero"`
 	// DefVersion is the definition's version; TriggerKind schedule or event; Slot and Due a schedule slot's number
 	// and instant (a daily one's local date, trigger.DayOf).
 	DefVersion  uint64    `json:"def_version,omitzero"`
@@ -187,6 +190,9 @@ type TaskOptions struct {
 	// Agent is the built-in agent the task runs when it isn't the chat (agents.go: "a_research"); "": the chat. Its
 	// caps (searches, page reads) are counted here; agentd applies its running time and budget.
 	Agent string `json:"agent,omitzero"`
+	// Temporary: started from a temporary chat (StartRequest.Temporary). Kept while the task is (EndedOptions keeps
+	// it): it is deleted once nobody followed it for TemporaryKeep (Host.Temporary), never kept its agent's keep.
+	Temporary bool `json:"temporary,omitzero"`
 	// Images are the person's own images with their messages (proto.Message.Images, v0.12.0; images_in.go): only
 	// here, never in the task's start, so the brain never gets them; the gateway puts them on the person's message
 	// in each model request for a model that sees images. Kept with the task (the encrypted disk) while it is kept.

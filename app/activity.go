@@ -62,6 +62,9 @@ type recGateway struct {
 	// approvals holds actions that need a person's approval (approve before send, guard.Approvals); nil: none held
 	// (gatewayd then refuses every action that needs one).
 	approvals *guard.Approvals
+	// creds holds a mail call whose task's login vaultd doesn't have (after its restart) until the person's app
+	// sends it again (credentials.go); nil: such a call is denied at once.
+	creds *guard.CredWaits
 }
 
 var (
@@ -556,6 +559,13 @@ func (g *recGateway) Action(ctx context.Context, ti *harness.TaskInfo, id string
 	}
 	if res == nil {
 		res, err = g.safeGateway.Action(guard.WithFacts(ctx, f), ti, id, req)
+		// v1: gatewayd sent nothing because vaultd has no login for the task (it restarted): ask the person's app
+		// for it (need_credential) and run the call again once; with none in time, the model gets the denial.
+		if err == nil && guard.IsMailLoginNeeded(res) && g.creds != nil && guard.CanWait(ti) &&
+			g.creds.Wait(ctx, ti, id, req.Call) {
+			f = &guard.Facts{}
+			res, err = g.safeGateway.Action(guard.WithFacts(ctx, f), ti, id, req)
+		}
 		if g.approvals != nil {
 			g.approvals.Done(ti.ID, id, res, err)
 		}
@@ -666,10 +676,12 @@ func (s *server) activityOut(w http.ResponseWriter, r *http.Request) {
 }
 
 // pruneActivity drops sealed records older than recordKeep, now and every hour.
-func pruneActivity(ctx context.Context, st activity.Store) {
+func pruneActivity(ctx context.Context, st activity.Store, drained func() bool) {
 	for {
-		if err := st.Prune(time.Now().Add(-recordKeep)); err != nil {
-			log.Printf("activity: prune: %v", err)
+		if !drained() { // drained (drain.go): the active VM prunes
+			if err := st.Prune(time.Now().Add(-recordKeep)); err != nil {
+				log.Printf("activity: prune: %v", err)
+			}
 		}
 		select {
 		case <-ctx.Done():

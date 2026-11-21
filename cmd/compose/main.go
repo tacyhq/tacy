@@ -127,7 +127,7 @@ var kmsURLs []string
 
 // unlockDomain: every holder URL in the unlock policy must be https on this domain or under it (gatewayd's
 // -unlock-domain; the no-downtime plan row 2: our own domains). keys-cf.tacy.io, keys-v.tacy.io, later keys-g.tacy.io.
-const unlockDomain = "tacy.io"
+const unlockDomain = verifier.UnlockDomain
 
 // unlockAdminKeys are the admin keys the unlock policy must be signed by (kms-admin-1, the key the
 // ceremony signs kms-unlock-policy with; privacy review #4: the VM pins them, so a forged policy never reaches it).
@@ -776,10 +776,12 @@ func generateWith(r *Release, p releasePins) (string, error) {
 # the root key; no network). A one-shot setup container (root, no network) gives them their directories first.
 `)
 	if cfd.bin != nil && !cfd.confined {
-		b.WriteString(`# The tunnel: gatewayd runs our patched, reproducibly built cloudflared as its child (` + cftunnel.BinPath + `,
-# sha256 ` + cfd.sha + `; it refuses configs the edge pushes and has
-# no management service), with the token leased from vaultd after the unlock. Its one origin is gatewayd's ingress
-# allowlist.
+		b.WriteString(`# The tunnel: our patched, reproducibly built cloudflared (` + cftunnel.BinPath + `, sha256
+# ` + cfd.sha + `; it refuses configs the edge pushes, has no
+# management service and no WARP or private-network routing) runs in gatewayd's container, confined: gatewayd's
+# launcher (root with SETUID and SETGID only) starts gatewayd as 10001 and cloudflared as ` + itoa(cftunnel.TunnelUID) + `, both with no
+# capabilities; cloudflared's uid can reach no vault, agentd, unlockd or dstack socket, only gatewayd's ingress
+# allowlist (a probe as its uid checks this before every start). The token is leased from vaultd after the unlock.
 `)
 		if cfd.noListen {
 			b.WriteString("# gatewayd publishes no port and nothing listens on 8080: the tunnel is the only way in.\n")
@@ -921,14 +923,33 @@ func generateWith(r *Release, p releasePins) (string, error) {
 	args("-socket", "/run/tacy/runner/runner.sock", "-agent-uid", agentdUID,
 		"-gvisor", gvisorDir, "-gvisor-release", sandbox.GVisorRelease, "-runsc-sha256", runscSum,
 		"-brain", "/tacy/brain", "-brain-sha256", brainSum, "-dir", "/run/runner", "-platform", "systrap", "-rootless")
-	service("agentvm", "gatewayd", gatewaydUID+":"+gatewaydUID, true)
+	launch := cfd.bin != nil && !cfd.confined // the in-container tunnel: gatewayd's launcher (review H1)
+	if launch {
+		// Root with SETUID and SETGID only (verifier.GatewaydLaunchException): the launcher starts gatewayd as its uid
+		// with no capabilities and cloudflared as cftunnel.TunnelUID (gateway/cftunnel launch_linux.go).
+		service("agentvm", "gatewayd", "0:0", true)
+		s := b.String()
+		i := strings.LastIndex(s, "    cap_drop: [ALL]\n") + len("    cap_drop: [ALL]\n")
+		b.Reset()
+		b.WriteString(s[:i] + "    cap_add: [SETGID, SETUID]\n" + s[i:])
+	} else {
+		service("agentvm", "gatewayd", gatewaydUID+":"+gatewaydUID, true)
+	}
 	if !cfd.noListen {
 		b.WriteString(`    ports:
       - "8080:8080"
 `)
 	}
-	b.WriteString(`    tmpfs: [/tmp]
-    volumes:
+	if launch {
+		// /tmp is gatewayd's alone; the tunnel's tmpfs holds the ingress socket (group cloudflared's) and the probe's
+		// report (gatewayd's).
+		b.WriteString(`    tmpfs: ["/tmp:mode=0700,uid=` + gatewaydUID + `,gid=` + gatewaydUID + `", "` + cftunnel.Dir + `:size=1m,mode=0750,uid=` +
+			gatewaydUID + `,gid=` + itoa(cftunnel.TunnelUID) + `"]
+`)
+	} else {
+		b.WriteString("    tmpfs: [/tmp]\n")
+	}
+	b.WriteString(`    volumes:
       - agentsock:/run/tacy/agent
       - vaultsock:/run/tacy/vault
       - opssock:/run/tacy/ops
@@ -988,8 +1009,14 @@ func generateWith(r *Release, p releasePins) (string, error) {
 		b.Reset()
 		b.WriteString(c)
 	}
-	// The verifier's rules (every image by digest, no tag, no build:; unlockd's isolation), on what it will see.
-	if _, err := verifier.ComposeImages(b.String()); err != nil {
+	// The verifier's rules (every image by digest, no tag, no build:; unlockd's isolation), on what it will see: a
+	// production verifier's for the release's form (the tunnel, no -listen, no spike routes), the e2e level's for
+	// development composes (unit tests' and --dev-out's, with -listen and the published 8080).
+	check := verifier.ComposeImages
+	if cfd.bin == nil || !cfd.noListen || cfd.spike || cfd.confined {
+		check = verifier.ComposeImagesE2E
+	}
+	if _, err := check(b.String()); err != nil {
 		return "", err
 	}
 	script, mode := verifier.MemoryRootScript, verifier.KeyProviderKMS

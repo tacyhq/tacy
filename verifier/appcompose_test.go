@@ -188,7 +188,7 @@ func TestReleaseAppCompose(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(res.Checks) != 21 || hex.EncodeToString(res.HPKEPublicKey) != c.a.HPKEPublicKey {
+	if len(res.Checks) != 22 || hex.EncodeToString(res.HPKEPublicKey) != c.a.HPKEPublicKey {
 		t.Fatalf("%d checks", len(res.Checks))
 	}
 	names := map[string]bool{}

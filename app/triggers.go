@@ -266,7 +266,17 @@ func (s *server) runTriggers(ctx context.Context, every time.Duration) {
 // triggerTick is one pass: due schedule slots start their tasks (a derived id: a repeat finds the first), each
 // recorded as fired once started, found, or skipped for the agent's cap; an open unattended task whose sponsor was
 // revoked, left the space or whose sponsorship ended is cancelled ("sponsor_gone").
+//
+// While drained (drain.go) only the last check runs: no fire, and none of the engine's own writes.
 func (s *server) triggerTick(ctx context.Context) {
+	if s.drain.on(time.Now()) {
+		for id, o := range s.tasks().Triggered() {
+			if err := s.triggers.Sponsored(o.Space, o.Sponsor, o.NotAfter); err != nil {
+				s.rt.Cancel(id, "sponsor_gone")
+			}
+		}
+		return
+	}
 	// Stored files' keys of schedules that reached their end go first (trigger.Engine.ExpireFiles).
 	if err := s.triggers.ExpireFiles(); err != nil {
 		log.Printf("triggers: %v", err)

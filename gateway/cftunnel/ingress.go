@@ -9,9 +9,11 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -19,10 +21,12 @@ import (
 // Worker uses to agentd's HTTP socket and refuses the rest before anything reaches agentd. It reads request heads
 // only; bodies (EHBP ciphertext) are streamed through unread.
 type Ingress struct {
-	Agent string      // agentd's HTTP unix socket (-forward)
-	Spike bool        // the spike's test routes (/spike/*): throwaway composes only
-	Sup   *Supervisor // for /spike/cfd
-	Boot  time.Time   // gatewayd's start (for /spike/cfd)
+	Agent string // agentd's HTTP unix socket (-forward)
+	Spike bool   // the spike's test routes (/spike/*): throwaway composes only
+	// Diag is the e2e diag route (DiagPrefix; gatewayd -e2e-diag, the e2e overlay's only: NewDiag). nil: no route.
+	Diag http.Handler
+	Sup  *Supervisor // for /spike/cfd
+	Boot time.Time   // gatewayd's start (for /spike/cfd)
 
 	proxy *httputil.ReverseProxy
 	seen  atomic.Int64 // every request that reached this socket (the spike: did a refused one get here?)
@@ -89,6 +93,10 @@ func (in *Ingress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		in.proxy.ServeHTTP(w, r)
 		return
 	}
+	if in.Diag != nil && strings.HasPrefix(r.URL.Path, DiagPrefix) {
+		in.Diag.ServeHTTP(w, r)
+		return
+	}
 	if in.Spike && r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/spike/") {
 		in.spike(w, r)
 		return
@@ -148,9 +156,41 @@ func (in *Ingress) spike(w http.ResponseWriter, r *http.Request) {
 			ev, pid = in.Sup.Events()
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{"pid": pid, "events": ev, "gatewayd_start": in.Boot, "now": time.Now().UTC(),
-			"requests_seen": in.seen.Load(), "forwarded": in.fwd.Load()})
+		out := map[string]any{"pid": pid, "events": ev, "gatewayd_start": in.Boot, "now": time.Now().UTC(),
+			"requests_seen": in.seen.Load(), "forwarded": in.fwd.Load()}
+		// The confinement evidence (review H1; throwaways only): the launcher's last probe as cloudflared's uid, and
+		// the running cloudflared's credentials as /proc shows them (world-readable lines: uid, groups, capabilities).
+		if b, err := os.ReadFile(ProbeFile); err == nil {
+			out["confinement"] = json.RawMessage(b)
+		}
+		if pid > 0 {
+			st, _ := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+			var lines []string
+			for _, ln := range strings.Split(string(st), "\n") {
+				for _, k := range []string{"Uid:", "Gid:", "Groups:", "CapInh:", "CapPrm:", "CapEff:", "CapBnd:", "CapAmb:", "NoNewPrivs:", "Seccomp:"} {
+					if strings.HasPrefix(ln, k) {
+						lines = append(lines, ln)
+					}
+				}
+			}
+			out["cloudflared_status"] = lines
+			out["self_status_dumpable_proc_owner"] = procOwner(fmt.Sprintf("/proc/%d/environ", os.Getpid()))
+		}
+		json.NewEncoder(w).Encode(out)
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// procOwner is the owner uid of a /proc file ("root" when the process is non-dumpable: the kernel shows its /proc
+// entries as root's).
+func procOwner(p string) string {
+	fi, err := os.Stat(p)
+	if err != nil {
+		return err.Error()
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		return fmt.Sprint(st.Uid)
+	}
+	return "?"
 }

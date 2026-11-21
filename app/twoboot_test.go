@@ -112,7 +112,7 @@ func TestTwoBootsDifferentProviderSameKeys(t *testing.T) {
 	// What the Worker holds: sealed, every state, in the app's namespaces, nothing in the clear.
 	held := w.state.Blobs()
 	for _, key := range []string{"agent-vm/state/" + stateSide, "agent-vm/state/" + stateActivity, "agent-vm/state/" + stateBudget,
-		"agent-vm/state/" + stateNotify, "agent-vm/conn/" + vault.ConnState} {
+		"agent-vm/state/" + stateNotify} {
 		blob, ok := held[key]
 		if !ok {
 			t.Fatalf("%s not saved (held: %d)", key, len(held))
@@ -143,9 +143,14 @@ func TestTwoBootsDifferentProviderSameKeys(t *testing.T) {
 	if c := b2.kept.ledger.MembersCost("schedule:"); c["2026-11-20"] != 1234 {
 		t.Fatalf("budget: %v", c)
 	}
+	// v1: the email login stayed in boot 1's vaultd memory only: nothing of it was saved, nothing moves (the
+	// person's app sends it again with the next task).
+	if _, ok := held["agent-vm/conn/"+vault.ConnState]; ok {
+		t.Fatal("the connections state was written")
+	}
 	v2, _, _ := w.bootVault(t, "inst-2")
-	if list := v2.ConnList("s_one"); len(list) != 1 {
-		t.Fatalf("connections after the move: %+v", list)
+	if list := v2.ConnList("s_one"); len(list) != 0 || v2.RunCreds() != 0 {
+		t.Fatalf("connections after the move: %+v, %d logins", list, v2.RunCreds())
 	}
 	// The chain goes on.
 	if _, err := b2.rec.Begin(activity.Start{Run: "r2", Space: "s_one", To: to, Started: now.Add(time.Minute)}); err != nil {
@@ -227,17 +232,20 @@ func TestTwoBootsDifferentProviderSameKeys(t *testing.T) {
 	}
 }
 
-// putTestConn connects an email account for space (an IMAP app password, the canary) on v.
+// putTestConn puts the person's email login (an IMAP app password, the canary) for a task in space on v, as their
+// app sends it with each task (v1: memory only, never in the sealed state).
 func putTestConn(t *testing.T, v *vault.Vault, space string) {
 	t.Helper()
-	box, _ := vault.SealConn(v.SealKey(), space, vault.ConnEmail, []byte(`{"type":"`+vault.EmailType+
+	exp := time.Now().Add(time.Hour).UnixMilli()
+	kh := vault.KeyHash("start-canary")
+	box, err := vault.SealRunCred(v.SealKey(), space, vault.ConnEmail, kh, exp, []byte(`{"type":"`+vault.MailLoginType+
 		`","provider":"other","host":"imap.canary.example","port":993,"security":"tls","address":"me@canary.example","username":"me@canary.example","password":"`+
 		testIMAPPassword+`"}`))
-	pid, _, err := v.ConnPut(space, vault.ConnEmail, box)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := v.ConnCommit(pid); err != nil {
+	if _, err := v.RunCredPut(vault.RunGrant{Task: "tk_canary", Space: space, Connection: vault.ConnEmail, KeyHash: kh, Expires: exp,
+		Sealed: box}); err != nil {
 		t.Fatal(err)
 	}
 }

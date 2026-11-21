@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -13,13 +15,16 @@ import (
 	"github.com/tacyhq/tacy/vault"
 )
 
-// runTunnel is the cloudflared spike's tunnel (gateway/cftunnel): the ingress socket in gatewayd's private tmpfs,
-// and cloudflared started (and started again) with the tunnel token leased from vaultd for each start. The vault
-// has the token only after the split-key unlock (the epoch's sealed secrets bundle), so cloudflared starts after it.
-func runTunnel(vc *vault.Client, bin, sum, config, secret, agentSock string, spike bool) {
+// runTunnel is the in-container tunnel (gateway/cftunnel): the ingress socket in the tunnel's tmpfs (group
+// cloudflared's uid: the one thing it may connect to), and cloudflared started (and started again) by gatewayd's
+// launcher as its own uid, with the tunnel token leased from vaultd for each start. The vault has the token only
+// after the split-key unlock (the epoch's sealed secrets bundle), so cloudflared starts after it. Each launcher
+// probe result goes to cftunnel.ProbeFile (0600, gatewayd's) with gatewayd's own hardening status. diag is the e2e
+// overlay's diag route (gatewayd -e2e-diag; nil in every other compose).
+func runTunnel(vc *vault.Client, bin, sum, secret, agentSock string, tunnelUID int, hs cftunnel.HardenStatus, spike bool, diag http.Handler) {
 	boot := time.Now()
 	n := 0
-	sup := &cftunnel.Supervisor{Bin: bin, BinSHA256: sum, Config: config, Dir: cftunnel.Dir, Logf: log.Printf, Out: os.Stdout,
+	sup := &cftunnel.Supervisor{Bin: bin, BinSHA256: sum, Logf: log.Printf,
 		Token: func(ctx context.Context) ([]byte, error) {
 			n++
 			s, err := vc.Lease(ctx, vault.Request{Secret: secret, Connector: "tunnel", Host: "argotunnel.com", Task: "tunnel",
@@ -30,14 +35,32 @@ func runTunnel(vc *vault.Client, bin, sum, config, secret, agentSock string, spi
 			defer s.Wipe()
 			return append([]byte(nil), s.Bytes()...), nil
 		}}
-	if err := os.MkdirAll(cftunnel.Dir, 0o700); err != nil {
-		log.Fatalf("gatewayd: tunnel: %v", err)
-	}
-	l, err := gateway.Listen(cftunnel.SocketPath, 0o600)
+	starter, err := cftunnel.LauncherFromEnv(func(raw []byte) {
+		var r cftunnel.ProbeResult
+		json.Unmarshal(raw, &r)
+		sup.Record(cftunnel.Event{Kind: "probe", Detail: fmt.Sprintf("ok %v, %d checks", r.OK, len(r.Checks))})
+		b, _ := json.Marshal(map[string]any{"at": time.Now().UTC(), "gatewayd": hs, "probe": json.RawMessage(raw)})
+		tmp := cftunnel.ProbeFile + ".tmp"
+		if os.WriteFile(tmp, b, 0o600) == nil {
+			os.Rename(tmp, cftunnel.ProbeFile)
+		}
+		log.Printf("gatewayd: tunnel: confinement probe ok %v (%d checks)", r.OK, len(r.Checks))
+	})
 	if err != nil {
 		log.Fatalf("gatewayd: tunnel: %v", err)
 	}
-	in := &cftunnel.Ingress{Agent: agentSock, Spike: spike, Sup: sup, Boot: boot}
+	sup.Start = starter
+	if err := os.MkdirAll(cftunnel.Dir, 0o750); err != nil {
+		log.Fatalf("gatewayd: tunnel: %v", err)
+	}
+	l, err := gateway.Listen(cftunnel.SocketPath, 0o660)
+	if err != nil {
+		log.Fatalf("gatewayd: tunnel: %v", err)
+	}
+	if err := os.Chown(cftunnel.SocketPath, -1, tunnelUID); err != nil {
+		log.Fatalf("gatewayd: tunnel: %v", err)
+	}
+	in := &cftunnel.Ingress{Agent: agentSock, Spike: spike, Sup: sup, Boot: boot, Diag: diag}
 	go func() { log.Fatal((&http.Server{Handler: in, ReadHeaderTimeout: 30 * time.Second}).Serve(l)) }()
 	log.Fatal(sup.Run(context.Background()))
 }

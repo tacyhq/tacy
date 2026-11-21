@@ -278,6 +278,11 @@ func (e *Engine) InstallChecked(env safety.Envelope, check func(*Definition) err
 	if err != nil {
 		return nil, err
 	}
+	// R1, the rule of two, for every new install (a definition installed before v1 still loads: Load; its runs
+	// leave mail out and get no web, guard.RuleOfTwo).
+	if err := CheckMailTools(d); err != nil {
+		return nil, fmt.Errorf("trigger: definition: %w", err)
+	}
 	if check != nil {
 		if err := check(d); err != nil {
 			return nil, fmt.Errorf("trigger: definition: %w", err)

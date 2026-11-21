@@ -321,6 +321,34 @@ type UnlockPolicy struct {
 	// Emergency, signed by the KMS id (two passphrase shares) on top of the admin signature, lets the release pins
 	// it names unlock at once, without the holders' pin delay (the no-downtime plan row 13). Every holder alerts on it.
 	Emergency *SignedEmergency `json:"emergency,omitempty"`
+
+	// The machine allowlist (V1-DESIGN §3; safety/machine.go). MachineCerts are the machines a VM may run on, each
+	// signed by the KMS id (two passphrase shares), not by the admin key and not tied to this seq; required and
+	// non-empty (no omitempty: an empty list never reads as "the built-in ones", review L2). MachinesRevoked are
+	// certificate hashes refused for good: each holder keeps every one it has seen (ItemMachineRevoked items, never
+	// withdrawn), so an admin key alone can revoke but never re-allow. Neither has a 24 h delay or a policy item of
+	// its own beyond the revocations' record (decided for v1). It stops quotes forged on machines outside the
+	// list, NOT the host: Phala (or anyone with physical access to a listed machine) can forge one that passes.
+	//
+	// omitzero, unlike the design's "no omitempty" (review L2), on purpose: the trap L2 names (an empty list
+	// dropped and read as "absent = the built-in ones") can't happen, since Validate refuses absent and empty alike
+	// at every holder and kmsctl (TestProductionPolicyNeedsMachineCerts), and a holder has no built-in machines. It
+	// keeps OtherItem's bytes for policies without the fields, so a holder upgrade starts no 24 h wait.
+	MachineCerts    []safety.SignedMachineCert `json:"machine_certs,omitzero"`
+	MachinesRevoked []string                   `json:"machines_revoked,omitzero"`
+}
+
+// OpenMachines checks every machine certificate is the KMS id's (a policy with one that isn't is refused whole) and
+// returns the policy's machines without its revoked ones. A holder also refuses the revocations its store kept.
+func (p *UnlockPolicy) OpenMachines(kmsID ed25519.PublicKey) (*safety.MachineSet, error) {
+	if len(p.MachineCerts) == 0 {
+		return nil, errors.New("split: unlock policy: no machine certificates (machine_certs is required)")
+	}
+	s, err := safety.OpenMachineCerts(kmsID, p.MachineCerts, p.MachinesRevoked, fmt.Sprintf("unlock policy %d", p.Seq))
+	if err != nil {
+		return nil, fmt.Errorf("split: unlock policy: %w", err)
+	}
+	return s, nil
 }
 
 // OpenShareSets checks every share set is signed by kmsID, of the policy's epoch or the one before, certified by an
@@ -440,6 +468,12 @@ func (p *UnlockPolicy) Validate() error {
 			return fmt.Errorf("split: unlock policy: witness %q isn't a holder", w)
 		}
 	}
+	if len(p.MachineCerts) == 0 || len(p.MachineCerts) > safety.MaxMachineCerts {
+		return fmt.Errorf("split: unlock policy: 1 to %d machine certificates (machine_certs is required)", safety.MaxMachineCerts)
+	}
+	if err := safety.ValidRevocations(p.MachinesRevoked); err != nil {
+		return fmt.Errorf("split: unlock policy: %w", err)
+	}
 	return nil
 }
 
@@ -519,18 +553,21 @@ type UnlockReply struct {
 	Epoch  uint32     `json:"epoch"`
 	Set    uint32     `json:"set"`
 	Sealed kms.Sealed `json:"sealed"`
-	// WitnessHead: a witness holder's highest SignedHead (JSON) for this app, or empty. Bound into the AAD, so it
-	// can't be stripped or swapped on the way.
-	WitnessHead []byte `json:"witness_head,omitempty"`
+	// No witness_head: the legacy rollback witness is removed (V1-DESIGN §2.5 step 1). The VM decodes replies
+	// strictly, so a reply that still carries one is refused.
 }
 
-// ReplyAAD binds a reply to the bound nonce (so to this quote and boot key), the KMS id, epoch, set, holder, index,
-// the policy the holder served it under (PolicyHash of its payload: the VM refuses a reply under another policy than
-// the one it sent) and the witness head it carries (nil: none).
-func ReplyAAD(bound []byte, kmsID string, epoch, set uint32, holder string, index byte, policyHash string, head []byte) []byte {
+// noWitnessHead is the last AAD item, as it was when replies could carry the legacy witness head and carried none
+// (sha256 of nothing): kept so the AAD's bytes don't change.
+var noWitnessHead = func() string { h := sha256.Sum256(nil); return string(h[:]) }()
+
+// ReplyAAD binds a reply to the bound nonce (so to this quote and boot key), the KMS id, epoch, set, holder, index
+// and the policy the holder served it under (PolicyHash of its payload: the VM refuses a reply under another policy
+// than the one it sent).
+func ReplyAAD(bound []byte, kmsID string, epoch, set uint32, holder string, index byte, policyHash string) []byte {
 	b := append(lp(nil, string(bound)), HolderShareAAD(kmsID, epoch, set, holder, index)...)
 	b = lp(b, policyHash)
-	return lp(b, headHash(head))
+	return lp(b, noWitnessHead)
 }
 
 // Status is GET /v1/status (public).

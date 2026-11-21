@@ -51,22 +51,37 @@ func mailFixture(t *testing.T) *imaptest.Server {
 	return s
 }
 
-// connect puts a connection for space straight into the vault (no test login).
-func connect(t *testing.T, v *vault.Vault, space, user, pass string) {
-	t.Helper()
-	b, _ := json.Marshal(map[string]any{"type": vault.EmailType, "provider": "other", "host": imaptest.Host, "port": 993,
-		"security": "tls", "address": user, "username": user, "password": pass})
-	box, err := vault.SealConn(v.SealKey(), space, vault.ConnEmail, b)
+// taskLogins is the mail tests' vault: the person's app sends their login with every task (v1, vault/runcred.go),
+// so the first time the gateway asks for a task's login in space, it is sealed and put for that task through the
+// vault's own per-task path (the box bound to the task's start key and space); other spaces have none.
+type taskLogins struct {
+	vault.Local
+	space, user, pass string
+}
+
+func (tl taskLogins) RunInfo(ctx context.Context, task, space string) (vault.ConnInfo, error) {
+	info, err := tl.Local.RunInfo(ctx, task, space)
+	if !errors.Is(err, vault.ErrLoginNeeded) || space != tl.space {
+		return info, err
+	}
+	if err := putLogin(tl.V, task, space, tl.user, tl.pass); err != nil {
+		return vault.ConnInfo{}, err
+	}
+	return tl.Local.RunInfo(ctx, task, space)
+}
+
+// putLogin seals a login for task as the app does and puts it in the vault.
+func putLogin(v *vault.Vault, task, space, user, pass string) error {
+	b, _ := json.Marshal(map[string]any{"type": vault.MailLoginType, "provider": "other", "host": imaptest.Host, "port": 993,
+		"security": "tls", "address": user, "username": user, "password": pass, "added_at": "2026-10-28T00:00:00Z"})
+	exp := time.Now().Add(time.Hour).UnixMilli()
+	kh := vault.KeyHash("start-" + task)
+	box, err := vault.SealRunCred(v.SealKey(), space, vault.ConnEmail, kh, exp, b)
 	if err != nil {
-		t.Fatal(err)
+		return err
 	}
-	pid, _, err := v.ConnPut(space, vault.ConnEmail, box)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := v.ConnCommit(pid); err != nil {
-		t.Fatal(err)
-	}
+	_, err = v.RunCredPut(vault.RunGrant{Task: task, Space: space, Connection: vault.ConnEmail, KeyHash: kh, Expires: exp, Sealed: box})
+	return err
 }
 
 type mailE2E struct {
@@ -93,14 +108,13 @@ func newMailE2EOn(t *testing.T, sm *splitModel, srv *imaptest.Server) *mailE2E {
 	if err := v.EnableConns(nil); err != nil {
 		t.Fatal(err)
 	}
-	connect(t, v, testSpace, mailUser, mailPassword)
 	up := httptest.NewServer(sm)
 	t.Cleanup(up.Close)
 	rc := DefaultReader
 	e := &mailE2E{sm: sm, srv: srv, v: v, st: &taintStore{MemStore: harness.NewMemStore()}}
 	e.g = New(Config{Up: &plainUpstream{url: up.URL, http: up.Client()}, Search: &fakeSearch{}, CacheSecret: "boot",
 		Fetcher: &http.Client{Transport: stubWeb{}}, Reader: &rc, Now: func() time.Time { return time.Date(2026, 10, 28, 0, 0, 0, 0, time.UTC) },
-		Mail: &MailConfig{Vault: vault.Local{V: v}, Dial: srv.Dial, TLS: srv.TLSConfig()}})
+		Mail: &MailConfig{Vault: taskLogins{Local: vault.Local{V: v}, space: testSpace, user: mailUser, pass: mailPassword}, Dial: srv.Dial, TLS: srv.TLSConfig()}})
 	e.rt = &harness.Runtime{Guard: e.g, Store: e.st}
 	r, b := net.Pipe()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -314,11 +328,11 @@ func TestMailWithoutConnectionOrUnknownID(t *testing.T) {
 	if slices.Contains(e.srv.CommandNames(), "UID FETCH") {
 		t.Fatal("an unknown id was fetched")
 	}
-	// Another space has no account.
+	// Another space's task came with no login: nothing is sent, the model is told the login is needed.
 	sm2 := &splitModel{acting: []string{toolCallSSE("c1", "mail_search", `{}`), textSSE("none")}}
 	e2 := newMailE2E(t, sm2)
 	evs = e2.run(t, proto.RunRequest{Space: "s_other", Permissions: AllowAll(), Messages: user("mail?")})
-	if r := toolResults(evs, "mail_search"); len(r) != 1 || !strings.Contains(string(r[0].Result), "no_mail_connected") {
+	if r := toolResults(evs, "mail_search"); len(r) != 1 || !strings.Contains(string(r[0].Result), MailLoginNeeded) {
 		t.Fatalf("no account: %s", types(evs))
 	}
 	if len(e2.srv.Commands()) != 0 {
@@ -502,7 +516,9 @@ func TestMailDetailsLeakScan(t *testing.T) {
 	}
 }
 
-func TestConnPutTestsLogin(t *testing.T) {
+// Settings → Connections through the guard (v1): a test login says whether the box works and keeps nothing,
+// whatever the outcome; put is gone (per_request); refusals have their codes.
+func TestConnTestKeepsNothing(t *testing.T) {
 	srv := mailFixture(t)
 	srv.Refuse["blocked@example.com"] = "web_login"
 	srv.Refuse["normal@example.com"] = "app_password"
@@ -515,27 +531,37 @@ func TestConnPutTestsLogin(t *testing.T) {
 	if list.Error != nil || list.SealKey == "" || len(list.Connections) != 0 {
 		t.Fatalf("list %+v", list)
 	}
-	put := func(user, pass string) *ConnResult {
+	box := func(user, pass string) *vault.Sealed {
 		b, _ := json.Marshal(map[string]any{"type": vault.EmailType, "provider": "other", "host": imaptest.Host, "port": 993,
 			"security": "tls", "address": user, "username": user, "password": pass})
-		box, _ := vault.SealConn(list.SealKey, testSpace, vault.ConnEmail, b)
-		return g.Conn(ctx, &ConnRequest{Op: "put", Space: testSpace, Connection: vault.ConnEmail, Sealed: &box})
+		bx, _ := vault.SealConn(list.SealKey, testSpace, vault.ConnEmail, b)
+		return &bx
+	}
+	test := func(user, pass string) *ConnResult {
+		return g.Conn(ctx, &ConnRequest{Op: "test", Space: testSpace, Connection: vault.ConnEmail, Sealed: box(user, pass)})
 	}
 	for user, code := range map[string]string{mailUser: "login_failed", "blocked@example.com": imapro.AppPasswordsBlocked,
 		"normal@example.com": imapro.AppPasswordRequired} {
-		if r := put(user, "wrong"); r.Error == nil || r.Error.Code != code {
+		if r := test(user, "wrong"); r.Error == nil || r.Error.Code != code {
 			t.Fatalf("%s: %+v", user, r.Error)
 		}
 	}
-	if l := g.Conn(ctx, &ConnRequest{Op: "list", Space: testSpace}); len(l.Connections) != 0 {
-		t.Fatal("a refused login was kept")
-	}
-	r := put(mailUser, mailPassword)
+	r := test(mailUser, mailPassword)
 	if r.Error != nil || r.Info == nil || r.Info.Host != imaptest.Host || r.Folders != 2 {
-		t.Fatalf("good put %+v %+v", r, r.Error)
+		t.Fatalf("good test %+v %+v", r, r.Error)
 	}
-	if l := g.Conn(ctx, &ConnRequest{Op: "list", Space: testSpace}); len(l.Connections) != 1 {
-		t.Fatal("not kept")
+	if l := g.Conn(ctx, &ConnRequest{Op: "list", Space: testSpace}); len(l.Connections) != 0 {
+		t.Fatal("a tested login was kept")
+	}
+	if n := v.RunCreds(); n != 0 {
+		t.Fatalf("%d task logins after a test", n)
+	}
+	if _, _, err := v.Lease(vault.Request{Secret: vault.ConnSecret, Connector: vault.MailConnector, Host: imaptest.Host, Task: "t_1",
+		Action: "a", Space: testSpace, Conn: vault.ConnEmail}); err == nil {
+		t.Fatal("the tested login is leased")
+	}
+	if p := g.Conn(ctx, &ConnRequest{Op: "put", Space: testSpace, Connection: vault.ConnEmail, Sealed: box(mailUser, mailPassword)}); p.Error == nil || p.Error.Code != "per_request" {
+		t.Fatalf("put: %+v", p.Error)
 	}
 	if names := srv.CommandNames(); slices.Contains(names, "SELECT") || slices.Contains(names, "STORE") {
 		t.Fatalf("commands %v", names)
@@ -543,21 +569,15 @@ func TestConnPutTestsLogin(t *testing.T) {
 	// A box sealed for another space doesn't open in this one; a stale key is said so.
 	b, _ := json.Marshal(map[string]any{"type": vault.EmailType, "provider": "other", "host": imaptest.Host, "port": 993,
 		"security": "tls", "address": mailUser, "username": mailUser, "password": mailPassword})
-	box, _ := vault.SealConn(list.SealKey, "s_other", vault.ConnEmail, b)
-	if r := g.Conn(ctx, &ConnRequest{Op: "put", Space: testSpace, Connection: vault.ConnEmail, Sealed: &box}); r.Error == nil || r.Error.Code != "bad_sealed" {
+	other, _ := vault.SealConn(list.SealKey, "s_other", vault.ConnEmail, b)
+	if r := g.Conn(ctx, &ConnRequest{Op: "test", Space: testSpace, Connection: vault.ConnEmail, Sealed: &other}); r.Error == nil || r.Error.Code != "bad_sealed" {
 		t.Fatalf("other space's box: %+v", r.Error)
 	}
-	box.Key = "x25519:AAAA"
-	if r := g.Conn(ctx, &ConnRequest{Op: "put", Space: testSpace, Connection: vault.ConnEmail, Sealed: &box}); r.Error == nil || r.Error.Code != "stale_key" {
+	other.Key = "x25519:AAAA"
+	if r := g.Conn(ctx, &ConnRequest{Op: "test", Space: testSpace, Connection: vault.ConnEmail, Sealed: &other}); r.Error == nil || r.Error.Code != "stale_key" {
 		t.Fatalf("stale key: %+v", r.Error)
 	}
 	if r := g.Conn(ctx, &ConnRequest{Op: "remove", Space: testSpace, Connection: vault.ConnEmail}); r.Error != nil {
 		t.Fatal(r.Error)
-	}
-	if l := g.Conn(ctx, &ConnRequest{Op: "list", Space: testSpace}); len(l.Connections) != 0 {
-		t.Fatal("not removed")
-	}
-	if _, err := v.ConnGet(testSpace, vault.ConnEmail); !errors.Is(err, vault.ErrNoConn) {
-		t.Fatal("still in the vault")
 	}
 }

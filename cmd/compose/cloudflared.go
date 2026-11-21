@@ -15,11 +15,12 @@ import (
 
 // The tunnel (a research note; chosen 2026-11-21: Phala Fix B plus our
 // patched cloudflared, in-container, as the only way in). Since vm-v1 the release has it: gatewayd's image gets one
-// more layer, the pinned cloudflared binary at /tacy/cloudflared and its locally-managed config at
-// /tacy/cloudflared.yml (gateway/cftunnel.Config), and gatewayd's command line names them and the tunnel token's
-// secret name; there is no gatewayd -listen and no published 8080 (go-condition 3), so the tunnel is the only way
-// in. The spike's flags (--cloudflared, --cloudflared-confined, --tunnel-spike-routes, --listen) are for development
-// composes only (--dev-out).
+// more layer, the pinned cloudflared binary at /tacy/cloudflared, and gatewayd's command line names it, the Access app
+// its locally-managed config checks (-cloudflared-access team,aud: gatewayd's launcher writes gateway/cftunnel.Config
+// into a memfd it hands cloudflared, so a staging compose changes the Access app as a pin, not as an image;
+// vm-v1-gate) and the tunnel token's secret name; there is no gatewayd -listen and no published 8080 (go-condition
+// 3), so the tunnel is the only way in. The spike's flags (--cloudflared, --cloudflared-confined,
+// --tunnel-spike-routes, --listen) are for development composes only (--dev-out).
 var cfd struct {
 	bin      []byte
 	sha      string
@@ -27,13 +28,19 @@ var cfd struct {
 	secret   string
 	spike    bool
 	confined bool // the confined variant: cloudflared in its own service (cftunnel), not gatewayd's child
+	// access (the release's form): the Access app as gatewayd's -cloudflared-access team,aud, so the image carries no
+	// config file and gatewayd's launcher writes cftunnel.Config into a memfd for cloudflared. "" (the spike's
+	// --cloudflared): the config is a file of gatewayd's image (-cloudflared-config).
+	access   string
 	noListen bool // no gatewayd -listen, no published 8080 (go-condition 3): the release's
 }
 
 // The release's tunnel pins.
-//   - ReleaseCloudflaredSHA256: cloudflared 2026.10.7 with cmd/cfdlocal/cloudflared-2026.10.7-tacy1.patch (refuses
-//     every config the edge pushes; no management service), built by cmd/cfdlocal/build-cloudflared.sh, byte for
-//     byte the same from two source trees (2026-11-21, and again for vm-v1).
+//   - ReleaseCloudflaredSHA256: cloudflared 2026.10.7 (upstream commit ReleaseCloudflaredCommit, fetched by commit,
+//     not by tag) with cloudflared/cloudflared-2026.10.7-tacy2.patch (refuses every config the edge pushes; no
+//     management service; no WARP or private-network routing: TCP, UDP and ICMP from the edge are refused),
+//     fetched by cloudflared/fetch.sh and built by cloudflared/build.sh: byte for byte the same on macOS and in
+//     Linux (Docker), and in scripts/reproduce.sh.
 //   - releaseTunnelSecret: the vault secret (vault.TunnelSecrets, in the epoch's sealed secrets bundle) gatewayd
 //     leases the tunnel token from: slot vm-a. A release on slot vm-b names CF_TUNNEL_TOKEN_VMB (blue/green by the
 //     Worker's target, never DNS).
@@ -42,8 +49,9 @@ var cfd struct {
 //     approves). Until then these placeholders fail closed (no Access app has an all-zero audience, so cloudflared
 //     refuses every request) and --manifest, which a release tag needs, refuses them (accessPinned).
 const (
-	ReleaseCloudflaredVersion = "2026.10.7-tacy1"
-	ReleaseCloudflaredSHA256  = "24fdcd7ecc7b4c05a0313f498a42af254e71a2e28e50273fb2dee0834d1ec946"
+	ReleaseCloudflaredVersion = "2026.10.7-tacy2"
+	ReleaseCloudflaredCommit  = "872b241f94871665c1c157adefcf90c11f0ead96"
+	ReleaseCloudflaredSHA256  = "1c8c92c803f5d919c51bf01e1ce8d642d3ec05b51326c214eff756ed4221f0dd"
 	releaseTunnelSecret       = "CF_TUNNEL_TOKEN_VMA"
 	releaseAccessTeam         = "unpinned"
 	releaseAccessAUD          = "0000000000000000000000000000000000000000000000000000000000000000"
@@ -62,18 +70,22 @@ func setReleaseTunnel(listen bool) error {
 	if err != nil {
 		return err
 	}
-	c, err := cftunnel.ConfigFor(cftunnel.SocketPath, releaseAccessTeam, releaseAccessAUD)
-	if err != nil {
+	access := releaseAccessTeam + "," + releaseAccessAUD
+	if _, _, err := cftunnel.ParseAccess(access); err != nil {
 		return err
 	}
-	cfd.bin, cfd.sha, cfd.config, cfd.secret, cfd.noListen = b, ReleaseCloudflaredSHA256, c, releaseTunnelSecret, !listen
+	cfd.bin, cfd.sha, cfd.access, cfd.secret, cfd.noListen = b, ReleaseCloudflaredSHA256, access, releaseTunnelSecret, !listen
 	return nil
 }
 
-// releaseCloudflared returns the pinned cloudflared binary, checked against ReleaseCloudflaredSHA256: from
-// $TACY_CLOUDFLARED_BIN if set, else from the user's cache, else built by cmd/cfdlocal/build-cloudflared.sh in a fresh
-// directory (git and network: GitHub and the Go toolchain; then cached). Wherever it comes from, only the pinned
-// bytes are used.
+// releaseCloudflared returns the pinned cloudflared binary, checked against ReleaseCloudflaredSHA256. Where from:
+//   - $TACY_CLOUDFLARED_BIN: a binary;
+//   - $TACY_CLOUDFLARED_SRC: a tree cloudflared/fetch.sh made (scripts/reproduce.sh fetches on the host, where git
+//     is, and builds here, in the pinned Go container), built by cloudflared/build.sh;
+//   - else the user's cache, unless $TACY_CLOUDFLARED_FRESH=1 (scripts/reproduce.sh: always from source);
+//   - else fetched and built in a fresh directory (git and network: GitHub, the Go module proxy), then cached.
+//
+// Wherever it comes from, only the pinned bytes are used.
 func releaseCloudflared() ([]byte, error) {
 	check := func(b []byte, from string) ([]byte, error) {
 		if h := sha256.Sum256(b); hex.EncodeToString(h[:]) != ReleaseCloudflaredSHA256 {
@@ -88,10 +100,12 @@ func releaseCloudflared() ([]byte, error) {
 		}
 		return check(b, p)
 	}
+	fresh := os.Getenv("TACY_CLOUDFLARED_FRESH") == "1"
+	src := os.Getenv("TACY_CLOUDFLARED_SRC")
 	cache := ""
 	if d, err := os.UserCacheDir(); err == nil {
 		cache = filepath.Join(d, "tacy", "cloudflared-"+ReleaseCloudflaredVersion+"-linux-amd64")
-		if b, err := os.ReadFile(cache); err == nil {
+		if b, err := os.ReadFile(cache); err == nil && !fresh && src == "" {
 			if b, err := check(b, cache); err == nil {
 				return b, nil
 			}
@@ -101,16 +115,28 @@ func releaseCloudflared() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	script, err := filepath.Abs(filepath.Join("cmd", "cfdlocal", "build-cloudflared.sh"))
+	scripts, err := filepath.Abs(filepath.Join("cmd", "compose", "cloudflared"))
 	if err != nil {
 		return nil, err
 	}
-	cmd := exec.Command("sh", script, dir)
-	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("cloudflared: build-cloudflared.sh: %w (or set TACY_CLOUDFLARED_BIN)", err)
+	run := func(name string, args ...string) error {
+		cmd := exec.Command("sh", append([]string{filepath.Join(scripts, name)}, args...)...)
+		cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("cloudflared: %s: %w (or set TACY_CLOUDFLARED_BIN)", name, err)
+		}
+		return nil
+	}
+	if src == "" {
+		if err := run("fetch.sh", dir); err != nil {
+			return nil, err
+		}
+		src = filepath.Join(dir, "src")
 	}
 	out := filepath.Join(dir, "cloudflared-tacy-linux-amd64")
+	if err := run("build.sh", src, out); err != nil {
+		return nil, err
+	}
 	b, err := os.ReadFile(out)
 	if err != nil {
 		return nil, err
@@ -118,6 +144,8 @@ func releaseCloudflared() ([]byte, error) {
 	if b, err = check(b, out); err != nil {
 		return nil, err
 	}
+	fmt.Fprintf(os.Stderr, "cloudflared %s (upstream %s) rebuilt from source: sha256 %s\n", ReleaseCloudflaredVersion,
+		ReleaseCloudflaredCommit, ReleaseCloudflaredSHA256)
 	if cache != "" && os.MkdirAll(filepath.Dir(cache), 0o755) == nil {
 		if tmp, err := os.CreateTemp(filepath.Dir(cache), ".cloudflared-*"); err == nil {
 			_, werr := tmp.Write(b)
@@ -176,15 +204,20 @@ func cloudflaredFiles() (*layer, error) {
 	if cfd.bin == nil {
 		return nil, nil
 	}
-	gz, err := filesLayer([]file{{path: strings.TrimPrefix(cftunnel.BinPath, "/tacy/"), data: cfd.bin},
-		{path: strings.TrimPrefix(cftunnel.ConfigPath, "/tacy/"), data: cfd.config, mode: 0o444}})
+	files := []file{{path: strings.TrimPrefix(cftunnel.BinPath, "/tacy/"), data: cfd.bin}}
+	what := "tacy cmd/compose: " + cftunnel.BinPath + " (cloudflared, sha256 " + cfd.sha + ")"
+	if cfd.config != nil {
+		files = append(files, file{path: strings.TrimPrefix(cftunnel.ConfigPath, "/tacy/"), data: cfd.config, mode: 0o444})
+		what += " and " + cftunnel.ConfigPath
+	}
+	gz, err := filesLayer(files)
 	if err != nil {
 		return nil, err
 	}
-	return &layer{gz, "tacy cmd/compose: " + cftunnel.BinPath + " (cloudflared, sha256 " + cfd.sha + ") and " + cftunnel.ConfigPath}, nil
+	return &layer{gz, what}, nil
 }
 
-// cloudflaredArgs are gatewayd's extra flags (none when no tunnel is set: unit tests' generateWith).
+// cloudflaredArgs are gatewayd's extra flags (-tunnel-uid: gatewayd's launcher starts cloudflared as its own uid) (none when no tunnel is set: unit tests' generateWith).
 func cloudflaredArgs() []string {
 	if cfd.bin == nil {
 		return nil
@@ -196,8 +229,13 @@ func cloudflaredArgs() []string {
 		}
 		return a
 	}
-	a := []string{"-cloudflared", cftunnel.BinPath, "-cloudflared-sha256", cfd.sha, "-cloudflared-config", cftunnel.ConfigPath,
-		"-tunnel-secret", cfd.secret}
+	a := []string{"-tunnel-uid", itoa(cftunnel.TunnelUID), "-cloudflared", cftunnel.BinPath, "-cloudflared-sha256", cfd.sha}
+	if cfd.access != "" {
+		a = append(a, "-cloudflared-access", cfd.access)
+	} else {
+		a = append(a, "-cloudflared-config", cftunnel.ConfigPath)
+	}
+	a = append(a, "-tunnel-secret", cfd.secret)
 	if cfd.spike {
 		a = append(a, "-tunnel-spike-routes")
 	}

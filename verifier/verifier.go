@@ -3,6 +3,9 @@
 //   - genuine Intel TDX quote: Intel signature chain, PCS collateral, revocation, TD attributes (no debug, not
 //     migratable, SEPT_VE_DISABLE, no PERFMON), no Revoked TCB part
 //   - TCB: the platform's and the TDX module's level (the worse of the two) and the quoting enclave's are UpToDate
+//   - the machine: the PPID and FMSPC of the quote's PCK certificate are a machine certificate's (machines.go). It
+//     stops quotes forged on machines outside the list; it does NOT stop the host (Phala, or anyone with physical
+//     access to prod5 or prod9), whose forged quote carries a listed PPID
 //   - report_data = proto.ReportData(our nonce, the HPKE key in the response): the key requests get encrypted to
 //     was generated inside this TD for this boot
 //   - dstack's event log replays to RTMR3, and its compose-hash event equals sha256(app-compose.json)
@@ -10,9 +13,6 @@
 //     key provider none, which measures no os-image-hash, the image of the pinned boot set the measurements match
 //   - the boot measurements (MRTD, RTMR0-2: firmware, its configuration and the VM shape, kernel, command line
 //     with the root filesystem hash, initramfs) are one of the pinned sets (BootMeasurements), for that OS image
-//   - on Google Cloud (only with Policy.WithGCP): the MRTD is a Google build we reviewed (pinned per set) that
-//     Google's signed firmware endorsement (gcetcb) also lists, and RTMR0-2 are a pinned GCP set whose firmware log
-//     holds the dstack UKI; Phala quotes never get this check
 //   - the VM's keys are made inside it at boot (key provider none), or in the explicit KMS fallback come from a
 //     pinned dstack KMS root (KMSRoots, the attested key-provider event): never keys a provider can derive at will
 //   - app-compose.json is exactly the release's, after a check of each setting on its own (appcompose.go: no
@@ -168,6 +168,9 @@ type Policy struct {
 	// browser, the chat Worker): a release with unlockd must attest agentd's key under proto.VersionAgent, so no
 	// unlock attestation passes as agentd's and no quote unlockd makes for agentd can ask a holder for a share.
 	KeyRelease bool
+	// RequireUnlockd (a split-key holder, review L3): the compose must have unlockd, the only service with dstack's
+	// socket. kmsd's release check doesn't set it (the KMS releases before v1 have no unlockd).
+	RequireUnlockd bool
 	// ReleaseFloor (vX.Y.Z) is the oldest signed VM release the release mode accepts on top of Release's minimum
 	// (a trust list's vm_release_floor); unused by the exact mode.
 	ReleaseFloor string
@@ -175,15 +178,15 @@ type Policy struct {
 	// may look up for the attested compose (ReleaseBundles), each verified as a built-in one; the release mode tries
 	// them when Bundle is empty. Unused by the exact mode.
 	Releases []safety.TrustRelease
+	// Machines are the machines a quote may come from (machines.go): nil = the built-in ones (MachineDocs minus
+	// MachinesRevoked). A trust list's (TrustState.Apply) or a holder's signed policy's (kms/split/holder) replace
+	// them. It stops a quote forged on a machine outside the list; it doesn't stop the host (FactMachine).
+	Machines *safety.MachineSet
 	// VerifyQuote checks a raw quote; nil = tdx.VerifyWith(Getter, Now) (needs Intel PCS). Tests replace it.
 	VerifyQuote func(ctx context.Context, raw []byte) (*tdx.Quote, error)
 	// Getter fetches Intel PCS collateral; nil = net/http straight to Intel. The browser (WebAssembly) build passes
 	// one that goes through the chat's same-origin relay; Intel's signatures on the collateral are still checked.
 	Getter trust.HTTPSGetter
-	// GoogleGetter fetches Google's firmware launch endorsements (internal/gcetcb), only for a quote whose RTMR0-2
-	// match a Google Cloud set (WithGCP); nil = net/http straight to Google's bucket. Google's signature is checked
-	// against the compiled-in root, so a relay or cache can withhold an endorsement but can't forge one.
-	GoogleGetter trust.HTTPSGetter
 	// Now is when certificates and collateral must be valid; zero = now. Only tests set it (recorded collateral).
 	Now time.Time
 	// legacy (tests only) checks recordings from before app-compose pinning: keys from a pinned KMS root, the old
@@ -338,6 +341,10 @@ func Verify(ctx context.Context, att *proto.Attestation, nonce []byte, p Policy)
 	if !r.add("TCB up to date, debug off", err, quote.TcbStatus+" (platform and TDX module), QE "+quote.QeStatus) {
 		return failed()
 	}
+	// The machine allowlist (V1-DESIGN §3), on the PCK certificate whose chain to Intel was just checked.
+	if !r.checkMachine(ctx, quote, att, p) {
+		return failed()
+	}
 	err = nil
 	label, want := proto.Version, proto.ReportData(nonce, key)
 	if att.Version == proto.VersionAgent && !p.KeyRelease { // a release with unlockd (the keys plan §11.2); see checkUnlockd
@@ -388,22 +395,6 @@ func Verify(ctx context.Context, att *proto.Attestation, nonce []byte, p Policy)
 		sets = BootMeasurements
 	}
 	osHash, hasOSEvent := rt.Values["os-image-hash"]
-	// Google Cloud (WithGCP): a quote whose RTMR0-2 match a GCP set gets one more check, and that set's MRTD becomes
-	// the quote's once Google's signed endorsement lists it. A quote that matches no GCP set (every Phala quote) skips
-	// this: no fetch, no extra check, the same checks as before.
-	sets, gcpSet, gcpDetail, err := gcpBoot(ctx, quote, ev, sets, kp, hasOSEvent, p.GoogleGetter, p.Now)
-	if gcpSet != nil {
-		// What the measurements show, not where the VM runs: any TDX host loading Google's firmware with the same
-		// inputs measures the same (review L2). Nothing should decide on it.
-		r.Facts["boot chain"] = "Google's TDX firmware and the dstack UKI (a GCP set; the host itself isn't attested)"
-		r.Facts[FactPlatformSet] = PlatformDstackGCP
-		if err == nil {
-			r.Facts["firmware"] = gcpDetail
-		}
-		if !r.add(GCPBootCheck, err, gcpDetail) {
-			return failed()
-		}
-	}
 	err = nil
 	osDetail, osCheck := "", OSImageCheck
 	if !hasOSEvent && keysMadeInVM(kp) {
@@ -469,8 +460,8 @@ func Verify(ctx context.Context, att *proto.Attestation, nonce []byte, p Policy)
 		} else if len(pinnedBytes) == 0 {
 			pinErr = errors.New("no pinned app-compose.json (the release's) to check against")
 		} else if pinned, pinErr = parseAppCompose(pinnedBytes); pinErr == nil {
-			// The Fix B switch-over (overlap.go, the no-downtime plan row 27): a Fix B build takes the KMS mode only for
-			// an overlap release's exact app-compose.json, and only where nothing is released to the VM.
+			// The Fix B switch-over (overlap.go, the no-downtime plan row 27): a Fix B build takes the KMS mode only for an overlap
+			// release's exact app-compose.json, and only where nothing is released to the VM.
 			allowKMS := p.KMSFallback
 			if overlapAllowed(p) {
 				var o *KMSOverlapRelease
@@ -727,6 +718,10 @@ func Verify(ctx context.Context, att *proto.Attestation, nonce []byte, p Policy)
 		}
 	}
 	if !r.checkImages(ac.DockerComposeFile, level, p.Services) {
+		return failed()
+	}
+	if p.RequireUnlockd && !HasUnlockd(ac.DockerComposeFile) {
+		r.add(UnlockdCheck, errors.New("a split-key holder releases shares only to a release with unlockd"), "")
 		return failed()
 	}
 	if !r.checkUnlockd(ac.DockerComposeFile, ac.PreLaunchScript, mode, att.Version, p.KeyRelease) {

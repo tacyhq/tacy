@@ -26,6 +26,7 @@ import (
 	"github.com/tacyhq/tacy/kms/split"
 	"github.com/tacyhq/tacy/proto"
 	"github.com/tacyhq/tacy/safety"
+	"github.com/tacyhq/tacy/verifier"
 )
 
 // The tests run the holders against a real recorded attestation, as kmsd's do (kms/server rig_test.go):
@@ -121,6 +122,35 @@ func editEvents(t testing.TB, quote json.RawMessage, set map[string]string) json
 	return out
 }
 
+// unlockdCompose is the release's compose.yaml (with unlockd: a holder releases shares only to such a release, review
+// L3) in the KMS fallback's form the recorded quote boots (no -key-mode none, no host-tmpfs task queue), its pinned
+// KMS id the rig's.
+func unlockdCompose(t testing.TB, kmsID string) string {
+	t.Helper()
+	b, err := os.ReadFile("../../../compose.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := string(b)
+	for _, cut := range []string{"      - " + verifier.TasksDir + ":" + verifier.TasksDir + "\n", "      - " + verifier.TasksDir + ":" + verifier.TasksDir + "\n",
+		`, "-dir", "` + verifier.TasksDir + `=10003:10003:0700"`, `, "-tasks-dir", "` + verifier.TasksDir + `"`} {
+		c = strings.Replace(c, cut, "", 1)
+	}
+	for _, cut := range []string{"      - " + verifier.UnlockCacheDir + ":" + verifier.UnlockCacheDir + "\n",
+		`, "-dir", "` + verifier.UnlockCacheDir + `=10005:10005:0700"`, `, "-key-mode", "none"`} {
+		if !strings.Contains(c, cut) {
+			t.Fatalf("compose.yaml has no %q", cut)
+		}
+		c = strings.Replace(c, cut, "", 1)
+	}
+	i := strings.Index(c, `"-kms-key", "`)
+	if i < 0 {
+		t.Fatal("compose.yaml has no -kms-key")
+	}
+	j := strings.Index(c[i+len(`"-kms-key", "`):], `"`)
+	return strings.ReplaceAll(c, c[i+len(`"-kms-key", "`):i+len(`"-kms-key", "`)+j], kmsID)
+}
+
 // releaseCompose is the recording's compose as a release has it: no diag service, every named volume in memory.
 func releaseCompose(t testing.TB, dc string) string {
 	t.Helper()
@@ -189,7 +219,8 @@ func newRig(t *testing.T, ids []string, threshold int) *rig {
 		t.Fatal(err)
 	}
 	dc, _ := kms.DockerCompose(ac)
-	r.vmCompose = releaseCompose(t, dc)
+	_ = dc
+	r.vmCompose = unlockdCompose(t, r.kmsID)
 	q, info, acHash := r.variant(func(m map[string]any) { m["docker_compose_file"] = r.vmCompose })
 	r.vm = &evidence{quote: q, info: info}
 
@@ -225,10 +256,30 @@ func newRig(t *testing.T, ids []string, threshold int) *rig {
 	for _, h := range ids {
 		r.pol.Holders = append(r.pol.Holders, split.HolderURL{Holder: h, URL: "https://" + h + ".holder.test"})
 	}
+	// The machine allowlist: the recorded quote's node (prod5) and prod9, certified by the rig's KMS id.
+	r.pol.MachineCerts = []safety.SignedMachineCert{r.machineCert(prod5, r.now.Add(-48*time.Hour)), r.machineCert(prod9, r.now.Add(-48*time.Hour))}
 	for _, h := range ids {
 		r.holders[h] = r.newHolder(h, nil)
 	}
 	return r
+}
+
+// Phala's prod5 (the recorded quote's node) and prod9.
+const (
+	prod5 = "3e306e133b7fdaa7bb79f67634cb520c"
+	prod9 = "62d54040cb9dfc08bb13006fa75ece56"
+)
+
+// machineCert is a Phala machine certificate signed by the rig's KMS id.
+func (r *rig) machineCert(ppid string, at time.Time) safety.SignedMachineCert {
+	r.t.Helper()
+	c, err := split.NewMachineCert(r.master, r.kmsID, safety.MachineDoc{Type: safety.MachineType, Platform: "dstack",
+		Host: safety.MachineHostPhala, Mode: safety.MachineModePPID, PPID: ppid, FMSPC: "20a06f000000", Label: "phala " + ppid[:4],
+		IssuedAt: at})
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	return *c
 }
 
 func (r *rig) clock() time.Time {
@@ -245,7 +296,12 @@ func (r *rig) advance(d time.Duration) {
 
 // variant is the release VM with its app-compose.json edited (quote and RTMR3 consistent).
 func (r *rig) variant(edit func(map[string]any)) (json.RawMessage, json.RawMessage, string) {
-	info, ac := editAppCompose(r.t, r.recInfo, edit)
+	info, ac := editAppCompose(r.t, r.recInfo, func(m map[string]any) {
+		edit(m)
+		if dc, _ := m["docker_compose_file"].(string); verifier.HasUnlockd(dc) {
+			m["pre_launch_script"] = verifier.MemoryRootScript // the split-key unlock in the KMS fallback (unlockd.go)
+		}
+	})
 	return editEvents(r.t, r.recQuote, map[string]string{"compose-hash": sum(ac)}), info, sum(ac)
 }
 

@@ -19,13 +19,16 @@ import (
 //     KMSOverlapReleases entry's, whose docker compose's sha256 is that entry's too, which has no unlockd (the Fix B
 //     shape) and asks for key_provider kms. Any other KMS-mode pin is refused as before ("allowed only in the explicit
 //     KMS fallback"), so the KMS mode can't reach a Fix B release or any other compose.
-//   - Only for a verifier that releases nothing (a browser, the apps, the chat Worker, the test tools: no KeyRelease,
-//     no RequireUnlockd) and pins the release by its bytes (Policy.AppCompose, or release mode's own pin), never by
-//     a hash list (kmsd's, a holder's signed policy): those keep their signed kms_fallback switch.
+//   - Only for a verifier that doesn't check a key release (no KeyRelease, no RequireUnlockd: a browser, the apps, the
+//     test tools, and the chat Worker, which then pushes the v0.20.0 VM its API keys after this check, as it does
+//     today) and pins the release by its bytes (Policy.AppCompose, or release mode's own pin), never by a hash list
+//     (kmsd's, a holder's signed policy): those keep their signed kms_fallback switch.
 //   - Every other check runs on that release as on any KMS-fallback one: the pinned KMS root (KMSRoots) in the
 //     attested key-provider event and as key_provider_id, nothing on the disk (memory volumes only), no deployer env,
 //     the app-compose flags, the image digests and the old denylist for a compose without unlockd, the boot set, the
-//     OS image, the machine. A release-mode verifier also requires the signed release's version to be the entry's.
+//     OS image, and the machine where the verifier has the machine check. A release-mode verifier also requires the
+//     signed release's version to be the entry's, and the version floors (the chat's min_version, a trust list's
+//     vm_release_floor) must stay at or below it, or the overlap ends there (fails closed).
 //   - Until KMSOverlapUntil, the removal date (kms.KMSFallbackRemoveBy): from then a client refuses it, whatever it
 //     was built with. The Worker answers app builds older than the overlap with the update text from the same date.
 //
@@ -66,7 +69,7 @@ func sha256Hex(b []byte) string {
 
 // overlapAllowed: the policy is one the overlap may apply to (see the top of this file).
 func overlapAllowed(p Policy) bool {
-	return !p.KMSFallback && !p.KeyRelease && len(p.AppComposeSHA256) == 0 && !p.legacy // no RequireUnlockd in this verifier yet (a holder's)
+	return !p.KMSFallback && !p.KeyRelease && !p.RequireUnlockd && len(p.AppComposeSHA256) == 0 && !p.legacy
 }
 
 // kmsOverlap is the overlap release pinned exactly as pinnedBytes, or nil when pinnedBytes isn't one (no error). An

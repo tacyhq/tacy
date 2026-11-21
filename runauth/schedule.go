@@ -34,8 +34,10 @@ const (
 	NotifyLabel = "tacy/v2/notify-set"
 	// Connections (app/connections.go, the connections contract, v0.19.0): list (no own items), put (the connection, then the
 	// hex SHA-256 of the sealed box's enc ‖ ct) and remove (the connection).
-	ConnListLabel   = "tacy/v2/connection-list"
-	ConnPutLabel    = "tacy/v2/connection-put"
+	ConnListLabel = "tacy/v2/connection-list"
+	ConnPutLabel  = "tacy/v2/connection-put"
+	// ConnTestLabel (v1, the v1 design §5.4): Settings' test login, nothing kept; own items as put's.
+	ConnTestLabel   = "tacy/v2/connection-test"
 	ConnRemoveLabel = "tacy/v2/connection-remove"
 )
 

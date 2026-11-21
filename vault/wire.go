@@ -45,6 +45,7 @@ func writeFrame(w io.Writer, v any) error {
 	if err != nil {
 		return err
 	}
+	defer clear(b) // a lease's frame holds the secret (base64): zeroed, as the copy below is (review 2, L7)
 	if len(b) > maxFrame {
 		return errors.New("vault: frame too large")
 	}
@@ -153,8 +154,10 @@ func (v *Vault) serveConn(c net.Conn, peerUID int) {
 			}
 		case "secrets_status":
 			rep = v.secretsOp(r)
-		case "conn_key", "conn_put", "conn_commit", "conn_discard", "conn_get", "conn_list", "conn_remove":
+		case "conn_key", "conn_put", "conn_discard", "conn_list", "conn_remove":
 			rep = v.connOp(r)
+		case "run_put", "run_info", "run_end":
+			rep = v.runOp(r)
 		default:
 			return // unknown op: closed, like any malformed frame
 		}
@@ -167,21 +170,26 @@ func (v *Vault) serveConn(c net.Conn, peerUID int) {
 	}
 }
 
+// connOpFail is a refused connection op's reply: the vault error's text and its detail (never a value).
+func (v *Vault) connOpFail(err error) reply {
+	rep := reply{Error: err.Error()}
+	for _, k := range append(connKnown, known...) {
+		if errors.Is(err, k) {
+			rep.Error = k.Error()
+			if d, ok := strings.CutPrefix(err.Error(), k.Error()+": "); ok {
+				rep.Detail = d
+			}
+			break
+		}
+	}
+	return rep
+}
+
 // connOp answers a connection op (conn.go). A request carries only the fields its op needs.
 func (v *Vault) connOp(r Request) reply {
-	fail := func(err error) reply {
-		rep := reply{Error: err.Error()}
-		for _, k := range connKnown {
-			if errors.Is(err, k) {
-				rep.Error = k.Error()
-				if d, ok := strings.CutPrefix(err.Error(), k.Error()+": "); ok {
-					rep.Detail = d
-				}
-			}
-		}
-		return rep
-	}
-	extra := r.Secret != "" || r.Connector != "" || r.Host != "" || r.Task != "" || r.Action != "" || r.Effect || len(r.Docs) > 0
+	fail := v.connOpFail
+	extra := r.Secret != "" || r.Connector != "" || r.Host != "" || r.Task != "" || r.Action != "" || r.Effect || len(r.Docs) > 0 ||
+		r.Run != nil
 	if extra {
 		return reply{Error: ErrBadRequest.Error()}
 	}
@@ -200,21 +208,9 @@ func (v *Vault) connOp(r Request) reply {
 			return fail(err)
 		}
 		return reply{Pending: pid, Info: &info}
-	case "conn_commit":
-		info, err := v.ConnCommit(r.Pending)
-		if err != nil {
-			return fail(err)
-		}
-		return reply{Info: &info}
 	case "conn_discard":
 		v.ConnDiscard(r.Pending)
 		return reply{}
-	case "conn_get":
-		info, err := v.ConnGet(r.Space, r.Conn)
-		if err != nil {
-			return fail(err)
-		}
-		return reply{Info: &info}
 	case "conn_list":
 		return reply{Infos: v.ConnList(r.Space), Key: v.SealKey()}
 	case "conn_remove":
@@ -226,11 +222,47 @@ func (v *Vault) connOp(r Request) reply {
 	return reply{Error: ErrBadRequest.Error()}
 }
 
+// runOp answers a per-task login op (runcred.go). A request carries only the fields its op needs.
+func (v *Vault) runOp(r Request) reply {
+	fail := func(err error) reply { return v.connOpFail(err) }
+	if r.Secret != "" || r.Connector != "" || r.Host != "" || r.Action != "" || r.Effect || len(r.Docs) > 0 || r.Conn != "" ||
+		r.Pending != "" || r.Sealed != nil {
+		return reply{Error: ErrBadRequest.Error()}
+	}
+	switch r.Op {
+	case "run_put":
+		if r.Run == nil || r.Task != "" || r.Space != "" {
+			return reply{Error: ErrBadRequest.Error()}
+		}
+		info, err := v.RunCredPut(*r.Run)
+		if err != nil {
+			return fail(err)
+		}
+		return reply{Info: &info}
+	case "run_info":
+		if r.Run != nil {
+			return reply{Error: ErrBadRequest.Error()}
+		}
+		info, err := v.RunCredInfo(r.Task, r.Space)
+		if err != nil {
+			return fail(err)
+		}
+		return reply{Info: &info}
+	case "run_end":
+		if r.Run != nil || r.Space != "" {
+			return reply{Error: ErrBadRequest.Error()}
+		}
+		v.RunCredEnd(r.Task)
+		return reply{}
+	}
+	return reply{Error: ErrBadRequest.Error()}
+}
+
 // secretsOp answers a secrets op (secrets.go): the status only (the names held). The secrets themselves come from
 // the key service's release in vaultd's own process, never over a socket.
 func (v *Vault) secretsOp(r Request) reply {
 	if r.Secret != "" || r.Connector != "" || r.Host != "" || r.Task != "" || r.Action != "" || r.Effect || len(r.Docs) > 0 ||
-		r.Space != "" || r.Conn != "" || r.Pending != "" || r.Sealed != nil || r.Op != "secrets_status" {
+		r.Space != "" || r.Conn != "" || r.Pending != "" || r.Sealed != nil || r.Run != nil || r.Op != "secrets_status" {
 		return reply{Error: ErrBadRequest.Error()}
 	}
 	st := v.SecretsStatus()
@@ -317,27 +349,15 @@ func (c *Client) ConnPut(ctx context.Context, space, id string, s Sealed) (strin
 	return rep.Pending, *rep.Info, nil
 }
 
-// ConnCommit keeps a pending connection.
-func (c *Client) ConnCommit(ctx context.Context, pending string) (ConnInfo, error) {
-	rep, err := c.conn(ctx, Request{Op: "conn_commit", Pending: pending})
-	if err != nil {
-		return ConnInfo{}, err
-	}
-	if rep.Info == nil {
-		return ConnInfo{}, errors.New("vault: empty reply")
-	}
-	return *rep.Info, nil
-}
-
 // ConnDiscard drops a pending connection.
 func (c *Client) ConnDiscard(ctx context.Context, pending string) error {
 	_, err := c.conn(ctx, Request{Op: "conn_discard", Pending: pending})
 	return err
 }
 
-// ConnGet is a space's connection's info.
-func (c *Client) ConnGet(ctx context.Context, space, id string) (ConnInfo, error) {
-	rep, err := c.conn(ctx, Request{Op: "conn_get", Space: space, Conn: id})
+// RunPut has the vault open a task's sealed mail login and hold it for that task.
+func (c *Client) RunPut(ctx context.Context, g RunGrant) (ConnInfo, error) {
+	rep, err := c.conn(ctx, Request{Op: "run_put", Run: &g})
 	if err != nil {
 		return ConnInfo{}, err
 	}
@@ -345,6 +365,24 @@ func (c *Client) ConnGet(ctx context.Context, space, id string) (ConnInfo, error
 		return ConnInfo{}, errors.New("vault: empty reply")
 	}
 	return *rep.Info, nil
+}
+
+// RunInfo is a task's mail login without its password (ErrLoginNeeded: none).
+func (c *Client) RunInfo(ctx context.Context, task, space string) (ConnInfo, error) {
+	rep, err := c.conn(ctx, Request{Op: "run_info", Task: task, Space: space})
+	if err != nil {
+		return ConnInfo{}, err
+	}
+	if rep.Info == nil {
+		return ConnInfo{}, errors.New("vault: empty reply")
+	}
+	return *rep.Info, nil
+}
+
+// RunEnd forgets a task's mail login.
+func (c *Client) RunEnd(ctx context.Context, task string) error {
+	_, err := c.conn(ctx, Request{Op: "run_end", Task: task})
+	return err
 }
 
 // ConnList is a space's connections and the seal key.

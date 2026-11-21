@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -29,6 +30,8 @@ import (
 //	platform:<name>                    an attestation platform (when the policy names platforms)
 //	tcb-grace:<sha256 of the grace>    a TCB grace
 //	floor:<scope>:<vX.Y.Z>             a floor: scope "*" (the policy's) or an app; lowering one is an expansion
+//	mrevoked:<sha256>                  a revoked machine certificate (machines_revoked): permanent, a store never
+//	                                   marks one withdrawn (so never prunes it); not something a VM relies on
 //	other:<sha256>                     the catch-all: every field that has no item of its own (OtherItem); every
 //	                                   VM relies on it, so a change to any of them waits too (by construction, not
 //	                                   one item per field found)
@@ -43,6 +46,8 @@ const (
 	ItemTCBGrace  = "tcb-grace:"
 	ItemFloor     = "floor:"
 	ItemOther     = "other:"
+	// ItemMachineRevoked items are permanent in every PolicyStore: Apply never marks one withdrawn.
+	ItemMachineRevoked = "mrevoked:"
 )
 
 // PolicyItems are the items policy p allows, sorted.
@@ -79,9 +84,12 @@ func PolicyItems(p *UnlockPolicy) []string {
 			add(FloorItem(name, a.Floor))
 		}
 	}
+	for _, h := range p.MachinesRevoked {
+		add(ItemMachineRevoked + h)
+	}
 	add(OtherItem(p))
 	sort.Strings(out)
-	return out
+	return slices.Compact(out)
 }
 
 // ReleaseItem is a release pin's item: the sha256 of the whole pin.
@@ -94,13 +102,15 @@ func ReleaseItem(r kms.ReleasePin) string {
 // OtherItem is the catch-all item: the sha256 of the policy with every field that has its own item, or that can't
 // widen what unlocks, taken out (seq, issued_at; the KMS id and epoch; the share sets and epoch certificates, signed
 // by the KMS id; the holders and the break-glass relay, which can only refuse; the emergency override, checked on its
-// own; release pins, OS images, boot sets, pre-launch scripts, KMS roots, the fallback flag, platforms, the TCB grace
+// own; the machine certificates, signed by the KMS id, and their revocations, which only narrow; release pins, OS
+// images, boot sets, pre-launch scripts, KMS roots, the fallback flag, platforms, the TCB grace
 // and floors, which have items). Everything else (apps and their grants, the key service pins, secrets_floor,
 // worker keys, e2e overlays, start-ticket keys, witnesses, next admin keys, and any field added later) is in it.
 func OtherItem(p *UnlockPolicy) string {
 	q := *p
 	q.Seq, q.IssuedAt, q.KMSID, q.Epoch = 0, time.Time{}, "", 0
 	q.ShareSets, q.EpochCerts, q.Holders, q.BreakGlass, q.Emergency = nil, nil, nil, "", nil
+	q.MachineCerts, q.MachinesRevoked = nil, nil // KMS-id signed, and revocations only narrow (no delay, F3)
 	q.Releases, q.OSImages, q.Boot, q.PreLaunch, q.KMSRoots, q.KMSFallback, q.Platforms, q.TCBGrace, q.Floor = nil, nil, nil, nil, nil, false, nil, nil, ""
 	if p.Apps != nil {
 		q.Apps = map[string]kms.AppPolicy{}

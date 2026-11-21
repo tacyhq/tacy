@@ -312,6 +312,40 @@ func Personal(d *Definition, space, seal, who string) error {
 	return nil
 }
 
+// The rule of two at install (the v1 design §5.6 R1): private mail and the open web never meet in a run nobody
+// watches. A definition that lists a mail tool with a web tool is refused (ErrMailAndWeb); in v1 any mail tool is
+// (ErrMailBackgroundLater), until background email ships with per-user keys. A mail kind in allow counts as listed.
+var (
+	ErrMailAndWeb          = errors.New("mail_and_web: a schedule that reads the person's email can't also use the web (web.search, web.fetch, web.images)")
+	ErrMailBackgroundLater = errors.New("mail_background_later: scheduled runs can't read email in this version of Tacy")
+)
+
+// CheckMailTools is R1 for a verified definition.
+func CheckMailTools(d *Definition) error {
+	mail, web := false, false
+	note := func(n string) {
+		switch {
+		case strings.HasPrefix(n, "mail."):
+			mail = true
+		case n == "web.search" || n == "web.fetch" || n == "web.images":
+			web = true
+		}
+	}
+	for _, t := range d.Tools {
+		note(t)
+	}
+	for k := range d.Allow {
+		note(k)
+	}
+	switch {
+	case mail && web:
+		return ErrMailAndWeb
+	case mail:
+		return ErrMailBackgroundLater
+	}
+	return nil
+}
+
 // PersonalTools are the tools a personal schedule may use: web reads, a document for the person, and (v0.19.0) the
 // person's own email, read-only.
 var PersonalTools = []string{"web.fetch", "web.search", "web.images", "document.create", "mail.search", "mail.read", "mail.folders"}

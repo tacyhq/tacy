@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -433,6 +434,11 @@ func TestApproveKMSFallbackRemovalDate(t *testing.T) {
 		{"after the date, flag off", kms.KMSFallbackRemoveBy.Add(24 * time.Hour), false, true},
 	} {
 		t.Run(c.name, func(t *testing.T) {
+			if c.ok && c.fallback && !time.Now().Before(kms.KMSFallbackRemoveBy) {
+				// checkUnlockPolicy dates the check at the later of the policy's issue time and the wall clock (an
+				// old or fed time never signs the fallback past the date), so the wall clock is past the date here.
+				t.Skipf("the wall clock is past %s: kmsctl refuses the fallback whatever time it is given", kms.KMSFallbackRemoveBy.Format(time.DateOnly))
+			}
 			d, err := splitdev.New([]string{"cloudflare", "vercel"}, 2, c.at.Add(-time.Hour))
 			if err != nil {
 				t.Fatal(err)
@@ -475,7 +481,7 @@ func TestApproveTrustEmergency(t *testing.T) {
 	if err := attachEmergency(np, d.Master, []releaseSpec{add}, nil, "CVE fix", now); err != nil {
 		t.Fatal(err)
 	}
-	if err := attachTrustEmergency(ntl, d.Master, np.KMSID, []releaseSpec{add}, nil, "CVE fix", now); err != nil {
+	if err := attachTrustEmergency(ntl, nil, d.Master, np.KMSID, []releaseSpec{add}, nil, "CVE fix", now); err != nil {
 		t.Fatal(err)
 	}
 	em, err := ntl.OpenEmergency(d.IDPub)
@@ -497,7 +503,7 @@ func TestApproveTrustEmergency(t *testing.T) {
 	// Another M: refused.
 	other := make([]byte, kms.MasterSize)
 	rand.Read(other)
-	if err := attachTrustEmergency(ntl, other, np.KMSID, []releaseSpec{add}, nil, "x", now); err == nil {
+	if err := attachTrustEmergency(ntl, nil, other, np.KMSID, []releaseSpec{add}, nil, "x", now); err == nil {
 		t.Fatal("a trust override from another M")
 	}
 	// The next approve drops it.
@@ -537,5 +543,75 @@ func TestSecretsEnvelope(t *testing.T) {
 	}
 	if unlockSecretsPath != "/api/vm/unlock-secrets" {
 		t.Fatal(unlockSecretsPath)
+	}
+}
+
+// holder-push also posts the policy to each holder's provider-native address (vercel.app, run.app), read
+// from a local native-addresses.json, never the policy, so Cloudflare's tacy.io DNS isn't the only route. A holder
+// counts when one route took it; none: the push fails. Every holder but Cloudflare needs a native address.
+func TestHolderPushNativeRoutes(t *testing.T) {
+	holders := []split.HolderURL{{Holder: "cloudflare", URL: "https://keys-cf.tacy.io"}, {Holder: "vercel", URL: "https://keys-v.tacy.io"},
+		{Holder: "gcp", URL: "https://keys-g.tacy.io"}}
+	file := func(body string) string {
+		p := filepath.Join(t.TempDir(), "native-addresses.json")
+		os.WriteFile(p, []byte(body), 0o644)
+		return p
+	}
+	good := `{"vercel": "https://tacy-key-holder.vercel.app", "gcp": "https://gcp-holder-abc123-uw.a.run.app/"}`
+	native, err := readNative(file(good), holders)
+	if err != nil || native["vercel"] != "https://tacy-key-holder.vercel.app" || native["gcp"] != "https://gcp-holder-abc123-uw.a.run.app" {
+		t.Fatalf("native addresses: %v %v", native, err)
+	}
+	for name, body := range map[string]string{
+		"vercel on tacy.io":  `{"vercel": "https://keys-v.tacy.io", "gcp": "https://x.run.app"}`,
+		"gcp on vercel.app":  `{"vercel": "https://p.vercel.app", "gcp": "https://x.vercel.app"}`,
+		"no gcp":             `{"vercel": "https://p.vercel.app"}`,
+		"http":               `{"vercel": "http://p.vercel.app", "gcp": "https://x.run.app"}`,
+		"a path":             `{"vercel": "https://p.vercel.app/api", "gcp": "https://x.run.app"}`,
+		"a look-alike host":  `{"vercel": "https://p.vercel.app.evil.io", "gcp": "https://x.run.app"}`,
+		"the bare suffix":    `{"vercel": "https://vercel.app", "gcp": "https://x.run.app"}`,
+		"an unknown holder":  `{"vercel": "https://p.vercel.app", "gcp": "https://x.run.app", "aws": "https://x.aws"}`,
+		"not a map of names": `{"vercel": 1}`,
+	} {
+		if _, err := readNative(file(body), holders); err == nil {
+			t.Errorf("%s: taken", name)
+		}
+	}
+
+	// The push: tacy.io down for every holder (a hostile or failed Cloudflare DNS) still reaches Vercel and Google
+	// at their native addresses; Cloudflare's own holder has no other route, so the push fails for it alone.
+	var asked []string
+	up := map[string]bool{"https://tacy-key-holder.vercel.app": true, "https://gcp-holder-abc123-uw.a.run.app": true}
+	do := func(_ context.Context, base string, body []byte) ([]byte, error) {
+		asked = append(asked, base)
+		if !up[base] {
+			return nil, errors.New("no answer")
+		}
+		return []byte(`{"policy_seq":2}`), nil
+	}
+	var out strings.Builder
+	err = pushHolders(context.Background(), do, []byte("{}"), holders, native, &out)
+	if err == nil || !strings.Contains(err.Error(), "at cloudflare") || strings.Contains(err.Error(), "vercel") || strings.Contains(err.Error(), "gcp") {
+		t.Fatalf("push with tacy.io down: %v\n%s", err, out.String())
+	}
+	if len(asked) != 5 {
+		t.Fatalf("routes asked: %v (want each holder's tacy.io URL, and Vercel's and Google's native addresses)", asked)
+	}
+	up["https://keys-cf.tacy.io"] = true
+	asked = nil
+	if err := pushHolders(context.Background(), do, []byte("{}"), holders, native, &out); err != nil {
+		t.Fatalf("push: %v\n%s", err, out.String())
+	}
+	// Both routes are pushed, also when the first one answers.
+	up["https://keys-v.tacy.io"], up["https://keys-g.tacy.io"] = true, true
+	asked = nil
+	pushHolders(context.Background(), do, []byte("{}"), holders, native, &out)
+	if len(asked) != 5 {
+		t.Fatalf("routes asked with all up: %v", asked)
+	}
+	// Both routes of one holder down: the push fails for it.
+	up["https://tacy-key-holder.vercel.app"], up["https://keys-v.tacy.io"] = false, false
+	if err := pushHolders(context.Background(), do, []byte("{}"), holders, native, &out); err == nil || !strings.Contains(err.Error(), "vercel") {
+		t.Fatalf("vercel unreachable on both routes: %v", err)
 	}
 }

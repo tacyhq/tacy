@@ -18,7 +18,7 @@ package main
 //	    a holder's key: the private key (base64) on stdout, which must be a pipe (into wrangler secret put or vercel
 //	    env add --sensitive), never a terminal or a file; its recipient string on stderr.
 //	kmsctl unlock-policy -kms-id ID -seq N -floor vX.Y.Z -holders ID=URL[,ID=URL] -share-set F [-share-set F] [-break-glass URL]
-//	        [-from-kms-policy P.signed.json] [-base U.json]
+//	        [-from-kms-policy P.signed.json] [-base U.json] [-machine-cert F ...]
 //	    an unsigned kms-unlock-policy (stdout): from a base, or from the key service's signed kms-policy (its pins,
 //	    floors, OS images, boot sets and apps), with the holders, share sets and break-glass relay given.
 //	kmsctl approve -base U.json [-release app=APP,version=vX.Y.Z,app-compose=F,compose=F] [-remove vX.Y.Z]
@@ -34,11 +34,28 @@ package main
 //	    the next unlock policy (seq + 1; a release added or removed) and, with -trust-base, the next trust list with
 //	    the same release added or removed, both signed in one session: DIR/unlock-policy-<seq>.signed.json and
 //	    DIR/trust-list-<seq>.signed.json.
+//	    -machine-cert F (repeat) adds a machine certificate (machine-cert's output) to the policy and the trust list;
+//	    -revoke-machine HASH|F (repeat) revokes one: its hash joins machines_revoked in both, for good (holders keep
+//	    every revocation they have seen, clients the union of every list), and the certificate leaves machine_certs.
+//	    Both take only the admin keys: a certificate is already the KMS id's, and an admin key alone can revoke but
+//	    never re-allow (a revoked machine needs a new certificate). With only these (nothing else changed), the next
+//	    seq of both documents carries the change. With -trust-base, the trust list always carries the policy's
+//	    machine_certs and the union of both documents' machines_revoked.
+//	kmsctl machine-cert -kms-id ID -share S -key pass -share S -key pass (-builtin prod5|prod9 | -ppid HEX -fmspc HEX
+//	        -label "phala prodN") [-issued-at T] -out F
+//	    a machine certificate (V1-DESIGN §3.2) signed by the KMS id (M from two passphrase shares; -dev-master for
+//	    staging): F (new) and its hash on stdout. -builtin signs exactly the document this build has built in
+//	    (verifier.MachineDocs, issued 2026-11-21), so the certificate's hash is the built-in one's. Every certificate
+//	    is one Phala machine (host phala, mode ppid); the Google Cloud host modes are gone (the v1 Google host removal).
 //	kmsctl sign -kind kms-unlock-policy -key K DOC.json   (checked as an unlock policy first)
-//	kmsctl holder-push -in U.signed.json -worker URL [-url HOLDER_URL]
+//	kmsctl holder-push -in U.signed.json -worker URL -native native-addresses.json [-url HOLDER_URL]
 //	    in order: the Worker first (POST /api/vm/unlock-policy), then a check that a VM's fetch (GET) returns that
-//	    seq, then POST /v1/policy to every holder the policy names (or one). A security withdrawal also raises every
-//	    holder's PolicyFloor at its next deploy.
+//	    seq, then POST /v1/policy to every holder the policy names (or one, -url) at its tacy.io URL and at its
+//	    provider-native address (vercel.app for Vercel, run.app for Google), so Cloudflare, which runs
+//	    tacy.io's DNS, isn't the only route to a holder. The native addresses come from the local file -native
+//	    (never from the policy: gatewayd refuses holder URLs off tacy.io). Every holder but Cloudflare must have one,
+//	    and the push fails unless each holder took the policy on at least one route. Signed receipts come later. A
+//	    security withdrawal also raises every holder's PolicyFloor at its next deploy.
 //	kmsctl split-dev -holders cloudflare,vercel -threshold 2 -out DIR   staging files (dev KMS id, dev keys)
 //	kmsctl break-glass -relay URL -policy U.signed.json -admin-keys A -sign-key K -share S -key pass -share S -key pass [-boots 1]
 //	    emergency only: rebuilds M from two passphrase shares, attaches to the relay with an admin-signed document and
@@ -57,7 +74,9 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"maps"
+	neturl "net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -80,7 +99,7 @@ import (
 )
 
 // splitCommands are the commands this file serves.
-var splitCommands = []string{"resplit", "secrets-seal", "secrets-push", "holder-keygen", "unlock-policy", "approve", "holder-push", "split-dev", "break-glass"}
+var splitCommands = []string{"resplit", "secrets-seal", "secrets-push", "holder-keygen", "unlock-policy", "approve", "holder-push", "split-dev", "break-glass", "machine-cert"}
 
 // splitMain runs a split-key command.
 func splitMain(cmd string, args []string) {
@@ -115,6 +134,7 @@ func splitMain(cmd string, args []string) {
 	breakGlass := fs.String("break-glass", "", "unlock-policy: the break-glass relay URL")
 	fromKMS := fs.String("from-kms-policy", "", "unlock-policy: the key service's signed kms-policy to take pins from")
 	base := fs.String("base", "", "the current unsigned unlock policy")
+	previous := fs.String("previous", "", "unlock-policy: the last unsigned unlock policy before (another admin-key generation's): its machine revocations carry over")
 	var releases, removes multi
 	fs.Var(&releases, "release", "approve: app=APP,version=vX.Y.Z,app-compose=FILE,compose=FILE")
 	fs.Var(&removes, "remove", "approve: a release version to withdraw")
@@ -125,11 +145,20 @@ func splitMain(cmd string, args []string) {
 	adminKeys := fs.String("admin-keys", "", "admin public keys (ed25519:<base64>, comma-separated)")
 	adminThreshold := fs.Int("admin-threshold", 1, "admin signatures needed")
 	url := fs.String("url", "", "holder-push: one holder's URL")
+	nativeFile := fs.String("native", "", "holder-push: native-addresses.json, each holder's provider-native address (required without -url)")
 	relay := fs.String("relay", "", "break-glass: the relay URL")
 	policyPath := fs.String("policy", "", "break-glass: the current signed unlock policy")
 	boots := fs.Int("boots", 1, "break-glass: unlocks to serve before exiting")
 	devMaster := fs.String("dev-master", "", "staging only: a dev M (base64) instead of passphrase shares")
 	staleTCB := fs.Bool("allow-stale-tcb", false, "break-glass: accept a TCB status other than UpToDate")
+	var machineCerts, revokeMachines multi
+	fs.Var(&machineCerts, "machine-cert", "unlock-policy, approve: a machine certificate file (machine-cert's output), repeat")
+	fs.Var(&revokeMachines, "revoke-machine", "approve: a machine certificate's hash (or its file) to revoke for good, repeat")
+	builtin := fs.String("builtin", "", "machine-cert: prod5 or prod9, the document this build has built in")
+	ppid := fs.String("ppid", "", "machine-cert: the machine's PPID (16 bytes, hex)")
+	fmspc := fs.String("fmspc", "", "machine-cert: its FMSPC (6 bytes, hex)")
+	label := fs.String("label", "", `machine-cert: its label ("phala prod5")`)
+	issuedAt := fs.String("issued-at", "", "machine-cert: the issue time (RFC 3339; default now, -builtin its own)")
 	fs.BoolVar(&devPlainKeys, "dev-plain-keys", false, "development only: read plaintext (base64 seed) admin key files")
 	fs.Parse(args)
 	ctx := context.Background()
@@ -194,6 +223,20 @@ func splitMain(cmd string, args []string) {
 	case "unlock-policy":
 		p, err := unlockPolicy(*base, *fromKMS, *kmsIDStr, *seq, *floor, *holderURLs, shareSets, epochCerts, *breakGlass, now,
 			kms.AdminKeys{Keys: parseKeysOrNil(*adminKeys), Threshold: *adminThreshold})
+		if p != nil && len(machineCerts) > 0 { // every unlock policy needs machine certificates (machine-cert)
+			p.MachineCerts = readMachineCerts(machineCerts)
+			err = checkUnlockPolicy(p)
+		}
+		// A holder keeps machine revocations per admin-key generation (review2 L2): a policy for a new generation
+		// must carry every earlier one itself, or each holder forgets them.
+		if err == nil && *previous != "" {
+			var prev split.UnlockPolicy
+			readJSON(*previous, &prev)
+			err = carryRevocations(p, &prev)
+		} else if err == nil && *base == "" && len(p.MachinesRevoked) == 0 {
+			fmt.Fprintln(os.Stderr, "unlock-policy: no -base or -previous: no machine revocation carried over (a new admin-key generation's holders "+
+				"keep none of the old one's; pass -previous with the last policy unless this is the first)")
+		}
 		if err == nil {
 			err = pinBuilds(p, holderBuilds)
 		}
@@ -245,10 +288,17 @@ func splitMain(cmd string, args []string) {
 		}
 		var np *split.UnlockPolicy
 		var ntl *safety.TrustList
-		if expediteOnly(*emergency, emergencyItems, adds, removes, sets, grace) {
+		mAdd, mRevoke := readMachineCerts(machineCerts), revocationHashes(revokeMachines)
+		switch {
+		case expediteOnly(*emergency, emergencyItems, adds, removes, sets, grace):
 			np, err = nextSeq(p, now) // the override alone: a release pinned earlier unlocks at once from this seq
-		} else {
+		case len(adds) == 0 && len(removes) == 0 && len(sets) == 0 && grace == nil && (len(mAdd) > 0 || len(mRevoke) > 0):
+			np, ntl, err = nextSeqs(p, tl, now) // a machine change alone
+		default:
 			np, ntl, err = approve(p, tl, adds, removes, entry, sets, certs, grace, now)
+		}
+		if err == nil {
+			err = changeMachines(np, ntl, mAdd, mRevoke)
 		}
 		if err != nil {
 			die("%v", err)
@@ -258,7 +308,11 @@ func splitMain(cmd string, args []string) {
 			err := attachEmergency(np, m, adds, emergencyItems, *emergency, now)
 			if err == nil && ntl != nil {
 				// The same items in the trust list: clients take them at once too (their 24 h delay, safety/trustdelay.go).
-				err = attachTrustEmergency(ntl, m, np.KMSID, adds, emergencyItems, *emergency, now)
+				var prev []string
+				if tl != nil {
+					prev = tl.RevokedReleases
+				}
+				err = attachTrustEmergency(ntl, prev, m, np.KMSID, adds, emergencyItems, *emergency, now)
 			}
 			clear(m)
 			if err != nil {
@@ -291,26 +345,27 @@ func splitMain(cmd string, args []string) {
 		if *worker == "" {
 			die("holder-push: -worker URL (the Worker takes the policy first, so a VM fetches it before holders need it)")
 		}
+		targets := []split.HolderURL{{Holder: "holder", URL: *url}}
+		var native map[string]string
+		if *url == "" {
+			if *nativeFile == "" {
+				die("holder-push: -native native-addresses.json (each holder's provider-native address: Cloudflare must not be the only route)")
+			}
+			var err error
+			if native, err = readNative(*nativeFile, p.Holders); err != nil {
+				die("%v (nothing was pushed)", err)
+			}
+			targets = p.Holders
+		}
 		if err := pushWorker(ctx, client.HTTP{Base: *worker}, raw, p.Seq); err != nil {
 			die("%v (no holder was pushed)", err)
 		}
 		fmt.Printf("worker %s: serves policy seq %d\n", *worker, p.Seq)
-		targets := []split.HolderURL{{Holder: "holder", URL: *url}}
-		if *url == "" {
-			targets = p.Holders
+		do := func(ctx context.Context, base string, body []byte) ([]byte, error) {
+			return client.HTTP{Base: base}.Do(ctx, "POST", "/v1/policy", body)
 		}
-		failed := false
-		for _, h := range targets {
-			b, err := client.HTTP{Base: h.URL}.Do(ctx, "POST", "/v1/policy", raw)
-			if err != nil {
-				failed = true
-				fmt.Printf("%s %s: %v\n", h.Holder, h.URL, err)
-				continue
-			}
-			fmt.Printf("%s %s: %s\n", h.Holder, h.URL, strings.TrimSpace(string(b)))
-		}
-		if failed {
-			die("not every holder took policy seq %d (push again; holders that took it already refuse older ones)", p.Seq)
+		if err := pushHolders(ctx, do, raw, targets, native, os.Stdout); err != nil {
+			die("%v; policy seq %d (push again; holders that took it already refuse older ones)", err, p.Seq)
 		}
 	case "split-dev":
 		ids := strings.Split(*holderURLs, ",")
@@ -322,6 +377,28 @@ func splitMain(cmd string, args []string) {
 			die("%v", err)
 		}
 		fmt.Printf("dev KMS id %s, %d-of-%d across %s: %s\n", d.KMSID, *threshold, len(ids), *holderURLs, *out)
+	case "machine-cert":
+		if *out == "" {
+			die("machine-cert: -out F (a new file)")
+		}
+		doc, err := machineDoc(*builtin, *ppid, *fmspc, *label, *issuedAt, now)
+		if err != nil {
+			die("%v", err)
+		}
+		id := parseKMSID(*kmsIDStr)
+		if *devMaster != "" && kms.IDString(id) == verifier.ReleaseKMSID {
+			die("machine-cert: -dev-master is for staging; production takes two passphrase shares")
+		}
+		m := masterFrom(id, shares, keys, *devMaster)
+		c, err := split.NewMachineCert(m, kms.IDString(id), doc)
+		clear(m)
+		if err != nil {
+			die("%v", err)
+		}
+		if err := writeNew(*out, c); err != nil {
+			die("%v", err)
+		}
+		fmt.Printf("machine certificate %s (%s %s, PPID %s, FMSPC %s): %s\n", c.Hash(), doc.Host, doc.Label, orDash(doc.PPID), doc.FMSPC, *out)
 	case "break-glass":
 		var env safety.Envelope
 		readJSON(*policyPath, &env)
@@ -585,8 +662,20 @@ func checkUnlockPolicy(p *split.UnlockPolicy) error {
 	if err != nil {
 		return err
 	}
-	_, err = p.OpenShareSets(id)
-	return err
+	if _, err = p.OpenShareSets(id); err != nil {
+		return err
+	}
+	if _, err = p.OpenMachines(id); err != nil { // every certificate the KMS id's, every one a Phala machine
+		return err
+	}
+	// Fail closed on platforms (the v1 Google host removal): holders built from this tree check only dstack and refuse a policy
+	// naming any other (kms/split/holder), so kmsctl doesn't sign one ("dstack-gcp" included).
+	for _, pl := range p.Platforms {
+		if !verifier.KnownPlatform(pl) {
+			return fmt.Errorf("unlock policy: unknown platform %q (holders check only %q)", pl, safety.PlatformDstack)
+		}
+	}
+	return nil
 }
 
 // latest is the later of a document's issue time and now: a document dated before the removal date and signed
@@ -694,6 +783,12 @@ func approve(p split.UnlockPolicy, tl *safety.TrustList, adds []releaseSpec, rem
 			ntl.RevokedReleases = append(ntl.RevokedReleases, v)
 		}
 	}
+	// Approving a revoked version again (-release vX) is its un-revocation (review2 H1): it leaves revoked_releases
+	// here, and each client keeps it revoked for 24 h from when it first sees it left out (unrevoke:vX,
+	// safety/trustdelay.go), as each holder waits 24 h on the pin added again; -emergency expedites both.
+	ntl.RevokedReleases = slices.DeleteFunc(ntl.RevokedReleases, func(v string) bool {
+		return slices.ContainsFunc(adds, func(a releaseSpec) bool { return a.Version == v })
+	})
 	if entry != nil {
 		if !slices.ContainsFunc(adds, func(a releaseSpec) bool { return a.Version == entry.Version }) {
 			return nil, nil, fmt.Errorf("approve: the trust-release entry is %s, not a -release added", entry.Version)
@@ -730,9 +825,10 @@ func writeApproved(out string, p *split.UnlockPolicy, tl *safety.TrustList, poli
 		}
 		fmt.Printf("trust list seq %d: %d release(s)\n", tl.Seq, len(tl.Releases))
 	}
-	fmt.Println("next: kmsctl holder-push -worker URL -in the unlock policy (the Worker, then every holder), then publish the trust list")
+	fmt.Println("next: kmsctl holder-push -worker URL -native native-addresses.json -in the unlock policy (the Worker, then every holder at its",
+		"tacy.io URL and its provider-native address), then publish the trust list")
 	if len(p.Releases) > 0 {
-		fmt.Printf("a security withdrawal: also raise every holder's PolicyFloor to %d at its next deploy\n", p.Seq)
+		fmt.Printf("a security withdrawal: push it to every holder's native address too (holder-push -native does), and raise every holder's PolicyFloor to %d at its next deploy\n", p.Seq)
 	}
 	return nil
 }
@@ -913,6 +1009,73 @@ func parseTCBGrace(s string) (*safety.TCBGrace, error) {
 	return g, nil
 }
 
+// nativeSuffix is the provider-native host each holder must have in native-addresses.json: an address
+// whose DNS and TLS the holder's own provider runs, so a push doesn't depend on Cloudflare's tacy.io DNS alone.
+var nativeSuffix = map[string]string{"vercel": ".vercel.app", "gcp": ".run.app", "cloudflare": ".workers.dev"}
+
+// readNative reads native-addresses.json ({"vercel": "https://<project>.vercel.app", "gcp": "https://<service>.run.app"}),
+// strictly: a known holder id each, an https origin on that provider's own domain. Every holder of the policy but
+// Cloudflare (whose own provider runs tacy.io's DNS: its tacy.io URL is its native route) must have one.
+func readNative(path string, holders []split.HolderURL) (map[string]string, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("native addresses: %w", err)
+	}
+	var m map[string]string
+	if err := kms.Strict(b, &m); err != nil {
+		return nil, fmt.Errorf("native addresses: %s: %w", path, err)
+	}
+	for id, raw := range m {
+		suffix, ok := nativeSuffix[id]
+		if !ok {
+			return nil, fmt.Errorf("native addresses: %q isn't a holder with a native address (vercel, gcp, cloudflare)", id)
+		}
+		u, err := neturl.Parse(raw)
+		if err != nil || u.Scheme != "https" || u.Host == "" || u.Port() != "" || (u.Path != "" && u.Path != "/") || u.RawQuery != "" ||
+			u.User != nil || u.Fragment != "" || !strings.HasSuffix(u.Hostname(), suffix) || u.Hostname() == strings.TrimPrefix(suffix, ".") {
+			return nil, fmt.Errorf("native addresses: %s: %q isn't https://<name>%s", id, raw, suffix)
+		}
+		m[id] = "https://" + u.Hostname()
+	}
+	for _, h := range holders {
+		if h.Holder != "cloudflare" && m[h.Holder] == "" {
+			return nil, fmt.Errorf("native addresses: none for %s (Cloudflare's DNS would be its only route)", h.Holder)
+		}
+	}
+	return m, nil
+}
+
+// pushHolders posts the signed policy to each holder at its policy URL and at its native address (native[holder],
+// when it has one), printing every answer to out. A holder counts as pushed when at least one route took it; the
+// error names the holders no route took.
+func pushHolders(ctx context.Context, do func(ctx context.Context, base string, body []byte) ([]byte, error), raw []byte,
+	targets []split.HolderURL, native map[string]string, out io.Writer) error {
+	var missed []string
+	for _, h := range targets {
+		routes := []string{h.URL}
+		if n := native[h.Holder]; n != "" && n != h.URL {
+			routes = append(routes, n)
+		}
+		took := false
+		for _, r := range routes {
+			b, err := do(ctx, r, raw)
+			if err != nil {
+				fmt.Fprintf(out, "%s %s: %v\n", h.Holder, r, err)
+				continue
+			}
+			took = true
+			fmt.Fprintf(out, "%s %s: %s\n", h.Holder, r, strings.TrimSpace(string(b)))
+		}
+		if !took {
+			missed = append(missed, h.Holder)
+		}
+	}
+	if len(missed) > 0 {
+		return fmt.Errorf("no route took the policy at %s", strings.Join(missed, ", "))
+	}
+	return nil
+}
+
 // unlockPolicyPath is where the Worker serves the newest unlock policy to VMs (GET) and takes a newer one (POST, a
 // signed kms-unlock-policy envelope; it keeps only a higher seq).
 const unlockPolicyPath = "/api/vm/unlock-policy"
@@ -999,12 +1162,21 @@ func attachEmergency(np *split.UnlockPolicy, m []byte, adds []releaseSpec, extra
 // SignedTrustEmergency, its optional member "emergency") for ntl's seq: the trust-list entries of the releases added
 // and the extra items that are also items of the list (an OS image, a boot set, a platform...; "release:vX.Y.Z" is
 // the list's entry for that version). None of them in the list: no override (clients delay as usual).
-func attachTrustEmergency(ntl *safety.TrustList, m []byte, kmsID string, adds []releaseSpec, extra []string, reason string, now time.Time) error {
+func attachTrustEmergency(ntl *safety.TrustList, prevRevoked []string, m []byte, kmsID string, adds []releaseSpec, extra []string, reason string, now time.Time) error {
 	all := safety.TrustItems(ntl)
 	var items []string
 	add := func(it string) {
-		if slices.Contains(all, it) && !slices.Contains(items, it) {
+		// An un-revocation (unrevoke:vX) of a version this list leaves out of revoked_releases counts as one it adds.
+		v, unrevoke := strings.CutPrefix(it, safety.TrustItemUnrevoke)
+		unrevoke = unrevoke && !slices.Contains(ntl.RevokedReleases, v)
+		if (unrevoke || slices.Contains(all, it)) && !slices.Contains(items, it) {
 			items = append(items, it)
+		}
+	}
+	// A revoked version approved again: its un-revocation is expedited with its release (review2 H1).
+	for _, a := range adds {
+		if slices.Contains(prevRevoked, a.Version) {
+			add(safety.TrustItemUnrevoke + a.Version)
 		}
 	}
 	versions := map[string]bool{}
@@ -1064,4 +1236,209 @@ func pinBuilds(p *split.UnlockPolicy, pins []string) error {
 		p.Holders[i].Build = build
 	}
 	return checkUnlockPolicy(p)
+}
+
+// ---- the machine allowlist (V1-DESIGN §3) ----
+
+// machineDoc is machine-cert's document: a built-in one exactly as this build has it, or one from the flags.
+func machineDoc(builtin, ppid, fmspc, label, issuedAt string, now time.Time) (safety.MachineDoc, error) {
+	if builtin != "" {
+		if ppid != "" || fmspc != "" || label != "" || issuedAt != "" {
+			return safety.MachineDoc{}, errors.New("machine-cert: -builtin takes the document as built in (no -ppid, -fmspc, -label or -issued-at)")
+		}
+		for _, d := range verifier.MachineDocs {
+			if verifier.MachineNode(d) == builtin {
+				return d, nil
+			}
+		}
+		return safety.MachineDoc{}, fmt.Errorf("machine-cert: -builtin %q isn't a built-in machine", builtin)
+	}
+	at := now
+	if issuedAt != "" {
+		t, err := time.Parse(time.RFC3339, issuedAt)
+		if err != nil {
+			return safety.MachineDoc{}, fmt.Errorf("machine-cert: -issued-at: %w", err)
+		}
+		at = t
+	}
+	d := safety.MachineDoc{Type: safety.MachineType, Platform: safety.PlatformDstack, Host: safety.MachineHostPhala,
+		Mode: safety.MachineModePPID, PPID: strings.ToLower(ppid), FMSPC: strings.ToLower(fmspc), Label: label, IssuedAt: at.UTC()}
+	d.KMSID = verifier.ReleaseKMSID // replaced by the signing key's id
+	return d, d.Validate()
+}
+
+// readMachineCerts reads machine certificate files.
+func readMachineCerts(files []string) []safety.SignedMachineCert {
+	var out []safety.SignedMachineCert
+	for _, f := range files {
+		var c safety.SignedMachineCert
+		if err := kms.Strict(readFile(f), &c); err != nil {
+			die("%s isn't a machine certificate: %v", f, err)
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+// revocationHashes reads -revoke-machine values: a certificate's hash, or its file.
+func revocationHashes(vals []string) []string {
+	var out []string
+	for _, v := range vals {
+		if len(v) == 64 && strings.Trim(v, "0123456789abcdef") == "" {
+			out = append(out, v)
+			continue
+		}
+		out = append(out, readMachineCerts([]string{v})[0].Hash())
+	}
+	return out
+}
+
+// nextSeqs is p and tl at their next seqs, unchanged otherwise (a machine change alone).
+func nextSeqs(p split.UnlockPolicy, tl *safety.TrustList, now time.Time) (*split.UnlockPolicy, *safety.TrustList, error) {
+	np := p
+	np.Seq++
+	np.IssuedAt = now
+	np.Emergency = nil
+	if tl == nil {
+		return &np, nil, nil
+	}
+	ntl := *tl
+	ntl.Seq++
+	ntl.IssuedAt, ntl.Expires = now, time.Time{}
+	if _, ok := ntl.Optional[safety.TrustEmergencyMember]; ok {
+		ntl.Optional = maps.Clone(ntl.Optional)
+		delete(ntl.Optional, safety.TrustEmergencyMember)
+	}
+	return &np, &ntl, nil
+}
+
+// changeMachines adds certificates to np and revokes hashes for good (np's machines_revoked only grows; a revoked
+// certificate leaves machine_certs), then gives ntl (when there is one) np's machine_certs and the union of both
+// documents' revocations, and checks both.
+func changeMachines(np *split.UnlockPolicy, ntl *safety.TrustList, add []safety.SignedMachineCert, revoke []string) error {
+	np.MachineCerts = slices.Clone(np.MachineCerts)
+	for _, c := range add {
+		if slices.ContainsFunc(np.MachineCerts, func(o safety.SignedMachineCert) bool { return o.Hash() == c.Hash() }) {
+			return fmt.Errorf("approve: machine certificate %s is already in the policy", c.Hash())
+		}
+		if slices.Contains(np.MachinesRevoked, c.Hash()) || slices.Contains(revoke, c.Hash()) {
+			return fmt.Errorf("approve: machine certificate %s is revoked (for good: issue a new one with machine-cert)", c.Hash())
+		}
+		np.MachineCerts = append(np.MachineCerts, c)
+	}
+	revoke, extra := machineRevocations(np.MachineCerts, revoke)
+	for _, h := range extra {
+		fmt.Fprintf(os.Stderr, "approve: also revoking %s: another certificate for the same machine (PPID) as one revoked\n", h)
+	}
+	for _, c := range add {
+		if d, err := machineDocOf(c); err == nil && slices.ContainsFunc(np.MachineCerts, func(o safety.SignedMachineCert) bool {
+			od, err := machineDocOf(o)
+			return err == nil && slices.Contains(revoke, o.Hash()) && od.Mode == safety.MachineModePPID && od.PPID == d.PPID && d.Mode == safety.MachineModePPID
+		}) {
+			return fmt.Errorf("approve: machine certificate %s is for a machine being revoked", c.Hash())
+		}
+	}
+	np.MachinesRevoked = slices.Clone(np.MachinesRevoked)
+	for _, h := range revoke {
+		if !slices.Contains(np.MachinesRevoked, h) {
+			np.MachinesRevoked = append(np.MachinesRevoked, h)
+		}
+	}
+	np.MachineCerts = slices.DeleteFunc(np.MachineCerts, func(c safety.SignedMachineCert) bool { return slices.Contains(np.MachinesRevoked, c.Hash()) })
+	if err := checkUnlockPolicy(np); err != nil {
+		return err
+	}
+	if ntl == nil {
+		return nil
+	}
+	_, kept, _, err := ntl.TrustMachines()
+	if err != nil {
+		return err
+	}
+	revoked := slices.Clone(np.MachinesRevoked)
+	for _, h := range kept {
+		if !slices.Contains(revoked, h) {
+			revoked = append(revoked, h)
+		}
+	}
+	slices.Sort(revoked)
+	if err := ntl.SetMachines(np.MachineCerts, revoked); err != nil {
+		return err
+	}
+	id, _ := kms.ParseID(np.KMSID)
+	if _, err := safety.OpenMachineCerts(id, np.MachineCerts, revoked, "trust list"); err != nil {
+		return fmt.Errorf("approve: the trust list's machines: %w", err)
+	}
+	for _, pl := range ntl.Platforms {
+		if !verifier.KnownPlatform(pl) { // clients refuse the whole list (verifier.WithTrustList): fail closed here too
+			return fmt.Errorf("approve: the trust list names unknown platform %q (clients check only %q)", pl, safety.PlatformDstack)
+		}
+	}
+	return ntl.Validate()
+}
+
+// carryRevocations adds prev's machines_revoked to p (a policy for a new admin-key generation, review2 L2) and drops
+// the revoked certificates from p's machine_certs.
+func carryRevocations(p, prev *split.UnlockPolicy) error {
+	for _, h := range prev.MachinesRevoked {
+		if !slices.Contains(p.MachinesRevoked, h) {
+			p.MachinesRevoked = append(p.MachinesRevoked, h)
+		}
+	}
+	p.MachineCerts = slices.DeleteFunc(slices.Clone(p.MachineCerts), func(c safety.SignedMachineCert) bool { return slices.Contains(p.MachinesRevoked, c.Hash()) })
+	return checkUnlockPolicy(p)
+}
+
+// machineRevocations is revoke plus every known certificate of the same machine (review2 L3: a revocation is per
+// certificate, so a second certificate for one PPID, such as one issued with -issued-at now beside the built-in one,
+// would stay valid): the policy's certificates and the build's built-in documents with a revoked certificate's PPID.
+// extra are the hashes added. A revoked hash whose certificate isn't known here (already out of the policy) adds
+// nothing: its other certificates must be named.
+func machineRevocations(certs []safety.SignedMachineCert, revoke []string) (all, extra []string) {
+	type known struct {
+		hash string
+		doc  safety.MachineDoc
+	}
+	var ks []known
+	for _, c := range certs {
+		if d, err := machineDocOf(c); err == nil {
+			ks = append(ks, known{c.Hash(), *d})
+		}
+	}
+	for _, d := range verifier.MachineDocs {
+		if h, err := safety.MachineDocHash(d); err == nil {
+			ks = append(ks, known{h, d})
+		}
+	}
+	all = slices.Clone(revoke)
+	for _, h := range revoke {
+		for _, k := range ks {
+			if k.hash != h || k.doc.Mode != safety.MachineModePPID {
+				continue
+			}
+			for _, o := range ks {
+				if o.doc.Mode == safety.MachineModePPID && o.doc.PPID == k.doc.PPID && !slices.Contains(all, o.hash) {
+					all, extra = append(all, o.hash), append(extra, o.hash)
+				}
+			}
+		}
+	}
+	return all, extra
+}
+
+// machineDocOf reads a certificate's document (unverified: only to find its machine; the KMS id's signature is
+// checked where it counts).
+func machineDocOf(c safety.SignedMachineCert) (*safety.MachineDoc, error) {
+	var d safety.MachineDoc
+	if err := json.Unmarshal(c.Doc, &d); err != nil {
+		return nil, err
+	}
+	return &d, nil
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
 }

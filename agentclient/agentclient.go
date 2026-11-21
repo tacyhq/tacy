@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -62,6 +63,9 @@ type Conn struct {
 	User string
 	// Model, when set, is sent as X-Agent-Model instead of the request's model (tests: the VM must refuse it).
 	Model string
+	// Temporary marks every task this connection starts as a temporary chat's (the start's "temporary"): the VM
+	// deletes it an hour after nobody follows it.
+	Temporary bool
 	// Kind and PriceModel, when set, are sent as X-Agent-Kind and X-Agent-Price-Model with a run or a task start: what
 	// the relay prices it at (v0.16.0; guard/charge.go). The VM refuses a start whose body doesn't match them.
 	Kind, PriceModel string
@@ -393,6 +397,12 @@ func (c *Conn) taskCall(ctx context.Context, path, model string, v any) (*Task, 
 // StartTask starts req as a task. key, when set, makes the start once-only (a retry finds the same task). Without a
 // run secret in req it makes one; the connection keeps it for the task's later calls (TaskSecret).
 func (c *Conn) StartTask(ctx context.Context, req proto.RunRequest, key string) (*Task, error) {
+	return c.StartTaskCredentials(ctx, req, key, nil)
+}
+
+// StartTaskCredentials is StartTask with the person's sealed mail login for the task (v1, agentd's
+// app/credentials.go): creds is the credentials member as JSON ([{connection, expires, sealed}]); nil: none.
+func (c *Conn) StartTaskCredentials(ctx context.Context, req proto.RunRequest, key string, creds any) (*Task, error) {
 	if req.Model == "" {
 		req.Model = proto.DefaultModel
 	}
@@ -411,8 +421,10 @@ func (c *Conn) StartTask(ctx context.Context, req proto.RunRequest, key string) 
 	}
 	t, err := c.taskCall(ctx, "/tasks", model, struct {
 		proto.RunRequest
-		Key string `json:"key,omitempty"`
-	}{req, key})
+		Key         string `json:"key,omitempty"`
+		Credentials any    `json:"credentials,omitempty"`
+		Temporary   bool   `json:"temporary,omitempty"`
+	}{req, key, creds, c.Temporary})
 	if err == nil && !t.Existing { // a start the key found already has the first start's secret
 		c.SetTaskSecret(t.Task, req.RunSecret)
 	}
@@ -436,6 +448,29 @@ func (c *Conn) Grant(ctx context.Context, secret string, p proto.Permission, dec
 		return "", err
 	}
 	return out.Outcome, nil
+}
+
+// SendCredential sends a task's sealed mail login again (POST /tasks/credential, after need_credential): key is the
+// task's start key, creds as StartTaskCredentials. It returns the HTTP status and the answer's error code ("" on 200).
+func (c *Conn) SendCredential(ctx context.Context, id, key string, creds any) (int, string, error) {
+	res, err := c.post(ctx, "/tasks/credential", "", c.ref("credential", id, map[string]any{"key": key, "credentials": creds}))
+	if err != nil { // "<path>: HTTP <code>: <body>"
+		var code int
+		var out struct {
+			Error string `json:"error"`
+		}
+		if _, rest, ok := strings.Cut(err.Error(), ": HTTP "); ok {
+			n, body, _ := strings.Cut(rest, ": ")
+			code, _ = strconv.Atoi(n)
+			json.Unmarshal([]byte(body), &out)
+		}
+		if code == 0 {
+			return 0, "", err
+		}
+		return code, out.Error, nil
+	}
+	res.Body.Close()
+	return res.StatusCode, "", nil
 }
 
 // TaskStatus is a task's state.

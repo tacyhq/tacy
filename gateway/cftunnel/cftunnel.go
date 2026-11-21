@@ -1,68 +1,88 @@
-// Package cftunnel is the cloudflared spike (a research note, branch
-// vm-fix-b-cloudflared): a Fix B VM has no inbound path, so gatewayd runs Cloudflare's tunnel client, cloudflared,
-// as its own child process in its own container (the six-service compose shape doesn't change), and serves that
-// child the only origin it may reach: an HTTP server on a unix socket in gatewayd's private tmpfs that forwards an
-// allowlist of agentd's routes (GET /attest, GET /health, POST /v) to agentd's socket and refuses everything else.
+// Package cftunnel is the agent VM's tunnel (a research note; decided
+// 2026-11-21: in-container): a Fix B VM has no inbound path, so gatewayd's container runs Cloudflare's tunnel client,
+// cloudflared (our patched, reproducible build), and serves it the only origin it may reach: an HTTP server on a
+// unix socket that forwards an allowlist of agentd's routes (GET /attest, GET /health, POST /v) to agentd's socket
+// and refuses everything else.
+//
+// cloudflared is confined in that container (review H1, 2026-11-21; launch_linux.go): gatewayd's launcher, the
+// container's first process (root with only SETUID and SETGID), starts gatewayd as its own uid with no capabilities
+// and cloudflared as another uid (TunnelUID) with no capabilities, no supplementary groups and no environment.
+// cloudflared's uid can't open the vault's, agentd's, unlockd's or the ops sockets (their directories are other
+// uids' with no access for others), has no dstack socket, can't trace or signal gatewayd (another uid, and gatewayd
+// is non-dumpable), and can connect only to the ingress socket (group TunnelUID). Before every start the launcher
+// runs a probe as cloudflared's uid that tries each of those and refuses to start cloudflared if any works.
 //
 // The tunnel token (routing and availability only; the bodies are EHBP-encrypted to agentd's attested key) is one of
 // the API keys in the epoch's sealed secrets bundle: unlockd opens it only after the attested split-key unlock and
 // hands it to vaultd, and gatewayd leases it from vaultd for each cloudflared start. Phala never sees it: it is never
-// in the compose, the environment or on the disk; it lives in TD memory (a 0600 file in gatewayd's tmpfs for the
-// few seconds cloudflared takes to read it at start).
-//
-// Throwaway spike code: not reviewed, not released.
+// in the compose, the environment or on any disk; gatewayd hands it to cloudflared in a memfd (TD memory) that
+// cloudflared reads at start as TokenPath, and empties it after TokenTTL.
 package cftunnel
 
 import (
 	"bytes"
+	"cmp"
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"sync"
 	"time"
 )
+
+// TokenPath is where cloudflared reads the token: the memfd the launcher passes as its fd 3.
+const TokenPath = "/proc/self/fd/3"
+
+// Starter starts one cloudflared with token (the launcher, launch_linux.go; a fake in tests).
+type Starter interface {
+	Start(ctx context.Context, token []byte) (Child, error)
+}
+
+// Child is one started cloudflared.
+type Child interface {
+	PID() int
+	// Wait blocks until it has exited.
+	Wait() error
+	// Wipe empties the token's copy (cloudflared read it at start).
+	Wipe()
+}
 
 // Supervisor starts cloudflared and starts it again when it exits.
 type Supervisor struct {
 	Bin       string // the pinned binary (/tacy/cloudflared)
 	BinSHA256 string // its sha256, checked before every start ("" = not checked: tests)
-	Config    string // the pinned locally-managed config (/tacy/cloudflared.yml)
-	Dir       string // gatewayd's private tmpfs directory for the token file (made 0700)
+	Start     Starter
 	// Token is the tunnel token, fetched for each start (a vault lease); the caller keeps no copy.
 	Token func(ctx context.Context) ([]byte, error)
 	Logf  func(string, ...any)
-	Out   io.Writer // cloudflared's stdout and stderr (nil: discarded)
-	// TokenTTL is how long the token file stays after a start (cloudflared reads it at start only).
+	// TokenTTL is how long the token stays readable after a start (cloudflared reads it at start only).
 	TokenTTL time.Duration
+	// Backoff is the first wait before a restart (doubling to 15 times it, reset after a minute up); 0: 1 s.
+	Backoff time.Duration
+	// TokenRetry is how often the token is asked for while the vault has none (before the unlock); 0: 2 s.
+	TokenRetry time.Duration
 
 	mu     sync.Mutex
 	events []Event
 	pid    int
 }
 
-var errNotTmpfs = errors.New("not a tmpfs: the token file must stay in TD memory")
-
 // Event is one start or exit (the spike reads them through /spike/cfd).
 type Event struct {
 	At     time.Time `json:"at"`
-	Kind   string    `json:"kind"` // lease_wait, lease, start, exit, refused
+	Kind   string    `json:"kind"` // lease_wait, lease, start, exit, refused, probe
 	PID    int       `json:"pid,omitempty"`
 	Detail string    `json:"detail,omitempty"`
 	MS     int64     `json:"ms,omitempty"` // lease: how long the lease took; exit: how long the process ran
 }
 
-// Args are cloudflared's arguments for a token file: the config pins the same values; the flags repeat them so a
-// config that lost a line still runs this way.
-func (s *Supervisor) Args(tokenFile string) []string {
-	return []string{"tunnel", "--config", s.Config, "--no-autoupdate", "--protocol", "http2", "--management-diagnostics=false",
-		"--metrics", "127.0.0.1:0", "--loglevel", "info", "run", "--token-file", tokenFile}
+// Args are cloudflared's arguments: the config pins the same values; the flags repeat them so a config that lost a
+// line still runs this way. The token is read from TokenPath (the memfd).
+func Args(config string) []string {
+	return []string{"tunnel", "--config", config, "--no-autoupdate", "--protocol", "http2", "--management-diagnostics=false",
+		"--metrics", "127.0.0.1:0", "--loglevel", "info", "run", "--token-file", TokenPath}
 }
 
 func (s *Supervisor) logf(f string, a ...any) {
@@ -70,6 +90,9 @@ func (s *Supervisor) logf(f string, a ...any) {
 		s.Logf(f, a...)
 	}
 }
+
+// Record adds an event (the launcher's probe results come in this way too).
+func (s *Supervisor) Record(e Event) { s.record(e) }
 
 func (s *Supervisor) record(e Event) {
 	e.At = time.Now().UTC()
@@ -94,23 +117,23 @@ func (s *Supervisor) Events() ([]Event, int) {
 	return append([]Event(nil), s.events...), s.pid
 }
 
-// Run starts cloudflared until ctx ends: it waits for the token (the vault has it only after the unlock), writes it
-// to a fresh 0600 file, starts the child, removes the file after TokenTTL, and starts again (backoff 1 s doubling to
-// 15 s, reset after a minute up) when the child exits.
+var errNotTmpfs = errors.New("not a tmpfs: the token file must stay in TD memory")
+
+// ErrRefused is a start the launcher refused (a failed confinement probe, a wrong binary): not retried.
+var ErrRefused = errors.New("cftunnel: the launcher refused to start cloudflared")
+
+// Run starts cloudflared until ctx ends: it checks the binary's hash, waits for the token (the vault has it only
+// after the unlock), starts the child through Start, empties the token after TokenTTL, and starts again when the
+// child exits (backoff 1 s doubling to 15 s, reset after a minute up). A wrong binary or a refused start stops it.
 func (s *Supervisor) Run(ctx context.Context) error {
 	if s.TokenTTL == 0 {
 		s.TokenTTL = 20 * time.Second
 	}
-	if err := os.MkdirAll(s.Dir, 0o700); err != nil {
-		return err
+	first := s.Backoff
+	if first == 0 {
+		first = time.Second
 	}
-	if err := os.Chmod(s.Dir, 0o700); err != nil {
-		return err
-	}
-	if err := checkTmpfs(s.Dir); err != nil {
-		return fmt.Errorf("cftunnel: %s: %w", s.Dir, err)
-	}
-	backoff := time.Second
+	backoff := first
 	for ctx.Err() == nil {
 		if s.BinSHA256 != "" {
 			if err := checkSHA(s.Bin, s.BinSHA256); err != nil {
@@ -124,45 +147,41 @@ func (s *Supervisor) Run(ctx context.Context) error {
 			return err
 		}
 		s.record(Event{Kind: "lease", MS: time.Since(t0).Milliseconds()})
-		f, err := writeToken(s.Dir, tok)
+		started := time.Now()
+		ch, err := s.Start.Start(ctx, tok)
 		clear(tok)
-		if err != nil {
+		if errors.Is(err, ErrRefused) {
+			s.record(Event{Kind: "refused", Detail: err.Error()})
 			return err
 		}
-		cmd := exec.CommandContext(ctx, s.Bin, s.Args(f)...)
-		cmd.Env = []string{"HOME=" + s.Dir} // nothing of gatewayd's environment
-		cmd.Stdout, cmd.Stderr = s.Out, s.Out
-		setDeathSignal(cmd)
-		started := time.Now()
-		if err := cmd.Start(); err != nil {
-			wipe(f)
+		if err != nil {
 			s.record(Event{Kind: "exit", Detail: "start: " + err.Error()})
 			s.logf("cftunnel: start: %v", err)
 		} else {
-			s.record(Event{Kind: "start", PID: cmd.Process.Pid})
-			s.logf("cftunnel: cloudflared started, pid %d", cmd.Process.Pid)
+			s.record(Event{Kind: "start", PID: ch.PID()})
+			s.logf("cftunnel: cloudflared started, pid %d", ch.PID())
 			done := make(chan error, 1)
-			go func() { done <- cmd.Wait() }()
+			go func() { done <- ch.Wait() }()
 			var werr error
 			select {
 			case werr = <-done:
-				wipe(f)
+				ch.Wipe()
 			case <-time.After(s.TokenTTL):
-				wipe(f)
+				ch.Wipe()
 				werr = <-done
 			}
 			ran := time.Since(started)
-			s.record(Event{Kind: "exit", PID: cmd.Process.Pid, Detail: errString(werr), MS: ran.Milliseconds()})
+			s.record(Event{Kind: "exit", PID: ch.PID(), Detail: errString(werr), MS: ran.Milliseconds()})
 			s.logf("cftunnel: cloudflared exited after %s: %v", ran.Round(time.Millisecond), werr)
 			if ran > time.Minute {
-				backoff = time.Second
+				backoff = first
 			}
 		}
 		select {
 		case <-ctx.Done():
 		case <-time.After(backoff):
 		}
-		backoff = min(2*backoff, 15*time.Second)
+		backoff = min(2*backoff, 15*first)
 	}
 	return ctx.Err()
 }
@@ -183,28 +202,9 @@ func (s *Supervisor) waitToken(ctx context.Context) ([]byte, error) {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(2 * time.Second):
+		case <-time.After(cmp.Or(s.TokenRetry, 2*time.Second)):
 		}
 	}
-}
-
-func writeToken(dir string, tok []byte) (string, error) {
-	var r [8]byte
-	rand.Read(r[:])
-	p := filepath.Join(dir, "token-"+hex.EncodeToString(r[:]))
-	f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
-		return "", err
-	}
-	_, err = f.Write(tok)
-	if cerr := f.Close(); err == nil {
-		err = cerr
-	}
-	if err != nil {
-		wipe(p)
-		return "", err
-	}
-	return p, nil
 }
 
 // wipe overwrites the token file with zeros and removes it (it is on tmpfs: TD memory).
@@ -233,10 +233,6 @@ func checkSHA(path, want string) error {
 func errString(err error) string {
 	if err == nil {
 		return ""
-	}
-	var ee *exec.ExitError
-	if errors.As(err, &ee) {
-		return ee.String()
 	}
 	return err.Error()
 }

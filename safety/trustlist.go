@@ -32,6 +32,16 @@ const MaxTrustListLifetime = 400 * 24 * time.Hour
 // VM release in it carries its Sigstore bundle (about 11 KiB).
 const MaxTrustListPayload = 128 << 10
 
+// MaxTrustListSeq is the highest trust list seq (2^53-1, review2 M1): every verifier, the JavaScript ones included
+// (a device's localStorage, the Worker's D1), must keep a seq exactly, and a number above this one can't be kept as a
+// JavaScript number. A list above it is refused, so no list can make a device drop its record.
+const MaxTrustListSeq = 1<<53 - 1
+
+// MaxTrustSeqJump is how far a trust list's seq may be above the highest one a verifier took (the holders'
+// split.MaxSeqJump): a list far above leaves the KMS admin no seq to withdraw with, and nothing legitimate jumps that
+// far (each approve is one seq).
+const MaxTrustSeqJump = 1000
+
 // MaxTrustReleases and MaxTrustBundle bound a list's VM releases and each one's Sigstore bundle (JSON bytes).
 const (
 	MaxTrustReleases = 8
@@ -215,6 +225,8 @@ func (l *TrustList) Validate() error {
 		return errors.New("trust list: type must be " + TrustListType)
 	case l.Seq == 0 || l.IssuedAt.IsZero():
 		return errors.New("trust list: seq and issued_at are required")
+	case l.Seq > MaxTrustListSeq:
+		return fmt.Errorf("trust list: seq %d is above %d (2^53-1, what every verifier can keep)", l.Seq, uint64(MaxTrustListSeq))
 	case !l.Expires.IsZero() && (!l.Expires.After(l.IssuedAt) || l.Expires.Sub(l.IssuedAt) > MaxTrustListLifetime):
 		return errors.New("trust list: expires, when set, must be after issued_at, within 400 days")
 	case len(l.OSImages) > 64 || len(l.BootMeasurements) > 64 || len(l.PreLaunch) > 64 || len(l.KMSIDs) > 64:

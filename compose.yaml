@@ -5,10 +5,12 @@
 # runsc; no network, no keys, no capabilities), gatewayd (service "agentvm": the only network and the only way
 # in), vaultd (the API keys; no network) and unlockd (the split-key unlock: the only one with dstack's socket and
 # the root key; no network). A one-shot setup container (root, no network) gives them their directories first.
-# The tunnel: gatewayd runs our patched, reproducibly built cloudflared as its child (/tacy/cloudflared,
-# sha256 24fdcd7ecc7b4c05a0313f498a42af254e71a2e28e50273fb2dee0834d1ec946; it refuses configs the edge pushes and has
-# no management service), with the token leased from vaultd after the unlock. Its one origin is gatewayd's ingress
-# allowlist.
+# The tunnel: our patched, reproducibly built cloudflared (/tacy/cloudflared, sha256
+# 1c8c92c803f5d919c51bf01e1ce8d642d3ec05b51326c214eff756ed4221f0dd; it refuses configs the edge pushes, has no
+# management service and no WARP or private-network routing) runs in gatewayd's container, confined: gatewayd's
+# launcher (root with SETUID and SETGID only) starts gatewayd as 10001 and cloudflared as 10006, both with no
+# capabilities; cloudflared's uid can reach no vault, agentd, unlockd or dstack socket, only gatewayd's ingress
+# allowlist (a probe as its uid checks this before every start). The token is leased from vaultd after the unlock.
 # gatewayd publishes no port and nothing listens on 8080: the tunnel is the only way in.
 #
 # key_provider none (Fix B): the data disk is under a key made inside the TD at boot, so there is no pre-launch
@@ -20,13 +22,13 @@
 # sha256 180dd277f657c1478f09490e8a9a595f7378257510b43d1d3694a769aef9ed02, each binary checked; its Apache-2.0 LICENSE at
 # /tacy/gvisor/LICENSE). Rebuild them from the tagged source (scripts/reproduce.sh) to get the same digests.
 # Binaries (linux/amd64, sha256):
-#   agentd   e1ba17487d60195d70d9b225c9d31e4a152fb9912bb253b8cb712986288c5d8e
+#   agentd   40fbc726892bd8683570d4d584091db728020e7d4c0cc18506df1429edb4a832
 #   brain    7c984294c1b91fd5c27fb407d655bb2536b35e427b23b6d5082055e73d88cf60
-#   gatewayd e031fd2a815aa27347f657c3ec335a20abbe33a8124b5f4780f3706a8359495a
+#   gatewayd 98bced09d9c3c7132843966a0436661ededcca27133cd01ba372e2c192f70d99
 #   runnerd  b1c1a2432beaf866395941d4d598ade89a0e885e226c6e13c5d2a4c359990bcb
 #   setup    80f380d97b1cc77da758d69ba978e5f09c720f10ef853f6afa06e06ffa006de6
-#   unlockd  404ab73f1afb4bbccf3eb23a801191353bfcafedabf977aae796beaf44ab6874
-#   vaultd   5e5d5d6a23a74e7a5c42e0f1c9a06c4aa9e49752dbf5374d58a6d6fe2b25281b
+#   unlockd  3ac86cccddb338933f8a6d7a21487ed74ba00a84cd2a9bd242f8b13dc6da39c6
+#   vaultd   b8806c4b0655268eab4a20b3be2c622d91f2ea4437c5c2fcf6640c164852a1a1
 #            56996c546dbafd5716e1d09e307a131d97eb3b6483c22a1178631751f3e0392f (gVisor runsc)
 #            1755e10a4c9d1db4973c0155497348db3737543b4c2e6a9f663a271ee71433d5 (gVisor gvisor-bin/gvisor_sentry)
 #            46d5c028723ac5fbe40b863f95100f15a00d2aa0cd39c69d892500a988c930bd (gVisor gvisor-bin/gvisor-sentry-prewarmer)
@@ -58,7 +60,7 @@ services:
       - /run/tacy-tasks:/run/tacy-tasks
     command: ["-dir", "/run/tacy/agent=10003:10001:0770", "-dir", "/run/tacy/vault=10002:10001:0750", "-dir", "/run/tacy/runner=10004:10003:0750", "-dir", "/run/tacy/ops=10001:10001:0750", "-dir", "/run/tacy/unlock=10005:10005:0750", "-dir", "/run/tacy/unlockv=10005:10005:0750", "-dir", "/run/tacy/unlockgw=10001:10001:0750", "-dir", "/run/tacy-unlock=10005:10005:0700", "-dir", "/run/tacy-tasks=10003:10003:0700"]
   agentd:
-    image: ghcr.io/tacyhq/tacy/agentd@sha256:caa147896e9df926182569f8d64322a641224e1f7675d4c3e84877f9839a7a4f
+    image: ghcr.io/tacyhq/tacy/agentd@sha256:fb3a20cd22ff755ffa77f0e9596f437798fdd48e515c5bec6eb86fc1d5987828
     entrypoint: ["/tacy/agentd"]
     network_mode: none
     restart: unless-stopped
@@ -104,7 +106,7 @@ services:
       - runnersock:/run/tacy/runner
     command: ["-socket", "/run/tacy/runner/runner.sock", "-agent-uid", "10003", "-gvisor", "/tacy/gvisor", "-gvisor-release", "20261012.0", "-runsc-sha256", "56996c546dbafd5716e1d09e307a131d97eb3b6483c22a1178631751f3e0392f", "-brain", "/tacy/brain", "-brain-sha256", "7c984294c1b91fd5c27fb407d655bb2536b35e427b23b6d5082055e73d88cf60", "-dir", "/run/runner", "-platform", "systrap", "-rootless"]
   agentvm:
-    image: ghcr.io/tacyhq/tacy/gatewayd@sha256:e4aec1d7520a52e7eea70cac1358c8667f06a6d93fd6c6fb63fff1f17b53b47a
+    image: ghcr.io/tacyhq/tacy/gatewayd@sha256:8f0242638959b6ad6a2a91ef6077457c259c59d803ab6c06c0ad7464e8ddb755
     entrypoint: ["/tacy/gatewayd"]
     restart: unless-stopped
     logging:
@@ -114,11 +116,12 @@ services:
     depends_on:
       setup:
         condition: service_completed_successfully
-    user: "10001:10001"
+    user: "0:0"
     read_only: true
     cap_drop: [ALL]
+    cap_add: [SETGID, SETUID]
     security_opt: ["no-new-privileges:true"]
-    tmpfs: [/tmp]
+    tmpfs: ["/tmp:mode=0700,uid=10001,gid=10001", "/run/tunnel:size=1m,mode=0750,uid=10001,gid=10006"]
     volumes:
       - agentsock:/run/tacy/agent
       - vaultsock:/run/tacy/vault
@@ -126,9 +129,9 @@ services:
       - unlockgw:/run/tacy/unlockgw
     environment:
       HOME: /tmp
-    command: ["-socket", "/run/tacy/agent/gateway.sock", "-agent-uid", "10003", "-vault-socket", "/run/tacy/vault/vault.sock", "-forward", "/run/tacy/agent/http.sock", "-search-provider", "exa", "-expected-keys", "TINFOIL_API_KEY,EXA_API_KEY,TAVILY_API_KEY", "-state-url", "https://chat.tacy.io", "-ops-socket", "/run/tacy/ops/gateway.sock", "-vault-uid", "10002", "-kms-key", "ed25519:1LPZHjHaCjYvuibeGa0PcuFHEIadIxsp8x9EbNNMmEg=", "-unlock-domain", "tacy.io", "-unlock-admin-keys", "ed25519:9ZU78UPBF2w6xfjTdSGODr5lQD7kTrt0SuLhTl+kOv8=", "-unlock-admin-threshold", "1", "-unlock-socket", "/run/tacy/unlockgw/gateway.sock", "-unlockd-uid", "10005", "-firm", "f_chat", "-personal-spaces", "-operator-key", "ed25519:UjnT9P6APMBeNg5pJlGCLbwOKDlVJQO3m3+yDzby2os=", "-keylog-genesis", "a35f4cb79bd5066638a0fd0aa8dc855b951febba003e6a6fd3e335adc8d47cfd", "-keylog-carry", "e6f08a761337f9a367594c3ed43a07723ac50cbf790f5b740e25442d9a8c7496,b1cf194b7246c31a565f7c11de8416f16c377a461976dd9eb8a4e290cef1fe1a", "-safety-url", "https://chat.tacy.io/api/safety/docs", "-keylog-url", "https://chat.tacy.io/api/safety/keylog", "-dns-tls", "dns.quad9.net@9.9.9.9:853,149.112.112.112:853", "-cloudflared", "/tacy/cloudflared", "-cloudflared-sha256", "24fdcd7ecc7b4c05a0313f498a42af254e71a2e28e50273fb2dee0834d1ec946", "-cloudflared-config", "/tacy/cloudflared.yml", "-tunnel-secret", "CF_TUNNEL_TOKEN_VMA"]
+    command: ["-socket", "/run/tacy/agent/gateway.sock", "-agent-uid", "10003", "-vault-socket", "/run/tacy/vault/vault.sock", "-forward", "/run/tacy/agent/http.sock", "-search-provider", "exa", "-expected-keys", "TINFOIL_API_KEY,EXA_API_KEY,TAVILY_API_KEY", "-state-url", "https://chat.tacy.io", "-ops-socket", "/run/tacy/ops/gateway.sock", "-vault-uid", "10002", "-kms-key", "ed25519:1LPZHjHaCjYvuibeGa0PcuFHEIadIxsp8x9EbNNMmEg=", "-unlock-domain", "tacy.io", "-unlock-admin-keys", "ed25519:9ZU78UPBF2w6xfjTdSGODr5lQD7kTrt0SuLhTl+kOv8=", "-unlock-admin-threshold", "1", "-unlock-socket", "/run/tacy/unlockgw/gateway.sock", "-unlockd-uid", "10005", "-firm", "f_chat", "-personal-spaces", "-operator-key", "ed25519:UjnT9P6APMBeNg5pJlGCLbwOKDlVJQO3m3+yDzby2os=", "-keylog-genesis", "a35f4cb79bd5066638a0fd0aa8dc855b951febba003e6a6fd3e335adc8d47cfd", "-keylog-carry", "e6f08a761337f9a367594c3ed43a07723ac50cbf790f5b740e25442d9a8c7496,b1cf194b7246c31a565f7c11de8416f16c377a461976dd9eb8a4e290cef1fe1a", "-safety-url", "https://chat.tacy.io/api/safety/docs", "-keylog-url", "https://chat.tacy.io/api/safety/keylog", "-dns-tls", "dns.quad9.net@9.9.9.9:853,149.112.112.112:853", "-tunnel-uid", "10006", "-cloudflared", "/tacy/cloudflared", "-cloudflared-sha256", "1c8c92c803f5d919c51bf01e1ce8d642d3ec05b51326c214eff756ed4221f0dd", "-cloudflared-access", "unpinned,0000000000000000000000000000000000000000000000000000000000000000", "-tunnel-secret", "CF_TUNNEL_TOKEN_VMA"]
   vaultd:
-    image: ghcr.io/tacyhq/tacy/vaultd@sha256:301229c22a616256418ffb0ff58142165ffbfd451d19881fea3776950a73300d
+    image: ghcr.io/tacyhq/tacy/vaultd@sha256:47af8e07676346d1ed5f7975761fc907b5d7b13966d33148db26601a1a36b36f
     entrypoint: ["/tacy/vaultd"]
     network_mode: none
     restart: unless-stopped
@@ -150,7 +153,7 @@ services:
       - unlockvault:/run/tacy/unlockv
     command: ["-socket", "/run/tacy/vault/vault.sock", "-gateway-uid", "10001", "-group-mode", "-unlock-socket", "/run/tacy/unlockv/vaultd.sock", "-ops-socket", "/run/tacy/ops/gateway.sock", "-firm", "f_chat", "-personal-spaces", "-operator-key", "ed25519:UjnT9P6APMBeNg5pJlGCLbwOKDlVJQO3m3+yDzby2os=", "-keylog-genesis", "a35f4cb79bd5066638a0fd0aa8dc855b951febba003e6a6fd3e335adc8d47cfd", "-keylog-carry", "e6f08a761337f9a367594c3ed43a07723ac50cbf790f5b740e25442d9a8c7496,b1cf194b7246c31a565f7c11de8416f16c377a461976dd9eb8a4e290cef1fe1a"]
   unlockd:
-    image: ghcr.io/tacyhq/tacy/unlockd@sha256:075b47b7b7ceb4944da8ce70aa6f152996102b9f28b67dce4f6e75b082d057c8
+    image: ghcr.io/tacyhq/tacy/unlockd@sha256:dfa2887ba6cd9311ddbbd53fc3f97ef3fa6288121a86684b3b8be7ad90ed19b7
     entrypoint: ["/tacy/unlockd"]
     network_mode: none
     restart: unless-stopped

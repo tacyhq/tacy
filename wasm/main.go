@@ -160,7 +160,7 @@ func run(attJSON, nonceHex string, bundle []byte, fetch js.Value, now, lastSeen 
 		return fail(errors.New("nonce must be 32 bytes of hex"))
 	}
 	p := verifier.Policy{Bundle: bundle, Getter: jsGetter{fetch}, Release: release.Policy{LastSeen: lastSeen},
-		KMSFallback: tacy.KMSFallback, GoogleGetter: jsGetter{fetch}} // Google's endorsements: only with a trust list's dstack-gcp
+		KMSFallback: tacy.KMSFallback}
 	if bundle == nil {
 		p.Compose, p.AppCompose = tacy.Compose, tacy.AppCompose
 	}

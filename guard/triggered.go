@@ -66,8 +66,15 @@ const scheduledMailNote = "\n\nYou can read the sponsor's connected email, read-
 const scheduledMailTimeNote = " Message times are the sponsor's local time (%s; it is %s there now), and mail_search's since and before take " +
 	"their local date, or date and time: for mail since 6 PM yesterday, since \"YYYY-MM-DD 18:00\" with yesterday's date."
 
-// scheduledNoMailNote: the definition asks for mail but the VM's policy doesn't allow it (the tools are left out).
-const scheduledNoMailNote = "\n\nThis task asks for the sponsor's email, but the VM's policy doesn't allow reading mail now: say so in one line."
+// backgroundMail: unattended runs may read the sponsor's mail. Off in v1 (the v1 design §5.1): the login stays with
+// the person's app, so a schedule has none; background email comes later with per-user or per-login keys. A
+// constant of the release, never a setting; the mail time tests turn it on to keep the schedule-zone logic tested
+// for then. With it on, the rule of two still holds (RuleOfTwo: no web in such a run).
+var backgroundMail = false
+
+// scheduledNoMailNote: the definition asks for mail, but scheduled runs can't read it in v1 (the tools are left out;
+// the v1 design §5.1: background email comes later, with per-user keys).
+const scheduledNoMailNote = "\n\nThis task asks for the sponsor's email, but scheduled runs can't read email in this version of Tacy: say so in one line."
 
 // scheduledFilesNote heads the list of a schedule's stored files in its run's first message.
 const scheduledFilesNote = "\n\nThe sponsor's files for this task (you never see their text: read them with files_read; cite what they say as [file quote N]):"
@@ -91,15 +98,16 @@ func TriggeredStartFor(f trigger.Fire, firm string, now time.Time, mem []trigger
 	d := f.Def
 	var s harness.Start
 	var web, sink, mail []string
-	docs := false
+	docs, mailDef := false, false
 	for _, t := range d.Tools {
 		switch {
 		case appTool(t) != "":
 			web = append(web, t)
 		case t == DocumentAction: // a result as a document (documents.go): nothing goes out
 			docs = allows(DocumentAction)
-		case isMailAction(t): // the sponsor's own email, read-only (mail.go): left out under a policy without it
-			if allows(t) {
+		case isMailAction(t): // the sponsor's own email: v1 runs never read it (the v1 design §5.1, backgroundMail)
+			mailDef = true
+			if backgroundMail && allows(t) {
 				mail = append(mail, t)
 			}
 		case t == "sink.post" || t == "sink.put":
@@ -156,7 +164,7 @@ func TriggeredStartFor(f trigger.Fire, firm string, now time.Time, mem []trigger
 			loc, _ := time.LoadLocation(z)
 			note += fmt.Sprintf(scheduledMailTimeNote, z, f.At.In(loc).Format("Monday, January 2, 2006, 15:04"))
 		}
-	} else if slices.ContainsFunc(d.Tools, isMailAction) {
+	} else if mailDef {
 		note += scheduledNoMailNote
 	}
 	if noChange {
@@ -201,7 +209,7 @@ func TriggeredStartFor(f trigger.Fire, firm string, now time.Time, mem []trigger
 		Slot: f.Slot, Due: f.Due,
 		Permissions: maps.Clone(perms), Approvers: []string{d.Sponsor}, Agent: AgentScheduled, DefAgent: d.Agent, Digest: f.Digest, Trigger: f.Trigger.ID,
 		Sponsor: d.Sponsor, NotAfter: d.NotAfter, Links: personLinks([]proto.Message{{Role: "user", Content: d.Instructions}}),
-		PageLinks: slices.Contains(web, "web.fetch"), Memory: d.Memory, NoChange: noChange,
+		PageLinks: slices.Contains(web, "web.fetch"), Memory: d.Memory, NoChange: noChange, MailDef: mailDef,
 		Stored: slices.Clone(d.Files), FilesGrant: d.FilesGrant,
 		// A daily or one-time schedule's own zone: its mail times are shown, and "since 6 PM yesterday" read, in it.
 		Zone: validZone(f.Trigger.Zone)}

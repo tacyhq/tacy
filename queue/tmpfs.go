@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
+	"time"
 )
 
 // The task queue across container restarts (V1-DESIGN §6.2): dstack's guest-agent watchdog restarts the containers
@@ -24,6 +26,21 @@ import (
 // starter of a task keeps the id it saw, so a status call for a task this queue doesn't know can say the task was
 // lost to a restart (task_unknown_after_restart), not that it never was.
 
+//
+// The queue's heartbeat (review 2, M3): the marker also holds when an agentd last had the queue open (alive=, ms
+// since the epoch), rewritten every HeartbeatEvery while it runs (Beat). A queue whose last heartbeat is more than
+// StaleAfter before this process started was left by an agentd that stopped long ago: a container restart (dstack's
+// watchdog) takes seconds, so a gap that long means another release held the VM in between (a rollback to one without
+// -tasks-dir, then a roll forward in the same boot), and the person may have asked again meanwhile. Such a queue is
+// wiped like one from another kernel boot, with a new queue boot: every task in it answers task_unknown_after_restart
+// ("interrupted, run it again?"), none resumes. A marker without a heartbeat (written before it) counts as stale.
+
+// The heartbeat's timing.
+const (
+	HeartbeatEvery = 30 * time.Second
+	StaleAfter     = 5 * time.Minute
+)
+
 // Tmpfs is where the task queue lives in a host tmpfs.
 type Tmpfs struct {
 	Dir string
@@ -31,6 +48,52 @@ type Tmpfs struct {
 	IsMemory func(dir string) (bool, error)
 	// BootID is the kernel's boot id (nil: /proc/sys/kernel/random/boot_id).
 	BootID func() (string, error)
+	// Started is when this process started (zero: now), what the last heartbeat is compared with; Now the clock
+	// (nil: time.Now).
+	Started time.Time
+	Now     func() time.Time
+}
+
+func (t Tmpfs) now() time.Time {
+	if t.Now != nil {
+		return t.Now()
+	}
+	return time.Now()
+}
+
+// writeMarker writes the marker (atomically: a temporary file renamed over it) with this moment as the heartbeat.
+func (t Tmpfs) writeMarker(kernel, boot string) error {
+	marker := filepath.Join(t.Dir, tmpfsMarker)
+	tmp := marker + ".tmp"
+	line := "kernel=" + kernel + " queue=" + boot + " alive=" + strconv.FormatInt(t.now().UnixMilli(), 10) + "\n"
+	if err := os.WriteFile(tmp, []byte(line), 0o600); err != nil {
+		return fmt.Errorf("queue: %w", err)
+	}
+	if err := os.Rename(tmp, marker); err != nil {
+		return fmt.Errorf("queue: %w", err)
+	}
+	return nil
+}
+
+// Beat records that this process still has queue boot open (its heartbeat); call it every HeartbeatEvery. It checks
+// the directory is still memory first, as OpenTmpfs does.
+func (t Tmpfs) Beat(boot string) error {
+	isMem := t.IsMemory
+	if isMem == nil {
+		isMem = isTmpfs
+	}
+	if ok, err := isMem(t.Dir); err != nil || !ok {
+		return fmt.Errorf("%w (%s)", ErrNotMemory, t.Dir)
+	}
+	bootID := t.BootID
+	if bootID == nil {
+		bootID = kernelBootID
+	}
+	kernel, err := bootID()
+	if err != nil {
+		return fmt.Errorf("queue: boot id: %w", err)
+	}
+	return t.writeMarker(kernel, boot)
 }
 
 // The files in a Tmpfs directory.
@@ -51,7 +114,7 @@ func NewBoot() string {
 
 // OpenTmpfs opens (or makes) the task queue in t.Dir after checking the directory is memory and this uid's alone,
 // and returns it with the queue's boot. A queue left by another kernel boot (which a tmpfs can't hold; a marker that
-// doesn't match) is deleted first: its tasks are not taken up.
+// doesn't match) is deleted first: its tasks are not taken up; so is one whose last heartbeat is stale (StaleAfter).
 func OpenTmpfs(t Tmpfs) (*Store, string, error) {
 	if t.Dir == "" {
 		return nil, "", errors.New("queue: no task queue directory")
@@ -94,7 +157,13 @@ func OpenTmpfs(t Tmpfs) (*Store, string, error) {
 			k, v, _ := strings.Cut(kv, "=")
 			f[k] = v
 		}
-		if f["kernel"] == kernel && strings.HasPrefix(f["queue"], "qb_") {
+		started := t.Started
+		if started.IsZero() {
+			started = t.now()
+		}
+		alive, err := strconv.ParseInt(f["alive"], 10, 64)
+		fresh := err == nil && started.Sub(time.UnixMilli(alive)) <= StaleAfter
+		if f["kernel"] == kernel && strings.HasPrefix(f["queue"], "qb_") && fresh {
 			boot = f["queue"]
 		}
 	}
@@ -105,13 +174,9 @@ func OpenTmpfs(t Tmpfs) (*Store, string, error) {
 			}
 		}
 		boot = NewBoot()
-		tmp := marker + ".tmp"
-		if err := os.WriteFile(tmp, []byte("kernel="+kernel+" queue="+boot+"\n"), 0o600); err != nil {
-			return nil, "", fmt.Errorf("queue: %w", err)
-		}
-		if err := os.Rename(tmp, marker); err != nil {
-			return nil, "", fmt.Errorf("queue: %w", err)
-		}
+	}
+	if err := t.writeMarker(kernel, boot); err != nil { // this process's first heartbeat
+		return nil, "", err
 	}
 	s, err := Open(filepath.Join(t.Dir, tmpfsQueue))
 	if err != nil {

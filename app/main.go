@@ -113,6 +113,7 @@ type server struct {
 	lim      Limits
 	quotes   chan struct{} // concurrent /attest limit
 	runsDone atomic.Int64  // finished runs (local platform stats only)
+	drain    drainState    // the Worker's drain before a switch (drain.go)
 
 	rec         *activity.Recorder // the runs' activity records (activity.go, docs/24)
 	safety      *safety.State      // signed policies and stop lists agentd verified (step 6, safety.go)
@@ -135,6 +136,9 @@ type server struct {
 	// saveState saves one sealed state now (Keeper.SaveNow; nil: memory only): an event's delivery is lasting
 	// before its task starts (triggers.go, V1-DESIGN §6.3).
 	saveState func(ctx context.Context, name string) error
+	// starts records once-only start keys as used (claimStart, review 2 M2): the side store's seen set, saved with
+	// saveState before the task runs. nil: the live map and the queue are the only record.
+	starts startClaimStore
 	// Triggers and approvals (triggers.go): the identity directory (keys v2's key log; nil until it reaches this VM, and then
 	// nothing that needs a person's signature works), approvals (POST /approvals) and triggers (POST /triggers).
 	dir       identity.Directory
@@ -480,6 +484,7 @@ func userFrom(ctx context.Context) string {
 }
 
 func main() {
+	started := time.Now() // the tmpfs queue's heartbeat is compared with this (queue.Tmpfs.Started)
 	addr := flag.String("addr", ":8080", "listen address (TCP)")
 	listenUnix := flag.String("listen-unix", "", "serve HTTP on this unix socket instead of -addr (the CVM: gatewayd forwards the published port to it)")
 	listenUID := flag.Int("listen-uid", -1, "the only uid allowed to connect to -listen-unix (gatewayd's); -1: no check")
@@ -518,6 +523,9 @@ func main() {
 	var sf safety.Flags
 	sf.Register(flag.CommandLine)
 	flag.Parse()
+	if flag.NArg() != 0 { // the attested command line is flags only (review 2, M1)
+		log.Fatalf("agentd: unexpected arguments %q", flag.Args())
+	}
 	log.Printf("agentd: %s", procinfo.Line())
 	var relayKey ed25519.PublicKey
 	if *relayAuth != "" {
@@ -611,9 +619,10 @@ func main() {
 	}
 	kept := boot.kept
 	if *tasksDir != "" {
-		if err := kept.useTasksQueue(queue.Tmpfs{Dir: *tasksDir}); err != nil {
+		if err := kept.useTasksQueue(queue.Tmpfs{Dir: *tasksDir, Started: started}); err != nil {
 			log.Fatalf("tasks: %v", err)
 		}
+		go kept.beatTasks(context.Background(), log.Printf)
 	}
 	// Step 6: the signed controls; their floors sealed with the rest when the state is kept (else they come back
 	// from the signed documents gatewayd pulls).
@@ -759,6 +768,12 @@ func main() {
 	if kept.keeper != nil { // a change that must be lasting before what follows it runs (an event's delivery)
 		s.saveState = kept.keeper.SaveNow
 	}
+	if sc, ok := side.(startClaimStore); ok { // both side stores can (queue.Side, trigger.MemStore)
+		s.starts = sc
+	} else {
+		log.Fatal("tasks: the side store can't record start keys")
+	}
+	host.ClaimStart = s.claimStart
 	host.TriggeredDone = s.triggeredDone
 	host.Memory = s.scheduleMemory
 	host.Allows = s.policyAllows
@@ -766,7 +781,13 @@ func main() {
 	s.notify = kept.notify
 	host.TaskEnded = s.taskEnded
 	rg.prompts.OnWait = s.onWait(rg.prompts.OnWait, sg.spaceOf)
+	if cw := s.credWaits(); cw != nil { // a call waiting for its mail login stops the run's clock, as a prompt does
+		cw.OnWait = s.onWait(sg.waiting, sg.spaceOf)
+	}
 	rg.approvals.OnWait = s.onWait(rg.approvals.OnWait, sg.spaceOf)
+	if kept.tasksTmpfs != nil { // a drain an earlier process of this boot kept (drain.go), before any schedule fires
+		s.drain.restore(kept.tasksTmpfs.Dir, time.Now())
+	}
 	ctx := context.Background()
 	s.resumeTasks(ctx, ids, log.Printf)
 	if d, ok := p.(*dstack); ok { // the first /attest after a cold start then waits for one guest agent call, not two
@@ -778,7 +799,7 @@ func main() {
 		go s.pruneResults(ctx)
 	}
 	go sg.enforce(ctx, 2*time.Second)
-	go pruneActivity(ctx, astore)
+	go pruneActivity(ctx, astore, func() bool { return s.drain.on(time.Now()) })
 	go func() { // gatewayd (and through it the vault) gets agentd's documents now and every 10 s
 		for {
 			s.pushSafety()
@@ -821,6 +842,7 @@ func main() {
 	s.connectionRoutes(mux, id)                                  // Settings → Connections (connections.go, the connections contract)
 	s.notifyRoutes(mux, id)                                      // run notifications (notify.go, the schedules contract)
 	s.secretsRoutes(mux)                                         // whether vaultd has the API keys (secrets.go)
+	s.drainRoutes(mux)                                           // the Worker's drain before a switch (drain.go)
 	mux.HandleFunc("POST /schedules/handoff", s.scheduleHandoff) // sealed results to the relay (handoff.go, the schedules contract)
 	mux.HandleFunc("GET /activity", s.activityOut)               // sealed activity records, for the relay (docs/24)
 	// Signed policies and stop lists; the signature is the authorization. Only served when the compose pins a key

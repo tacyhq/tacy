@@ -545,6 +545,10 @@ type resultBody struct {
 	Quiet  bool          `json:"quiet,omitzero"`
 	Note   string        `json:"note,omitzero"`
 	Events []proto.Event `json:"events"`
+	// MailRead: the run read (or tried to read) the person's mail, or its definition lists mail: its text has its
+	// remote images and links as plain text (guard.PlainRemote, R4 of the v1 design §5.6), and the client renders it
+	// without images or links. v1 runs never read mail; this is the line after that.
+	MailRead bool `json:"mail_read,omitzero"`
 }
 
 func resultAAD(space, task string) []byte { return []byte(resultInfo + "\x00" + space + "\x00" + task) }
@@ -640,6 +644,14 @@ func (s *server) triggeredDone(id string, o guard.TaskOptions) {
 	for _, e := range evs {
 		if e.Type == "error" && e.Code != "" {
 			body.Code = e.Code
+		}
+	}
+	if o.MailDef || guard.MailRead(evs) {
+		body.MailRead = true
+		for i := range body.Events {
+			if body.Events[i].Type == "text" {
+				body.Events[i].Delta = guard.PlainRemote(body.Events[i].Delta)
+			}
 		}
 	}
 	if o.NoChange && body.State == harness.OutcomeSucceeded {
@@ -738,10 +750,12 @@ func (s *server) scheduleMemory(space, agent string) ([]trigger.Remembered, erro
 // the definitions first) and then every hour, until ctx ends.
 func (s *server) pruneResults(ctx context.Context) {
 	for {
-		if err := s.results.PruneResults(time.Now().Add(-trigger.ResultKeep)); err != nil {
-			log.Printf("schedules: %v", err)
+		if !s.drain.on(time.Now()) { // drained (drain.go): the active VM prunes
+			if err := s.results.PruneResults(time.Now().Add(-trigger.ResultKeep)); err != nil {
+				log.Printf("schedules: %v", err)
+			}
+			s.pruneMemory()
 		}
-		s.pruneMemory()
 		select {
 		case <-ctx.Done():
 			return

@@ -67,8 +67,9 @@ type Keyring struct {
 	// NeedsSecrets: the app has API keys that aren't in yet (secrets.sealed not fetched or opened yet).
 	NeedsSecrets bool      `json:"needs_secrets,omitempty"`
 	UnlockedAt   time.Time `json:"unlocked_at"`
-	// Floors are the generations the witnesses' newest state head names, "<tag>/<name>" -> gen (tag "state" for
-	// agentd's state/v1, "conn" for vaultd's conn/v1): a process refuses its sealed state below them.
+	// Floors are the lowest generations of each sealed state, "<tag>/<name>" -> gen (tag "state" for agentd's
+	// state/v1, "conn" for vaultd's conn/v1): a process refuses its sealed state below them. Nothing sets them since
+	// the legacy rollback witness (its state head in the unlock reply) is removed; the freshness record will.
 	Floors map[string]uint64 `json:"floors,omitempty"`
 	// Boot is the kernel's boot id when it was derived: a cached keyring serves only the same boot.
 	Boot string `json:"boot"`

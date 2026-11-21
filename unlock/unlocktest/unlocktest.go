@@ -37,6 +37,7 @@ import (
 	"github.com/tacyhq/tacy/kms/split/splitdev"
 	"github.com/tacyhq/tacy/proto"
 	"github.com/tacyhq/tacy/safety"
+	"github.com/tacyhq/tacy/verifier"
 )
 
 // The VM's app, release and firm in the world's policy.
@@ -105,7 +106,8 @@ func New(t testing.TB, ids []string, threshold int) *World {
 		t.Fatal(err)
 	}
 	dc, _ := kms.DockerCompose(ac)
-	w.VMCompose = releaseCompose(t, dc)
+	_ = dc
+	w.VMCompose = UnlockdCompose(t, d.KMSID)
 	q, info, acHash := w.Variant(func(m map[string]any) { m["docker_compose_file"] = w.VMCompose })
 	w.VM, w.AppComposeSHA256 = &Evidence{Quote: q, Info: info}, acHash
 	d.Policy.KMSFallback, d.Policy.Seq, d.Policy.Floor = true, 5, "v0.19.0"
@@ -143,7 +145,12 @@ func (w *World) HolderEvents() []holder.Event {
 // Variant is the release VM with its app-compose.json edited (quote and RTMR3 consistent): its quote, info and
 // app-compose hash.
 func (w *World) Variant(edit func(map[string]any)) (json.RawMessage, json.RawMessage, string) {
-	info, ac := editAppCompose(w.t, w.recInfo, edit)
+	info, ac := editAppCompose(w.t, w.recInfo, func(m map[string]any) {
+		edit(m)
+		if dc, _ := m["docker_compose_file"].(string); verifier.HasUnlockd(dc) {
+			m["pre_launch_script"] = verifier.MemoryRootScript // the split-key unlock in the KMS fallback (unlockd.go)
+		}
+	})
 	return editEvents(w.t, w.recQuote, map[string]string{"compose-hash": sum(ac)}), info, sum(ac)
 }
 
@@ -305,6 +312,36 @@ func editEvents(t testing.TB, quote json.RawMessage, set map[string]string) json
 		t.Fatal(err)
 	}
 	return out
+}
+
+// UnlockdCompose is the release's compose.yaml (with unlockd: holders release shares only to such a release, review
+// L3) in the KMS fallback's form the recorded quote boots (no -key-mode none, no host-tmpfs task queue), its pinned
+// KMS id kmsID.
+func UnlockdCompose(t testing.TB, kmsID string) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(Testdata(), "..", "compose.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := string(b)
+	for _, cut := range []string{"      - " + verifier.TasksDir + ":" + verifier.TasksDir + "\n", "      - " + verifier.TasksDir + ":" + verifier.TasksDir + "\n",
+		`, "-dir", "` + verifier.TasksDir + `=10003:10003:0700"`, `, "-tasks-dir", "` + verifier.TasksDir + `"`} {
+		c = strings.Replace(c, cut, "", 1)
+	}
+	for _, cut := range []string{"      - " + verifier.UnlockCacheDir + ":" + verifier.UnlockCacheDir + "\n",
+		`, "-dir", "` + verifier.UnlockCacheDir + `=10005:10005:0700"`, `, "-key-mode", "none"`} {
+		if !strings.Contains(c, cut) {
+			t.Fatalf("compose.yaml has no %q", cut)
+		}
+		c = strings.Replace(c, cut, "", 1)
+	}
+	const k = `"-kms-key", "`
+	i := strings.Index(c, k)
+	if i < 0 {
+		t.Fatal("compose.yaml has no -kms-key")
+	}
+	j := strings.Index(c[i+len(k):], `"`)
+	return strings.ReplaceAll(c, c[i+len(k):i+len(k)+j], kmsID)
 }
 
 // releaseCompose is the recording's compose as a release has it: no diag service, every named volume in memory.

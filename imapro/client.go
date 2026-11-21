@@ -233,7 +233,7 @@ func str(s string) arg    { return arg{'s', s} }
 func rawArg(s string) arg { return arg{'r', s} }
 
 // quotable: a string that can go in quotes (7-bit, no CR, LF or NUL).
-func quotable(s string) bool {
+func quotable[T string | []byte](s T) bool {
 	if len(s) > 1000 {
 		return false
 	}
@@ -393,14 +393,21 @@ func (e *statusError) Error() string { return "imapro: " + e.name + " " + e.resp
 // Login logs in with LOGIN, or AUTHENTICATE PLAIN when the server disables LOGIN. A refusal is a *LoginError with
 // a fixed code: app_password_required (Gmail's "Application-specific password required"), app_passwords_blocked
 // (the provider refuses this kind of sign-in for the account: web login required, IMAP off), else login_failed.
-func (c *Client) Login(user, pass string) error {
-	if user == "" || pass == "" {
+//
+// Login takes the password as a string, which Go can't zero: the connector uses LoginBytes.
+func (c *Client) Login(user, pass string) error { return c.LoginBytes(user, []byte(pass)) }
+
+// LoginBytes is Login with the password as bytes (review 2, L7): the command line it builds, the AUTHENTICATE PLAIN
+// token and bufio's buffer are zeroed once sent. The caller zeroes pass. (crypto/tls seals each record in place, so
+// it keeps no plaintext copy; the server's copy is the server's.)
+func (c *Client) LoginBytes(user string, pass []byte) error {
+	if user == "" || len(pass) == 0 {
 		return &LoginError{Code: LoginFailed}
 	}
 	var err error
 	switch {
 	case !c.Has("LOGINDISABLED"):
-		_, err = c.do("LOGIN", []arg{str(user), str(pass)})
+		err = c.loginCmd(user, pass)
 	case c.Has("AUTH=PLAIN"):
 		err = c.authPlain(user, pass)
 	default:
@@ -426,8 +433,78 @@ func (c *Client) Login(user, pass string) error {
 	return nil
 }
 
+// wipeWriteBuffer zeroes bufio's buffer after a Flush (nothing is buffered then: its whole buffer is free).
+func (c *Client) wipeWriteBuffer() {
+	b := c.w.AvailableBuffer()
+	clear(b[:cap(b)])
+}
+
+// loginCmd is LOGIN "user" <password>: the password quoted when it can be, else as a synchronizing literal; every
+// buffer that held it zeroed once sent.
+func (c *Client) loginCmd(user string, pass []byte) error {
+	if !quotable(user) {
+		return fmt.Errorf("%w: bad user name", ErrRefused)
+	}
+	qu := `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(user) + `"`
+	if err := Allowed("LOGIN " + qu + " {" + strconv.Itoa(len(pass)) + "}"); err != nil {
+		return err
+	}
+	c.tag++
+	tag := "t" + strconv.Itoa(c.tag)
+	c.Sent = append(c.Sent, "LOGIN")
+	head := tag + " LOGIN " + qu + " "
+	if quotable(pass) {
+		line := make([]byte, 0, len(head)+2*len(pass)+4)
+		line = append(line, head...)
+		line = append(line, '"')
+		for _, b := range pass {
+			if b == '\\' || b == '"' {
+				line = append(line, '\\')
+			}
+			line = append(line, b)
+		}
+		line = append(line, '"', '\r', '\n')
+		c.w.Write(line)
+		clear(line)
+		err := c.w.Flush()
+		c.wipeWriteBuffer()
+		if err != nil {
+			return err
+		}
+	} else {
+		if !utf8.Valid(pass) || len(pass) > 64<<10 {
+			return fmt.Errorf("%w: bad string", ErrRefused)
+		}
+		c.w.WriteString(head + "{" + strconv.Itoa(len(pass)) + "}\r\n")
+		if err := c.w.Flush(); err != nil {
+			return err
+		}
+		for { // a synchronizing literal: wait for "+"
+			r, err := c.r.read()
+			if err != nil {
+				return err
+			}
+			if r.tag == "+" {
+				break
+			}
+			if r.tag == tag {
+				return &statusError{name: "LOGIN", resp: r}
+			}
+		}
+		c.w.Write(pass)
+		c.w.WriteString("\r\n")
+		err := c.w.Flush()
+		c.wipeWriteBuffer()
+		if err != nil {
+			return err
+		}
+	}
+	_, err := c.wait(tag, "LOGIN")
+	return err
+}
+
 // authPlain: AUTHENTICATE PLAIN with the credentials after the server's go-ahead.
-func (c *Client) authPlain(user, pass string) error {
+func (c *Client) authPlain(user string, pass []byte) error {
 	tag, err := c.write("AUTHENTICATE", []arg{atom("PLAIN")})
 	if err != nil {
 		return err
@@ -442,9 +519,17 @@ func (c *Client) authPlain(user, pass string) error {
 		}
 		return errors.New("imapro: no go-ahead for AUTHENTICATE")
 	}
-	tok := base64.StdEncoding.EncodeToString([]byte("\x00" + user + "\x00" + pass))
-	c.w.WriteString(tok + "\r\n")
-	if err := c.w.Flush(); err != nil {
+	raw := make([]byte, 0, 2+len(user)+len(pass))
+	raw = append(append(append(append(raw, 0), user...), 0), pass...)
+	tok := make([]byte, base64.StdEncoding.EncodedLen(len(raw)), base64.StdEncoding.EncodedLen(len(raw))+2)
+	base64.StdEncoding.Encode(tok, raw)
+	clear(raw)
+	tok = append(tok, '\r', '\n')
+	c.w.Write(tok)
+	clear(tok)
+	err = c.w.Flush()
+	c.wipeWriteBuffer()
+	if err != nil {
 		return err
 	}
 	_, err = c.wait(tag, "AUTHENTICATE")

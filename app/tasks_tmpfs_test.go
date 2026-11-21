@@ -199,3 +199,48 @@ func TestTaskUnknownAfterReboot(t *testing.T) {
 		t.Fatalf("memory queues' boots %q %q", a, b)
 	}
 }
+
+// Review 2, M3: rollback then roll forward in one kernel boot. A release without -tasks-dir ran in between (nothing
+// beat the queue's heartbeat for longer than a container restart takes), so the person may have asked again; the
+// next agentd with -tasks-dir doesn't resume the old task: the queue is wiped with a new boot, the task's status
+// answers task_unknown_after_restart, and no model call runs for it.
+func TestStaleQueueNotResumedAfterRollForward(t *testing.T) {
+	dir := tasksDir(t)
+	fs := &fakeSearch{}
+	m := newStepModel(t, "block")
+	q1, boot1 := tasksQueueAt(t, dir, "kernel-boot-1")
+	p1 := bootTasksOn(t, q1, boot1, m, fs, false)
+	c1 := p1.conn(t, tasksUser)
+	tk, err := c1.StartTask(context.Background(), proto.RunRequest{Permissions: guard.AllowAll(), Messages: user1("hello")}, "k1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitCalls(t, m, 1)
+	p1.kill() // the rollback: this agentd stops, an older release (no -tasks-dir) serves for a while
+
+	// The roll forward, the same kernel boot, an hour later.
+	k := newAgentState()
+	later := time.Now().Add(time.Hour)
+	err = k.useTasksQueue(queue.Tmpfs{Dir: dir, IsMemory: func(string) (bool, error) { return true, nil },
+		BootID: func() (string, error) { return "kernel-boot-1", nil }, Started: later, Now: func() time.Time { return later }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c, ok := k.queue.(interface{ Close() error }); ok {
+		t.Cleanup(func() { c.Close() })
+	}
+	if k.queueBoot == boot1 {
+		t.Fatalf("the roll forward took the stale queue up (boot %q)", boot1)
+	}
+	p2 := bootTasksOn(t, k.queue, k.queueBoot, m, fs, false)
+	c2 := p2.conn(t, tasksUser)
+	c2.SetTaskSecret(tk.Task, c1.TaskSecret(tk.Task))
+	c2.SetTaskBoot(tk.Task, boot1)
+	if _, err := c2.TaskStatus(context.Background(), tk.Task); err == nil || !strings.Contains(err.Error(), `"error":"task_unknown_after_restart"`) {
+		t.Fatalf("status of the stale task: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if n := m.calls.Load(); n != 1 {
+		t.Fatalf("model calls after the roll forward: %d, want 1 (the stale task never resumed)", n)
+	}
+}

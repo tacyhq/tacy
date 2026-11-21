@@ -58,8 +58,7 @@ type Config struct {
 	policyHash string                // PolicyHash of the policy's payload: every reply must be under it
 }
 
-// Root is an epoch's VM root R_e after an unlock, with its epoch certificate and the highest state head the
-// policy's witnesses returned (nil: none yet). Derive what the VM needs, then Drop it. There is no M here and no KMS
+// Root is an epoch's VM root R_e after an unlock, with its epoch certificate. Derive what the VM needs, then Drop it. There is no M here and no KMS
 // id private key.
 type Root struct {
 	r     []byte
@@ -67,10 +66,9 @@ type Root struct {
 	Epoch uint32
 	Set   uint32
 	Cert  *EpochCert
-	Head  *StateHead
 }
 
-// WitnessKey is the key the VM signs its state heads with (WitnessKey of R_e).
+// WitnessKey is the epoch's witness key (WitnessKey of R_e): what the VM signs its freshness record ops with.
 func (r *Root) WitnessKey() (ed25519.PrivateKey, error) {
 	if r.r == nil {
 		return nil, errors.New("split: root dropped")
@@ -239,7 +237,7 @@ func (cfg *Config) breakGlass(ctx context.Context, pol *UnlockPolicy, cert *Epoc
 	if r.Holder != BreakGlassHolder || r.Set != 0 || r.Index != 0 || r.KMSID != pol.KMSID || r.Epoch != pol.Epoch {
 		return nil, errors.New("break-glass reply names another holder, set, KMS id or epoch")
 	}
-	root, err := kms.Open(priv, LabelBreakGlass, ReplyAAD(bound, pol.KMSID, pol.Epoch, 0, BreakGlassHolder, 0, cfg.policyHash, nil), r.Sealed)
+	root, err := kms.Open(priv, LabelBreakGlass, ReplyAAD(bound, pol.KMSID, pol.Epoch, 0, BreakGlassHolder, 0, cfg.policyHash), r.Sealed)
 	if err != nil {
 		return nil, errors.New("break-glass reply doesn't open with this boot's key")
 	}
@@ -318,13 +316,12 @@ func (cfg *Config) unlockSet(ctx context.Context, pol *UnlockPolicy, set *ShareS
 
 	// 3. Each holder's share, in parallel; a share is kept only if it matches its commitment.
 	shares := map[string]kms.Share{}
-	heads := map[string][]byte{}
 	var asked []string
 	for _, n := range hn {
 		asked = append(asked, n.Holder)
 	}
 	parallel(ctx, cfg.Timeout, asked, func(ctx context.Context, id string) {
-		y, idx, head, err := askShare(ctx, byID[id], req, id, set, bound, cfg.policyHash, priv)
+		y, idx, err := askShare(ctx, byID[id], req, id, set, bound, cfg.policyHash, priv)
 		mu.Lock()
 		defer mu.Unlock()
 		if err != nil {
@@ -332,9 +329,6 @@ func (cfg *Config) unlockSet(ctx context.Context, pol *UnlockPolicy, set *ShareS
 			return
 		}
 		shares[id] = kms.Share{X: idx, Y: y}
-		if len(head) > 0 {
-			heads[id] = head
-		}
 		out[id] = "ok"
 	})
 	defer func() {
@@ -365,43 +359,7 @@ func (cfg *Config) unlockSet(ctx context.Context, pol *UnlockPolicy, set *ShareS
 		clear(root)
 		return nil, nil, fmt.Errorf("split: %w", err)
 	}
-	head, err := highestHead(pol, heads, cfg.certs)
-	if err != nil {
-		clear(root)
-		return nil, nil, err
-	}
-	return &Root{r: root, KMSID: set.KMSID, Epoch: set.Epoch, Set: set.Set, Cert: cert, Head: head}, use, nil
-}
-
-// highestHead verifies the heads the policy's witnesses returned (each under its epoch's certificate) and returns
-// the one with the highest counter. A head that doesn't verify fails the unlock: a witness never lies by accident.
-func highestHead(pol *UnlockPolicy, heads map[string][]byte, certs map[uint32]*EpochCert) (*StateHead, error) {
-	var best *StateHead
-	for id, raw := range heads {
-		if !slices.Contains(pol.Witnesses, id) {
-			continue // not a witness under this policy: its head counts for nothing
-		}
-		var sh SignedHead
-		if err := kms.Strict(raw, &sh); err != nil {
-			return nil, fmt.Errorf("split: %s's state head: %w", id, err)
-		}
-		var peek struct {
-			Epoch uint32 `json:"epoch"`
-		}
-		json.Unmarshal(sh.Doc, &peek)
-		c := certs[peek.Epoch]
-		if c == nil {
-			continue // an epoch the policy no longer certifies (after a re-split): the new epoch's heads take over
-		}
-		h, err := sh.Open(c)
-		if err != nil {
-			return nil, fmt.Errorf("split: %s's state head: %w", id, err)
-		}
-		if best == nil || h.Counter > best.Counter {
-			best = h
-		}
-	}
-	return best, nil
+	return &Root{r: root, KMSID: set.KMSID, Epoch: set.Epoch, Set: set.Set, Cert: cert}, use, nil
 }
 
 // openPolicy reads the unlock policy (and checks the admin keys when the VM pins them), its share sets (newest
@@ -437,28 +395,28 @@ func (cfg *Config) openPolicy() (*UnlockPolicy, []*ShareSet, map[uint32]*EpochCe
 // askShare sends the unlock request to one holder and opens its reply: the holder, index, KMS id, epoch and set
 // must be its share set entry's, and the share its commitment.
 func askShare(ctx context.Context, t client.Transport, req []byte, id string, set *ShareSet, bound []byte, policyHash string,
-	priv *ecdh.PrivateKey) ([]byte, byte, []byte, error) {
+	priv *ecdh.PrivateKey) ([]byte, byte, error) {
 	b, err := t.Do(ctx, http.MethodPost, "/v1/unlock", req)
 	if err != nil {
-		return nil, 0, nil, err
+		return nil, 0, err
 	}
 	var r UnlockReply
 	if err := kms.Strict(b, &r); err != nil {
-		return nil, 0, nil, fmt.Errorf("reply: %w", err)
+		return nil, 0, fmt.Errorf("reply: %w", err)
 	}
 	e, _ := set.Holder(id)
 	if r.Holder != id || r.Index != e.Index || r.KMSID != set.KMSID || r.Epoch != set.Epoch || r.Set != set.Set {
-		return nil, 0, nil, errors.New("reply names another holder, index, KMS id, epoch or set")
+		return nil, 0, errors.New("reply names another holder, index, KMS id, epoch or set")
 	}
-	y, err := kms.Open(priv, LabelReply, ReplyAAD(bound, set.KMSID, set.Epoch, set.Set, id, e.Index, policyHash, r.WitnessHead), r.Sealed)
+	y, err := kms.Open(priv, LabelReply, ReplyAAD(bound, set.KMSID, set.Epoch, set.Set, id, e.Index, policyHash), r.Sealed)
 	if err != nil {
-		return nil, 0, nil, errors.New("reply doesn't open with this boot's key (a reply under another policy, or its witness head was changed)")
+		return nil, 0, errors.New("reply doesn't open with this boot's key (a reply under another policy)")
 	}
 	if Commitment(set.KMSID, set.Epoch, set.Set, id, e.Index, y) != e.Commitment {
 		clear(y)
-		return nil, 0, nil, errors.New("share doesn't match its commitment")
+		return nil, 0, errors.New("share doesn't match its commitment")
 	}
-	return y, e.Index, r.WitnessHead, nil
+	return y, e.Index, nil
 }
 
 func parallel(ctx context.Context, timeout time.Duration, ids []string, f func(context.Context, string)) {

@@ -14,12 +14,12 @@ import (
 
 // The 24 h delay at clients (safety/trustdelay.go): what a signed list adds counts at a verifier only once that
 // verifier has seen it listed for safety.TrustDelay; a withdrawal applies at once and an item listed again waits
-// again; Google Cloud (dstack-gcp) waits like any addition; a lowered floor keeps the old one for the delay; the
+// again; a lowered floor keeps the old one for the delay; the
 // emergency override (the pinned KMS id's signature) expedites only the items it names, and a bad one refuses the list.
 func TestTrustDelay(t *testing.T) {
 	admin := testAdmin(t)
 	id := kmsKey(t)
-	rc := bootWith(t, composeWithKMS(t, `"-kms-key", "`+id+`", "-kms-url", "https://kms.tacy.io", `), false, nil, keyEvent(false))
+	rc := bootWith(t, composeWithKMS(t, id), false, nil, keyEvent(false))
 	passes := func(s *TrustState, at time.Time) error {
 		p, info := s.Apply(rc.p, at)
 		if info != nil && !info.OK {
@@ -93,33 +93,26 @@ func TestTrustDelay(t *testing.T) {
 	}
 }
 
-// dstack-gcp is an addition like any other: Google Cloud's sets come on only a day after a client first saw the
-// platform listed, and off at once when a list drops it.
-func TestTrustDelayGCP(t *testing.T) {
+// A list naming a platform this verifier has no checks for ("dstack-gcp", the Google Cloud host fallback taken out
+// of v1: the v1 Google host removal) is refused at once, not held pending for 24 h: the list taken before stays in force, and the
+// item record isn't touched. Before the change, dstack-gcp was taken as a pending addition and turned Google Cloud's
+// boot sets on a day later.
+func TestTrustListUnknownPlatformRefused(t *testing.T) {
 	admin := testAdmin(t)
-	gcpOn := func(p Policy) bool {
-		for h := range GCPImages {
-			if _, ok := p.ProdImages[h]; ok {
-				return true
-			}
-		}
-		return false
-	}
 	var s TrustState
-	env := signedList(t, admin, safety.TrustList{Seq: 3, Platforms: []string{"dstack", PlatformDstackGCP}})
-	info := s.Take(env, 0, listNow)
-	if !info.OK || len(info.Pending) != 1 || info.Pending[0].Item != safety.TrustItemPlatform+PlatformDstackGCP {
-		t.Fatalf("dstack-gcp should be pending: %+v", info)
+	first := s.Take(signedList(t, admin, safety.TrustList{Seq: 3, Platforms: []string{"dstack"}}), 0, listNow)
+	if !first.OK || len(first.Pending) != 0 {
+		t.Fatalf("a dstack-only list: %+v", first)
 	}
-	if p, _ := s.Apply(Policy{}, listNow); gcpOn(p) {
-		t.Fatal("Google Cloud's sets on at once")
-	}
-	if p, _ := s.Apply(Policy{}, listNow.Add(safety.TrustDelay)); !gcpOn(p) {
-		t.Fatal("Google Cloud's sets still off a day later")
-	}
-	off := s.TakeSeen(signedList(t, admin, safety.TrustList{Seq: 4, Platforms: []string{"dstack"}}), 3, listNow.Add(safety.TrustDelay), []byte(info.Seen))
-	if p, _ := s.Apply(Policy{}, listNow.Add(safety.TrustDelay)); !off.OK || gcpOn(p) {
-		t.Fatalf("dropped dstack-gcp still on: %+v", off)
+	for _, plats := range [][]string{{"dstack", "dstack-gcp"}, {"dstack-gcp"}} {
+		info := s.TakeSeen(signedList(t, admin, safety.TrustList{Seq: 4, Platforms: plats}), 3, listNow, []byte(first.Seen))
+		if info.OK || !strings.Contains(info.Error, `unknown platform "dstack-gcp"`) || info.Seen != "" {
+			t.Fatalf("platforms %v: %+v", plats, info)
+		}
+		_, in := s.Apply(Policy{}, listNow.Add(safety.TrustDelay))
+		if in == nil || !in.OK || in.Seq != 3 {
+			t.Fatalf("platforms %v: the list taken before isn't the one in force: %+v", plats, in)
+		}
 	}
 }
 

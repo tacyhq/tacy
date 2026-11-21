@@ -3,6 +3,7 @@ package holder
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,12 +17,31 @@ type MemoryNonces struct {
 	max    int
 	used   map[string]time.Time
 	claims map[string]claim
-	now    func() time.Time
+	now    func() time.Time // the holder's clock (bind); nil: the wall clock
 }
 
-// NewMemoryNonces holds at most max live nonces.
+// NewMemoryNonces holds at most max live nonces. It keeps time on the clock of the holder it is given to (New binds
+// it to Config.Now): an in-process store has no clock of its own, and one on the wall clock beside a holder on another
+// clock would drop a ticket claim the holder still counts on (the start ticket tests broke the day after their
+// fixed date). A durable store (D1, Upstash, Firestore) keeps time on its server's clock, as the holder's own is.
 func NewMemoryNonces(max int) *MemoryNonces {
-	return &MemoryNonces{max: max, used: map[string]time.Time{}, now: time.Now}
+	return &MemoryNonces{max: max, used: map[string]time.Time{}}
+}
+
+// bind sets the store's clock to the holder's, once: the first holder given the store sets it.
+func (m *MemoryNonces) bind(now func() time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.now == nil {
+		m.now = now
+	}
+}
+
+func (m *MemoryNonces) clock() time.Time {
+	if m.now == nil {
+		return time.Now()
+	}
+	return m.now()
 }
 
 // Use implements NonceStore.
@@ -32,7 +52,7 @@ func (m *MemoryNonces) Use(_ context.Context, nonce string, expires time.Time) (
 		return false, nil
 	}
 	if len(m.used) >= m.max {
-		now := m.now()
+		now := m.clock()
 		for n, e := range m.used {
 			if !now.Before(e) {
 				delete(m.used, n)
@@ -53,7 +73,7 @@ func (m *MemoryNonces) Claim(_ context.Context, key, value string, create bool, 
 	if m.claims == nil {
 		m.claims = map[string]claim{}
 	}
-	now := m.now()
+	now := m.clock()
 	if c, ok := m.claims[key]; ok && now.Before(c.expires) {
 		return c.value, nil
 	}
@@ -129,7 +149,7 @@ func (m *MemoryStore) Apply(_ context.Context, gen string, seq uint64, hash stri
 	}
 	for it, st := range g.items {
 		switch {
-		case !in[it] && st.Withdrawn.IsZero():
+		case !in[it] && st.Withdrawn.IsZero() && !Permanent(it):
 			g.items[it] = ItemState{First: st.First, Withdrawn: now}
 		case !st.Withdrawn.IsZero() && now.Sub(st.Withdrawn) > prune:
 			delete(g.items, it)
@@ -169,35 +189,6 @@ func (m *MemoryStore) Expedite(_ context.Context, gen, item string, t time.Time)
 	return true, nil
 }
 
-// MemoryWitness is a WitnessStore in memory (tests; Vercel's is Upstash KV).
-type MemoryWitness struct {
-	mu    sync.Mutex
-	heads map[string]witnessHead
-}
-
-type witnessHead struct {
-	counter uint64
-	head    []byte
-}
-
-// Put implements WitnessStore.
-func (m *MemoryWitness) Put(_ context.Context, key string, counter uint64, head []byte) (uint64, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.heads == nil {
-		m.heads = map[string]witnessHead{}
-	}
-	cur := m.heads[key]
-	if counter > cur.counter {
-		m.heads[key] = witnessHead{counter: counter, head: append([]byte(nil), head...)}
-		return counter, nil
-	}
-	return cur.counter, nil
-}
-
-// Get implements WitnessStore.
-func (m *MemoryWitness) Get(_ context.Context, key string) ([]byte, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return append([]byte(nil), m.heads[key].head...), nil
-}
+// Permanent says whether a policy item is never withdrawn (a revoked machine certificate, split.ItemMachineRevoked):
+// every PolicyStore's Apply leaves it as it is when a newer policy doesn't list it, so it is never pruned either.
+func Permanent(item string) bool { return strings.HasPrefix(item, split.ItemMachineRevoked) }

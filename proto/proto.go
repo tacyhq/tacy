@@ -321,6 +321,19 @@ type Event struct {
 	To       string `json:"to,omitempty"`
 	// Approval: an effect held for a person's approval (approve before send, docs/27 section 4), or what became of it.
 	Approval *Approval `json:"approval,omitempty"`
+	// Credential: need_credential (v1, the v1 design §5.4): a mail call waits for the person's app to send the task's
+	// mail login again (POST /tasks/credential), or what became of it.
+	Credential *CredentialNeed `json:"credential,omitempty"`
+}
+
+// CredentialNeed is a mail call waiting for its task's login: the task and the held request, the connection, how
+// long it waits; settled: Decision provided or timed_out. Never a login or any part of one.
+type CredentialNeed struct {
+	Task       string `json:"task"`
+	Request    string `json:"request"`
+	Connection string `json:"connection"`
+	TimeoutS   int    `json:"timeout_s,omitempty"`
+	Decision   string `json:"decision,omitempty"`
 }
 
 // Approval is an effect held for approval: exactly what would happen (Effect, canonical JSON) and its hash, which the

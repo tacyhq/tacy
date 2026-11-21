@@ -211,7 +211,7 @@ func TestKMSID(t *testing.T) {
 		}
 		return []byte(c[:i] + args + c[i:])
 	}
-	ok := withKMS(`"-kms-key", "` + id + `", "-kms-url", "https://kms.tacy.io", `)
+	ok := composeWithKMS(t, id)
 	rc := bootWith(t, ok, false, nil, keyEvent(false))
 	_, err := Verify(context.Background(), rc.a, rc.nonce, rc.p)
 	if err == nil || !strings.HasPrefix(err.Error(), KMSIDCheck+": ") || !strings.Contains(err.Error(), "isn't a pinned one") {
@@ -223,7 +223,7 @@ func TestKMSID(t *testing.T) {
 	}
 	p, _ := rc.p.WithTrustList(l)
 	res, err := Verify(context.Background(), rc.a, rc.nonce, p)
-	if err != nil || res.Facts["Tacy KMS"] != id || res.Facts["Tacy KMS url"] != "https://kms.tacy.io" {
+	if err != nil || res.Facts["Tacy KMS"] != id {
 		t.Fatalf("listed KMS id: %v %v", err, res.Facts)
 	}
 	rc.p.KMSIDs = map[string]string{id: "built in"}
@@ -262,15 +262,15 @@ func composeNoKMS(t *testing.T) []byte {
 	return []byte(c)
 }
 
-// composeWithKMS is compose.yaml with args put in agentd's command (a -kms-key and -kms-url, as a release names them).
-func composeWithKMS(t *testing.T, args string) []byte {
+// composeWithKMS is compose.yaml naming the KMS id id where the release names one (gatewayd's and unlockd's
+// -kms-key: a release with unlockd has exactly that shape, ReleaseShape, and no -kms-url).
+func composeWithKMS(t *testing.T, id string) []byte {
 	t.Helper()
-	c := string(composeNoKMS(t))
-	i := strings.Index(c, `"-runner-socket", "/run/tacy/runner/runner.sock"`)
-	if i < 0 {
-		t.Fatal("agentd's -runner-socket not in compose.yaml")
+	c := regexp.MustCompile(`"-kms-key", "[^"]*", `).ReplaceAllString(string(composeYAML(t)), `"-kms-key", "`+id+`", `)
+	if strings.Count(c, `"-kms-key", "`+id+`", `) != 2 {
+		t.Fatal("compose.yaml doesn't name the KMS id in gatewayd and unlockd")
 	}
-	return []byte(c[:i] + args + c[i:])
+	return []byte(c)
 }
 
 func kmsKey(t *testing.T) string {
@@ -303,7 +303,7 @@ func TestReleaseKMSID(t *testing.T) {
 	}
 
 	// With the built-in values only (no trust list), a compose naming a KMS id: refused unless it is the pin.
-	compose := composeWithKMS(t, `"-kms-key", "`+id+`", "-kms-url", "https://kms.tacy.io", `)
+	compose := composeWithKMS(t, id)
 	rc := bootWith(t, compose, false, nil, keyEvent(false))
 	if _, err := Verify(context.Background(), rc.a, rc.nonce, rc.p); err == nil || !strings.HasPrefix(err.Error(), KMSIDCheck+": ") {
 		t.Fatalf("an id that isn't the pin: %v", err)
@@ -313,7 +313,7 @@ func TestReleaseKMSID(t *testing.T) {
 	if err != nil || res.Facts["Tacy KMS"] != id {
 		t.Fatalf("the pinned id: %v %v", err, res.Facts)
 	}
-	other := bootWith(t, composeWithKMS(t, `"-kms-key", "`+kmsKey(t)+`", `), false, nil, keyEvent(false))
+	other := bootWith(t, composeWithKMS(t, kmsKey(t)), false, nil, keyEvent(false))
 	other.p.KMSIDs = releaseKMSIDs(id)
 	if _, err := Verify(context.Background(), other.a, other.nonce, other.p); err == nil || !strings.HasPrefix(err.Error(), KMSIDCheck+": ") {
 		t.Fatalf("another id under the pin: %v", err)
@@ -410,7 +410,7 @@ func TestTrustState(t *testing.T) {
 	if r := s.Take(signedList(t, admin, safety.TrustList{Seq: 4}), 5, listNow); r.OK || !strings.Contains(r.Error, "older") {
 		t.Fatalf("older: %+v", r)
 	}
-	rc := bootWith(t, composeWithKMS(t, `"-kms-key", "`+id+`", "-kms-url", "https://kms.tacy.io", `), false, nil, keyEvent(false))
+	rc := bootWith(t, composeWithKMS(t, id), false, nil, keyEvent(false))
 	p, used := s.Apply(rc.p, listNow)
 	if used == nil || !used.OK || used.Seq != 5 || used.ReleaseEntries != nil || len(p.Releases) != 1 || p.ReleaseFloor != "v0.21.0" {
 		t.Fatalf("applied: %+v %+v", used, p.Releases)
@@ -418,7 +418,7 @@ func TestTrustState(t *testing.T) {
 	if res, err := Verify(context.Background(), rc.a, rc.nonce, p); err != nil || res.Facts["Tacy KMS"] != id {
 		t.Fatalf("the listed KMS id: %v", err)
 	}
-	unlisted := bootWith(t, composeWithKMS(t, `"-kms-key", "`+kmsKey(t)+`", `), false, nil, keyEvent(false))
+	unlisted := bootWith(t, composeWithKMS(t, kmsKey(t)), false, nil, keyEvent(false))
 	q, _ := s.Apply(unlisted.p, listNow)
 	if _, err := Verify(context.Background(), unlisted.a, unlisted.nonce, q); err == nil || !strings.HasPrefix(err.Error(), "Tacy KMS:") {
 		t.Fatalf("an unlisted KMS id: %v", err)

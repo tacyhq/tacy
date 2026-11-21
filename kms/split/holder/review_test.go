@@ -6,6 +6,8 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"maps"
+	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -153,77 +155,52 @@ func TestVMChecksAdminAndMinEpoch(t *testing.T) {
 	}
 }
 
-// Privacy review #9: the rollback witness. The VM's signed state head goes to the witness; each unlock brings back
-// the highest one (inside the reply's AAD); a stripped or swapped head breaks the reply; a forged head is refused.
-func TestRollbackWitness(t *testing.T) {
+// The legacy rollback witness is removed before the genesis ceremony (V1-DESIGN §2.5 step 1): no witness store in a
+// holder's config, no POST /v1/witness, no state head in the unlock reply. A policy that still names witnesses
+// unlocks with no head, and a reply that carries one anyway is refused by the VM's strict decoder.
+func TestLegacyWitnessRemoved(t *testing.T) {
+	if _, ok := reflect.TypeOf(Config{}).FieldByName("Witness"); ok {
+		t.Fatal("holder.Config still has a witness store")
+	}
+	if _, ok := reflect.TypeOf(split.UnlockReply{}).FieldByName("WitnessHead"); ok {
+		t.Fatal("the unlock reply still carries a witness head")
+	}
+	if _, ok := reflect.TypeOf(&Holder{}).MethodByName("PushWitness"); ok {
+		t.Fatal("the holder still takes witness pushes")
+	}
 	r := newRig(t, twoOfTwo, 2)
 	r.pol.Witnesses = []string{"vercel"}
-	witness := &MemoryWitness{}
-	r.holders["vercel"] = r.newHolder("vercel", func(c *Config) { c.Witness = witness })
-
-	// First boot: no head yet.
-	m, rep, err := r.unlock(r.transports(nil), nil)
-	if err != nil || m.Head != nil {
-		t.Fatalf("first boot: %v %v %+v", err, rep, m)
+	r.holders["vercel"] = r.newHolder("vercel", nil)
+	w := httptest.NewRecorder()
+	r.holders["vercel"].Handler().ServeHTTP(w, httptest.NewRequest("POST", "/v1/witness", strings.NewReader(`{"cert":{},"head":{}}`)))
+	if w.Code != 404 || strings.Contains(w.Body.String(), "witness") {
+		t.Fatalf("POST /v1/witness: %d %s", w.Code, w.Body)
 	}
-	// The VM signs heads 1 and 2 and pushes them; a lower counter afterwards is kept out.
-	wk, _ := m.WitnessKey()
-	var certs []split.SignedEpochCert
-	certs = append(certs, r.pol.EpochCerts...)
-	push := func(counter uint64, gen uint64) uint64 {
-		sh, err := split.SignHead(wk, split.StateHead{KMSID: r.kmsID, App: vmApp, Epoch: 1, Counter: counter,
-			Names: map[string]split.HeadEntry{"side": {Gen: gen, Hash: strings.Repeat("c", 64)}}, At: r.now})
-		if err != nil {
-			t.Fatal(err)
-		}
-		wr, err := r.holders["vercel"].PushWitness(context.Background(), split.WitnessPush{Cert: certs[0], Head: *sh})
-		if err != nil {
-			t.Fatal(err)
-		}
-		return wr.Counter
-	}
-	if push(1, 4) != 1 || push(2, 7) != 2 || push(1, 3) != 2 {
-		t.Fatal("the witness should keep the highest counter")
-	}
-	m, rep, err = r.unlock(r.transports(nil), nil)
-	if err != nil || m.Head == nil || m.Head.Counter != 2 || m.Head.Names["side"].Gen != 7 {
-		t.Fatalf("the head back at unlock: %v %v %+v", err, rep, m)
-	}
-
-	// A forged head (not the epoch's witness key) isn't taken by the witness.
-	_, other, _ := edKey()
-	sh, _ := split.SignHead(other, split.StateHead{KMSID: r.kmsID, App: vmApp, Epoch: 1, Counter: 99, At: r.now})
-	if _, err := r.holders["vercel"].PushWitness(context.Background(), split.WitnessPush{Cert: certs[0], Head: *sh}); err == nil {
-		t.Fatal("a forged head was kept")
-	}
-
-	// Someone on the path strips the head from the reply: the reply no longer opens.
-	strip := func(next interface {
-		Do(context.Context, string, string, []byte) ([]byte, error)
-	}) stripper {
-		return stripper{next: next}
+	if _, rep, err := r.unlock(r.transports(nil), nil); err != nil {
+		t.Fatalf("an unlock under a policy naming witnesses: %v %v", err, rep)
 	}
 	hs := r.transports(nil)
-	hs[1].Transport = strip(hs[1].Transport)
-	if _, rep, err := r.unlock(hs, nil); err == nil || !strings.Contains(rep.Outcome["vercel"], "witness head was changed") {
-		t.Fatalf("a stripped head: %v %v", err, rep.Outcome)
+	hs[1].Transport = addHead{next: hs[1].Transport}
+	if _, rep, err := r.unlock(hs, nil); err == nil || !strings.Contains(rep.Outcome["vercel"], "witness_head") {
+		t.Fatalf("a reply with a witness head: %v %v", err, rep.Outcome)
 	}
 }
 
-type stripper struct {
+// addHead adds a witness head to every unlock reply, as a holder with the legacy path would.
+type addHead struct {
 	next interface {
 		Do(context.Context, string, string, []byte) ([]byte, error)
 	}
 }
 
-func (s stripper) Do(ctx context.Context, method, path string, body []byte) ([]byte, error) {
-	b, err := s.next.Do(ctx, method, path, body)
+func (a addHead) Do(ctx context.Context, method, path string, body []byte) ([]byte, error) {
+	b, err := a.next.Do(ctx, method, path, body)
 	if err != nil || path != "/v1/unlock" {
 		return b, err
 	}
-	var rep split.UnlockReply
+	var rep map[string]any
 	json.Unmarshal(b, &rep)
-	rep.WitnessHead = nil
+	rep["witness_head"] = "e30="
 	return json.Marshal(rep)
 }
 

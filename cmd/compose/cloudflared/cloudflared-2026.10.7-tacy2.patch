@@ -1,0 +1,291 @@
+Tacy's patch to cloudflared 2026.10.7 (commit 872b241f94871665c1c157adefcf90c11f0ead96), tacy2.
+
+- Every config the edge pushes is refused (orchestration.UpdateConfig): the config pinned in the attested image is
+  the only one.
+- No management service on the tunnel (no remote log stream, host details or diagnostics: `cloudflared tail` 403).
+- No WARP or private-network routing (review M1): every TCP stream from the edge (HTTP/2 TypeTCP and QUIC both call
+  proxy.ProxyTCP) is refused before anything is dialed; the WARP origin dialer (TCP, the UDP sessions of datagram v2
+  and v3, the virtual DNS service) dials nothing; there is no ICMP proxy. Unconditional: no local or remote config
+  turns them on.
+- Tests (not in the binary): go test -run Tacy ./proxy ./ingress ./orchestration ./cmd/cloudflared/tunnel
+
+diff --git a/cmd/cloudflared/tunnel/cmd.go b/cmd/cloudflared/tunnel/cmd.go
+index 8896c8d..8fc3268 100644
+--- a/cmd/cloudflared/tunnel/cmd.go
++++ b/cmd/cloudflared/tunnel/cmd.go
+@@ -459,7 +459,9 @@ func StartServer(
+ 		logger.ManagementLogger.Log,
+ 		logger.ManagementLogger,
+ 	)
+-	internalRules := []ingress.Rule{ingress.NewManagementRule(mgmt)}
++	// Tacy build: no management service (remote log stream, host details, diagnostics) on the tunnel.
++	internalRules := []ingress.Rule{}
++	_ = mgmt
+ 	orchestrator, err := orchestration.NewOrchestratorWithHTTPRequestAuthorizer(
+ 		ctx,
+ 		orchestratorConfig,
+diff --git a/cmd/cloudflared/tunnel/configuration.go b/cmd/cloudflared/tunnel/configuration.go
+index e9c5a25..000059e 100644
+--- a/cmd/cloudflared/tunnel/configuration.go
++++ b/cmd/cloudflared/tunnel/configuration.go
+@@ -357,7 +357,11 @@ func adjustIPVersionByBindAddress(ipVersion allregions.ConfigIPVersion, ip net.I
+ 	}
+ }
+ 
++// errICMPRefused: Tacy's build has no ICMP proxy (no ICMP from the edge reaches any address through this connector).
++var errICMPRefused = errors.New("ICMP proxy is refused in this build (Tacy)")
++
+ func newICMPRouter(c *cli.Context, logger *zerolog.Logger) (ingress.ICMPRouterServer, error) {
++	return nil, errICMPRefused
+ 	ipv4Src, ipv6Src, err := determineICMPSources(c, logger)
+ 	if err != nil {
+ 		return nil, err
+diff --git a/cmd/cloudflared/tunnel/tacy_test.go b/cmd/cloudflared/tunnel/tacy_test.go
+new file mode 100644
+index 0000000..535706f
+--- /dev/null
++++ b/cmd/cloudflared/tunnel/tacy_test.go
+@@ -0,0 +1,16 @@
++package tunnel
++
++import (
++	"testing"
++
++	"github.com/rs/zerolog"
++	"github.com/stretchr/testify/require"
++)
++
++// Tacy build: no ICMP proxy, whatever the flags (it returns before reading them).
++func TestTacyNoICMPRouter(t *testing.T) {
++	log := zerolog.Nop()
++	r, err := newICMPRouter(nil, &log)
++	require.ErrorIs(t, err, errICMPRefused)
++	require.Nil(t, r)
++}
+diff --git a/ingress/origin_dialer.go b/ingress/origin_dialer.go
+index 9860077..549b1da 100644
+--- a/ingress/origin_dialer.go
++++ b/ingress/origin_dialer.go
+@@ -2,6 +2,7 @@ package ingress
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"net"
+ 	"net/netip"
+@@ -13,6 +14,11 @@ import (
+ 
+ const writeDeadlineUDP = 200 * time.Millisecond
+ 
++// ErrPrivateRoutingRefused is what Tacy's build answers every dial of the WARP-routing origin dialer (TCP streams,
++// UDP sessions of datagram v2 and v3, the virtual DNS resolver): no flow from the edge reaches any address through
++// this connector. HTTP ingress to the configured origin doesn't use this dialer.
++var ErrPrivateRoutingRefused = errors.New("private-network routing is refused in this build (Tacy)")
++
+ // OriginTCPDialer provides a TCP dial operation to a requested address.
+ type OriginTCPDialer interface {
+ 	DialTCP(ctx context.Context, addr netip.AddrPort) (net.Conn, error)
+@@ -81,6 +87,8 @@ func (d *OriginDialerService) UpdateDefaultDialer(dialer *Dialer) {
+ 
+ // DialTCP will perform a dial TCP to the requested addr.
+ func (d *OriginDialerService) DialTCP(ctx context.Context, addr netip.AddrPort) (net.Conn, error) {
++	// Tacy build: refused, whatever the reserved services and the default dialer are.
++	return nil, ErrPrivateRoutingRefused
+ 	conn, err := d.dialTCP(ctx, addr)
+ 	if err != nil {
+ 		return nil, err
+@@ -106,6 +114,8 @@ func (d *OriginDialerService) dialTCP(ctx context.Context, addr netip.AddrPort)
+ 
+ // DialUDP will perform a dial UDP to the requested addr.
+ func (d *OriginDialerService) DialUDP(addr netip.AddrPort) (net.Conn, error) {
++	// Tacy build: refused (UDP sessions from the edge, datagram v2 and v3).
++	return nil, ErrPrivateRoutingRefused
+ 	// Check to see if any reserved services are available for this addr and call their dialer instead.
+ 	if dialer, ok := d.reservedUDPServices[addr]; ok {
+ 		return dialer.DialUDP(addr)
+diff --git a/ingress/tacy_test.go b/ingress/tacy_test.go
+new file mode 100644
+index 0000000..60dc9d2
+--- /dev/null
++++ b/ingress/tacy_test.go
+@@ -0,0 +1,49 @@
++package ingress
++
++import (
++	"net"
++	"net/netip"
++	"testing"
++	"time"
++
++	"github.com/rs/zerolog"
++	"github.com/stretchr/testify/require"
++
++	"github.com/cloudflare/cloudflared/config"
++)
++
++// Tacy build: the WARP-routing dialer (TCP streams, UDP sessions of datagram v2 and v3, the virtual DNS service)
++// dials nothing, whatever its default dialer and reserved services are.
++func TestTacyOriginDialerRefuses(t *testing.T) {
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	require.NoError(t, err)
++	defer ln.Close()
++	accepted := make(chan struct{}, 1)
++	go func() {
++		if c, err := ln.Accept(); err == nil {
++			accepted <- struct{}{}
++			c.Close()
++		}
++	}()
++	udp, err := net.ListenPacket("udp", "127.0.0.1:0")
++	require.NoError(t, err)
++	defer udp.Close()
++	log := zerolog.Nop()
++	def := NewDialer(WarpRoutingConfig{ConnectTimeout: config.CustomDuration{Duration: time.Second}})
++	d := NewOriginDialer(OriginConfig{DefaultDialer: def}, &log)
++	tcpAddr := netip.MustParseAddrPort(ln.Addr().String())
++	udpAddr := netip.MustParseAddrPort(udp.LocalAddr().String())
++	d.AddReservedService(def, []netip.AddrPort{udpAddr})
++
++	c, err := d.DialTCP(t.Context(), tcpAddr)
++	require.ErrorIs(t, err, ErrPrivateRoutingRefused)
++	require.Nil(t, c)
++	u, err := d.DialUDP(udpAddr)
++	require.ErrorIs(t, err, ErrPrivateRoutingRefused)
++	require.Nil(t, u)
++	select {
++	case <-accepted:
++		t.Fatal("DialTCP reached the loopback target")
++	case <-time.After(300 * time.Millisecond):
++	}
++}
+diff --git a/orchestration/orchestrator.go b/orchestration/orchestrator.go
+index ca63061..ae31670 100644
+--- a/orchestration/orchestrator.go
++++ b/orchestration/orchestrator.go
+@@ -101,10 +101,19 @@ func newOrchestrator(
+ }
+ 
+ // UpdateConfig creates a new proxy with the new ingress rules
++// RefuseRemoteConfig is set in Tacy's build.
++var RefuseRemoteConfig = true
++
+ func (o *Orchestrator) UpdateConfig(version int32, config []byte) *pogs.UpdateConfigurationResponse {
+ 	o.lock.Lock()
+ 	defer o.lock.Unlock()
+ 
++	// Tacy build: the config pinned in the attested image is the only one. A config the edge pushes (a remotely
++	// managed tunnel, or a dashboard or API change) is refused, whatever its version.
++	if RefuseRemoteConfig {
++		o.log.Warn().Int32("received_version", version).Msg("Refused a remote configuration (this build runs its local config only)")
++		return &pogs.UpdateConfigurationResponse{LastAppliedVersion: o.currentVersion}
++	}
+ 	if o.currentVersion >= version {
+ 		o.log.Debug().
+ 			Int32("current_version", o.currentVersion).
+diff --git a/orchestration/tacy_test.go b/orchestration/tacy_test.go
+new file mode 100644
+index 0000000..5e979a3
+--- /dev/null
++++ b/orchestration/tacy_test.go
+@@ -0,0 +1,28 @@
++package orchestration
++
++import (
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++
++	"github.com/cloudflare/cloudflared/ingress"
++)
++
++// Tacy build: a config the edge pushes is refused whatever its version; the local config keeps serving.
++func TestTacyRefusesRemoteConfig(t *testing.T) {
++	originDialer := ingress.NewOriginDialer(ingress.OriginConfig{DefaultDialer: testDefaultDialer, TCPWriteTimeout: time.Second}, &testLogger)
++	o, err := NewOrchestrator(t.Context(), &Config{Ingress: &ingress.Ingress{}, OriginDialerService: originDialer}, testTags, nil, &testLogger)
++	require.NoError(t, err)
++	before, err := o.GetOriginProxy()
++	require.NoError(t, err)
++	pushed := []byte(`{"ingress":[{"service":"http://127.0.0.1:8080"}],"warp-routing":{"enabled":true}}`)
++	for _, v := range []int32{1, 2, 1 << 30} {
++		resp := o.UpdateConfig(v, pushed)
++		require.Nil(t, resp.Err)
++		require.Equal(t, int32(-1), resp.LastAppliedVersion)
++	}
++	after, err := o.GetOriginProxy()
++	require.NoError(t, err)
++	require.Same(t, before, after)
++}
+diff --git a/proxy/proxy.go b/proxy/proxy.go
+index c2abfce..a54c52f 100644
+--- a/proxy/proxy.go
++++ b/proxy/proxy.go
+@@ -36,6 +36,10 @@ const (
+ 
+ var errHTTPAuthorizationUnsupportedTransport = errors.New("HTTP authorization does not support TCP transport")
+ 
++// ErrWarpRoutingRefused is what Tacy's build answers every WARP-routed TCP stream (HTTP/2 and QUIC both call
++// ProxyTCP): there is no private-network routing through this connector, whatever the local or remote config says.
++var ErrWarpRoutingRefused = errors.New("WARP routing is refused in this build (Tacy): no private-network TCP")
++
+ // Proxy represents a means to Proxy between cloudflared and the origin services.
+ type Proxy struct {
+ 	ingressRules          ingress.Ingress
+@@ -189,6 +193,9 @@ func (p *Proxy) ProxyTCP(
+ 	conn connection.ReadWriteAcker,
+ 	req *connection.TCPRequest,
+ ) error {
++	// Tacy build: refused before anything is dialed, the flow limiter or the request parsed.
++	p.log.Warn().Str("dest", req.Dest).Msg("Refused a WARP-routed TCP stream (this build has no private-network routing)")
++	return ErrWarpRoutingRefused
+ 	if p.httpRequestAuthorizer != nil {
+ 		p.log.Debug().
+ 			Str("authOutcome", "unsupported_tcp_transport").
+diff --git a/proxy/tacy_test.go b/proxy/tacy_test.go
+new file mode 100644
+index 0000000..aa92e78
+--- /dev/null
++++ b/proxy/tacy_test.go
+@@ -0,0 +1,41 @@
++package proxy
++
++import (
++	"net"
++	"testing"
++	"time"
++
++	"github.com/rs/zerolog"
++	"github.com/stretchr/testify/require"
++
++	"github.com/cloudflare/cloudflared/config"
++	"github.com/cloudflare/cloudflared/connection"
++	cfdflow "github.com/cloudflare/cloudflared/flow"
++	"github.com/cloudflare/cloudflared/ingress"
++)
++
++// Tacy build: a WARP-routed TCP stream (HTTP/2 TypeTCP and QUIC both call ProxyTCP) is refused, and nothing is
++// dialed, even with a real dialer and a listening loopback target (cloudflared's own metrics port, say).
++func TestTacyRefusesWarpTCP(t *testing.T) {
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	require.NoError(t, err)
++	defer ln.Close()
++	accepted := make(chan struct{}, 1)
++	go func() {
++		if c, err := ln.Accept(); err == nil {
++			accepted <- struct{}{}
++			c.Close()
++		}
++	}()
++	log := zerolog.Nop()
++	dialer := ingress.NewOriginDialer(ingress.OriginConfig{DefaultDialer: ingress.NewDialer(ingress.WarpRoutingConfig{
++		ConnectTimeout: config.CustomDuration{Duration: time.Second}})}, &log)
++	p := NewOriginProxy(ingress.Ingress{}, dialer, nil, cfdflow.NewLimiter(0), &log)
++	err = p.ProxyTCP(t.Context(), nil, &connection.TCPRequest{Dest: ln.Addr().String()})
++	require.ErrorIs(t, err, ErrWarpRoutingRefused)
++	select {
++	case <-accepted:
++		t.Fatal("ProxyTCP dialed the loopback target")
++	case <-time.After(300 * time.Millisecond):
++	}
++}

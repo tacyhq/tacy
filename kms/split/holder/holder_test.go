@@ -356,7 +356,7 @@ func (l *lying) Do(ctx context.Context, method, path string, body []byte) ([]byt
 	bound, _ := split.Bind(req.Nonces)
 	junk := make([]byte, kms.MasterSize)
 	rand.Read(junk)
-	rep.Sealed, _ = kms.Seal(pub, split.LabelReply, split.ReplyAAD(bound, rep.KMSID, rep.Epoch, rep.Set, rep.Holder, rep.Index, policyHashOf(req.Policy), rep.WitnessHead), junk)
+	rep.Sealed, _ = kms.Seal(pub, split.LabelReply, split.ReplyAAD(bound, rep.KMSID, rep.Epoch, rep.Set, rep.Holder, rep.Index, policyHashOf(req.Policy)), junk)
 	return json.Marshal(rep)
 }
 
@@ -474,4 +474,29 @@ func policyHashOf(raw json.RawMessage) string {
 	var env safety.Envelope
 	json.Unmarshal(raw, &env)
 	return split.PolicyHash(env.Payload)
+}
+
+// Review L3 (2026-11-21): a pinned release whose compose has no unlockd gets nothing from any holder (another service
+// there could hold dstack's socket and quote for any key). The same pin with unlockd unlocks.
+func TestReleaseWithoutUnlockdRefused(t *testing.T) {
+	r := newRig(t, twoOfTwo, 2)
+	i, j := strings.Index(r.vmCompose, "\n  unlockd:\n"), strings.Index(r.vmCompose, "\nvolumes:\n")
+	if i < 0 || j < i {
+		t.Fatal("the rig's compose has no unlockd before volumes:")
+	}
+	noUnlockd := r.vmCompose[:i] + r.vmCompose[j:]
+	q, info, ach := r.variant(func(m map[string]any) { m["docker_compose_file"] = noUnlockd })
+	r.pol.Releases = append(r.pol.Releases, kms.ReleasePin{App: vmApp, Version: "v0.19.4", ComposeSHA256: sum([]byte(noUnlockd)), AppComposeSHA256: ach})
+	_, rep, err := r.unlock(r.transports(nil), &evidence{quote: q, info: info})
+	if !errors.Is(err, split.ErrNotEnough) {
+		t.Fatalf("a release without unlockd unlocked: %v", err)
+	}
+	for _, h := range twoOfTwo {
+		if !strings.Contains(rep.Outcome[h], "only to a release with unlockd") {
+			t.Fatalf("%s: %q", h, rep.Outcome[h])
+		}
+	}
+	if _, rep, err := r.unlock(r.transports(nil), nil); err != nil {
+		t.Fatalf("the release with unlockd: %v %v", err, rep.Outcome)
+	}
 }

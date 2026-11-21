@@ -110,7 +110,7 @@ func main() {
 }
 
 // fromUnlockd is vaultd's boot: its keys from unlockd (conn/v1 and the API keys; it waits while unlockd unlocks),
-// then the people's connections from their sealed state. A failure after the keys is fatal: the container restarts
+// then the connections' sealed state (v1: kept empty). A failure after the keys is fatal: the container restarts
 // and asks unlockd again (which serves the same keys from its memory), and nothing is leased meanwhile.
 func fromUnlockd(v *vault.Vault, uc *unlock.Client, gw *gateway.Client) {
 	ctx := context.Background()
@@ -140,7 +140,9 @@ func fromUnlockd(v *vault.Vault, uc *unlock.Client, gw *gateway.Client) {
 	if err := v.EnableConns(p); err != nil {
 		log.Fatalf("vaultd: connections: %v", err)
 	}
-	log.Printf("vaultd: connections on (sealed under conn/v1, stored at the chat Worker)")
+	// v1 (the v1 design §5): no login is kept; each task's comes sealed with it and stays in this process's memory.
+	// The state stays, empty; what an older release kept there was wiped just now (a count only).
+	log.Printf("vaultd: connections on (per-task logins in memory only; %d kept accounts wiped)", v.Wiped())
 	// Another VM holds the connections now (a conflict at the Worker): stop.
 	keeper.OnFatal = func(err error) { log.Fatalf("vaultd: connections: %v", err) }
 	kctx, stop := context.WithCancel(ctx)

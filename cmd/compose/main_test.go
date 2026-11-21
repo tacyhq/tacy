@@ -42,7 +42,9 @@ func TestComposeCurrent(t *testing.T) {
 	if err := setReleaseTunnel(false); err != nil { // what main sets for the release (cloudflared.go)
 		t.Fatal(err)
 	}
-	defer func() { cfd.bin, cfd.sha, cfd.config, cfd.secret, cfd.noListen = nil, "", nil, "", false }()
+	defer func() {
+		cfd.bin, cfd.sha, cfd.config, cfd.access, cfd.secret, cfd.noListen = nil, "", nil, "", "", false
+	}()
 	rel, err := build()
 	if err != nil {
 		t.Fatal(err)
@@ -330,7 +332,9 @@ func TestComposeLayout(t *testing.T) {
 		if !s.ReadOnly || len(s.CapDrop) != 1 || s.CapDrop[0] != "ALL" || strings.Join(s.SecurityOpt, ",") != strings.Join(sec, ",") {
 			t.Errorf("%s isn't hardened: %v", name, s.SecurityOpt)
 		}
-		if (len(s.CapAdd) > 0) != (name == "setup") {
+		// setup's three, and gatewayd's launcher's two (review H1: it starts gatewayd and cloudflared as their uids).
+		if (len(s.CapAdd) > 0) != (name == "setup" || name == "agentvm") ||
+			name == "agentvm" && strings.Join(s.CapAdd, ",") != "SETGID,SETUID" {
 			t.Errorf("%s: cap_add %v", name, s.CapAdd)
 		}
 		for _, env := range []string{"TINFOIL_API_KEY", "TAVILY_API_KEY", "BRAVE_SEARCH_API_KEY", "EXA_API_KEY", "AGENT_VM_TOKEN", "SEARCH_PROVIDER"} {
@@ -349,8 +353,10 @@ func TestComposeLayout(t *testing.T) {
 			}
 			continue
 		}
-		// No long-running process is root; each waits for setup.
-		if s.User == "" || strings.HasPrefix(s.User, "0") || s.DependsOn["setup"].Condition != "service_completed_successfully" ||
+		// No long-running process is root but gatewayd's launcher (which runs gatewayd as gatewaydUID, with -tunnel-uid);
+		// each waits for setup.
+		launcher := name == "agentvm" && s.User == "0:0" && strings.Contains(strings.Join(s.Command, " "), "-tunnel-uid 10006 ")
+		if s.User == "" || strings.HasPrefix(s.User, "0") && !launcher || s.DependsOn["setup"].Condition != "service_completed_successfully" ||
 			s.Restart != "unless-stopped" {
 			t.Errorf("%s: user %q, depends_on %v, restart %q", name, s.User, s.DependsOn, s.Restart)
 		}
@@ -366,7 +372,7 @@ func TestComposeLayout(t *testing.T) {
 	if agentd.User != agentdUID+":"+agentdUID || !strings.Contains(strings.Join(gw.Command, " "), "-agent-uid "+agentdUID+" ") {
 		t.Error("agentd's uid and gatewayd's -agent-uid differ")
 	}
-	if byName["runner"].User != runnerdUID+":"+agentdUID || byName["vaultd"].User != vaultdUID+":"+gatewaydUID || gw.User != gatewaydUID+":"+gatewaydUID {
+	if byName["runner"].User != runnerdUID+":"+agentdUID || byName["vaultd"].User != vaultdUID+":"+gatewaydUID || gw.User != "0:0" {
 		t.Error("uids")
 	}
 	if strings.Join(agentd.GroupAdd, ",") != gatewaydUID+","+unlockdUID {

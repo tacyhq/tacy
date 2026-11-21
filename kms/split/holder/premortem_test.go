@@ -245,3 +245,50 @@ func (r *rig) vmAppID(t *testing.T) string {
 
 // vmACHash is the rig VM's app-compose sha256 (its release pin).
 func (r *rig) vmACHash(t *testing.T) string { return r.pol.Releases[0].AppComposeSHA256 }
+
+// The in-process nonce store keeps time on its holder's clock, not the wall clock: a ticket claim lives until its
+// expiry on the clock the holder decides on, and is gone after it. The clocks here are decades from the wall clock
+// either way, so a store on time.Now fails this on any day (as TestStartTicket did the day after the rig's date).
+func TestMemoryNoncesOnHolderClock(t *testing.T) {
+	r := newRig(t, twoOfTwo, 2)
+	ctx := context.Background()
+	for name, at := range map[string]time.Time{
+		"past":   time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC),
+		"future": time.Date(2101, 1, 1, 0, 0, 0, 0, time.UTC),
+	} {
+		now := at
+		cfg := r.config("vercel")
+		cfg.Nonces = NewMemoryNonces(2)
+		cfg.Now = func() time.Time { return now }
+		if _, err := New(cfg); err != nil {
+			t.Fatal(err)
+		}
+		n := cfg.Nonces
+		if v, err := n.Claim(ctx, "ticket:a", "vm-a", true, now.Add(split.StartTicketBoot)); v != "vm-a" || err != nil {
+			t.Fatalf("%s: the first claim: %q %v", name, v, err)
+		}
+		now = now.Add(3 * time.Hour)
+		if v, _ := n.Claim(ctx, "ticket:a", "vm-b", false, now.Add(split.StartTicketBoot)); v != "vm-a" {
+			t.Fatalf("%s: the claim before its expiry on the holder's clock: %q", name, v)
+		}
+		if v, _ := n.Claim(ctx, "ticket:a", "vm-b", true, now.Add(split.StartTicketBoot)); v != "vm-a" {
+			t.Fatalf("%s: another VM's claim before the expiry: %q", name, v)
+		}
+		// Nonces too: a full store forgets only nonces expired on the holder's clock.
+		for _, nonce := range []string{"n1", "n2"} {
+			if ok, err := n.Use(ctx, nonce, now.Add(split.NonceTTL)); !ok || err != nil {
+				t.Fatalf("%s: nonce %s: %v %v", name, nonce, ok, err)
+			}
+		}
+		if ok, err := n.Use(ctx, "n3", now.Add(split.NonceTTL)); ok || err == nil {
+			t.Fatalf("%s: a full store forgot a live nonce: %v %v", name, ok, err)
+		}
+		now = now.Add(split.StartTicketBoot)
+		if v, _ := n.Claim(ctx, "ticket:a", "vm-b", false, now); v != "" {
+			t.Fatalf("%s: the claim after its expiry on the holder's clock: %q", name, v)
+		}
+		if ok, err := n.Use(ctx, "n3", now.Add(split.NonceTTL)); !ok || err != nil {
+			t.Fatalf("%s: a full store after its nonces expired: %v %v", name, ok, err)
+		}
+	}
+}

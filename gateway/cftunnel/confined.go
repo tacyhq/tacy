@@ -17,7 +17,7 @@ const (
 	ConfinedDir    = "/run/tacy/cft"
 	ConfinedSocket = "/run/tacy/cft/ingress.sock"
 	ConfinedToken  = "/run/tacy/cft/token"
-	ConfinedUID    = 10006
+	ConfinedUID    = TunnelUID
 )
 
 // PublishToken waits for the token and writes it to dir/token, 0640 with group gid (cloudflared's), atomically.

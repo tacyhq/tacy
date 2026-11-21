@@ -98,13 +98,19 @@ func (p Policy) Revoked(version string) bool {
 }
 
 // WithTrustList returns p with l's values added to what p uses (its own, or the built-in ones where p has none):
-// OS images, boot measurement sets, pre-launch scripts, KMS ids, VM releases (MergeReleases), the higher of the
-// two release floors, and the Google Cloud sets (WithGCP) when its platforms name PlatformDstackGCP. It never
-// removes a value, and refuses a list that brings back a retired OS image, adds a set
+// OS images, boot measurement sets, pre-launch scripts, KMS ids, VM releases (MergeReleases), and the higher of the
+// two release floors. It never removes a value, and refuses a list that brings back a retired OS image, adds a set
 // for an unknown image, or adds a set with a retired image's kernel or command line (retiredBoot), under any label.
+// It also refuses a list naming a platform other than dstack, the only one this verifier has checks for (KnownPlatform):
+// fail closed, so a list can't switch on a host this build doesn't know (the v1 Google host removal: "dstack-gcp" is unknown).
 func (p Policy) WithTrustList(l *safety.TrustList) (Policy, error) {
 	if l == nil {
 		return p, nil
+	}
+	for _, pl := range l.Platforms {
+		if !KnownPlatform(pl) {
+			return p, fmt.Errorf("trust list %d: unknown platform %q (this verifier checks only %q)", l.Seq, pl, safety.PlatformDstack)
+		}
 	}
 	images := maps.Clone(cmpOr(p.ProdImages, ProdImages))
 	for h, n := range l.OSImages {
@@ -165,10 +171,6 @@ func (p Policy) WithTrustList(l *safety.TrustList) (Policy, error) {
 		return slices.Contains(l.RevokedReleases, r.Version) || !dstackRelease(r)
 	})
 	p.ReleaseFloor = NewerVersion(p.ReleaseFloor, l.VMReleaseFloor)
-	if slices.Contains(l.Platforms, PlatformDstackGCP) {
-		// The Google Cloud fallback, on only by a signed list (the app carries the sets, off): no app update needed.
-		p = p.WithGCP()
-	}
 	p.trust = l
 	return p, nil
 }
@@ -195,6 +197,12 @@ func retiredBoot(rtmr1, rtmr2 string) string {
 func dstackRelease(r safety.TrustRelease) bool {
 	return r.Platform == "" || r.Platform == safety.PlatformDstack
 }
+
+// KnownPlatform: name is an attestation platform this verifier has checks for. Only dstack on Phala (the Google
+// Cloud host fallback, "dstack-gcp", was taken out of v1: the v1 Google host removal). A signed trust list naming any other is
+// refused whole (WithTrustList), and kmsctl signs no unlock policy or trust list naming one; a holder refuses a policy
+// naming a platform it has no checks for (kms/split/holder, Config.Platforms).
+func KnownPlatform(name string) bool { return name == safety.PlatformDstack }
 
 // WithTCBGrace is p accepting a TCB status other than UpToDate when the trust list p took grants a grace window that
 // is open at now (tcb_grace, safety.TCBGrace.Allows: at most 30 days), and only for the TCB and QE
@@ -290,6 +298,10 @@ type TrustInfo struct {
 	Seen string `json:"seen,omitempty"`
 	// Emergency is the reason of the emergency override the list carries (signed by the pinned KMS id), if any.
 	Emergency string `json:"emergency,omitempty"`
+	// Machines are the labels of the machines a VM may run on under this list (its machine_certs when it carries
+	// them, else the build's own), and MachinesRevoked how many certificate hashes this verifier refuses for good.
+	Machines        []string `json:"machines,omitempty"`
+	MachinesRevoked int      `json:"machinesRevoked"`
 }
 
 // TrustInfoOf summarizes a taken list; withReleases adds its release entries.
@@ -353,12 +365,21 @@ func (s *TrustState) TakeSeen(env []byte, minSeq uint64, now time.Time, seen []b
 		return TrustInfo{OK: true}
 	}
 	l, err := ParseTrustList(env, minSeq, now)
+	kept := safety.ParseTrustSeen(seen)
+	// The jump limit (review2 M1, the holders' split.MaxSeqJump): from the highest seq the caller or its own
+	// record took, at least the build's floor.
+	if base := max(minSeq, kept.Seq, TrustListFloorSeq); err == nil && l.Seq > base+safety.MaxTrustSeqJump {
+		err = fmt.Errorf("trust list %d jumps more than %d above list %d", l.Seq, safety.MaxTrustSeqJump, base)
+	}
 	var em *safety.TrustEmergency
 	if err == nil {
 		_, err = Policy{}.WithTrustList(l)
 	}
 	if err == nil {
 		em, err = trustEmergency(l)
+	}
+	if err == nil {
+		_, err = trustMachines(l, nil) // a machine certificate that doesn't verify refuses the list, as a bad override does
 	}
 	if err != nil {
 		return TrustInfo{Error: err.Error()}
@@ -367,12 +388,17 @@ func (s *TrustState) TakeSeen(env []byte, minSeq uint64, now time.Time, seen []b
 	if em != nil {
 		expedite = em.Items
 	}
-	s.env, s.seen = slices.Clone(env), safety.ParseTrustSeen(seen).Observe(l, expedite, now)
+	s.env, s.seen = slices.Clone(env), kept.Observe(l, expedite, now)
 	in, pending := s.inForce(Policy{}, l, now)
 	i := TrustInfoOf(l, false)
-	i.ReleaseEntries, i.Pending, i.Seen = slices.Clone(in.Releases), pending, string(s.seen.Marshal())
+	// The releases in force, and the revocations in force: the list's own and every one this verifier keeps whose
+	// un-revocation doesn't count yet (review2 H1; verifier-core.ts refuses a VM running one).
+	i.ReleaseEntries, i.RevokedReleases, i.Pending, i.Seen = slices.Clone(in.Releases), slices.Clone(in.RevokedReleases), pending, string(s.seen.Marshal())
 	if em != nil {
 		i.Emergency = em.Reason
+	}
+	if ms, err := trustMachines(l, s.seen.RevokedMachines); err == nil {
+		i.Machines, i.MachinesRevoked = machineSummary(ms), len(ms.Revoked)
 	}
 	return i
 }
@@ -410,12 +436,21 @@ func (s *TrustState) Apply(p Policy, now time.Time) (Policy, *TrustInfo) {
 	if err == nil {
 		s.mu.Lock()
 		in, pending := s.inForce(p, l, now)
+		kept := slices.Clone(s.seen.RevokedMachines)
 		s.mu.Unlock()
 		var q Policy
-		if q, err = p.WithTrustList(in); err == nil {
+		var ms *safety.MachineSet
+		if ms, err = trustMachines(l, kept); err == nil {
+			q, err = p.WithTrustList(in)
+		}
+		if err == nil {
 			// q.trust is the list in force (its withdrawals are the list's own; a pending TCB grace isn't in it).
+			// The machines: the list's certificates when it carries them, else the build's, minus every revocation
+			// this verifier took (no delay: each certificate needs the KMS id; revocations narrow).
+			q.Machines = ms
 			i := TrustInfoOf(l, false)
-			i.Pending = pending
+			i.RevokedReleases, i.Pending = slices.Clone(in.RevokedReleases), pending
+			i.Machines, i.MachinesRevoked = machineSummary(ms), len(ms.Revoked)
 			return q.WithTCBGrace(now), &i
 		}
 	}

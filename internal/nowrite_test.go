@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -38,13 +39,16 @@ var writeAllowed = map[string]string{
 	"unlock/cache.go:Cache.Save": "unlockd's keyring into its host tmpfs (TD memory), checked to be tmpfs first",
 	// The cloudflared spike (branch vm-fix-b-cloudflared): the tunnel token for the few seconds cloudflared takes to
 	// read it, in gatewayd's private tmpfs (/tmp in its container: TD memory), checked to be tmpfs first; then zeroed.
-	"gateway/cftunnel/cftunnel.go:writeToken":   "the tunnel token file in gatewayd's tmpfs, checked to be tmpfs first",
+	"cmd/gatewayd/tunnel.go:runTunnel":          "the launcher's confinement probe report (check names and errors, no secret) in the tunnel's tmpfs, 0600",
 	"gateway/cftunnel/cftunnel.go:wipe":         "zeroes the tunnel token file before removing it",
 	"gateway/cftunnel/confined.go:PublishToken": "the confined variant: the tunnel token for cloudflared's uid in the shared tmpfs volume, checked to be tmpfs first",
 	// agentd's task queue across container restarts (V1-DESIGN §6.2): only into the host tmpfs setup makes for agentd
 	// alone (verifier.TasksDir); OpenTmpfs refuses a directory statfs doesn't call tmpfs, or one other uids can read,
 	// before it writes. TD memory, gone at every real boot (TestNoWriteExceptionTasksTmpfs).
-	tasksTmpfsKey: "agentd's task queue (its boot marker) into its host tmpfs (TD memory), checked to be tmpfs first",
+	// The Worker's drain (app/drain.go): its end time, one number, beside the queue in the same host tmpfs, so the
+	// hourly container restart doesn't end a drain early. Only with -tasks-dir (the directory OpenTmpfs checked).
+	"app/drain.go:drainState.keep": "the drain's end time (a unix second, nothing of anyone's) in the task queue's host tmpfs (TD memory), checked by OpenTmpfs",
+	tasksTmpfsKey:                  "agentd's task queue (its boot marker) into its host tmpfs (TD memory), checked to be tmpfs first",
 	// Before v0.20.0 these kept state on the CVM's disk. Since the quick path nothing in the mains opens them
 	// (TestMainsOpenNoFileStores); they move onto sealstate's snapshots (the keys plan §3.2, Stage C) and leave this list.
 	"activity/store.go:OpenStore":  "legacy file store, unused by the mains",
@@ -54,10 +58,10 @@ var writeAllowed = map[string]string{
 	"queue/side.go:OpenSide":       "legacy file store (its tests and the rollback tests), unused by the mains (OpenSideMemory)",
 }
 
-// The task queue's exception (V1-DESIGN §6.2): OpenTmpfs writes its boot marker and opens the queue (Open) in agentd's
-// host tmpfs.
+// The task queue's exception (V1-DESIGN §6.2): OpenTmpfs writes its boot marker (writeMarker, also the heartbeat's
+// Beat: review 2 M3) and opens the queue (Open) in agentd's host tmpfs.
 const (
-	tasksTmpfsKey = "queue/tmpfs.go:OpenTmpfs"
+	tasksTmpfsKey = "queue/tmpfs.go:Tmpfs.writeMarker"
 	tasksQueueKey = "queue/queue.go:Open"
 )
 
@@ -380,10 +384,48 @@ func TestNoWriteExceptionTasksTmpfs(t *testing.T) {
 	if got := calls["OpenTmpfs"]; len(got) != 1 || got[0] != "app/state.go" {
 		t.Errorf("queue.OpenTmpfs called from %v, want once from app/state.go (useTasksQueue)", got)
 	}
-	// In OpenTmpfs, the memory check comes before the first write and before Open.
+	// In OpenTmpfs, the memory check comes before the first write and before Open; in Beat before its write.
 	f, err := parser.ParseFile(fset, filepath.Join("..", "queue", "tmpfs.go"), nil, parser.SkipObjectResolution)
 	if err != nil {
 		t.Fatal(err)
+	}
+	var markers []string // the functions that call writeMarker
+	ast.Inspect(f, func(n ast.Node) bool {
+		if fn, ok := n.(*ast.FuncDecl); ok {
+			ast.Inspect(fn.Body, func(m ast.Node) bool {
+				if c, ok := m.(*ast.CallExpr); ok {
+					if sel, ok := c.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "writeMarker" {
+						markers = append(markers, fn.Name.Name)
+					}
+				}
+				return true
+			})
+		}
+		return true
+	})
+	if !slices.Equal(markers, []string{"Beat", "OpenTmpfs"}) {
+		t.Errorf("writeMarker called from %v, want Beat and OpenTmpfs (each after its memory check)", markers)
+	}
+	for _, name := range []string{"Beat"} {
+		var check, write token.Pos
+		for _, d := range f.Decls {
+			if fn, ok := d.(*ast.FuncDecl); ok && fn.Name.Name == name {
+				ast.Inspect(fn.Body, func(n ast.Node) bool {
+					if c, ok := n.(*ast.CallExpr); ok {
+						if id, ok := c.Fun.(*ast.Ident); ok && id.Name == "isMem" && !check.IsValid() {
+							check = c.Pos()
+						}
+						if sel, ok := c.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "writeMarker" && !write.IsValid() {
+							write = c.Pos()
+						}
+					}
+					return true
+				})
+			}
+		}
+		if !check.IsValid() || !write.IsValid() || check > write {
+			t.Errorf("queue.%s must check the directory is memory before it writes the marker", name)
+		}
 	}
 	var check, write, open token.Pos
 	for _, d := range f.Decls {
@@ -406,6 +448,9 @@ func TestNoWriteExceptionTasksTmpfs(t *testing.T) {
 				}
 			case *ast.SelectorExpr:
 				if id, ok := fun.X.(*ast.Ident); ok && id.Name == "os" && (fun.Sel.Name == "WriteFile" || fun.Sel.Name == "Remove") && !write.IsValid() {
+					write = c.Pos()
+				}
+				if fun.Sel.Name == "writeMarker" && !write.IsValid() {
 					write = c.Pos()
 				}
 			}

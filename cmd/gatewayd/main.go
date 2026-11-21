@@ -23,7 +23,9 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
+	"path/filepath"
 	"runtime/debug"
 	"slices"
 	"strings"
@@ -31,6 +33,7 @@ import (
 	"time"
 
 	"github.com/tacyhq/tacy/gateway"
+	"github.com/tacyhq/tacy/gateway/cftunnel"
 	"github.com/tacyhq/tacy/guard"
 	"github.com/tacyhq/tacy/internal/procinfo"
 	"github.com/tacyhq/tacy/internal/tinfoil"
@@ -40,19 +43,33 @@ import (
 )
 
 func main() {
+	// The confinement probe (gateway/cftunnel): run by gatewayd's launcher as cloudflared's uid, before anything else.
+	if len(os.Args) == 3 && os.Args[1] == cftunnel.ProbeArg {
+		cftunnel.RunProbe(os.Args[2])
+	}
+	if len(os.Args) == 3 && os.Args[1] == cftunnel.Vsock32Arg { // the probe's 32-bit child (gateway/cftunnel seccomp.go)
+		cftunnel.RunVsock32(os.Args[2])
+	}
+	if len(os.Args) == 2 && os.Args[1] == cftunnel.ReapArg { // the reaper, as cloudflared's uid (review 2, L1)
+		cftunnel.RunReap()
+	}
 	socket := flag.String("socket", "", "gateway/v0 unix socket agentd connects to")
 	agentUID := flag.Int("agent-uid", -1, "the only uid allowed to connect to -socket (agentd's); -1: no check")
 	vaultSocket := flag.String("vault-socket", "", "vaultd's unix socket")
 	listen := flag.String("listen", "", "TCP address of the published port to forward to -forward (empty: none)")
 	forward := flag.String("forward", "", "agentd's HTTP unix socket")
-	// The cloudflared spike (gateway/cftunnel; branch vm-fix-b-cloudflared): the compose pins all four.
-	cfdBin := flag.String("cloudflared", "", "spike: run this cloudflared as a child, its only origin gatewayd's ingress socket (forwarding to -forward)")
-	cfdSHA := flag.String("cloudflared-sha256", "", "spike: the cloudflared binary's pinned sha256")
-	cfdConfig := flag.String("cloudflared-config", "", "spike: the pinned locally-managed config")
-	tunnelSecret := flag.String("tunnel-secret", "", "spike: the vault secret name of the tunnel token (leased for each start)")
+	// The tunnel (gateway/cftunnel): the compose pins all of these.
+	cfdBin := flag.String("cloudflared", "", "run this cloudflared (started by the launcher as -tunnel-uid), its only origin gatewayd's ingress socket (forwarding to -forward)")
+	cfdSHA := flag.String("cloudflared-sha256", "", "the cloudflared binary's pinned sha256")
+	cfdConfig := flag.String("cloudflared-config", "", "spike and development composes: cloudflared's locally-managed config, a file in the image (in place of -cloudflared-access)")
+	cfdAccess := flag.String("cloudflared-access", "", "the Access app cloudflared checks the JWT of, team,aud: the launcher hands cloudflared the locally-managed config (cftunnel.Config) in a memfd; the release pins it (in place of -cloudflared-config)")
+	e2eDiag := flag.String(cftunnel.DiagFlag, "", "e2e test only: the overlay's diag service (http://<service>:<port>) on the tunnel's ingress at "+cftunnel.DiagPrefix+" (the verifier refuses the flag in every compose but an e2e overlay's)")
+	tunnelSecret := flag.String("tunnel-secret", "", "the vault secret name of the tunnel token (leased for each start)")
 	tunnelConfined := flag.String("tunnel-confined", "", "spike, confined variant: the volume shared with the cftunnel container (ingress socket and token file)")
 	tunnelConfinedGID := flag.Int("tunnel-confined-gid", 10006, "spike, confined variant: cloudflared's gid (it may connect and read the token)")
 	tunnelSpike := flag.Bool("tunnel-spike-routes", false, "spike: the /spike/* test routes on the ingress socket (throwaways only)")
+	tunnelUID := flag.Int("tunnel-uid", 0, "cloudflared's uid and gid: gatewayd's container starts as root with SETUID and SETGID only, and its launcher starts gatewayd as -gatewayd-uid and cloudflared as this uid (gateway/cftunnel launch_linux.go; needed for -cloudflared)")
+	gatewaydUID := flag.Int("gatewayd-uid", cftunnel.GatewaydUID, "with -tunnel-uid: the uid and gid the launcher starts gatewayd as")
 	memLimit := flag.Int("mem-limit-mib", 900, "Go soft memory limit (GOMEMLIMIT), MiB; 0 = none")
 	safetyURL := flag.String("safety-url", "", "https URL to pull the signed stop lists and policies from (empty: agentd's pushes only)")
 	safetyEvery := flag.Duration("safety-every", 10*time.Second, "how often to pull -safety-url (and -keylog-url)")
@@ -76,7 +93,38 @@ func main() {
 	var sf safety.Flags
 	sf.Register(flag.CommandLine)
 	flag.Parse()
-	log.Printf("gatewayd: %s", procinfo.Line())
+	if flag.NArg() != 0 { // the attested command line is flags only (review 2, M1)
+		log.Fatalf("gatewayd: unexpected arguments %q", flag.Args())
+	}
+	if os.Getuid() == 0 {
+		// gatewayd's launcher (review H1): the container's first process, root with SETUID and SETGID only. It starts
+		// gatewayd (this binary, these flags) as -gatewayd-uid and cloudflared as -tunnel-uid; it never returns.
+		if *tunnelUID <= 0 {
+			log.Fatal("gatewayd: never as root, except as the launcher (-tunnel-uid)")
+		}
+		deny := []string{"/var/run/dstack.sock", "/run/dstack.sock", "/tmp/"}
+		for _, p := range []string{*socket, *vaultSocket, *forward, *opsSocket, *unlockSocket} {
+			if p != "" {
+				deny = append(deny, p, filepath.Dir(p)+"/")
+			}
+		}
+		cfg := cftunnel.LaunchConfig{GatewaydUID: *gatewaydUID, GatewaydGID: *gatewaydUID, TunnelUID: *tunnelUID,
+			Bin: *cfdBin, BinSHA256: *cfdSHA, Config: *cfdConfig, Access: *cfdAccess, Deny: deny}
+		if *cfdBin != "" {
+			cfg.Allow = []string{cftunnel.SocketPath}
+		}
+		cftunnel.Launch(cfg, os.Args, os.Environ())
+	}
+	// Non-dumpable before anything is read (review H1): no core, no ptrace, no /proc/<pid>/mem or environ for any uid
+	// without CAP_SYS_PTRACE, gatewayd's own included.
+	hs, err := cftunnel.Harden()
+	if err != nil {
+		log.Fatalf("gatewayd: %v", err)
+	}
+	if hs.Launched && (hs.CapEff != "0000000000000000" || hs.CapPrm != "0000000000000000") {
+		log.Fatalf("gatewayd: started by the launcher with capabilities (eff %s, prm %s): refusing", hs.CapEff, hs.CapPrm)
+	}
+	log.Printf("gatewayd: %s; dumpable %d, ptrace_scope %s, launched %v", procinfo.Line(), hs.Dumpable, hs.YamaPtraceScope, hs.Launched)
 	if *dnsTLS != "" { // before anything looks a name up
 		d, err := gateway.ParseDoT(*dnsTLS)
 		if err != nil {
@@ -217,11 +265,21 @@ func main() {
 		}
 		go runConfined(vc, *tunnelConfined, *tunnelConfinedGID, *tunnelSecret, *forward, *tunnelSpike)
 	}
-	if *cfdBin != "" {
-		if *forward == "" || *cfdConfig == "" || *tunnelSecret == "" {
-			log.Fatal("gatewayd: -cloudflared needs -forward, -cloudflared-config and -tunnel-secret")
+	var diag http.Handler
+	if *e2eDiag != "" {
+		if *cfdBin == "" {
+			log.Fatalf("gatewayd: -%s needs -cloudflared (the route is on the tunnel's ingress)", cftunnel.DiagFlag)
 		}
-		go runTunnel(vc, *cfdBin, *cfdSHA, *cfdConfig, *tunnelSecret, *forward, *tunnelSpike)
+		if diag, err = cftunnel.NewDiag(*e2eDiag); err != nil {
+			log.Fatalf("gatewayd: %v", err)
+		}
+		log.Printf("gatewayd: E2E TEST DIAG ROUTE ON at %s (never in a release): %s", cftunnel.DiagPrefix, *e2eDiag)
+	}
+	if *cfdBin != "" {
+		if *forward == "" || (*cfdConfig == "") == (*cfdAccess == "") || *tunnelSecret == "" || *tunnelUID <= 0 {
+			log.Fatal("gatewayd: -cloudflared needs -forward, one of -cloudflared-config and -cloudflared-access, -tunnel-secret and -tunnel-uid")
+		}
+		go runTunnel(vc, *cfdBin, *cfdSHA, *tunnelSecret, *forward, *tunnelUID, hs, *tunnelSpike, diag)
 	}
 	log.Printf("gatewayd %s on %s (search %s, keys set %v, forwarding %s to %s)", gateway.Version, *socket,
 		search.Name(), names, *listen, *forward)

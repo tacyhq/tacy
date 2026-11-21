@@ -25,8 +25,20 @@ kms=""
 if [ -f "$work/src/kms-compose.yaml" ] && grep -q '"kms-release"' "$work/src/cmd/compose/main.go"; then kms=1; fi
 [ -n "$vm" ] || [ -n "$kms" ] || { echo "$tag has no kms-compose.yaml" >&2; exit 1; }
 
+# Releases with the tunnel (gatewayd's image carries our patched cloudflared): fetch cloudflared's source here, by its
+# pinned upstream commit (cmd/compose/cloudflared/fetch.sh checks the commit and applies Tacy's patch), and have
+# cmd/compose rebuild it from that source (TACY_CLOUDFLARED_FRESH: never a cached binary), so the gatewayd image's
+# digest covers the rebuilt cloudflared.
+cfd=""
+if [ -n "$vm" ] && [ -f "$work/src/cmd/compose/cloudflared/fetch.sh" ]; then
+  mkdir "$work/cfd"
+  sh "$work/src/cmd/compose/cloudflared/fetch.sh" "$work/cfd"
+  cfd=1
+fi
+
 # compose ARGS...: go run ./cmd/compose ARGS in the tag's source, natively or in the pinned Go container.
 if [ -n "$native" ]; then
+  if [ -n "$cfd" ]; then export TACY_CLOUDFLARED_SRC="$work/cfd/src" TACY_CLOUDFLARED_FRESH=1; fi
   echo "rebuilding $repo $tag ($commit) natively"
   gocmd() { if command -v mise >/dev/null 2>&1; then mise trust -q "$work/src/mise.toml" && mise exec -C "$work/src" -- go "$@"; else command go "$@"; fi; }
   compose() { (cd "$work/src" && GOFLAGS=-mod=readonly gocmd run ./cmd/compose "$@"); }
@@ -34,9 +46,12 @@ else
   image=$(grep -o 'golang:[^"]*@sha256:[0-9a-f]*' "$work/src/cmd/compose/main.go")
   echo "rebuilding $repo $tag ($commit) in $image"
   # The container runs as root: give what it writes back to this user (else the cleanup can't remove it).
+  cfdargs=""
+  if [ -n "$cfd" ]; then cfdargs="-v $work/cfd:/cfd -e TACY_CLOUDFLARED_SRC=/cfd/src -e TACY_CLOUDFLARED_FRESH=1"; fi
   compose() {
-    docker run --rm -v "$work/src:/src" -w /src -e GOFLAGS=-mod=readonly -e OWNER="$(id -u):$(id -g)" "$image" \
-      sh -c 'go run ./cmd/compose "$@"; rc=$?; chown -R "$OWNER" rebuilt*.json rebuilt-oci* 2>/dev/null; exit $rc' sh "$@"
+    # shellcheck disable=SC2086 # cfdargs is several words
+    docker run --rm -v "$work/src:/src" $cfdargs -w /src -e GOFLAGS=-mod=readonly -e OWNER="$(id -u):$(id -g)" "$image" \
+      sh -c 'go run ./cmd/compose "$@"; rc=$?; chown -R "$OWNER" rebuilt*.json rebuilt-oci* /cfd 2>/dev/null; exit $rc' sh "$@"
   }
 fi
 
@@ -69,6 +84,7 @@ if [ -n "$vm" ]; then
     exit 1
   fi
   echo "REPRODUCED: the published release.json matches this rebuild"
+  if [ -n "$cfd" ]; then echo "REPRODUCED: cloudflared $(git -C "$work/cfd/src" rev-parse HEAD) + Tacy's patch, rebuilt from source inside the gatewayd image"; fi
   if [ -n "$oci" ]; then served "$work/release.json" "$work/src/rebuilt-oci"; fi
 fi
 if [ -n "$kms" ]; then

@@ -396,13 +396,45 @@ func TestApproveEmergencySignsTheDryRun(t *testing.T) {
 	if len(dd) != 2 || !strings.Contains(errOut, `-emergency "CVE fix": the override expedites release:`) {
 		t.Fatalf("approve -dry-run -emergency: %q\n%s", dd, errOut)
 	}
-	if strings.Contains(string(readFile(wouldSign)), `"emergency"`) {
+	var doc struct {
+		UnlockPolicy json.RawMessage  `json:"unlock_policy"`
+		TrustList    json.RawMessage  `json:"trust_list"`
+		Emergency    *dryRunEmergency `json:"emergency"`
+	}
+	if err := json.Unmarshal(readFile(wouldSign), &doc); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(doc.UnlockPolicy), `"emergency"`) || strings.Contains(string(doc.TrustList), `"emergency"`) {
 		t.Fatal("approve -dry-run -emergency shows an override it can't sign")
 	}
-	_, plain, _ := f.dryRun(t, "would-sign.json")
+	// Slots4 1: the override's reason and items, shown as the dry run's unsigned "emergency" member.
+	if e := doc.Emergency; e == nil || e.Reason != "CVE fix" || len(e.Items) != 1 || !strings.HasPrefix(e.Items[0], "release:") ||
+		len(e.TrustItems) != 1 {
+		t.Fatalf("approve -dry-run -emergency's emergency member: %+v", doc.Emergency)
+	}
+	plainFile, plain, _ := f.dryRun(t, "would-sign.json")
 	if !slices.Equal(dd, plain) {
 		t.Fatalf("with -emergency the dry run's documents %q aren't the plain run's %q", dd, plain)
 	}
+
+	// Slots4 1: -expect binds the override too. A different -emergency-item or reason, -emergency against a plain dry
+	// run, or a plain run against an -emergency dry run: refused before anything is signed, nothing written.
+	overrideRefused := func(name, expect string, extra ...string) {
+		t.Helper()
+		outDir := filepath.Join(f.dir, name)
+		stdout, errOut, err := f.sign(t, expect, outDir, extra...)
+		if err == nil || !strings.Contains(errOut, "the emergency override (its reason or items) this run derives isn't the one the dry run showed") ||
+			!strings.Contains(errOut, "nothing signed") || strings.Contains(stdout, "EMERGENCY override") {
+			t.Fatalf("%s: %v\n%s%s", name, err, stdout, errOut)
+		}
+		if _, err := os.Stat(outDir); !os.IsNotExist(err) {
+			t.Fatalf("%s: written", name)
+		}
+	}
+	overrideRefused("other-item", wouldSign, append(slices.Clone(em), "-emergency-item", "other")...)
+	overrideRefused("other-reason", wouldSign, "-emergency", "another reason", "-dev-master", master)
+	overrideRefused("emergency-on-plain", plainFile, em...)
+	overrideRefused("plain-on-emergency", wouldSign)
 
 	// No -expect: refused, nothing written.
 	noExpect := filepath.Join(f.dir, "no-expect")

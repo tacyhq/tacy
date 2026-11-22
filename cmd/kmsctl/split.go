@@ -42,8 +42,9 @@ package main
 //	    signs and writes nothing (no -sign-key, -out or shares): what a run without it would sign. The run that
 //	    signs takes that output back (-expect F, always required) and signs only if it derives the same bytes again,
 //	    issued_at aside. Both print each document's sha256 (issued_at left out) on stderr. With -emergency, -dry-run
-//	    shows everything but the override itself (its items and reason go on stderr); the signing run matches both
-//	    documents before it attaches the override, so only the override is unseen.
+//	    shows everything but the override's signature: the documents without it, and its reason and items as an
+//	    unsigned "emergency" member; the signing run matches all three (a different reason or -emergency-item is
+//	    refused) before it attaches the override, so only its signature is unseen.
 //	    -machine-cert F (repeat) adds a machine certificate (machine-cert's output) to the policy and the trust list;
 //	    -revoke-machine HASH|F (repeat) revokes one: its hash joins machines_revoked in both, for good (holders keep
 //	    every revocation they have seen, clients the union of every list), and the certificate leaves machine_certs.
@@ -345,28 +346,38 @@ func splitMain(cmd string, args []string) {
 		if *emergency == "" && len(emergencyItems) > 0 {
 			die("approve: -emergency-item needs -emergency REASON")
 		}
+		var ed *dryRunEmergency
 		if *emergency != "" { // the items it would expedite, checked now: a -dry-run shows them, without the shares
 			items, err := emergencyItemsFor(np, adds, emergencyItems)
 			if err != nil {
 				die("%v", err)
 			}
+			var prev []string
+			if tl != nil {
+				prev = tl.RevokedReleases
+			}
+			ed = &dryRunEmergency{Reason: *emergency, Items: items}
+			if ntl != nil {
+				ed.TrustItems = trustEmergencyItems(ntl, prev, adds, emergencyItems)
+			}
 			fmt.Fprintf(os.Stderr, "-emergency %q: the override expedites %s at every holder (each alerts); it is signed with "+
-				"the shares after the check below, the only part a -dry-run doesn't show\n", *emergency, strings.Join(items, ", "))
+				"the shares after the check below, its signature the only part a -dry-run doesn't show\n", *emergency, strings.Join(items, ", "))
 		}
 		if *dryRun {
 			describeApps(os.Stderr, np.Apps)
 			fmt.Fprintf(os.Stderr, "approve -dry-run: unlock policy seq %d (%d release(s)) and the trust list: unsigned, nothing written\n",
 				np.Seq, len(np.Releases))
 			printDigests(os.Stderr, np, ntl)
-			os.Stdout.Write(wouldSign(np, ntl))
+			os.Stdout.Write(wouldSign(np, ntl, ed))
 			return
 		}
 		// Slots re-check Low 1: -emergency too signs only what a -dry-run showed. Both documents are matched before the
-		// override is attached, so the comparison leaves the Emergency field (and the trust list's "emergency" member) out.
+		// override is attached, so the comparison leaves the Emergency field (and the trust list's "emergency" member) out;
+		// the override's reason and items are matched as the dry run's unsigned "emergency" member (slots4 1).
 		if *expect == "" {
 			die("approve: -expect would-sign.json, the -dry-run output of this same command (it signs only what that showed)")
 		}
-		if err := matchDryRun(readFile(*expect), np, ntl); err != nil {
+		if err := matchDryRun(readFile(*expect), np, ntl, ed); err != nil {
 			die("approve: %s: %v (nothing signed)", *expect, err)
 		}
 		printDigests(os.Stderr, np, ntl)
@@ -729,18 +740,29 @@ func unlockPolicy(base, fromKMS, kmsIDStr string, seq uint64, floor, holderURLs 
 type dryRunDoc struct {
 	UnlockPolicy *split.UnlockPolicy `json:"unlock_policy"`
 	TrustList    *safety.TrustList   `json:"trust_list,omitempty"`
+	Emergency    *dryRunEmergency    `json:"emergency,omitempty"`
 }
 
-// wouldSign is approve -dry-run's output for np and ntl.
-func wouldSign(np *split.UnlockPolicy, ntl *safety.TrustList) []byte {
-	b, _ := json.MarshalIndent(dryRunDoc{np, ntl}, "", "  ")
+// dryRunEmergency is the override an approve -emergency run signs, shown by its -dry-run without the shares: its
+// reason and the items it expedites in the policy and in the trust list. It isn't signed as is (the override is,
+// with the master key, after the match), but -expect matches it like the documents, so a different reason or
+// -emergency-item, or -emergency added or dropped after the dry run, is refused (slots4 1).
+type dryRunEmergency struct {
+	Reason     string   `json:"reason"`
+	Items      []string `json:"items"`
+	TrustItems []string `json:"trust_items,omitempty"`
+}
+
+// wouldSign is approve -dry-run's output for np, ntl and the override ed (nil: none).
+func wouldSign(np *split.UnlockPolicy, ntl *safety.TrustList, ed *dryRunEmergency) []byte {
+	b, _ := json.MarshalIndent(dryRunDoc{np, ntl, ed}, "", "  ")
 	return append(b, '\n')
 }
 
-// matchDryRun is nil only when raw is exactly wouldSign(np, ntl) with each document's issued_at the dry run's (slots
+// matchDryRun is nil only when raw is exactly wouldSign(np, ntl, ed) with each document's issued_at the dry run's (slots
 // review M2): an input changed between the dry run and this run (a base, a compose, a trust entry, a certificate) is
 // refused rather than signed unseen.
-func matchDryRun(raw []byte, np *split.UnlockPolicy, ntl *safety.TrustList) error {
+func matchDryRun(raw []byte, np *split.UnlockPolicy, ntl *safety.TrustList, ed *dryRunEmergency) error {
 	var d struct {
 		UnlockPolicy *struct {
 			IssuedAt time.Time `json:"issued_at"`
@@ -762,14 +784,18 @@ func matchDryRun(raw []byte, np *split.UnlockPolicy, ntl *safety.TrustList) erro
 		}
 		tl = &c
 	}
-	if bytes.Equal(wouldSign(&p, tl), raw) {
+	if bytes.Equal(wouldSign(&p, tl, ed), raw) {
 		return nil
 	}
 	var e dryRunDoc
 	json.Unmarshal(raw, &e)
 	what := "the unlock policy"
-	if e.UnlockPolicy != nil && digest(e.UnlockPolicy) == digest(np) {
+	switch {
+	case e.UnlockPolicy == nil || digest(e.UnlockPolicy) != digest(np):
+	case (e.TrustList == nil) != (ntl == nil) || (ntl != nil && digest(e.TrustList) != digest(ntl)):
 		what = "the trust list"
+	default:
+		what = "the emergency override (its reason or items)"
 	}
 	return fmt.Errorf("%s this run derives isn't the one the dry run showed: run -dry-run again and check it", what)
 }
@@ -1365,6 +1391,19 @@ func emergencyItemsFor(np *split.UnlockPolicy, adds []releaseSpec, extra []strin
 // and the extra items that are also items of the list (an OS image, a boot set, a platform...; "release:vX.Y.Z" is
 // the list's entry for that version). None of them in the list: no override (clients delay as usual).
 func attachTrustEmergency(ntl *safety.TrustList, prevRevoked []string, m []byte, kmsID string, adds []releaseSpec, extra []string, reason string, now time.Time) error {
+	items := trustEmergencyItems(ntl, prevRevoked, adds, extra)
+	if len(items) == 0 {
+		return nil
+	}
+	em, err := split.NewTrustEmergency(m, kmsID, ntl.Seq, items, reason, now)
+	if err != nil {
+		return err
+	}
+	return ntl.SetEmergency(em)
+}
+
+// trustEmergencyItems is the items attachTrustEmergency expedites in ntl (approve -dry-run -emergency shows them).
+func trustEmergencyItems(ntl *safety.TrustList, prevRevoked []string, adds []releaseSpec, extra []string) []string {
 	all := safety.TrustItems(ntl)
 	var items []string
 	add := func(it string) {
@@ -1397,14 +1436,7 @@ func attachTrustEmergency(ntl *safety.TrustList, prevRevoked []string, m []byte,
 			add(safety.TrustReleaseItem(r))
 		}
 	}
-	if len(items) == 0 {
-		return nil
-	}
-	em, err := split.NewTrustEmergency(m, kmsID, ntl.Seq, items, reason, now)
-	if err != nil {
-		return err
-	}
-	return ntl.SetEmergency(em)
+	return items
 }
 
 // KindUnlockSecrets is the envelope the chat Worker takes a sealed secrets bundle in (the chat Worker's unlock routes).

@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/tacyhq/tacy/gateway/cftunnel"
+	"github.com/tacyhq/tacy/verifier"
 )
 
 // The tunnel (a research note; chosen 2026-11-21: Phala Fix B plus our
@@ -44,16 +45,17 @@ var cfd struct {
 //   - tunnelSlots: the vault secret (vault.TunnelSecrets, in the epoch's sealed secrets bundle) gatewayd leases the
 //     tunnel token from, per slot: --tunnel-slot a (vm-a) or b (vm-b), chosen per release (blue/green by the
 //     Worker's target, never DNS): a release goes on the slot the live one isn't on.
-//   - releaseAccessTeam, releaseAccessAUD: the Cloudflare Access app cloudflared checks the JWT of in the TD. NOT
-//     PINNED YET: the production Access app and tunnel are made at the Cloudflare setup (a live step the owner
-//     approves). Until then these placeholders fail closed (no Access app has an all-zero audience, so cloudflared
-//     refuses every request) and --manifest, which a release tag needs, refuses them (accessPinned).
+//   - releaseAccessTeam, releaseAccessAUD: the Cloudflare Access app cloudflared checks the JWT of in the TD: the
+//     production app tacy-agent-vm over vm-a.tacy.dev and vm-b.tacy.dev (its one policy includes only the chat
+//     Worker's service token), made by scripts/ceremony-tunnels.sh on 2026-11-22. The team is verifier.AccessTeam
+//     (the verifiers pin it by value); the audience is the app's. Both public. Before then they were placeholders
+//     that fail closed (an all-zero audience), which --manifest still refuses (accessPinned).
 const (
 	ReleaseCloudflaredVersion = "2026.10.7-tacy2"
 	ReleaseCloudflaredCommit  = "872b241f94871665c1c157adefcf90c11f0ead96"
 	ReleaseCloudflaredSHA256  = "1c8c92c803f5d919c51bf01e1ce8d642d3ec05b51326c214eff756ed4221f0dd"
-	releaseAccessTeam         = "unpinned"
-	releaseAccessAUD          = "0000000000000000000000000000000000000000000000000000000000000000"
+	releaseAccessTeam         = verifier.AccessTeam
+	releaseAccessAUD          = "4b3edae68fd8b0f6913601a52763b6ab048dcf3981a9d5669efec249530bb00b"
 )
 
 // tunnelSlots are the release's tunnel slots and the vault secret each one's gatewayd leases its token from

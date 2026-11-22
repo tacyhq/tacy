@@ -35,6 +35,13 @@ const ReleaseShapeCheck = "a release with unlockd is exactly cmd/compose's shape
 // UnlockDomain is the only domain the holders may be on (gatewayd's -unlock-domain; cmd/compose's unlockDomain).
 const UnlockDomain = "tacy.io"
 
+// AccessTeam is the Cloudflare Zero Trust team whose Access app cloudflared checks the JWT of (gatewayd's
+// -cloudflared-access <team>,<aud>; cmd/compose's releaseAccessTeam): pinned by value, so a release can only name an
+// Access app of our own account (its certs at https://<team>.cloudflareaccess.com/cdn-cgi/access/certs). The audience
+// is taken by form (a staging release names its own app in the same team) but never the all-zero placeholder, which
+// no Access app has.
+const AccessTeam = "baldcactus"
+
 // val is a scalar the shape takes by form, not by value: ok says whether s is of the form; same, when set, names a
 // value that must be equal wherever it appears (part picks the compared piece; nil: all of it).
 type val struct {
@@ -61,7 +68,10 @@ var (
 	isProvider = re(`^(exa|tavily|brave)$`)
 	isGVisor   = re(`^[0-9]{8}\.[0-9]+$`)
 	isTunnel   = re(`^CF_TUNNEL_TOKEN_VM[AB]$`)
-	isAccess   = re(`^[a-z0-9-]{1,63},[0-9a-f]{64}$`) // gateway/cftunnel.ParseAccess: <team>,<aud>
+	isAccess   = func(s string) bool { // gateway/cftunnel.ParseAccess's <team>,<aud>: our team, a real audience
+		team, aud, ok := strings.Cut(s, ",")
+		return ok && team == AccessTeam && isHex64(aud) && aud != strings.Repeat("0", 64)
+	}
 )
 
 func key(same string) val                        { return val{what: "an ed25519 key", ok: isKey, same: same} }
@@ -178,7 +188,7 @@ func releaseShape(keysInVM bool) map[string]any {
 	// gatewayd: its launcher (GatewaydLaunchException) as root with SETUID and SETGID only, its own bridge network,
 	// HOME=/tmp and nothing else in its environment, no published port and no -listen, cloudflared as 10006, the Access
 	// app as a pin (-cloudflared-access: the launcher writes cloudflared's config from it; no config file in the
-	// image), never the e2e diag route (-e2e-diag: not in the shape, so refused).
+	// image; the team by value, AccessTeam), never the e2e diag route (-e2e-diag: not in the shape, so refused).
 	gw := serviceShape("gatewayd", "0:0", true)
 	gw["cap_add"] = list("SETGID", "SETUID")
 	gw["tmpfs"] = list("/tmp:mode=0700,uid=10001,gid=10001", "/run/tunnel:size=1m,mode=0750,uid=10001,gid=10006")
@@ -192,7 +202,7 @@ func releaseShape(keysInVM bool) map[string]any {
 		trustShape(),
 		list("-safety-url", https(), "-keylog-url", https(), "-dns-tls", form("a DNS-over-TLS resolver", isDoT),
 			"-"+TunnelUIDFlag, "10006", "-cloudflared", "/tacy/cloudflared", "-cloudflared-sha256", hex64(""),
-			"-cloudflared-access", form("an Access app (team,aud)", isAccess), "-tunnel-secret", form("a tunnel token's name", isTunnel)))
+			"-cloudflared-access", form("an Access app ("+AccessTeam+",aud)", isAccess), "-tunnel-secret", form("a tunnel token's name", isTunnel)))
 
 	vaultd := serviceShape("vaultd", "10002:10001", false)
 	vaultd["group_add"] = list("10005")

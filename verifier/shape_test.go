@@ -194,24 +194,41 @@ func TestReleaseShapeAcceptsTheGenerator(t *testing.T) {
 	}
 }
 
-// The Access pin (vm-v1-gate2): the release names its Access app on gatewayd's command line (-cloudflared-access
-// <team>,<aud>), which the shape takes by form; the config-file form, a malformed pin, the pin twice and the e2e
-// diag route (-e2e-diag, the e2e overlay's only) are each refused.
+// The Access pin (vm-v1-gate2; the team by value since the production app, 2026-11-22): the release names its Access
+// app on gatewayd's command line (-cloudflared-access <team>,<aud>). The team must be AccessTeam (our account's), the
+// audience a sha256-form value other than the all-zero placeholder: another app of our team (a staging release's)
+// passes, another team, the placeholders, the config-file form, a malformed pin, the pin twice and the e2e diag
+// route (-e2e-diag, the e2e overlay's only) are each refused.
 func TestShapeAccessPinAndDiagFlag(t *testing.T) {
 	base := string(composeYAML(t))
 	if _, err := ComposeImages(base); err != nil {
 		t.Fatalf("the release compose: %v", err)
 	}
-	pin := `"-cloudflared-access", "unpinned,` + strings.Repeat("0", 64) + `"`
-	other := edit(t, base, pin, `"-cloudflared-access", "tacy-gate,`+strings.Repeat("ab", 32)+`"`)
-	if _, err := ComposeImages(other); err != nil {
-		t.Fatalf("another Access app (a pin): %v", err)
+	if AccessTeam != "baldcactus" {
+		t.Fatalf("AccessTeam %q: the production Access app's team is baldcactus", AccessTeam)
 	}
+	pin := `"-cloudflared-access", "baldcactus,4b3edae68fd8b0f6913601a52763b6ab048dcf3981a9d5669efec249530bb00b"`
+	other := edit(t, base, pin, `"-cloudflared-access", "baldcactus,`+strings.Repeat("ab", 32)+`"`)
+	if _, err := ComposeImages(other); err != nil {
+		t.Fatalf("another Access app of our team (a staging release's pin): %v", err)
+	}
+	if err := ReleaseShape(other); err != nil {
+		t.Fatalf("another Access app of our team, the release shape: %v", err)
+	}
+	aud := "4b3edae68fd8b0f6913601a52763b6ab048dcf3981a9d5669efec249530bb00b"
 	for name, comp := range map[string]string{
-		"the config-file form": edit(t, base, pin, `"-cloudflared-config", "/tacy/cloudflared.yml"`),
-		"a short audience":     edit(t, base, pin, `"-cloudflared-access", "unpinned,0000"`),
-		"no team":              edit(t, base, pin, `"-cloudflared-access", ",`+strings.Repeat("0", 64)+`"`),
-		"the pin twice":        edit(t, base, pin, pin+", "+pin),
+		"another team":                    edit(t, base, pin, `"-cloudflared-access", "kikosh,`+aud+`"`),
+		"another team, our team's prefix": edit(t, base, pin, `"-cloudflared-access", "baldcactus-x,`+aud+`"`),
+		"another team, a suffix of ours":  edit(t, base, pin, `"-cloudflared-access", "xbaldcactus,`+aud+`"`),
+		"our team in capitals":            edit(t, base, pin, `"-cloudflared-access", "BALDCACTUS,`+aud+`"`),
+		"our team, the zero audience":     edit(t, base, pin, `"-cloudflared-access", "baldcactus,`+strings.Repeat("0", 64)+`"`),
+		"the placeholders":                edit(t, base, pin, `"-cloudflared-access", "unpinned,`+strings.Repeat("0", 64)+`"`),
+		"an upper-case audience":          edit(t, base, pin, `"-cloudflared-access", "baldcactus,`+strings.ToUpper(aud)+`"`),
+		"a second comma":                  edit(t, base, pin, `"-cloudflared-access", "baldcactus,`+aud+`,x"`),
+		"the config-file form":            edit(t, base, pin, `"-cloudflared-config", "/tacy/cloudflared.yml"`),
+		"a short audience":                edit(t, base, pin, `"-cloudflared-access", "baldcactus,0000"`),
+		"no team":                         edit(t, base, pin, `"-cloudflared-access", ",`+aud+`"`),
+		"the pin twice":                   edit(t, base, pin, pin+", "+pin),
 		"the e2e diag route": edit(t, base, `"-tunnel-secret", "CF_TUNNEL_TOKEN_VMA"]`,
 			`"-tunnel-secret", "CF_TUNNEL_TOKEN_VMA", "-`+E2EDiagFlag+`", "http://e2ediag:8082"]`),
 		"the diag route, --flag": edit(t, base, `"-tunnel-secret", "CF_TUNNEL_TOKEN_VMA"]`,

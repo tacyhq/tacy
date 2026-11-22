@@ -480,6 +480,12 @@ func failed(r *ProbeResult) string {
 }
 
 // probe runs the confinement probe as cloudflared's uid (gatewayd's binary with ProbeArg).
+//
+// Known limit: the probe is a snapshot of the namespace at one moment, and
+// the supervisor doesn't retry a start the probe refused. So any socket that exists only briefly at that moment (a
+// UDP lookup's socket, say) keeps the tunnel down until the VM restarts: fail closed, at availability's cost. Low risk
+// today: gatewayd resolves over DNS-over-TLS (TCP), and a release has no other UDP, UDP-Lite, abstract or
+// NETLINK_USERSOCK socket there. Should it ever bite, the fix is to probe again before giving up, never to allow more.
 func (l *launcher) probe() (*ProbeResult, []byte, error) {
 	spec, _ := json.Marshal(ProbeSpec{Deny: l.cfg.Deny, Allow: l.cfg.Allow, PIDs: []int{l.gatewayd, os.Getpid()}, UID: l.cfg.TunnelUID})
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -603,9 +609,9 @@ func Probe(spec ProbeSpec) ProbeResult {
 			add("tcp "+addr, "unreachable", err.Error(), true)
 		}
 	}
-	// UDP and abstract UNIX sockets in the same namespace (sockets.go): none may exist but Docker's resolver's UDP
-	// socket. Unlike TCP, nothing is sent: a socket's existence is the failure. /proc/net/udp and unix can't be read:
-	// failed (fail closed); udp6 is absent on a kernel without IPv6.
+	// UDP, UDP-Lite, abstract UNIX and NETLINK_USERSOCK sockets in the same namespace (sockets.go): none may exist
+	// but Docker's resolver's UDP socket. Unlike TCP, nothing is sent: a socket's existence is the failure. A file
+	// that can't be read fails (fail closed), but udp6, udplite and udplite6 that don't exist (no IPv6, no UDP-Lite).
 	var udpRes map[string]bool
 	var udpErr error
 	r.UDPSockets, udpRes, udpErr = udpSockets()
@@ -625,6 +631,16 @@ func Probe(spec ProbeSpec) ProbeResult {
 		r.AbstractUnix = abstractUnixIn(string(b))
 		for _, a := range r.AbstractUnix {
 			add("abstract unix "+a, "none", "exists", false)
+		}
+	}
+	// NETLINK_USERSOCK sockets (sockets.go netlinkUsersockIn): the one netlink protocol any uid may send to another
+	// process's socket on. /proc/net/netlink can't be read: failed.
+	if b, err := os.ReadFile("/proc/net/netlink"); err != nil {
+		add("netlink sockets", "readable", err.Error(), false)
+	} else {
+		r.NetlinkUsersock = netlinkUsersockIn(string(b))
+		for _, n := range r.NetlinkUsersock {
+			add(n, "none", "exists", false)
 		}
 	}
 	r.GatewayReachable = gatewayPorts()
@@ -831,26 +847,9 @@ func tcpListeners() ([]string, map[string]bool) {
 	return out, resolver
 }
 
-// udpSockets are the network namespace's UDP sockets (udpSocketsIn) and which of them is Docker's resolver; an error
-// when /proc/net/udp can't be read (udp6 may be absent).
+// udpSockets: udpSocketsFrom on this namespace's /proc/net.
 func udpSockets() ([]string, map[string]bool, error) {
-	var out []string
-	resolver := map[string]bool{}
-	for _, f := range []string{"udp", "udp6"} {
-		b, err := os.ReadFile("/proc/net/" + f)
-		if err != nil {
-			if f == "udp" {
-				return out, resolver, err
-			}
-			continue
-		}
-		socks, res := udpSocketsIn(f, string(b))
-		out = append(out, socks...)
-		for k := range res {
-			resolver[k] = true
-		}
-	}
-	return out, resolver, nil
+	return udpSocketsFrom(func(f string) ([]byte, error) { return os.ReadFile("/proc/net/" + f) })
 }
 
 // LauncherStarter is gatewayd's side of the launcher: it starts cloudflared through it (Supervisor.Start).

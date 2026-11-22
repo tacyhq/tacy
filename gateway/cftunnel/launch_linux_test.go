@@ -43,7 +43,7 @@ func TestMain(m *testing.M) {
 		RunVsock32(os.Args[2])
 	}
 	switch os.Getenv(roleEnv) {
-	case "listen", "sleeper", "tcplisten", "udpbind", "abstractlisten": // helpers end when the test closes their stdin, or after a minute (root without CAP_KILL can't kill them)
+	case "listen", "sleeper", "tcplisten", "udpbind", "udplitebind", "nlusersock", "abstractlisten": // helpers end when the test closes their stdin, or after a minute (root without CAP_KILL can't kill them)
 		go func() {
 			io.Copy(io.Discard, os.Stdin)
 			os.Exit(0)
@@ -60,6 +60,27 @@ func TestMain(m *testing.M) {
 			os.Exit(1)
 		}
 		defer c.Close()
+		select {}
+	case "udplitebind": // a UDP-Lite socket (IPPROTO_UDPLITE) on 127.0.0.1:TACY_TEST_PORT
+		fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM, 136)
+		if err == nil {
+			port, _ := strconv.Atoi(os.Getenv("TACY_TEST_PORT"))
+			err = syscall.Bind(fd, &syscall.SockaddrInet4{Port: port, Addr: [4]byte{127, 0, 0, 1}})
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "udplite:", err)
+			os.Exit(1)
+		}
+		select {}
+	case "nlusersock": // a NETLINK_USERSOCK socket, bound (the kernel picks its port id)
+		fd, err := syscall.Socket(syscall.AF_NETLINK, syscall.SOCK_RAW, 2)
+		if err == nil {
+			err = syscall.Bind(fd, &syscall.SockaddrNetlink{Family: syscall.AF_NETLINK})
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "netlink:", err)
+			os.Exit(1)
+		}
 		select {}
 	case "abstractlisten": // an abstract UNIX socket (no file: no permissions keep any uid from it)
 		l, err := net.Listen("unix", "@"+os.Getenv("TACY_TEST_SOCK"))
@@ -672,15 +693,15 @@ func TestProbeRefusesReachableTCP(t *testing.T) {
 	}
 }
 
-// A UDP socket or an abstract UNIX socket in the shared network namespace fails the
-// probe, whoever owns it, as a reachable TCP listener does; without one the probe passes, and on a user-defined
+// A UDP or UDP-Lite socket, an abstract UNIX socket or a NETLINK_USERSOCK socket in the shared network namespace fails
+// the probe, whoever owns it, as a reachable TCP listener does; without one the probe passes, and on a user-defined
 // network (TACY_TEST_DOCKER_DNS=1) Docker's resolver's UDP socket (127.0.0.11, root's) is allowed, and only it.
 func TestProbeRefusesUDPAndAbstract(t *testing.T) {
 	root := launchRoot(t)
 	socks := startServices(t, root)
 	spec := ProbeSpec{Deny: denyList(root, socks), UID: TunnelUID}
 	clean := probeAs(t, cred(TunnelUID, TunnelUID), spec)
-	if !clean.OK || len(clean.AbstractUnix) != 0 {
+	if !clean.OK || len(clean.AbstractUnix) != 0 || len(clean.NetlinkUsersock) != 0 {
 		t.Fatalf("no UDP socket but Docker's resolver, no abstract socket: %s (udp %v, abstract %v)", failed(&clean), clean.UDPSockets, clean.AbstractUnix)
 	}
 	t.Logf("udp %v", clean.UDPSockets)
@@ -704,6 +725,8 @@ func TestProbeRefusesUDPAndAbstract(t *testing.T) {
 		{"udp 0.0.0.0 (Go binds it dual-stack: on udp6)", []string{roleEnv + "=udpbind", "TACY_TEST_ADDR=0.0.0.0:18092"}, "udp6 00000000000000000000000000000000:46AC "},
 		{"udp 127.0.0.11 of gatewayd's uid", []string{roleEnv + "=udpbind", "TACY_TEST_ADDR=127.0.0.11:18093"}, "udp 0B00007F:46AD "},
 		{"abstract", []string{roleEnv + "=abstractlisten", "TACY_TEST_SOCK=tacy-probe-test"}, "abstract unix @tacy-probe-test"},
+		{"udplite 127.0.0.1 of gatewayd's uid", []string{roleEnv + "=udplitebind", "TACY_TEST_PORT=18094"}, "udplite 0100007F:46AE "},
+		{"netlink usersock of gatewayd's uid", []string{roleEnv + "=nlusersock"}, "netlink usersock pid "},
 	} {
 		// Each helper stays until the test ends (root without CAP_KILL can't kill it): each look names its own socket.
 		h := sh(t, cred(GatewaydUID, GatewaydUID), c.env)
@@ -717,7 +740,7 @@ func TestProbeRefusesUDPAndAbstract(t *testing.T) {
 			}
 		}
 		if r.OK || hit == nil || hit.OK {
-			t.Errorf("%s: probe OK %v, check %+v (udp %v, abstract %v)", c.name, r.OK, hit, r.UDPSockets, r.AbstractUnix)
+			t.Errorf("%s: probe OK %v, check %+v (udp %v, abstract %v, netlink %v)", c.name, r.OK, hit, r.UDPSockets, r.AbstractUnix, r.NetlinkUsersock)
 		}
 	}
 }

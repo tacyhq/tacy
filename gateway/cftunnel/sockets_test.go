@@ -1,6 +1,8 @@
 package cftunnel
 
 import (
+	"io/fs"
+	"os"
 	"slices"
 	"testing"
 )
@@ -60,5 +62,61 @@ func TestAbstractUnixSockets(t *testing.T) {
 		"00000000ac: 00000002 00000000 00010000 0001 01  7003 @with space\n")
 	if !slices.Equal(got, []string{"@tacy-x", "@0001e", "@with space"}) {
 		t.Fatalf("abstract sockets: %v", got)
+	}
+}
+
+// UDP-Lite and the read errors: udplite and udplite6 are read like udp, every socket there
+// fails (never the resolver); a file that doesn't exist is skipped (but udp); any other read error is the error.
+func TestUDPSocketsFromFiles(t *testing.T) {
+	hdr := "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n"
+	lite := hdr + "  5: 0B00007F:46B5 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 4243 2 0000000000000000 0\n"
+	files := map[string]string{"udp": vmUDP, "udplite": lite, "udplite6": lite}
+	read := func(errs map[string]error) func(string) ([]byte, error) {
+		return func(f string) ([]byte, error) {
+			if err := errs[f]; err != nil {
+				return nil, err
+			}
+			if c, ok := files[f]; ok {
+				return []byte(c), nil
+			}
+			return nil, &os.PathError{Op: "open", Path: "/proc/net/" + f, Err: fs.ErrNotExist}
+		}
+	}
+	socks, res, err := udpSocketsFrom(read(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"udp 0B00007F:CCBE 00000000:0000 uid 0", "udplite 0B00007F:46B5 00000000:0000 uid 0", "udplite6 0B00007F:46B5 00000000:0000 uid 0"}
+	if !slices.Equal(socks, want) || len(res) != 1 || !res[want[0]] {
+		t.Fatalf("sockets %v, resolver %v (want %v, only the udp one the resolver)", socks, res, want)
+	}
+	for _, f := range []string{"udp", "udp6", "udplite", "udplite6"} {
+		if _, _, err := udpSocketsFrom(read(map[string]error{f: &os.PathError{Op: "open", Path: "/proc/net/" + f, Err: fs.ErrPermission}})); err == nil {
+			t.Errorf("%s unreadable (permission): no error", f)
+		}
+	}
+	if _, _, err := udpSocketsFrom(read(map[string]error{"udp": &os.PathError{Op: "open", Path: "/proc/net/udp", Err: fs.ErrNotExist}})); err == nil {
+		t.Error("no /proc/net/udp: no error")
+	}
+}
+
+// Netlink: only NETLINK_USERSOCK sockets (protocol 2) are listed, whatever their port id; the kernel's
+// and dockerd's NETLINK_ROUTE socket (a container's own, 2026-11-22) aren't.
+func TestNetlinkUsersock(t *testing.T) {
+	docker := `sk               Eth Pid        Groups   Rmem     Wmem     Dump  Locks    Drops    Inode
+00000000969b26ea 0   13         00000000 1152     0        0     2        0        3954069 
+0000000058a40604 0   0          00000000 0        0        0     2        0        3957060 
+00000000819f7892 4   0          00000000 0        0        0     2        0        3957065 
+000000008168436d 12  0          00000000 0        0        0     2        0        3957066 
+00000000898c524d 15  0          00000000 0        0        0     2        0        3957062 
+`
+	if n := netlinkUsersockIn(docker); len(n) != 0 {
+		t.Fatalf("a container's netlink sockets: %v", n)
+	}
+	got := netlinkUsersockIn(docker + "00000000aaaaaaaa 2   4242       00000000 0        0        0     2        0        7001 \n" +
+		"00000000bbbbbbbb 2   0          00000001 0        0        0     2        0        7002 \n" +
+		"00000000cccccccc 2   77\n")
+	if !slices.Equal(got, []string{"netlink usersock pid 4242 inode 7001", "netlink usersock pid 0 inode 7002"}) {
+		t.Fatalf("usersock sockets: %v", got)
 	}
 }

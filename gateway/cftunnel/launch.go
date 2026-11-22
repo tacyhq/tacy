@@ -67,11 +67,14 @@ type ProbeResult struct {
 	// uid can connect to is a failed check (review 2, L3: a release's gatewayd has none, and cloudflared isn't running
 	// while the probe is), unless spec.AllowTCP names it.
 	LoopbackListeners []string `json:"tcp_listeners"`
-	// UDPSockets are the UDP sockets in the shared network namespace (/proc/net/udp, udp6; sockets.go), and
+	// UDPSockets are the UDP and UDP-Lite sockets in the shared network namespace (/proc/net/udp, udp6, udplite,
+	// udplite6; sockets.go), and
 	// AbstractUnix its abstract UNIX sockets (/proc/net/unix). Each one is a failed check but Docker's resolver's UDP
 	// socket (127.0.0.11, root's): a uid can't be kept from either.
 	UDPSockets   []string `json:"udp_sockets"`
 	AbstractUnix []string `json:"abstract_unix"`
+	// NetlinkUsersock are the NETLINK_USERSOCK sockets there (/proc/net/netlink; sockets.go): each one a failed check.
+	NetlinkUsersock []string `json:"netlink_usersock"`
 	// GatewayReachable are the bridge gateway's ports (the host side) this uid connected to: information only (the
 	// shared network namespace can't refuse them by uid; public_logs and public_sysinfo are off, so they show
 	// metadata at most). "no default route" when there is none.

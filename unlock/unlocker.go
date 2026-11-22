@@ -379,7 +379,7 @@ func (u *Unlocker) loadSecrets(ctx context.Context, root Root, k *Keyring, names
 				return fmt.Errorf("secrets seq %d is below the policy's floor %d", b.Seq, floor)
 			}
 			err = k.SetSecrets(b, names)
-			clear(b.Values) // the names the grant leaves out (the other slot's tunnel token) go with the bundle
+			clear(b.Values) // drops what the grant leaves out (Go strings can't be zeroed; unlockd holds the root anyway)
 			return err
 		}()
 		if err == nil {

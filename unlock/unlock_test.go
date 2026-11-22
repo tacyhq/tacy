@@ -606,9 +606,9 @@ func TestTunnelSecret(t *testing.T) {
 	ac := func(dc string) []byte { b, _ := json.Marshal(map[string]string{"docker_compose_file": dc}); return b }
 	for dc, want := range map[string]string{
 		"services:\n  agentvm:\n    command: [\"-x\", \"1\", \"-tunnel-secret\", \"CF_TUNNEL_TOKEN_VMB\"]\n": "CF_TUNNEL_TOKEN_VMB",
-		"services:\n  agentvm:\n    command: [\"--tunnel-secret=CF_TUNNEL_TOKEN_VMA\"]\n":                 "CF_TUNNEL_TOKEN_VMA",
-		"services:\n  agentvm:\n    command: -a -tunnel-secret CF_TUNNEL_TOKEN_VMB\n":                       "CF_TUNNEL_TOKEN_VMB",
-		"services:\n  agentvm:\n    command: [\"-socket\", \"/s\"]\n":                                       "",
+		"services:\n  agentvm:\n    command: [\"--tunnel-secret=CF_TUNNEL_TOKEN_VMA\"]\n":                    "CF_TUNNEL_TOKEN_VMA",
+		"services:\n  agentvm:\n    command: -a -tunnel-secret CF_TUNNEL_TOKEN_VMB\n":                        "CF_TUNNEL_TOKEN_VMB",
+		"services:\n  agentvm:\n    command: [\"-socket\", \"/s\"]\n":                                        "",
 	} {
 		if got, err := unlock.TunnelSecret(ac(dc)); err != nil || got != want {
 			t.Fatalf("%q: %q %v, want %q", dc, got, err, want)

@@ -130,8 +130,13 @@ func TestFirstPolicyApps(t *testing.T) {
 	if _, err := os.Stat(outDir); !os.IsNotExist(err) {
 		t.Fatalf("approve -dry-run wrote %s: %v", outDir, err)
 	}
-	if _, errOut, err := kmsctl(t, "approve", "-base", base, "-release", rel, "-dry-run", "-emergency", "x"); err == nil || !strings.Contains(errOut, "no -emergency") {
+	// -emergency can be previewed (slots re-check Low 1): everything but the override, no shares, nothing written.
+	if _, errOut, err := kmsctl(t, "approve", "-base", base, "-release", rel, "-out", outDir, "-dry-run", "-emergency", "x"); err != nil ||
+		!strings.Contains(errOut, `-emergency "x": the override expedites release:`) {
 		t.Fatalf("approve -dry-run -emergency: %v\n%s", err, errOut)
+	}
+	if _, err := os.Stat(outDir); !os.IsNotExist(err) {
+		t.Fatalf("approve -dry-run -emergency wrote %s: %v", outDir, err)
 	}
 	if _, errOut, err := kmsctl(t, "approve", "-base", base, "-release", rel); err == nil || !strings.Contains(errOut, "-sign-key K -out DIR") {
 		t.Fatalf("approve without -dry-run, -out or -sign-key: %v\n%s", err, errOut)
@@ -217,7 +222,18 @@ func TestSecretsSealBothTunnels(t *testing.T) {
 // derives the policy and trust list again from its inputs and compares bytes, issued_at aside, so an input changed
 // between the two runs (here the app-compose, the trust entry, the base) is refused and nothing is signed. Both runs print
 // the same sha256 for each document.
-func TestApproveSignsTheDryRun(t *testing.T) {
+// approveFixture is a first policy (agent-vm grant), a release to pin, a trust list and its entry, and the dev admin
+// key: approve's arguments for them (no -sign-key, -out, -dry-run or -expect) and the files a test changes.
+type approveFixture struct {
+	d                      *splitdev.Dev
+	dir, base, ac, tr, key string
+	baseJSON               string
+	entry                  safety.TrustRelease
+	approve                []string
+}
+
+func newApproveFixture(t *testing.T) *approveFixture {
+	t.Helper()
 	now := time.Now().UTC()
 	d, err := splitdev.New([]string{"cloudflare", "vercel"}, 2, now.Add(-time.Hour))
 	if err != nil {
@@ -248,34 +264,51 @@ func TestApproveSignsTheDryRun(t *testing.T) {
 	os.WriteFile(key, []byte(base64.StdEncoding.EncodeToString(d.Admin.Seed())), 0o600)
 	approve := []string{"approve", "-base", base, "-release", "app=agent-vm,version=v1.0.0,app-compose=" + ac + ",compose=" + cy,
 		"-trust-base", tl, "-trust-release", tr}
-	sign := func(expect, outDir string) (string, error) {
-		a := append(slices.Clone(approve), "-sign-key", key, "-trust-key", key, "-dev-plain-keys", "-out", outDir)
-		if expect != "" {
-			a = append(a, "-expect", expect)
+	return &approveFixture{d: d, dir: dir, base: base, ac: ac, tr: tr, key: key, baseJSON: out, entry: entry, approve: approve}
+}
+
+// sign runs approve with the admin keys, -out outDir, -expect expect (if any) and extra; it returns stdout and stderr.
+func (f *approveFixture) sign(t *testing.T, expect, outDir string, extra ...string) (string, string, error) {
+	t.Helper()
+	a := append(slices.Clone(f.approve), "-sign-key", f.key, "-trust-key", f.key, "-dev-plain-keys", "-out", outDir)
+	if expect != "" {
+		a = append(a, "-expect", expect)
+	}
+	return kmsctl(t, append(a, extra...)...)
+}
+
+// dryRun runs approve -dry-run (and extra) into the file name; it returns that file, the digest lines and stderr.
+func (f *approveFixture) dryRun(t *testing.T, name string, extra ...string) (string, []string, string) {
+	t.Helper()
+	out, errOut, err := kmsctl(t, append(append(slices.Clone(f.approve), "-dry-run"), extra...)...)
+	if err != nil {
+		t.Fatalf("approve -dry-run: %v\n%s", err, errOut)
+	}
+	p := filepath.Join(f.dir, name)
+	os.WriteFile(p, []byte(out), 0o644)
+	return p, digestLines(errOut), errOut
+}
+
+func digestLines(s string) []string {
+	var out []string
+	for _, l := range strings.Split(s, "\n") {
+		if strings.Contains(l, " sha256 ") {
+			out = append(out, l)
 		}
-		_, errOut, err := kmsctl(t, a...)
+	}
+	return out
+}
+
+func TestApproveSignsTheDryRun(t *testing.T) {
+	f := newApproveFixture(t)
+	dir, ac, tr, base, out, entry := f.dir, f.ac, f.tr, f.base, f.baseJSON, f.entry
+	sign := func(expect, outDir string) (string, error) {
+		_, errOut, err := f.sign(t, expect, outDir)
 		return errOut, err
 	}
-	digests := func(s string) []string {
-		var out []string
-		for _, l := range strings.Split(s, "\n") {
-			if strings.Contains(l, " sha256 ") {
-				out = append(out, l)
-			}
-		}
-		return out
-	}
-	dryRun := func(name string) (string, []string) {
-		out, errOut, err := kmsctl(t, append(slices.Clone(approve), "-dry-run")...)
-		if err != nil {
-			t.Fatalf("approve -dry-run: %v\n%s", err, errOut)
-		}
-		f := filepath.Join(dir, name)
-		os.WriteFile(f, []byte(out), 0o644)
-		return f, digests(errOut)
-	}
+	digests := digestLines
 
-	wouldSign, dd := dryRun("would-sign.json")
+	wouldSign, dd, _ := f.dryRun(t, "would-sign.json")
 	if len(dd) != 2 || !strings.HasPrefix(dd[0], "unlock policy seq 2 sha256 ") || !strings.HasPrefix(dd[1], "trust list seq 4 sha256 ") {
 		t.Fatalf("approve -dry-run's digests: %q", dd)
 	}
@@ -326,7 +359,7 @@ func TestApproveSignsTheDryRun(t *testing.T) {
 
 	// The same inputs: signed, with the dry run's digests.
 	outDir := filepath.Join(dir, "signed")
-	errOut, err = sign(wouldSign, outDir)
+	errOut, err := sign(wouldSign, outDir)
 	if err != nil {
 		t.Fatalf("approve -expect: %v\n%s", err, errOut)
 	}
@@ -347,5 +380,83 @@ func TestApproveSignsTheDryRun(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(outDir, "trust-list-4.signed.json")); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Slots re-check Low 1: approve -emergency signs only what a -dry-run -emergency showed, the override aside. The dry
+// run needs no shares and shows everything but the override; the signing run needs -expect, matches both documents
+// with the override left out, and only then attaches it.
+func TestApproveEmergencySignsTheDryRun(t *testing.T) {
+	f := newApproveFixture(t)
+	master := filepath.Join(f.dir, "master.b64")
+	os.WriteFile(master, []byte(base64.StdEncoding.EncodeToString(f.d.Master)), 0o600)
+	em := []string{"-emergency", "CVE fix", "-dev-master", master}
+
+	wouldSign, dd, errOut := f.dryRun(t, "would-sign-emergency.json", "-emergency", "CVE fix")
+	if len(dd) != 2 || !strings.Contains(errOut, `-emergency "CVE fix": the override expedites release:`) {
+		t.Fatalf("approve -dry-run -emergency: %q\n%s", dd, errOut)
+	}
+	if strings.Contains(string(readFile(wouldSign)), `"emergency"`) {
+		t.Fatal("approve -dry-run -emergency shows an override it can't sign")
+	}
+	_, plain, _ := f.dryRun(t, "would-sign.json")
+	if !slices.Equal(dd, plain) {
+		t.Fatalf("with -emergency the dry run's documents %q aren't the plain run's %q", dd, plain)
+	}
+
+	// No -expect: refused, nothing written.
+	noExpect := filepath.Join(f.dir, "no-expect")
+	if _, errOut, err := f.sign(t, "", noExpect, em...); err == nil || !strings.Contains(errOut, "-expect would-sign.json") {
+		t.Fatalf("approve -emergency without -expect: %v\n%s", err, errOut)
+	}
+	if _, err := os.Stat(noExpect); !os.IsNotExist(err) {
+		t.Fatal("approve -emergency without -expect: written")
+	}
+	// An input changed after the dry run: refused before the override is signed, nothing written.
+	os.WriteFile(f.ac, []byte(`{"name":"agent-vm-2"}`), 0o644)
+	changed := filepath.Join(f.dir, "changed")
+	stdout, errOut, err := f.sign(t, wouldSign, changed, em...)
+	if err == nil || !strings.Contains(errOut, "nothing signed") || strings.Contains(stdout, "EMERGENCY override") {
+		t.Fatalf("approve -emergency, app-compose changed: %v\n%s%s", err, stdout, errOut)
+	}
+	if _, err := os.Stat(changed); !os.IsNotExist(err) {
+		t.Fatal("approve -emergency, app-compose changed: written")
+	}
+	os.WriteFile(f.ac, []byte(`{"name":"agent-vm"}`), 0o644)
+
+	// The same inputs: signed, with the dry run's digests, and the override in both documents.
+	outDir := filepath.Join(f.dir, "signed")
+	stdout, errOut, err = f.sign(t, wouldSign, outDir, em...)
+	if err != nil || !strings.Contains(stdout, "EMERGENCY override") {
+		t.Fatalf("approve -emergency -expect: %v\n%s%s", err, stdout, errOut)
+	}
+	if got := digestLines(errOut); !slices.Equal(got, dd) {
+		t.Fatalf("the signing run's digests %q aren't the dry run's %q", got, dd)
+	}
+	var env safety.Envelope
+	var signed split.UnlockPolicy
+	if json.Unmarshal(readFile(filepath.Join(outDir, "unlock-policy-2.signed.json")), &env) != nil || json.Unmarshal(env.Payload, &signed) != nil ||
+		signed.Emergency == nil {
+		t.Fatal("the signed policy carries no override")
+	}
+	// Left out, the override: the signed policy is the dry run's.
+	signed.Emergency = nil
+	if !strings.Contains(dd[0], digest(&signed)) {
+		t.Fatalf("the signed policy without its override isn't the dry run's: %s", dd[0])
+	}
+	var tenv safety.Envelope
+	var stl safety.TrustList
+	if json.Unmarshal(readFile(filepath.Join(outDir, "trust-list-4.signed.json")), &tenv) != nil || json.Unmarshal(tenv.Payload, &stl) != nil {
+		t.Fatal("no signed trust list")
+	}
+	if _, ok := stl.Optional[safety.TrustEmergencyMember]; !ok {
+		t.Fatal("the signed trust list carries no override")
+	}
+	delete(stl.Optional, safety.TrustEmergencyMember)
+	if len(stl.Optional) == 0 {
+		stl.Optional = nil
+	}
+	if !strings.Contains(dd[1], digest(&stl)) {
+		t.Fatalf("the signed trust list without its override isn't the dry run's: %s", dd[1])
 	}
 }

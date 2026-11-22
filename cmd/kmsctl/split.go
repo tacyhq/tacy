@@ -39,9 +39,11 @@ package main
 //	    the next unlock policy (seq + 1; a release added or removed) and, with -trust-base, the next trust list with
 //	    the same release added or removed, both signed in one session: DIR/unlock-policy-<seq>.signed.json and
 //	    DIR/trust-list-<seq>.signed.json. -dry-run prints both unsigned (stdout: {"unlock_policy", "trust_list"}) and
-//	    signs and writes nothing (no -sign-key, -out or -emergency): what a run without it would sign. The run that
-//	    signs takes that output back (-expect F, required but with -emergency) and signs only if it derives the same
-//	    bytes again, issued_at aside. Both print each document's sha256 (issued_at left out) on stderr.
+//	    signs and writes nothing (no -sign-key, -out or shares): what a run without it would sign. The run that
+//	    signs takes that output back (-expect F, always required) and signs only if it derives the same bytes again,
+//	    issued_at aside. Both print each document's sha256 (issued_at left out) on stderr. With -emergency, -dry-run
+//	    shows everything but the override itself (its items and reason go on stderr); the signing run matches both
+//	    documents before it attaches the override, so only the override is unseen.
 //	    -machine-cert F (repeat) adds a machine certificate (machine-cert's output) to the policy and the trust list;
 //	    -revoke-machine HASH|F (repeat) revokes one: its hash joins machines_revoked in both, for good (holders keep
 //	    every revocation they have seen, clients the union of every list), and the certificate leaves machine_certs.
@@ -275,9 +277,6 @@ func splitMain(cmd string, args []string) {
 		describeApps(os.Stderr, p.Apps)
 		printJSON(p)
 	case "approve":
-		if *dryRun && *emergency != "" {
-			die("approve: -dry-run signs nothing, so no -emergency (check the policy without it)")
-		}
 		if *base == "" || (!*dryRun && (*out == "" || *signKey == "")) {
 			die("approve: -base U.json -sign-key K -out DIR (or -base U.json -dry-run)")
 		}
@@ -343,6 +342,34 @@ func splitMain(cmd string, args []string) {
 		if err != nil {
 			die("%v", err)
 		}
+		if *emergency == "" && len(emergencyItems) > 0 {
+			die("approve: -emergency-item needs -emergency REASON")
+		}
+		if *emergency != "" { // the items it would expedite, checked now: a -dry-run shows them, without the shares
+			items, err := emergencyItemsFor(np, adds, emergencyItems)
+			if err != nil {
+				die("%v", err)
+			}
+			fmt.Fprintf(os.Stderr, "-emergency %q: the override expedites %s at every holder (each alerts); it is signed with "+
+				"the shares after the check below, the only part a -dry-run doesn't show\n", *emergency, strings.Join(items, ", "))
+		}
+		if *dryRun {
+			describeApps(os.Stderr, np.Apps)
+			fmt.Fprintf(os.Stderr, "approve -dry-run: unlock policy seq %d (%d release(s)) and the trust list: unsigned, nothing written\n",
+				np.Seq, len(np.Releases))
+			printDigests(os.Stderr, np, ntl)
+			os.Stdout.Write(wouldSign(np, ntl))
+			return
+		}
+		// Slots re-check Low 1: -emergency too signs only what a -dry-run showed. Both documents are matched before the
+		// override is attached, so the comparison leaves the Emergency field (and the trust list's "emergency" member) out.
+		if *expect == "" {
+			die("approve: -expect would-sign.json, the -dry-run output of this same command (it signs only what that showed)")
+		}
+		if err := matchDryRun(readFile(*expect), np, ntl); err != nil {
+			die("approve: %s: %v (nothing signed)", *expect, err)
+		}
+		printDigests(os.Stderr, np, ntl)
 		if *emergency != "" {
 			m := masterFrom(parseKMSID(np.KMSID), shares, keys, *devMaster)
 			err := attachEmergency(np, m, adds, emergencyItems, *emergency, now)
@@ -361,28 +388,7 @@ func splitMain(cmd string, args []string) {
 			em, _ := np.Emergency.Open(parseKMSID(np.KMSID), np)
 			fmt.Printf("EMERGENCY override: %d release(s) unlock at once at every holder (each alerts); items %s\n", len(adds),
 				strings.Join(em.Items, ", "))
-		} else if len(emergencyItems) > 0 {
-			die("approve: -emergency-item needs -emergency REASON")
 		}
-		if *dryRun {
-			describeApps(os.Stderr, np.Apps)
-			fmt.Fprintf(os.Stderr, "approve -dry-run: unlock policy seq %d (%d release(s)) and the trust list: unsigned, nothing written\n",
-				np.Seq, len(np.Releases))
-			printDigests(os.Stderr, np, ntl)
-			os.Stdout.Write(wouldSign(np, ntl))
-			return
-		}
-		switch {
-		case *emergency == "" && *expect == "":
-			die("approve: -expect would-sign.json, the -dry-run output of this same command (it signs only what that showed)")
-		case *emergency != "" && *expect != "":
-			die("approve: -emergency has no dry run, so no -expect")
-		case *expect != "":
-			if err := matchDryRun(readFile(*expect), np, ntl); err != nil {
-				die("approve: %s: %v (nothing signed)", *expect, err)
-			}
-		}
-		printDigests(os.Stderr, np, ntl)
 		uk := readAdminKeys(*signKey)
 		var tk []ed25519.PrivateKey
 		if ntl != nil {
@@ -1305,8 +1311,23 @@ func nextSeq(p split.UnlockPolicy, now time.Time) (*split.UnlockPolicy, error) {
 // attachEmergency signs, with the KMS id M derives, an emergency override for np's seq naming the releases added
 // and the extra items (each one of np's policy items; "other" is np's catch-all item), and puts it in np.
 func attachEmergency(np *split.UnlockPolicy, m []byte, adds []releaseSpec, extra []string, reason string, now time.Time) error {
+	items, err := emergencyItemsFor(np, adds, extra)
+	if err != nil {
+		return err
+	}
+	em, err := split.NewEmergency(m, np.KMSID, np.Seq, items, reason, now)
+	if err != nil {
+		return err
+	}
+	np.Emergency = em
+	return checkUnlockPolicy(np)
+}
+
+// emergencyItemsFor is the items an override for np expedites: the releases added and the extra items (each one of
+// np's policy items; "other" is np's catch-all item). approve -dry-run -emergency prints them without the shares.
+func emergencyItemsFor(np *split.UnlockPolicy, adds []releaseSpec, extra []string) ([]string, error) {
 	if len(adds) == 0 && len(extra) == 0 {
-		return errors.New("approve: -emergency expedites the releases -release adds and the -emergency-item items; there are none")
+		return nil, errors.New("approve: -emergency expedites the releases -release adds and the -emergency-item items; there are none")
 	}
 	var items []string
 	all := split.PolicyItems(np)
@@ -1317,12 +1338,12 @@ func attachEmergency(np *split.UnlockPolicy, m []byte, adds []releaseSpec, extra
 		if v, ok := strings.CutPrefix(it, split.ItemRelease); ok && strings.HasPrefix(v, "v") { // release:vX.Y.Z, pinned
 			i := slices.IndexFunc(np.Releases, func(r kms.ReleasePin) bool { return r.Version == v })
 			if i < 0 {
-				return fmt.Errorf("approve: -emergency-item %s: %s isn't pinned in the new policy", it, v)
+				return nil, fmt.Errorf("approve: -emergency-item %s: %s isn't pinned in the new policy", it, v)
 			}
 			it = split.ReleaseItem(np.Releases[i])
 		}
 		if !slices.Contains(all, it) {
-			return fmt.Errorf("approve: -emergency-item %s isn't an item of the new policy", it)
+			return nil, fmt.Errorf("approve: -emergency-item %s isn't an item of the new policy", it)
 		}
 		if !slices.Contains(items, it) {
 			items = append(items, it)
@@ -1332,16 +1353,11 @@ func attachEmergency(np *split.UnlockPolicy, m []byte, adds []releaseSpec, extra
 		h := fileSHA256(a.AppCompose)
 		i := slices.IndexFunc(np.Releases, func(r kms.ReleasePin) bool { return r.AppComposeSHA256 == h && r.Version == a.Version })
 		if i < 0 {
-			return fmt.Errorf("approve: %s isn't pinned in the new policy", a.Version)
+			return nil, fmt.Errorf("approve: %s isn't pinned in the new policy", a.Version)
 		}
 		items = append(items, split.ReleaseItem(np.Releases[i]))
 	}
-	em, err := split.NewEmergency(m, np.KMSID, np.Seq, items, reason, now)
-	if err != nil {
-		return err
-	}
-	np.Emergency = em
-	return checkUnlockPolicy(np)
+	return items, nil
 }
 
 // attachTrustEmergency signs, with the KMS id M derives, the trust list's emergency override (safety

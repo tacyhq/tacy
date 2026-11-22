@@ -603,6 +603,30 @@ func Probe(spec ProbeSpec) ProbeResult {
 			add("tcp "+addr, "unreachable", err.Error(), true)
 		}
 	}
+	// UDP and abstract UNIX sockets in the same namespace (sockets.go): none may exist but Docker's resolver's UDP
+	// socket. Unlike TCP, nothing is sent: a socket's existence is the failure. /proc/net/udp and unix can't be read:
+	// failed (fail closed); udp6 is absent on a kernel without IPv6.
+	var udpRes map[string]bool
+	var udpErr error
+	r.UDPSockets, udpRes, udpErr = udpSockets()
+	if udpErr != nil {
+		add("udp sockets", "readable", udpErr.Error(), false)
+	}
+	for _, sk := range r.UDPSockets {
+		if udpRes[sk] {
+			add(sk, "Docker's embedded resolver only (127.0.0.11, root's)", "allowed", true)
+		} else {
+			add(sk, "none", "exists", false)
+		}
+	}
+	if b, err := os.ReadFile("/proc/net/unix"); err != nil {
+		add("unix sockets", "readable", err.Error(), false)
+	} else {
+		r.AbstractUnix = abstractUnixIn(string(b))
+		for _, a := range r.AbstractUnix {
+			add("abstract unix "+a, "none", "exists", false)
+		}
+	}
 	r.GatewayReachable = gatewayPorts()
 	r.OK = true
 	for _, c := range r.Checks {
@@ -805,6 +829,28 @@ func tcpListeners() ([]string, map[string]bool) {
 		fh.Close()
 	}
 	return out, resolver
+}
+
+// udpSockets are the network namespace's UDP sockets (udpSocketsIn) and which of them is Docker's resolver; an error
+// when /proc/net/udp can't be read (udp6 may be absent).
+func udpSockets() ([]string, map[string]bool, error) {
+	var out []string
+	resolver := map[string]bool{}
+	for _, f := range []string{"udp", "udp6"} {
+		b, err := os.ReadFile("/proc/net/" + f)
+		if err != nil {
+			if f == "udp" {
+				return out, resolver, err
+			}
+			continue
+		}
+		socks, res := udpSocketsIn(f, string(b))
+		out = append(out, socks...)
+		for k := range res {
+			resolver[k] = true
+		}
+	}
+	return out, resolver, nil
 }
 
 // LauncherStarter is gatewayd's side of the launcher: it starts cloudflared through it (Supervisor.Start).

@@ -43,7 +43,7 @@ func TestMain(m *testing.M) {
 		RunVsock32(os.Args[2])
 	}
 	switch os.Getenv(roleEnv) {
-	case "listen", "sleeper", "tcplisten": // helpers end when the test closes their stdin, or after a minute (root without CAP_KILL can't kill them)
+	case "listen", "sleeper", "tcplisten", "udpbind", "abstractlisten": // helpers end when the test closes their stdin, or after a minute (root without CAP_KILL can't kill them)
 		go func() {
 			io.Copy(io.Discard, os.Stdin)
 			os.Exit(0)
@@ -53,6 +53,22 @@ func TestMain(m *testing.M) {
 	switch os.Getenv(roleEnv) {
 	case "listen": // a service: listen on a socket until killed
 		listenRole()
+	case "udpbind": // a UDP socket in the shared network namespace
+		c, err := net.ListenPacket("udp", os.Getenv("TACY_TEST_ADDR"))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "listen:", err)
+			os.Exit(1)
+		}
+		defer c.Close()
+		select {}
+	case "abstractlisten": // an abstract UNIX socket (no file: no permissions keep any uid from it)
+		l, err := net.Listen("unix", "@"+os.Getenv("TACY_TEST_SOCK"))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "listen:", err)
+			os.Exit(1)
+		}
+		defer l.Close()
+		select {}
 	case "tcplisten": // a TCP listener in the shared network namespace
 		l, err := net.Listen("tcp", os.Getenv("TACY_TEST_ADDR"))
 		if err != nil {
@@ -652,6 +668,56 @@ func TestProbeRefusesReachableTCP(t *testing.T) {
 		}
 		if r.OK || hit == nil || hit.OK {
 			t.Errorf("a listener on %s: probe OK %v, check %+v (listeners %v)", addr, r.OK, hit, r.LoopbackListeners)
+		}
+	}
+}
+
+// A UDP socket or an abstract UNIX socket in the shared network namespace fails the
+// probe, whoever owns it, as a reachable TCP listener does; without one the probe passes, and on a user-defined
+// network (TACY_TEST_DOCKER_DNS=1) Docker's resolver's UDP socket (127.0.0.11, root's) is allowed, and only it.
+func TestProbeRefusesUDPAndAbstract(t *testing.T) {
+	root := launchRoot(t)
+	socks := startServices(t, root)
+	spec := ProbeSpec{Deny: denyList(root, socks), UID: TunnelUID}
+	clean := probeAs(t, cred(TunnelUID, TunnelUID), spec)
+	if !clean.OK || len(clean.AbstractUnix) != 0 {
+		t.Fatalf("no UDP socket but Docker's resolver, no abstract socket: %s (udp %v, abstract %v)", failed(&clean), clean.UDPSockets, clean.AbstractUnix)
+	}
+	t.Logf("udp %v", clean.UDPSockets)
+	if os.Getenv("TACY_TEST_DOCKER_DNS") == "1" {
+		seen := 0
+		for _, c := range clean.Checks {
+			if strings.HasPrefix(c.What, "udp 0B00007F:") && c.Got == "allowed" && c.OK {
+				seen++
+			}
+		}
+		if seen != 1 {
+			t.Fatalf("want one allowed Docker resolver UDP check on a user-defined network, got %d (udp %v)", seen, clean.UDPSockets)
+		}
+	}
+	for _, c := range []struct {
+		name string
+		env  []string
+		what string
+	}{
+		{"udp 127.0.0.1 of gatewayd's uid", []string{roleEnv + "=udpbind", "TACY_TEST_ADDR=127.0.0.1:18091"}, "udp 0100007F:46AB "},
+		{"udp 0.0.0.0 (Go binds it dual-stack: on udp6)", []string{roleEnv + "=udpbind", "TACY_TEST_ADDR=0.0.0.0:18092"}, "udp6 00000000000000000000000000000000:46AC "},
+		{"udp 127.0.0.11 of gatewayd's uid", []string{roleEnv + "=udpbind", "TACY_TEST_ADDR=127.0.0.11:18093"}, "udp 0B00007F:46AD "},
+		{"abstract", []string{roleEnv + "=abstractlisten", "TACY_TEST_SOCK=tacy-probe-test"}, "abstract unix @tacy-probe-test"},
+	} {
+		// Each helper stays until the test ends (root without CAP_KILL can't kill it): each look names its own socket.
+		h := sh(t, cred(GatewaydUID, GatewaydUID), c.env)
+		helper(t, h)
+		time.Sleep(200 * time.Millisecond)
+		r := probeAs(t, cred(TunnelUID, TunnelUID), spec)
+		var hit *ProbeCheck
+		for i := range r.Checks {
+			if strings.HasPrefix(r.Checks[i].What, c.what) {
+				hit = &r.Checks[i]
+			}
+		}
+		if r.OK || hit == nil || hit.OK {
+			t.Errorf("%s: probe OK %v, check %+v (udp %v, abstract %v)", c.name, r.OK, hit, r.UDPSockets, r.AbstractUnix)
 		}
 	}
 }

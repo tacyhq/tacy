@@ -24,7 +24,7 @@
 # Binaries (linux/amd64, sha256):
 #   agentd   8a9a206444bbca67c12938f6cb6bbf8ddf3699f2861bcf254fad6ac832f53f97
 #   brain    7c984294c1b91fd5c27fb407d655bb2536b35e427b23b6d5082055e73d88cf60
-#   gatewayd 359423755d83502070d195e831f0755baa6100d3541d51ddfbbb18833acc1347
+#   gatewayd 8c317b2e47ac12b97b9a37bf48922ab94dab12869a39636d1beb6a1e1250f412
 #   runnerd  b1c1a2432beaf866395941d4d598ade89a0e885e226c6e13c5d2a4c359990bcb
 #   setup    80f380d97b1cc77da758d69ba978e5f09c720f10ef853f6afa06e06ffa006de6
 #   unlockd  4d5abac2cea48948eec7052fef2f1045cf2e3c423e78117b6333b05937c40619
@@ -106,7 +106,7 @@ services:
       - runnersock:/run/tacy/runner
     command: ["-socket", "/run/tacy/runner/runner.sock", "-agent-uid", "10003", "-gvisor", "/tacy/gvisor", "-gvisor-release", "20261012.0", "-runsc-sha256", "56996c546dbafd5716e1d09e307a131d97eb3b6483c22a1178631751f3e0392f", "-brain", "/tacy/brain", "-brain-sha256", "7c984294c1b91fd5c27fb407d655bb2536b35e427b23b6d5082055e73d88cf60", "-dir", "/run/runner", "-platform", "systrap", "-rootless"]
   agentvm:
-    image: ghcr.io/tacyhq/tacy/gatewayd@sha256:b3018b0feecabe7b6f0aa3e12629233a4f5b7291c45f7047f2dcd2680fc6c181
+    image: ghcr.io/tacyhq/tacy/gatewayd@sha256:d22148deda95a000b26c665a21925b46aa6437ece4610203832d6d360eea00c0
     entrypoint: ["/tacy/gatewayd"]
     restart: unless-stopped
     logging:

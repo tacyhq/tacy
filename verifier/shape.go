@@ -50,8 +50,8 @@ const (
 )
 
 // AccessPinOK says whether s (gatewayd's -cloudflared-access value) is the production Access app: AccessTeam and
-// AccessAUD, exactly. cmd/compose's --manifest uses the same check, so a release manifest and the verifiers can't
-// disagree.
+// AccessAUD, exactly. cmd/compose's --manifest uses the same predicate (and the generator's own ComposeImages check
+// runs the shape on what it writes).
 func AccessPinOK(s string) bool { return s == AccessTeam+","+AccessAUD }
 
 // val is a scalar the shape takes by form, not by value: ok says whether s is of the form; same, when set, names a

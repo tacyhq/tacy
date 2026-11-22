@@ -442,7 +442,7 @@ func Verify(ctx context.Context, att *proto.Attestation, nonce []byte, p Policy)
 	}
 	// The key mode is the release's (its pinned app-compose.json), as far as the policy allows it.
 	mode, pinErr := KeyProviderKMS, error(nil)
-	var overlap *KMSOverlapRelease // the KMS-fallback release a Fix B build takes by its exact pins (overlap.go)
+	var overlap *KMSOverlapRelease        // the KMS-fallback release a Fix B build takes by its exact pins (overlap.go)
 	var releaseOverlap *KMSOverlapRelease // the same, as release mode's pin for the attested docker compose
 	if !p.legacy {
 		// Release mode: the pin is the app-compose.json a release of the attested docker compose is deployed with

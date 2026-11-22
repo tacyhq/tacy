@@ -39,7 +39,12 @@ func TestComposeCurrent(t *testing.T) {
 			"service's genesis); compose.yaml is regenerated with them")
 	}
 	os.Chdir("../..")
-	if err := setReleaseTunnel(false); err != nil { // what main sets for the release (cloudflared.go)
+	cur, _ := os.ReadFile("compose.yaml")
+	slot, err := committedSlot(cur)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := setReleaseTunnel(false, slot); err != nil { // what main sets for the release (cloudflared.go)
 		t.Fatal(err)
 	}
 	defer func() {
@@ -53,7 +58,6 @@ func TestComposeCurrent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cur, _ := os.ReadFile("compose.yaml")
 	if string(cur) != out {
 		t.Fatal("compose.yaml is stale: run go run ./cmd/compose")
 	}

@@ -44,6 +44,7 @@ var nologAllowed = map[string]string{
 	"cmd/kmsctl/main.go:shares in %s":                  "len(rep.Shares): how many sealed shares were written",
 	"cmd/kmsctl/main.go:share %d sent":                 "r.Shares: how many shares the replica has, a count",
 	"cmd/kmsctl/split.go:fmt.Println(priv)":            "holder-keygen prints the holder key only into a pipe (it refuses a terminal) for the secret store",
+	"cmd/kmsctl/split.go:app %s: firm %s, floor %s":    "describeApps prints an app grant: AppPolicy.Secrets are the bundle's names, never values",
 }
 
 func TestNoKeyMaterialInLogs(t *testing.T) {

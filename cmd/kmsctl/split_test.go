@@ -267,14 +267,14 @@ func TestUnlockPolicyBuild(t *testing.T) {
 	sb, _ := json.Marshal(d.Set)
 	os.WriteFile(set, sb, 0o644)
 	p, err := unlockPolicy(base, "", "", 7, "v0.21.0", "cloudflare=https://keys-cf.tacy.io,vercel=https://keys-v.tacy.io", []string{set}, nil,
-		"https://keys-cf.tacy.io/break-glass", now, kms.AdminKeys{})
+		"https://keys-cf.tacy.io/break-glass", now, kms.AdminKeys{}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if p.Seq != 7 || p.Floor != "v0.21.0" || len(p.Holders) != 2 || p.Holders[1].URL != "https://keys-v.tacy.io" || p.BreakGlass == "" {
 		t.Fatalf("policy: %+v", p)
 	}
-	if _, err := unlockPolicy(base, "", "", 7, "", "cloudflare=http://insecure", nil, nil, "", now, kms.AdminKeys{}); err == nil {
+	if _, err := unlockPolicy(base, "", "", 7, "", "cloudflare=http://insecure", nil, nil, "", now, kms.AdminKeys{}, ""); err == nil {
 		t.Fatal("a plain-http holder URL")
 	}
 }

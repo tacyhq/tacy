@@ -1064,6 +1064,9 @@ type Manifest struct {
 	GoVersion        string            `json:"go_version"`
 	BuildImage       string            `json:"build_image"`      // the toolchain image the release builds in
 	GVisor           *GVisor           `json:"gvisor,omitempty"` // the gVisor release in runnerd's image (since v0.4.0)
+	// TunnelSlot is the slot (a: vm-a, b: vm-b) whose tunnel token gatewayd leases (--tunnel-slot; since v1). The next
+	// release takes the other one.
+	TunnelSlot string `json:"tunnel_slot,omitempty"`
 }
 
 // GVisor is the third-party release an image carries: Google's tarball and the binaries taken from it.
@@ -1118,6 +1121,8 @@ func main() {
 	cfdSpike := flag.Bool("tunnel-spike-routes", false, "spike: gatewayd's /spike/* test routes on the tunnel")
 	cfdConfined := flag.Bool("cloudflared-confined", false, "spike: the confined variant (cloudflared in its own service, cftunnel)")
 	cfdNoListen := flag.Bool("no-listen", false, "with --cloudflared (in-container): no gatewayd -listen and no published 8080 (the release always has none)")
+	slotFlag := flag.String("tunnel-slot", "", "the release's tunnel slot, a (vm-a) or b (vm-b): required to write the release compose; "+
+		"--check and --dev-out take the committed compose.yaml's")
 	listen := flag.Bool("listen", false, "development (--dev-out): keep gatewayd's -listen :8080 and the published port beside the release's tunnel, for harnesses that still reach the VM through Phala's gateway")
 	flag.Parse()
 	if *cfdNoListen && (*cfdBin == "" || *cfdConfined) {
@@ -1136,11 +1141,20 @@ func main() {
 	if err := setCloudflared(*cfdBin, *cfdSum, *cfdAccess, *cfdSecret, *cfdSpike, *cfdConfined); err != nil {
 		fail(err)
 	}
+	if (*cfdBin != "" || *kmsMode) && *slotFlag != "" {
+		fail(fmt.Errorf("--tunnel-slot is the release tunnel's (not with --cloudflared or --kms)"))
+	}
+	slot := ""
 	if *cfdBin != "" {
 		cfd.noListen = *cfdNoListen
 	} else if !*kmsMode {
 		// The release's tunnel (vm-v1): the pinned patched cloudflared in gatewayd's container, no -listen, no 8080.
-		if err := setReleaseTunnel(*listen); err != nil {
+		committed, _ := os.ReadFile("compose.yaml")
+		var err error
+		if slot, err = tunnelSlot(*slotFlag, *check || *devOut != "", *check, committed); err != nil {
+			fail(err)
+		}
+		if err := setReleaseTunnel(*listen, slot); err != nil {
 			fail(err)
 		}
 	}
@@ -1262,11 +1276,11 @@ func main() {
 		}
 		fmt.Printf("wrote %s (%d bytes) and %s (%d bytes)\n", devPath(*devOut, "compose.yaml"), len(out), AppComposeFile, len(appCompose))
 	}
-	fmt.Printf("compose sha256 %x (%d bytes)\n", h, len(out))
+	fmt.Printf("compose sha256 %x (%d bytes), tunnel slot %s\n", h, len(out), slot)
 	fmt.Printf("app-compose sha256 %x (%d bytes)\n", ah, len(appCompose))
 	m := Manifest{Schema: Schema, Repository: "https://" + modulePath, Version: *version, Commit: *commit,
 		ComposeSHA256: hex.EncodeToString(h[:]), AppComposeSHA256: hex.EncodeToString(ah[:]), Binaries: map[string]string{},
-		Images: map[string]string{}, BaseImage: baseImage, GoVersion: goVersion(), BuildImage: image}
+		Images: map[string]string{}, BaseImage: baseImage, GoVersion: goVersion(), BuildImage: image, TunnelSlot: slot}
 	for _, b := range rel.Binaries {
 		m.Binaries[b.Name] = b.SHA256
 		fmt.Printf("%-8s binary sha256 %s\n", b.Name, b.SHA256)

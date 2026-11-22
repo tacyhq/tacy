@@ -1,0 +1,7 @@
+{
+  "agent-vm": {
+    "firm": "f_chat",
+    "purposes": ["state/v1", "activity-sign/v1", "task-ids/v1", "conn/v1", "notify/v1", "operator/v1", "relay-auth/v1"],
+    "secrets": ["TINFOIL_API_KEY", "EXA_API_KEY", "TAVILY_API_KEY", "CF_TUNNEL_TOKEN_VMA", "CF_TUNNEL_TOKEN_VMB"]
+  }
+}

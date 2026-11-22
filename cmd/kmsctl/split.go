@@ -9,7 +9,9 @@ package main
 //	    share-set-N.json and epoch-cert-E.json (public, signed by the KMS id: R_E's root id, its store certificates
 //	    and activity signer) and holder-<id>-set-N.json (each sealed to its holder's key). Nothing else is written. A
 //	    leaked R_E is answered by the same command with -epoch E+1 (and secrets-seal for E+1).
-//	kmsctl secrets-seal -kms-id ID -share S -key pass -share S -key pass -epoch E -seq N -in values.json|- -out F
+//	kmsctl secrets-seal -kms-id ID -share S -key pass -share S -key pass -epoch E -seq N -apps G.json -in values.json|- -out F
+//	    values.json must carry exactly the names the grants G list (for the agent VM both tunnel tokens, VMA and
+//	    VMB, so a release on either slot unlocks from one bundle), each with a value.
 //	kmsctl secrets-push -in F -sign-key K -worker URL
 //	    the sealed bundle to the chat Worker (POST /api/vm/unlock-secrets, which unlockd fetches): a kms-unlock-secrets
 //	    envelope signed with the kms-admin key, {"sealed": base64}. The Worker keeps it only above the stored seq.
@@ -18,9 +20,12 @@ package main
 //	    a holder's key: the private key (base64) on stdout, which must be a pipe (into wrangler secret put or vercel
 //	    env add --sensitive), never a terminal or a file; its recipient string on stderr.
 //	kmsctl unlock-policy -kms-id ID -seq N -floor vX.Y.Z -holders ID=URL[,ID=URL] -share-set F [-share-set F] [-break-glass URL]
-//	        [-from-kms-policy P.signed.json] [-base U.json] [-machine-cert F ...]
+//	        [-from-kms-policy P.signed.json] [-base U.json] [-apps kms/policies/agent-vm-v1.json] [-machine-cert F ...]
 //	    an unsigned kms-unlock-policy (stdout): from a base, or from the key service's signed kms-policy (its pins,
-//	    floors, OS images, boot sets and apps), with the holders, share sets and break-glass relay given.
+//	    floors, OS images, boot sets and apps), with the holders, share sets and break-glass relay given. -apps F sets
+//	    the policy's app grants to exactly F's (kms/policies.Load: a grant naming a tunnel token names both); a
+//	    policy with no grant is refused (approve couldn't pin a release in it), so the first policy takes -apps.
+//	    Each grant is summed up on stderr.
 //	kmsctl approve -base U.json [-release app=APP,version=vX.Y.Z,app-compose=F,compose=F] [-remove vX.Y.Z]
 //	        [-share-set F ...] [-trust-base T.json -trust-release R.json] -sign-key K [-trust-key K] -out DIR
 //	        [-emergency REASON [-emergency-item ITEM ...] -share S -key pass -share S -key pass]
@@ -33,7 +38,8 @@ package main
 //	    carries the override alone: a release pinned earlier unlocks at once.
 //	    the next unlock policy (seq + 1; a release added or removed) and, with -trust-base, the next trust list with
 //	    the same release added or removed, both signed in one session: DIR/unlock-policy-<seq>.signed.json and
-//	    DIR/trust-list-<seq>.signed.json.
+//	    DIR/trust-list-<seq>.signed.json. -dry-run prints both unsigned (stdout) and signs and writes nothing (no
+//	    -sign-key, -out or -emergency): what a run without it would sign.
 //	    -machine-cert F (repeat) adds a machine certificate (machine-cert's output) to the policy and the trust list;
 //	    -revoke-machine HASH|F (repeat) revokes one: its hash joins machines_revoked in both, for good (holders keep
 //	    every revocation they have seen, clients the union of every list), and the certificate leaves machine_certs.
@@ -92,6 +98,7 @@ import (
 	"github.com/tacyhq/tacy/activity"
 	"github.com/tacyhq/tacy/kms"
 	"github.com/tacyhq/tacy/kms/client"
+	"github.com/tacyhq/tacy/kms/policies"
 	"github.com/tacyhq/tacy/kms/server"
 	"github.com/tacyhq/tacy/kms/split"
 	"github.com/tacyhq/tacy/kms/split/glass"
@@ -137,6 +144,9 @@ func splitMain(cmd string, args []string) {
 	breakGlass := fs.String("break-glass", "", "unlock-policy: the break-glass relay URL")
 	fromKMS := fs.String("from-kms-policy", "", "unlock-policy: the key service's signed kms-policy to take pins from")
 	base := fs.String("base", "", "the current unsigned unlock policy")
+	appsFile := fs.String("apps", "", "unlock-policy: the app grants file (kms/policies/agent-vm-v1.json), the policy's apps become exactly its; "+
+		"secrets-seal: the grants the bundle must carry every name of")
+	dryRun := fs.Bool("dry-run", false, "approve: print the unsigned policy and trust list it would sign; sign and write nothing")
 	previous := fs.String("previous", "", "unlock-policy: the last unsigned unlock policy before (another admin-key generation's): its machine revocations carry over")
 	var releases, removes multi
 	fs.Var(&releases, "release", "approve: app=APP,version=vX.Y.Z,app-compose=FILE,compose=FILE")
@@ -185,12 +195,23 @@ func splitMain(cmd string, args []string) {
 			die("%v", err)
 		}
 	case "secrets-seal":
+		if *appsFile == "" {
+			die("secrets-seal: -apps F, the grants the bundle serves (kms/policies/agent-vm-v1.json): it must carry every name they list")
+		}
+		apps, err := policies.Load(readFile(*appsFile))
+		if err != nil {
+			die("%s: %v", *appsFile, err)
+		}
 		id := parseKMSID(*kmsIDStr)
 		m := masterFrom(id, shares, keys, *devMaster)
 		defer clear(m)
 		var values map[string]string
 		if err := kms.Strict(readFile(*in), &values); err != nil || len(values) == 0 {
 			die("%s: a JSON object of names to values: %v", *in, err)
+		}
+		if err := bundleNames(values, apps); err != nil {
+			clear(values)
+			die("%s: %v", *in, err)
 		}
 		sealed, err := secretsSeal(m, kms.IDString(id), uint32(*epoch), *seq, values)
 		for k := range values {
@@ -226,7 +247,7 @@ func splitMain(cmd string, args []string) {
 		fmt.Fprintln(os.Stderr, rcp)
 	case "unlock-policy":
 		p, err := unlockPolicy(*base, *fromKMS, *kmsIDStr, *seq, *floor, *holderURLs, shareSets, epochCerts, *breakGlass, now,
-			kms.AdminKeys{Keys: parseKeysOrNil(*adminKeys), Threshold: *adminThreshold})
+			kms.AdminKeys{Keys: parseKeysOrNil(*adminKeys), Threshold: *adminThreshold}, *appsFile)
 		if p != nil && len(machineCerts) > 0 { // every unlock policy needs machine certificates (machine-cert)
 			p.MachineCerts = readMachineCerts(machineCerts)
 			err = checkUnlockPolicy(p)
@@ -247,10 +268,14 @@ func splitMain(cmd string, args []string) {
 		if err != nil {
 			die("%v", err)
 		}
+		describeApps(os.Stderr, p.Apps)
 		printJSON(p)
 	case "approve":
-		if *base == "" || *out == "" || *signKey == "" {
-			die("approve: -base U.json -sign-key K -out DIR")
+		if *dryRun && *emergency != "" {
+			die("approve: -dry-run signs nothing, so no -emergency (check the policy without it)")
+		}
+		if *base == "" || (!*dryRun && (*out == "" || *signKey == "")) {
+			die("approve: -base U.json -sign-key K -out DIR (or -base U.json -dry-run)")
 		}
 		var p split.UnlockPolicy
 		readJSON(*base, &p)
@@ -334,6 +359,16 @@ func splitMain(cmd string, args []string) {
 				strings.Join(em.Items, ", "))
 		} else if len(emergencyItems) > 0 {
 			die("approve: -emergency-item needs -emergency REASON")
+		}
+		if *dryRun {
+			describeApps(os.Stderr, np.Apps)
+			fmt.Fprintf(os.Stderr, "approve -dry-run: unlock policy seq %d (%d release(s)) and, below it, the trust list: unsigned, nothing written\n",
+				np.Seq, len(np.Releases))
+			printJSON(np)
+			if ntl != nil {
+				printJSON(ntl)
+			}
+			return
 		}
 		uk := readAdminKeys(*signKey)
 		var tk []ed25519.PrivateKey
@@ -591,7 +626,7 @@ func holderKeygen(curve string) (string, string, error) {
 
 // unlockPolicy builds an unsigned unlock policy.
 func unlockPolicy(base, fromKMS, kmsIDStr string, seq uint64, floor, holderURLs string, shareSets, epochCerts []string, breakGlass string,
-	now time.Time, admin kms.AdminKeys) (*split.UnlockPolicy, error) {
+	now time.Time, admin kms.AdminKeys, appsFile string) (*split.UnlockPolicy, error) {
 	var p split.UnlockPolicy
 	switch {
 	case base != "":
@@ -649,6 +684,17 @@ func unlockPolicy(base, fromKMS, kmsIDStr string, seq uint64, floor, holderURLs 
 	if breakGlass != "" {
 		p.BreakGlass = breakGlass
 	}
+	if appsFile != "" {
+		apps, err := policies.Load(readFile(appsFile))
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", appsFile, err)
+		}
+		p.Apps = apps
+	}
+	if len(p.Apps) == 0 {
+		return nil, errors.New("unlock-policy: no app grant, so no release could be pinned (approve refuses a pin for an unknown app): " +
+			"pass -apps kms/policies/agent-vm-v1.json")
+	}
 	if p.Epoch == 1 && len(p.ShareSets) > 0 { // the epoch is the newest share set's
 		id, _ := kms.ParseID(p.KMSID)
 		for _, ss := range p.ShareSets {
@@ -658,6 +704,18 @@ func unlockPolicy(base, fromKMS, kmsIDStr string, seq uint64, floor, holderURLs 
 		}
 	}
 	return &p, checkUnlockPolicy(&p)
+}
+
+// describeApps sums up each app grant, for the person about to sign it.
+func describeApps(w io.Writer, apps map[string]kms.AppPolicy) {
+	for _, name := range slices.Sorted(maps.Keys(apps)) {
+		a := apps[name]
+		floor := a.Floor
+		if floor == "" {
+			floor = "the policy's"
+		}
+		fmt.Fprintf(w, "app %s: firm %s, floor %s, purposes %s, secrets %s\n", name, a.Firm, floor, strings.Join(a.Purposes, " "), strings.Join(a.Secrets, " "))
+	}
 }
 
 // checkUnlockPolicy validates a policy and its share sets under its own KMS id.
@@ -986,6 +1044,35 @@ func secretsSeal(m []byte, kmsID string, epoch uint32, seq uint64, values map[st
 	}
 	defer clear(root)
 	return split.SealSecrets(root, split.SecretsBundle{KMSID: kmsID, Epoch: epoch, Seq: seq, Values: values})
+}
+
+// bundleNames checks a secrets bundle carries exactly the names the grants list, each with a value: a VM's unlock
+// fails on a name its grant lists and the bundle lacks (unlock.Keyring.SetSecrets), and a name no grant lists would
+// go to the Worker for nothing. Errors name names, never values.
+func bundleNames(values map[string]string, apps map[string]kms.AppPolicy) error {
+	want := map[string]bool{}
+	for _, a := range apps {
+		for _, n := range a.Secrets {
+			want[n] = true
+		}
+	}
+	var missing, extra []string
+	for n := range want {
+		if values[n] == "" {
+			missing = append(missing, n)
+		}
+	}
+	for n := range values {
+		if !want[n] {
+			extra = append(extra, n)
+		}
+	}
+	slices.Sort(missing)
+	slices.Sort(extra)
+	if len(missing) > 0 || len(extra) > 0 {
+		return fmt.Errorf("the bundle must carry exactly the grants' names: missing or empty %v, not granted %v", missing, extra)
+	}
+	return nil
 }
 
 // parseTCBGrace reads -tcb-grace: until=RFC3339,statuses=A+B[,min-tcb-date=YYYY-MM-DD][,min-tcb-eval=N].

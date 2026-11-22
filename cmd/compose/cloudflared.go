@@ -41,9 +41,9 @@ var cfd struct {
 //     management service; no WARP or private-network routing: TCP, UDP and ICMP from the edge are refused),
 //     fetched by cloudflared/fetch.sh and built by cloudflared/build.sh: byte for byte the same on macOS and in
 //     Linux (Docker), and in scripts/reproduce.sh.
-//   - releaseTunnelSecret: the vault secret (vault.TunnelSecrets, in the epoch's sealed secrets bundle) gatewayd
-//     leases the tunnel token from: slot vm-a. A release on slot vm-b names CF_TUNNEL_TOKEN_VMB (blue/green by the
-//     Worker's target, never DNS).
+//   - tunnelSlots: the vault secret (vault.TunnelSecrets, in the epoch's sealed secrets bundle) gatewayd leases the
+//     tunnel token from, per slot: --tunnel-slot a (vm-a) or b (vm-b), chosen per release (blue/green by the
+//     Worker's target, never DNS): a release goes on the slot the live one isn't on.
 //   - releaseAccessTeam, releaseAccessAUD: the Cloudflare Access app cloudflared checks the JWT of in the TD. NOT
 //     PINNED YET: the production Access app and tunnel are made at the Cloudflare setup (a live step the owner
 //     approves). Until then these placeholders fail closed (no Access app has an all-zero audience, so cloudflared
@@ -52,10 +52,56 @@ const (
 	ReleaseCloudflaredVersion = "2026.10.7-tacy2"
 	ReleaseCloudflaredCommit  = "872b241f94871665c1c157adefcf90c11f0ead96"
 	ReleaseCloudflaredSHA256  = "1c8c92c803f5d919c51bf01e1ce8d642d3ec05b51326c214eff756ed4221f0dd"
-	releaseTunnelSecret       = "CF_TUNNEL_TOKEN_VMA"
 	releaseAccessTeam         = "unpinned"
 	releaseAccessAUD          = "0000000000000000000000000000000000000000000000000000000000000000"
 )
+
+// tunnelSlots are the release's tunnel slots and the vault secret each one's gatewayd leases its token from
+// (vault.TunnelSecrets, in that order; the verifier accepts exactly these two names).
+var tunnelSlots = map[string]string{"a": "CF_TUNNEL_TOKEN_VMA", "b": "CF_TUNNEL_TOKEN_VMB"}
+
+// tunnelSecretRE finds gatewayd's tunnel secret in a compose.
+var tunnelSecretRE = regexp.MustCompile(`"-tunnel-secret", "CF_TUNNEL_TOKEN_VM([AB])"`)
+
+// committedSlot is the slot a compose's gatewayd names (exactly one -tunnel-secret of the two).
+func committedSlot(compose []byte) (string, error) {
+	m := tunnelSecretRE.FindAllSubmatch(compose, -1)
+	if len(m) != 1 {
+		return "", fmt.Errorf("compose.yaml: %d tunnel slots named (want exactly one -tunnel-secret CF_TUNNEL_TOKEN_VMA or _VMB)", len(m))
+	}
+	return strings.ToLower(string(m[0][1])), nil
+}
+
+// tunnelSlot is the release's slot. Writing the release compose (and a manifest without --check) needs --tunnel-slot:
+// nothing defaults to a slot, since two VMs on one slot share one tunnel and the edge splits requests between them.
+// follow (--check, --dev-out) takes the committed compose.yaml's slot, which it is held to: --check refuses another
+// one; a development compose (--dev-out) may take the other slot for a throwaway.
+func tunnelSlot(flagSlot string, follow, check bool, committed []byte) (string, error) {
+	if _, ok := tunnelSlots[flagSlot]; flagSlot != "" && !ok {
+		return "", fmt.Errorf("--tunnel-slot %q: a or b", flagSlot)
+	}
+	if !follow {
+		if flagSlot == "" {
+			return "", fmt.Errorf("--tunnel-slot a|b is required: the slot (vm-a, vm-b) whose tunnel token this release's gatewayd " +
+				"leases; take the one the live release isn't on (its release.json tunnel_slot)")
+		}
+		return flagSlot, nil
+	}
+	c, err := committedSlot(committed)
+	if err != nil {
+		if flagSlot != "" && !check {
+			return flagSlot, nil
+		}
+		return "", err
+	}
+	if check && flagSlot != "" && flagSlot != c {
+		return "", fmt.Errorf("--check --tunnel-slot %s: the committed compose.yaml is on slot %s", flagSlot, c)
+	}
+	if flagSlot != "" {
+		return flagSlot, nil
+	}
+	return c, nil
+}
 
 // accessPinned says whether the release's Access app is pinned (not the placeholders).
 func accessPinned() bool {
@@ -73,9 +119,13 @@ func manifestPins(manifest string, kmsMode bool) error {
 }
 
 // setReleaseTunnel sets the release's tunnel: the pinned binary (releaseCloudflared), the config for the release's
-// Access app, slot vm-a's token, no -listen. listen (development composes only) keeps gatewayd's -listen :8080 and
-// the published port for harnesses that still reach the VM through Phala's gateway.
-func setReleaseTunnel(listen bool) error {
+// Access app, the slot's token (tunnelSlots), no -listen. listen (development composes only) keeps gatewayd's -listen
+// :8080 and the published port for harnesses that still reach the VM through Phala's gateway.
+func setReleaseTunnel(listen bool, slot string) error {
+	secret, ok := tunnelSlots[slot]
+	if !ok {
+		return fmt.Errorf("tunnel slot %q: a or b", slot)
+	}
 	b, err := releaseCloudflared()
 	if err != nil {
 		return err
@@ -84,7 +134,7 @@ func setReleaseTunnel(listen bool) error {
 	if _, _, err := cftunnel.ParseAccess(access); err != nil {
 		return err
 	}
-	cfd.bin, cfd.sha, cfd.access, cfd.secret, cfd.noListen = b, ReleaseCloudflaredSHA256, access, releaseTunnelSecret, !listen
+	cfd.bin, cfd.sha, cfd.access, cfd.secret, cfd.noListen = b, ReleaseCloudflaredSHA256, access, secret, !listen
 	return nil
 }
 

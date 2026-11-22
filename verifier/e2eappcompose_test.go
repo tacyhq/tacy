@@ -27,15 +27,15 @@ func overlayOf(t *testing.T, compose []byte, ports ...string) []byte {
 // (AllowE2EDiag); a release's stays 8080 only, and a compose without the diag service gets exactly the release's.
 func TestE2EAppCompose(t *testing.T) {
 	compose := fallbackCompose(t)
-	rel, err := ReleaseAppCompose(compose, nil, true)
+	rel, err := ReleaseAppCompose(compose, []byte(MemoryRootScript), true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if same, err := E2EAppCompose(compose, nil, true); err != nil || string(same) != string(rel) {
+	if same, err := E2EAppCompose(compose, []byte(MemoryRootScript), true); err != nil || string(same) != string(rel) {
 		t.Fatalf("no diag service: %v, same %v", err, string(same) == string(rel))
 	}
 	overlay := overlayOf(t, compose, "8082:8082")
-	e2e, err := E2EAppCompose(overlay, nil, true)
+	e2e, err := E2EAppCompose(overlay, []byte(MemoryRootScript), true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +45,7 @@ func TestE2EAppCompose(t *testing.T) {
 		t.Fatalf("port_policy %s", got)
 	}
 	// What the release itself makes of the overlay compose keeps 8080 only.
-	relOverlay, err := ReleaseAppCompose(overlay, nil, true)
+	relOverlay, err := ReleaseAppCompose(overlay, []byte(MemoryRootScript), true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,6 +84,39 @@ func TestE2EAppCompose(t *testing.T) {
 	for _, bad := range [][]string{{"8080:8080"}, {"9000:8082"}, {"8082"}, {"8082:8082", "8082:8082"}} {
 		if _, err := E2EAppCompose(overlayOf(t, compose, bad...), nil, true); err == nil {
 			t.Errorf("diag ports %v accepted", bad)
+		}
+	}
+}
+
+// Fix B's push diag (cmd/e2e fixb, review L1): a VM that booted with it verifies only for a policy that names the
+// root exception on top of AllowE2EDiag (fixb verify's). A staging policy (AllowE2EDiag alone, a staging key
+// service's or holders') refuses it, and the root exception alone means nothing.
+func TestE2EDiagRootPolicy(t *testing.T) {
+	c := string(composeYAML(t))
+	i := strings.LastIndex(c, "\nvolumes:\n")
+	push := "\n  " + E2EDiagService + ":\n    image: docker.io/library/busybox@sha256:" + strings.Repeat("ab", 32) +
+		"\n    ulimits:\n      core: 0\n    pid: \"host\"\n    network_mode: host\n    user: \"0:0\"\n    cap_add: [ALL]\n" +
+		"    security_opt: [\"seccomp:unconfined\"]\n    device_cgroup_rules: [\"b *:* rwm\"]\n    tmpfs: [\"/scan:mode=0700\"]\n" +
+		"    volumes:\n      - \"/:/host:ro,rslave\""
+	overlay := []byte(c[:i] + push + c[i:])
+	ac, err := E2EAppCompose(overlay, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []struct {
+		name       string
+		diag, root bool
+		ok         bool
+	}{{"fixb (AllowE2EDiag and AllowE2EDiagRoot)", true, true, true}, {"staging (AllowE2EDiag)", true, false, false},
+		{"root exception alone", false, true, false}, {"production", false, false, false}} {
+		rc := bootWith(t, overlay, false, func([]byte) []byte { return ac }, keyEvent(false))
+		rc.p.AppCompose, rc.p.AllowE2EDiag, rc.p.AllowE2EDiagRoot = ac, p.diag, p.root
+		_, err := Verify(context.Background(), rc.a, rc.nonce, rc.p)
+		if p.ok && err != nil {
+			t.Errorf("%s: %v", p.name, err)
+		}
+		if !p.ok && (err == nil || !strings.HasPrefix(err.Error(), ImagesCheck+": ")) {
+			t.Errorf("%s: %v, want the images check to refuse", p.name, err)
 		}
 	}
 }

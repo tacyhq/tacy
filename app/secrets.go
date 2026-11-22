@@ -93,6 +93,10 @@ var quickPathOff = []offRoute{
 func (s *server) gate(next http.Handler, off []offRoute) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
+		if s.drain.on(time.Now()) && !drainPasses(r) { // drain.go: nothing new on a VM being replaced
+			failDetail(w, 503, "draining", "this VM is being replaced: new work goes to the active one")
+			return
+		}
 		for _, o := range off {
 			if strings.HasPrefix(p, o.prefix) {
 				failDetail(w, 503, o.code, o.detail)
@@ -111,7 +115,7 @@ func (s *server) gate(next http.Handler, off []offRoute) http.Handler {
 // keyless: routes that work before the keys arrived.
 func keyless(p string) bool {
 	switch p {
-	case "/", "/attest", "/health", ehbpproto.KeysPath, "/safety", "/keylog", "/secrets/status":
+	case "/", "/attest", "/health", ehbpproto.KeysPath, "/safety", "/keylog", "/secrets/status", "/drain", "/undrain":
 		return true
 	}
 	return false

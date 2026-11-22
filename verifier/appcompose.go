@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"regexp"
 	"slices"
 	"sort"
@@ -25,7 +26,9 @@ import (
 //   - KeyProviderNone (the default): key_provider "none". dstack makes a random seed inside the TD at each boot and
 //     derives the disk key from it; nothing is asked of a KMS, so no provider holds or can derive it. The data disk
 //     is reformatted at every boot (requirements.ephemeral_data_disk, manifest_version "3" so a guest that doesn't
-//     know requirements fails closed).
+//     know requirements fails closed). Fix B (2026-11-21): no provider gateway (gateway_enabled and tproxy_enabled
+//     off: the VM dials out), no pre-launch script, and ulimits core 0 on every service (a crash would otherwise
+//     write a process's memory into its writable layer on the disk).
 //   - KeyProviderKMS (Policy.KMSFallback only, if Phala refuses "none"): key_provider "kms" with key_provider_id
 //     pinned to a KMSRoots root, so the guest itself refuses another root. The disk is then under a key Phala's KMS
 //     derives, so the VM must keep nothing on it: the docker compose has no volume that isn't memory (tmpfs).
@@ -57,6 +60,7 @@ const (
 type appCompose struct {
 	ManifestVersion         json.RawMessage `json:"manifest_version"`
 	Name                    string          `json:"name"`
+	Features                []string        `json:"features"` // deprecated in dstack; "tproxy-net" turns the gateway on
 	DockerComposeFile       string          `json:"docker_compose_file"`
 	PreLaunchScript         *string         `json:"pre_launch_script"`
 	InitScript              json.RawMessage `json:"init_script"`
@@ -66,11 +70,15 @@ type appCompose struct {
 	PublicSysinfo           bool            `json:"public_sysinfo"`
 	PublicTcbinfo           *bool           `json:"public_tcbinfo"` // dstack's default is true
 	KMSEnabled              bool            `json:"kms_enabled"`
+	GatewayEnabled          *bool           `json:"gateway_enabled"`
+	TproxyEnabled           *bool           `json:"tproxy_enabled"`
 	LocalKeyProviderEnabled bool            `json:"local_key_provider_enabled"`
 	KeyProvider             *string         `json:"key_provider"`
 	KeyProviderID           string          `json:"key_provider_id"`
 	SecureTime              *bool           `json:"secure_time"` // dstack 0.6.5's default is true; we require it written
 	SwapSize                json.RawMessage `json:"swap_size"`
+	StorageFS               *string         `json:"storage_fs"`      // the data disk's filesystem; overrides the kernel command line
+	StorageDiscard          *bool           `json:"storage_discard"` // dstack's default is true (TRIM to the host)
 	PortPolicy              *struct {
 		Ports []struct {
 			Port int  `json:"port"`
@@ -108,16 +116,38 @@ func (ac *appCompose) keyMode() string {
 // zeroSize: swap_size absent, 0, or a size string of zero ("0", "0G").
 var zeroSize = regexp.MustCompile(`^"0+\s*[A-Za-z]*"$`)
 
+// StorageFS is the data disk's filesystem every release asks for (app-compose storage_fs). ZFS keeps a checksum of
+// each block in its parent, up to the uberblock in memory, so a block the host randomizes or rolls back (aes-xts has
+// no integrity) reads as an error, never as other data. On ext4 a sector rolled back to an earlier ciphertext of
+// the same boot would read back as that earlier plaintext.
+const StorageFS = "zfs"
+
 // checkFlags checks the settings of an app-compose.json for key mode mode (KeyProviderNone or KeyProviderKMS).
 // The gateway may forward exactly ports: a release's is the app port alone; only the e2e test's overlay adds its
-// diag service's (E2EAppCompose). The error names the first flag that's wrong.
-func (ac *appCompose) checkFlags(mode string, kmsRoots map[string]string, ports []int) error {
+// diag service's (E2EAppCompose). allowDiscard accepts storage_discard true (Policy.AllowStorageDiscard; nothing
+// sets it). The error names the first flag that's wrong.
+func (ac *appCompose) checkFlags(mode string, kmsRoots map[string]string, ports []int, allowDiscard bool) error {
 	if len(ports) == 0 {
 		return errors.New("no port to check port_policy against")
 	}
 	port := ports[0]
 	if string(ac.ManifestVersion) != `"3"` {
 		return fmt.Errorf("manifest_version %s, want \"3\" (older guests ignore requirements instead of failing closed)", ac.ManifestVersion)
+	}
+	// dstack-types 0.6.5: gateway_enabled() is gateway_enabled || features contains "tproxy-net". The list is
+	// deprecated and a release writes it empty, so any entry is refused, not only the ones known to turn something on.
+	if len(ac.Features) > 0 {
+		return fmt.Errorf("features %q, want none (deprecated; \"tproxy-net\" turns the provider gateway on)", ac.Features)
+	}
+	if ac.StorageFS == nil || *ac.StorageFS != StorageFS {
+		got := "unset (the kernel command line's)"
+		if ac.StorageFS != nil {
+			got = strconv.Quote(*ac.StorageFS)
+		}
+		return fmt.Errorf("storage_fs %s, want %q (its block checksums turn a host's rollback of the disk into a read error)", got, StorageFS)
+	}
+	if (ac.StorageDiscard == nil || *ac.StorageDiscard) && !allowDiscard {
+		return errors.New("storage_discard is on or unset (dstack's default is on), want off (TRIM shows the host which blocks are free)")
 	}
 	if got := ac.keyMode(); got != mode {
 		return fmt.Errorf("key_provider %q, want %q", got, mode)
@@ -133,6 +163,27 @@ func (ac *appCompose) checkFlags(mode string, kmsRoots map[string]string, ports 
 		if ac.KeyProviderID != "" {
 			return errors.New("key_provider_id is set with key_provider none")
 		}
+		// Fix B: no provider gateway (its TLS and app registration need the provider's KMS; the VM dials out
+		// instead), so nothing of the provider's sits in front of the VM either.
+		if ac.GatewayEnabled == nil || *ac.GatewayEnabled {
+			return errors.New("gateway_enabled is on or unset, want off with key_provider none (no provider gateway)")
+		}
+		if ac.TproxyEnabled != nil && *ac.TproxyEnabled {
+			return errors.New("tproxy_enabled is on, want off with key_provider none")
+		}
+		// No pre-launch script: the disk's key is the TD's, so the images need not be moved into memory, and the
+		// deploy always sends "" (without it Phala inserts its own script, which runs as root).
+		if ac.PreLaunchScript != nil && *ac.PreLaunchScript != "" {
+			return errors.New("a pre-launch script with key_provider none, want none (sent as \"\")")
+		}
+		if err := coreDumpsOff(ac.DockerComposeFile); err != nil {
+			return err
+		}
+		// The disk's key is the TD's here, but the VM still keeps nothing there (v0.20.0's rule, kept: what a
+		// container writes to a volume would outlive the container's restarts in this boot).
+		if err := noDiskVolumesMode(ac.DockerComposeFile, KeyProviderNone); err != nil {
+			return err
+		}
 	case KeyProviderKMS:
 		if !ac.KMSEnabled {
 			return errors.New("kms_enabled is off with key_provider kms")
@@ -140,7 +191,7 @@ func (ac *appCompose) checkFlags(mode string, kmsRoots map[string]string, ports 
 		if kmsRoots[strings.ToLower(ac.KeyProviderID)] == "" {
 			return fmt.Errorf("key_provider_id %s isn't a pinned KMS root (the guest must refuse any other)", short(ac.KeyProviderID))
 		}
-		if err := noDiskVolumes(ac.DockerComposeFile); err != nil {
+		if err := noDiskVolumesMode(ac.DockerComposeFile, KeyProviderKMS); err != nil {
 			return fmt.Errorf("KMS fallback: %w", err)
 		}
 	default:
@@ -181,11 +232,48 @@ func (ac *appCompose) checkFlags(mode string, kmsRoots map[string]string, ports 
 	return nil
 }
 
+// coreDumpsOff: every service sets ulimits core 0 (soft and hard). dstack's core_pattern is "core", a file in the
+// crashing process's working directory, and dockerd and containerd run with an unlimited core limit, so a crash
+// would write the process's memory (keys, what people sent) into its container's writable layer on the data disk.
+func coreDumpsOff(compose string) error {
+	var doc struct {
+		Services map[string]struct {
+			Ulimits map[string]any `yaml:"ulimits"`
+		} `yaml:"services"`
+	}
+	if err := yaml.Unmarshal([]byte(compose), &doc); err != nil {
+		return fmt.Errorf("docker compose isn't YAML: %w", err)
+	}
+	if len(doc.Services) == 0 {
+		return errors.New("docker compose has no services")
+	}
+	for _, n := range slices.Sorted(maps.Keys(doc.Services)) {
+		zero := false
+		switch c := doc.Services[n].Ulimits["core"].(type) {
+		case int:
+			zero = c == 0
+		case map[string]any:
+			soft, ok1 := c["soft"].(int)
+			hard, ok2 := c["hard"].(int)
+			zero = ok1 && ok2 && soft == 0 && hard == 0
+		}
+		if !zero {
+			return fmt.Errorf("service %s doesn't set ulimits core 0 (a crash would dump its memory to the disk)", n)
+		}
+	}
+	return nil
+}
+
 // noDiskVolumes: the docker compose keeps nothing on the data disk. Every top-level volume is memory (driver_opts
 // type tmpfs), and a service mounts only those, tmpfs, or dstack's socket (/var/run/dstack.sock, for quotes). The
 // e2e test's diag service may also bind the host's root read-only (its plaintext-disk scan reads the disk, writes
-// nothing): only an e2e verification takes a compose with that service at all (ComposeImagesE2E).
-func noDiskVolumes(compose string) error {
+// nothing): only an e2e verification takes a compose with that service at all (ComposeImagesE2E). The KMS
+// fallback's rule (noDiskVolumesMode for mode KeyProviderKMS).
+func noDiskVolumes(compose string) error { return noDiskVolumesMode(compose, KeyProviderKMS) }
+
+// noDiskVolumesMode is noDiskVolumes for a key mode: with key_provider none, setup may also bind the unlock cache
+// directory (host /run, tmpfs) to give it to unlockd's uid (UnlockdRules).
+func noDiskVolumesMode(compose, mode string) error {
 	var doc struct {
 		Services map[string]struct {
 			Volumes []any `yaml:"volumes"`
@@ -236,6 +324,9 @@ func noDiskVolumes(compose string) error {
 			switch {
 			case typ == "tmpfs":
 			case typ == "bind" && src == "/var/run/dstack.sock":
+			case typ == "bind" && src == UnlockCacheDir && s == UnlockdService: // a host tmpfs (TD memory): UnlockdRules
+			case typ == "bind" && src == UnlockCacheDir && s == SetupService && mode == KeyProviderNone:
+			case typ == "bind" && src == TasksDir && (s == AgentdService || s == SetupService) && mode == KeyProviderNone: // TasksRules
 			case typ == "volume" && mem[src]:
 			case s == E2EDiagService && typ == "bind" && src == "/" && ro:
 			default:
@@ -243,7 +334,7 @@ func noDiskVolumes(compose string) error {
 			}
 		}
 	}
-	return nil
+	return TasksRules(compose, mode) // agentd's task queue tmpfs: agentd's alone, made for its uid only
 }
 
 // ReleaseAppCompose is the app-compose.json a release's CVM attests: compose and preLaunch (a reviewed pre-launch
@@ -266,7 +357,7 @@ func ReleaseAppCompose(compose, preLaunch []byte, kmsFallback bool) ([]byte, err
 	if kmsFallback {
 		mode = KeyProviderKMS
 	}
-	if err := parsed.checkFlags(mode, KMSRoots, []int{AppPort}); err != nil {
+	if err := parsed.checkFlags(mode, KMSRoots, []int{AppPort}, false); err != nil {
 		return nil, fmt.Errorf("release app-compose: %w", err)
 	}
 	return out, nil
@@ -298,7 +389,7 @@ func E2EAppCompose(compose, preLaunch []byte, kmsFallback bool) ([]byte, error) 
 	if kmsFallback {
 		mode = KeyProviderKMS
 	}
-	if err := parsed.checkFlags(mode, KMSRoots, ports); err != nil {
+	if err := parsed.checkFlags(mode, KMSRoots, ports, false); err != nil {
 		return nil, fmt.Errorf("e2e app-compose: %w", err)
 	}
 	return out, nil
@@ -380,7 +471,9 @@ func appComposeJSONPorts(compose, preLaunch []byte, kmsFallback bool, name strin
 		}
 		ac["key_provider"], ac["kms_enabled"] = KeyProviderKMS, true
 	} else {
+		// Fix B: no provider gateway (Phala stores tproxy_enabled false with it).
 		ac["key_provider"], ac["kms_enabled"] = KeyProviderNone, false
+		ac["gateway_enabled"], ac["tproxy_enabled"] = false, false
 	}
 	return compactSorted(ac)
 }

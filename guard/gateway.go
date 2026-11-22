@@ -72,7 +72,7 @@ func (g *Guard) ModelCall(ctx context.Context, ti *harness.TaskInfo, req *harnes
 		withImages(msgs, req.Messages, t.opts.Images, SeesImages(model)) // the person's images: to the model only (images_in.go)
 		body := map[string]any{"model": model, "messages": msgs, "stream": true,
 			"stream_options": map[string]any{"include_usage": true}}
-		if secret := cmp.Or(t.opts.CacheSecret, g.cfg.CacheSecret); secret != "" {
+		if secret := g.cacheScope(t.opts); secret != "" {
 			body["user_cache_secret"] = secret
 		}
 		if effort != "" {

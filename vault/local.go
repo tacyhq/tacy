@@ -17,17 +17,20 @@ func (l Local) ConnPut(_ context.Context, space, id string, s Sealed) (string, C
 	return l.V.ConnPut(space, id, s)
 }
 
-func (l Local) ConnCommit(_ context.Context, pending string) (ConnInfo, error) {
-	return l.V.ConnCommit(pending)
-}
-
 func (l Local) ConnDiscard(_ context.Context, pending string) error {
 	l.V.ConnDiscard(pending)
 	return nil
 }
 
-func (l Local) ConnGet(_ context.Context, space, id string) (ConnInfo, error) {
-	return l.V.ConnGet(space, id)
+func (l Local) RunPut(_ context.Context, g RunGrant) (ConnInfo, error) { return l.V.RunCredPut(g) }
+
+func (l Local) RunInfo(_ context.Context, task, space string) (ConnInfo, error) {
+	return l.V.RunCredInfo(task, space)
+}
+
+func (l Local) RunEnd(_ context.Context, task string) error {
+	l.V.RunCredEnd(task)
+	return nil
 }
 
 func (l Local) ConnList(_ context.Context, space string) ([]ConnInfo, string, error) {

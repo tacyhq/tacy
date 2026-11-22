@@ -43,7 +43,8 @@ func TestReleaseModeTrustListReleases(t *testing.T) {
 	verifyWith := func(t *testing.T, l safety.TrustList) (*Result, error) {
 		t.Helper()
 		var st TrustState
-		if info := st.Take(signedList(t, admin, l), 0, listNow); !info.OK {
+		if info := ripen(t, &st, signedList(t, admin, l), 0); !info.OK { // listed for a day: clients' delay
+
 			t.Fatalf("list not taken: %+v", info)
 		}
 		rc := boot(t)

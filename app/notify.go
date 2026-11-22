@@ -215,9 +215,10 @@ func handoffNotifies(o guard.TaskOptions) bool {
 	return o.Agent != "" && o.Agent != guard.AgentScheduled
 }
 
-// taskEnded is guard.Host.TaskEnded: a hand-off task that ended while no event stream followed it marks its space
+// taskEnded is guard.Host.TaskEnded: vaultd forgets the task's mail login; a hand-off task that ended while no event stream followed it marks its space
 // "finished" (if on). One that a tab follows was seen there.
 func (s *server) taskEnded(id string, o guard.TaskOptions) {
+	s.endCredential(id) // v1: the task's mail login, if one came with it, is forgotten now (credentials.go)
 	if handoffNotifies(o) && !s.followed(id) {
 		s.notify.Mark(o.Space, notifyFinished)
 	}

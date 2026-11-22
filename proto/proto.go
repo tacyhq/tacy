@@ -30,9 +30,26 @@ func ReportData(nonce, hpkePublicKey []byte) []byte {
 	return h.Sum(nil)
 }
 
+// VersionAgent names the agent attestation of a release with unlockd (the keys plan §11.2): only unlockd has dstack's
+// socket, and it makes agentd's quotes with this label only, so a quote it makes for agentd can never be an unlock
+// attestation (the holders check ReportData's label) and an unlock attestation can never pass as agentd's.
+const VersionAgent = "sealed-agent-vm/v2-agentd"
+
+// AgentReportData is ReportData under VersionAgent:
+//
+//	sha512("sealed-agent-vm/v2-agentd" || 0x00 || nonce (32 bytes) || hpke_public_key (32 bytes, raw X25519))
+func AgentReportData(nonce, hpkePublicKey []byte) []byte {
+	h := sha512.New()
+	h.Write([]byte(VersionAgent))
+	h.Write([]byte{0})
+	h.Write(nonce)
+	h.Write(hpkePublicKey)
+	return h.Sum(nil)
+}
+
 // Attestation is the GET /attest?nonce=<64 hex> response.
 type Attestation struct {
-	Version       string `json:"version"`         // Version
+	Version       string `json:"version"`         // Version, or VersionAgent (a release with unlockd)
 	Platform      string `json:"platform"`        // "dstack" (Phala, or dstack on Google Cloud); "local" in dev mode
 	Nonce         string `json:"nonce"`           // the verifier's nonce, echoed (hex)
 	HPKEPublicKey string `json:"hpke_public_key"` // this boot's EHBP key: raw X25519, hex
@@ -304,6 +321,19 @@ type Event struct {
 	To       string `json:"to,omitempty"`
 	// Approval: an effect held for a person's approval (approve before send, docs/27 section 4), or what became of it.
 	Approval *Approval `json:"approval,omitempty"`
+	// Credential: need_credential (v1, the v1 design §5.4): a mail call waits for the person's app to send the task's
+	// mail login again (POST /tasks/credential), or what became of it.
+	Credential *CredentialNeed `json:"credential,omitempty"`
+}
+
+// CredentialNeed is a mail call waiting for its task's login: the task and the held request, the connection, how
+// long it waits; settled: Decision provided or timed_out. Never a login or any part of one.
+type CredentialNeed struct {
+	Task       string `json:"task"`
+	Request    string `json:"request"`
+	Connection string `json:"connection"`
+	TimeoutS   int    `json:"timeout_s,omitempty"`
+	Decision   string `json:"decision,omitempty"`
 }
 
 // Approval is an effect held for approval: exactly what would happen (Effect, canonical JSON) and its hash, which the

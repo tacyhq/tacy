@@ -278,6 +278,11 @@ func (e *Engine) InstallChecked(env safety.Envelope, check func(*Definition) err
 	if err != nil {
 		return nil, err
 	}
+	// R1, the rule of two, for every new install (a definition installed before v1 still loads: Load; its runs
+	// leave mail out and get no web, guard.RuleOfTwo).
+	if err := CheckMailTools(d); err != nil {
+		return nil, fmt.Errorf("trigger: definition: %w", err)
+	}
 	if check != nil {
 		if err := check(d); err != nil {
 			return nil, fmt.Errorf("trigger: definition: %w", err)
@@ -730,6 +735,30 @@ func (e *Engine) Delivered(f Fire) error {
 	}
 	_, err := e.cfg.Store.See(f.Trigger.ID, f.Delivery, f.SentAt.Add(2*EventWindow))
 	return err
+}
+
+// Claim records an event's delivery as used before its task starts (V1-DESIGN §6.3): fresh is false when another
+// call claimed it first (a replay). The caller makes the claim lasting (a synchronous save of the side state) before
+// it starts the task, and gives it back (Unclaim) if the task then doesn't start, so the sender may deliver it again.
+func (e *Engine) Claim(f Fire) (fresh bool, err error) {
+	if f.Trigger.Kind != Event {
+		return false, errors.New("trigger: not an event")
+	}
+	return e.cfg.Store.See(f.Trigger.ID, f.Delivery, f.SentAt.Add(2*EventWindow))
+}
+
+// Unseer is a Store that can give a claimed delivery back (Unclaim).
+type Unseer interface {
+	Unsee(trigger, delivery string) error
+}
+
+// Unclaim gives back a delivery Claim recorded whose task didn't start.
+func (e *Engine) Unclaim(f Fire) error {
+	u, ok := e.cfg.Store.(Unseer)
+	if !ok {
+		return errors.New("trigger: this store can't give a delivery back")
+	}
+	return u.Unsee(f.Trigger.ID, f.Delivery)
 }
 
 // Event checks an inbound event: the envelope's shape, the trigger installed as an event trigger, the sender's

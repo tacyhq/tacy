@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/tacyhq/tacy/activity"
-	"github.com/tacyhq/tacy/kms/kmsdev"
 	"github.com/tacyhq/tacy/safety"
 	"github.com/tacyhq/tacy/sealstate"
 	"github.com/tacyhq/tacy/trigger"
@@ -42,11 +41,11 @@ func newProviderStub(t *testing.T) providerStub {
 
 const testIMAPPassword = "canary-imap-app-password-71c2"
 
-// The provider changed its keys (the keys plan §7.3, local part), against a real key service (kms/server) and the Worker's
+// The provider changed its keys (the keys plan §7.3, local part), against unlockd (package unlock) and the Worker's
 // sealed-state API over HTTP, through gatewayd's fixed calls: a second boot as another instance on another host
 // (another GetKey, an empty disk). Every state comes back: schedules' holders, memory and results, the notification
 // switches, the budgets' day counters, the activity chain (same signing key, verifying from its first record across
-// both boots), the once-only task-id key, and vaultd's email connection. The generation register goes on; neither
+// both boots), the once-only task-id key, and vaultd's email connection. The Worker's generation goes on; neither
 // host's disk holds anything; the Worker holds only sealed blobs.
 func TestTwoBootsDifferentProviderSameKeys(t *testing.T) {
 	ctx := context.Background()
@@ -113,7 +112,7 @@ func TestTwoBootsDifferentProviderSameKeys(t *testing.T) {
 	// What the Worker holds: sealed, every state, in the app's namespaces, nothing in the clear.
 	held := w.state.Blobs()
 	for _, key := range []string{"agent-vm/state/" + stateSide, "agent-vm/state/" + stateActivity, "agent-vm/state/" + stateBudget,
-		"agent-vm/state/" + stateNotify, "agent-vm/conn/" + vault.ConnState} {
+		"agent-vm/state/" + stateNotify} {
 		blob, ok := held[key]
 		if !ok {
 			t.Fatalf("%s not saved (held: %d)", key, len(held))
@@ -127,9 +126,6 @@ func TestTwoBootsDifferentProviderSameKeys(t *testing.T) {
 	b2, k2 := w.bootAgent(t, "inst-2")
 	if b1.signer.Public() != b2.signer.Public() || !bytes.Equal(b1.idKey, b2.idKey) {
 		t.Fatal("the signing or task-id key changed with the instance and host")
-	}
-	if k2.Lease().Seq != k1.Lease().Seq+1 {
-		t.Fatalf("lease seq %d after %d", k2.Lease().Seq, k1.Lease().Seq)
 	}
 	if h, err := b2.kept.side.Holder("s_one", "i_one"); err != nil || h == nil || h.Seal != to {
 		t.Fatalf("holder: %+v %v", h, err)
@@ -147,9 +143,14 @@ func TestTwoBootsDifferentProviderSameKeys(t *testing.T) {
 	if c := b2.kept.ledger.MembersCost("schedule:"); c["2026-11-20"] != 1234 {
 		t.Fatalf("budget: %v", c)
 	}
+	// v1: the email login stayed in boot 1's vaultd memory only: nothing of it was saved, nothing moves (the
+	// person's app sends it again with the next task).
+	if _, ok := held["agent-vm/conn/"+vault.ConnState]; ok {
+		t.Fatal("the connections state was written")
+	}
 	v2, _, _ := w.bootVault(t, "inst-2")
-	if list := v2.ConnList("s_one"); len(list) != 1 {
-		t.Fatalf("connections after the move: %+v", list)
+	if list := v2.ConnList("s_one"); len(list) != 0 || v2.RunCreds() != 0 {
+		t.Fatalf("connections after the move: %+v, %d logins", list, v2.RunCreds())
 	}
 	// The chain goes on.
 	if _, err := b2.rec.Begin(activity.Start{Run: "r2", Space: "s_one", To: to, Started: now.Add(time.Minute)}); err != nil {
@@ -171,10 +172,9 @@ func TestTwoBootsDifferentProviderSameKeys(t *testing.T) {
 	if err := b2.kept.keeper.Flush(ctx); err != nil {
 		t.Fatal(err)
 	}
-	// The register followed every save: activity at generation 2 after two boots' saves.
-	if e, err := k2.Register(PurposeState).Generation(ctx, stateActivity); err != nil || e.Gen != 2 || !e.Stored ||
-		e.Hash != sealstate.BlobHash(w.state.Blobs()["agent-vm/state/"+stateActivity]) {
-		t.Fatalf("register: %+v %v", e, err)
+	// The Worker's compare-and-set followed every save: activity at generation 2 after two boots' saves.
+	if _, g, err := sealstate.Header(w.state.Blobs()["agent-vm/state/"+stateActivity]); err != nil || g != 2 {
+		t.Fatalf("the Worker's generation: %d %v", g, err)
 	}
 
 	// Neither host's disk holds anything.
@@ -190,14 +190,31 @@ func TestTwoBootsDifferentProviderSameKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The Worker hands back an older activity blob: the register refuses it (no rollback).
-	oldActivity := held["agent-vm/state/"+stateActivity]
-	w.state.Set("agent-vm/state/"+stateActivity, oldActivity)
+	// Two VMs unlocked at once (no instance lease at the holders): the second writer's save fails the Worker's
+	// compare-and-set and its Store stops (fail closed), so a fork never overwrites the state.
 	k3 := w.release(t, "inst-3", agentPurposes...)
-	if _, err := bootState(ctx, kmsKeys{k3}, w.relayBackend(t, k3, PurposeState), k3.Register(PurposeState), "f_chat"); !errors.Is(err, sealstate.ErrRollback) {
-		t.Fatalf("an older blob: %v", err)
+	b3, err := bootState(ctx, unlockKeys{k3.Keys}, w.relayBackend(t, k3, PurposeState), nil, "f_chat")
+	if err != nil {
+		t.Fatal(err)
 	}
-	k3.Drop(ctx)
+	if _, err := b2.rec.Begin(activity.Start{Run: "r3", Space: "s_one", To: to, Started: now.Add(2 * time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b2.kept.keeper.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b3.rec.Begin(activity.Start{Run: "r4", Space: "s_one", To: to, Started: now.Add(3 * time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b3.kept.keeper.Flush(ctx); !errors.Is(err, sealstate.ErrFailed) {
+		t.Fatalf("the second writer's save: %v", err)
+	}
+	// Accepted limit (the keys plan §11.10): the Worker can hand back an older blob with its row (R2 and D1 together);
+	// it opens. Integrity, not secrecy; a rollback witness at the other holders is Q3.
+	w.state.Set("agent-vm/state/"+stateActivity, held["agent-vm/state/"+stateActivity])
+	if _, err := bootState(ctx, unlockKeys{k3.Keys}, w.relayBackend(t, k3, PurposeState), nil, "f_chat"); err != nil {
+		t.Fatalf("an older blob the Worker hands back: %v", err)
+	}
 
 	// Another key service (its own master key): the sealed states don't open, and agentd refuses to start over
 	// people's schedules rather than starting empty.
@@ -206,27 +223,29 @@ func TestTwoBootsDifferentProviderSameKeys(t *testing.T) {
 		other.state.Set(k, b)
 	}
 	ko := other.release(t, "inst-4", agentPurposes...)
-	if _, err := bootState(ctx, kmsKeys{ko}, other.relayBackend(t, ko, PurposeState), ko.Register(PurposeState), "f_chat"); !errors.Is(err, sealstate.ErrSealed) {
+	if _, err := bootState(ctx, unlockKeys{ko.Keys}, other.relayBackend(t, ko, PurposeState), nil, "f_chat"); !errors.Is(err, sealstate.ErrSealed) {
 		t.Fatalf("another key service: %v", err)
 	}
 	// Boot keys can't keep state at all.
 	if _, err := bootState(ctx, newBootKeys(), &sealstate.Mem{}, nil, "f_chat"); err == nil {
 		t.Fatal("sealed state under boot keys")
 	}
-	_ = kmsdev.App
 }
 
-// putTestConn connects an email account for space (an IMAP app password, the canary) on v.
+// putTestConn puts the person's email login (an IMAP app password, the canary) for a task in space on v, as their
+// app sends it with each task (v1: memory only, never in the sealed state).
 func putTestConn(t *testing.T, v *vault.Vault, space string) {
 	t.Helper()
-	box, _ := vault.SealConn(v.SealKey(), space, vault.ConnEmail, []byte(`{"type":"`+vault.EmailType+
+	exp := time.Now().Add(time.Hour).UnixMilli()
+	kh := vault.KeyHash("start-canary")
+	box, err := vault.SealRunCred(v.SealKey(), space, vault.ConnEmail, kh, exp, []byte(`{"type":"`+vault.MailLoginType+
 		`","provider":"other","host":"imap.canary.example","port":993,"security":"tls","address":"me@canary.example","username":"me@canary.example","password":"`+
 		testIMAPPassword+`"}`))
-	pid, _, err := v.ConnPut(space, vault.ConnEmail, box)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := v.ConnCommit(pid); err != nil {
+	if _, err := v.RunCredPut(vault.RunGrant{Task: "tk_canary", Space: space, Connection: vault.ConnEmail, KeyHash: kh, Expires: exp,
+		Sealed: box}); err != nil {
 		t.Fatal(err)
 	}
 }

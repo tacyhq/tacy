@@ -18,10 +18,37 @@ import (
 // under test can fail. The docker compose is this folder's compose.yaml (images by digest), as in
 // TestImageComposeOffline.
 
-// fallbackCompose is compose.yaml: every named volume in memory (tmpfs), what the KMS fallback must run.
+// kmsComposeOf is a key_provider none compose (Fix B, this folder's compose.yaml since vm-fix-b) in the KMS
+// fallback's form, as go run ./cmd/compose -kms-fallback writes it: setup doesn't mount the unlock cache (the
+// memory-root script makes it) and unlockd runs without -key-mode none. A compose already in that form is returned
+// as it is.
+func kmsComposeOf(t *testing.T, b []byte) []byte {
+	t.Helper()
+	c := string(b)
+	if !strings.Contains(c, `, "-key-mode", "none"`) {
+		return b
+	}
+	// The task queue's tmpfs (TasksRules) is key_provider none's too: setup's and agentd's mounts, setup's -dir and
+	// agentd's -tasks-dir go with it.
+	for _, cut := range []string{"      - " + TasksDir + ":" + TasksDir + "\n", "      - " + TasksDir + ":" + TasksDir + "\n",
+		`, "-dir", "` + TasksDir + `=10003:10003:0700"`, `, "-tasks-dir", "` + TasksDir + `"`} {
+		c = strings.Replace(c, cut, "", 1) // absent before the task queue's tmpfs (older recorded composes)
+	}
+	for _, cut := range []string{"      - " + UnlockCacheDir + ":" + UnlockCacheDir + "\n", `, "-dir", "` + UnlockCacheDir + `=10005:10005:0700"`,
+		`, "-key-mode", "none"`} {
+		if !strings.Contains(c, cut) {
+			t.Fatalf("compose.yaml has no %q", cut)
+		}
+		c = strings.Replace(c, cut, "", 1) // setup's cache mount comes first (unlockd keeps its own)
+	}
+	return []byte(c)
+}
+
+// fallbackCompose is compose.yaml in the KMS fallback's form: every named volume in memory (tmpfs), what the KMS
+// fallback must run.
 func fallbackCompose(t *testing.T) []byte {
 	t.Helper()
-	compose := composeYAML(t)
+	compose := kmsComposeOf(t, composeYAML(t))
 	if err := noDiskVolumes(string(compose)); err != nil {
 		t.Fatalf("compose.yaml: %v", err)
 	}
@@ -32,7 +59,7 @@ func fallbackCompose(t *testing.T) []byte {
 func diskCompose(t *testing.T) []byte {
 	t.Helper()
 	// Every top-level volume with its driver_opts dropped (whatever their form).
-	c := string(composeYAML(t))
+	c := string(kmsComposeOf(t, composeYAML(t)))
 	i := strings.LastIndex(c, "\nvolumes:\n")
 	if i < 0 || !strings.Contains(c[i:], "type: tmpfs") {
 		t.Fatal("compose.yaml's volumes aren't the expected tmpfs ones")
@@ -52,6 +79,7 @@ type releaseCase struct {
 	nonce   []byte
 	p       Policy
 	release []byte
+	rd      []byte // the agentd label's report_data (a release with unlockd), or nil
 }
 
 // keyEvent is the key-provider event dstack measures for a mode: {"name":"none","id":""} or the KMS root's.
@@ -69,7 +97,11 @@ func keyEvent(fallback bool) []byte {
 // key-provider event, and returns the policy pinning release (compose, the pinned pre-launch script, the mode).
 func bootWith(t *testing.T, compose []byte, fallback bool, attested func(release []byte) []byte, event []byte) releaseCase {
 	t.Helper()
-	var pre []byte // a release runs no pre-launch script
+	var pre []byte // a release without unlockd, or with key_provider none, runs no pre-launch script
+	unlockd := HasUnlockd(string(compose))
+	if unlockd && fallback { // the split-key unlock's in the KMS fallback: the memory-root script
+		pre = []byte(MemoryRootScript)
+	}
 	release, err := ReleaseAppCompose(compose, pre, fallback)
 	if err != nil {
 		t.Fatal(err)
@@ -82,9 +114,30 @@ func bootWith(t *testing.T, compose []byte, fallback bool, attested func(release
 	setAppComposeRaw(t, a, ac)
 	recompose(t, a, ac)
 	rtmr3 := setEvent(t, a, "key-provider", event)
+	rd := agentLabel(t, a, nonce, unlockd)
 	p := Policy{AllowStaleTCB: true, ProdImages: allImages(), Boot: allSets(), Compose: compose, AppCompose: release,
-		KMSFallback: fallback, VerifyQuote: changeQuote(func(q *tdx.Quote) { q.Rtmrs[3] = rtmr3 })}
-	return releaseCase{a: a, nonce: nonce, p: p, release: release}
+		KMSFallback: fallback, VerifyQuote: changeQuote(func(q *tdx.Quote) {
+			q.Rtmrs[3] = rtmr3
+			if rd != nil {
+				q.ReportData = rd
+			}
+		})}
+	return releaseCase{a: a, nonce: nonce, p: p, release: release, rd: rd}
+}
+
+// agentLabel makes a an agentd attestation of a release with unlockd (proto.VersionAgent) and returns the
+// report_data its quote must carry; nil (no change) without unlockd.
+func agentLabel(t *testing.T, a *proto.Attestation, nonce []byte, unlockd bool) []byte {
+	t.Helper()
+	if !unlockd {
+		return nil
+	}
+	key, err := hex.DecodeString(a.HPKEPublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.Version = proto.VersionAgent
+	return proto.AgentReportData(nonce, key)
 }
 
 // setAppComposeRaw puts exactly raw in a's info as its app-compose.json (withAppCompose re-encodes it).
@@ -135,7 +188,7 @@ func TestReleaseAppCompose(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(res.Checks) != 20 || hex.EncodeToString(res.HPKEPublicKey) != c.a.HPKEPublicKey {
+	if len(res.Checks) != 22 || hex.EncodeToString(res.HPKEPublicKey) != c.a.HPKEPublicKey {
 		t.Fatalf("%d checks", len(res.Checks))
 	}
 	names := map[string]bool{}
@@ -153,7 +206,7 @@ func TestReleaseAppCompose(t *testing.T) {
 	var ac map[string]any
 	json.Unmarshal(c.release, &ac)
 	for k, want := range map[string]string{"key_provider": `"none"`, "kms_enabled": "false", "local_key_provider_enabled": "false",
-		"allowed_envs": "[]", "swap_size": `"0"`, "tproxy_enabled": "true", "features": "[]", "init_script": "[]", "public_logs": "false", "public_sysinfo": "false", "public_tcbinfo": "false",
+		"allowed_envs": "[]", "swap_size": `"0"`, "gateway_enabled": "false", "tproxy_enabled": "false", "features": "[]", "init_script": "[]", "public_logs": "false", "public_sysinfo": "false", "public_tcbinfo": "false",
 		"secure_time": "true", "manifest_version": `"3"`, "requirements": `{"ephemeral_data_disk":true}`,
 		"port_policy": `{"ports":[{"port":8080,"pp":false}],"restrict_mode":true}`} {
 		if got := string(mustJSON(ac[k])); got != want {
@@ -196,10 +249,32 @@ func TestAppComposeFlags(t *testing.T) {
 		{"key provider kms", AppComposeFlagsCheck, `key_provider "kms", want "none"`, func(ac map[string]any) { ac["key_provider"] = "kms" }},
 		{"key provider id", AppComposeFlagsCheck, "key_provider_id is set", func(ac map[string]any) { ac["key_provider_id"] = strings.Repeat("ab", 32) }},
 		{"manifest version 2", AppComposeFlagsCheck, "manifest_version", func(ac map[string]any) { ac["manifest_version"] = 2 }},
+		// Fix B: no provider gateway, no pre-launch script, no core dumps.
+		{"provider gateway", AppComposeFlagsCheck, "gateway_enabled", func(ac map[string]any) { ac["gateway_enabled"] = true }},
+		{"gateway unset", AppComposeFlagsCheck, "gateway_enabled", func(ac map[string]any) { delete(ac, "gateway_enabled") }},
+		{"tproxy", AppComposeFlagsCheck, "tproxy_enabled", func(ac map[string]any) { ac["tproxy_enabled"] = true }},
+		{"a pre-launch script", AppComposeFlagsCheck, "a pre-launch script with key_provider none", func(ac map[string]any) {
+			ac["pre_launch_script"] = MemoryRootScript
+		}},
+		{"core dumps", AppComposeFlagsCheck, "ulimits core 0", func(ac map[string]any) {
+			ac["docker_compose_file"] = strings.Replace(ac["docker_compose_file"].(string), "    ulimits:\n      core: 0\n", "", 1)
+		}},
+		{"core dumps soft only", AppComposeFlagsCheck, "ulimits core 0", func(ac map[string]any) {
+			ac["docker_compose_file"] = strings.Replace(ac["docker_compose_file"].(string), "    ulimits:\n      core: 0\n",
+				"    ulimits:\n      core:\n        soft: 0\n        hard: 1024\n", 1)
+		}},
+		// Review L1 (2026-11-21): dstack's own semantics, not only the flags' names. gateway_enabled() is
+		// gateway_enabled || features contains "tproxy-net"; storage_fs and storage_discard (default on) are the disk's.
+		{"tproxy-net feature", AppComposeFlagsCheck, "features", func(ac map[string]any) { ac["features"] = []string{"tproxy-net"} }},
+		{"kms feature", AppComposeFlagsCheck, "features", func(ac map[string]any) { ac["features"] = []string{"kms"} }},
+		{"any feature", AppComposeFlagsCheck, "features", func(ac map[string]any) { ac["features"] = []string{"x"} }},
+		{"ext4", AppComposeFlagsCheck, `storage_fs "ext4", want "zfs"`, func(ac map[string]any) { ac["storage_fs"] = "ext4" }},
+		{"storage_fs unset", AppComposeFlagsCheck, "storage_fs unset", func(ac map[string]any) { delete(ac, "storage_fs") }},
+		{"storage discard", AppComposeFlagsCheck, "storage_discard", func(ac map[string]any) { ac["storage_discard"] = true }},
+		{"storage discard unset (dstack's default is on)", AppComposeFlagsCheck, "storage_discard", func(ac map[string]any) { delete(ac, "storage_discard") }},
 		// The same settings, written another way, or a setting no rule names: only the pin sees it.
 		{"key provider implied", AppComposePinCheck, "the release pins", func(ac map[string]any) { delete(ac, "key_provider") }},
 		{"another name", AppComposePinCheck, "the release pins", func(ac map[string]any) { ac["name"] = "other" }},
-		{"storage discard", AppComposePinCheck, "the release pins", func(ac map[string]any) { ac["storage_discard"] = true }},
 		{"verity volumes", AppComposePinCheck, "the release pins", func(ac map[string]any) {
 			ac["verity_volumes"] = []any{map[string]any{"source": "x.img", "verity_root": strings.Repeat("00", 32), "target": "/data"}}
 		}},
@@ -220,8 +295,14 @@ func TestAppComposeFlags(t *testing.T) {
 			}
 		})
 	}
+	// storage_discard only where a policy allows it explicitly (nothing does): then only the pin refuses it.
+	rc := bootWith(t, composeYAML(t), false, edited(func(ac map[string]any) { ac["storage_discard"] = true }), keyEvent(false))
+	rc.p.AllowStorageDiscard = true
+	if _, err := Verify(context.Background(), rc.a, rc.nonce, rc.p); err == nil || !strings.HasPrefix(err.Error(), AppComposePinCheck) {
+		t.Fatalf("discard allowed: %v", err)
+	}
 	// One byte of whitespace is another file.
-	rc := bootWith(t, composeYAML(t), false, func(r []byte) []byte { return append(append([]byte{}, r...), ' ') }, keyEvent(false))
+	rc = bootWith(t, composeYAML(t), false, func(r []byte) []byte { return append(append([]byte{}, r...), ' ') }, keyEvent(false))
 	if _, err := Verify(context.Background(), rc.a, rc.nonce, rc.p); err == nil || !strings.HasPrefix(err.Error(), AppComposePinCheck) {
 		t.Fatalf("trailing space: %v", err)
 	}
@@ -324,7 +405,7 @@ func TestKMSFallback(t *testing.T) {
 	// The flag rule on its own (what a release is built against): key_provider_id must be a pinned root.
 	ac, _ := parseAppCompose(rc.release)
 	ac.KeyProviderID = otherRoot
-	if err := ac.checkFlags(KeyProviderKMS, KMSRoots, []int{AppPort}); err == nil || !strings.Contains(err.Error(), "isn't a pinned KMS root") {
+	if err := ac.checkFlags(KeyProviderKMS, KMSRoots, []int{AppPort}, false); err == nil || !strings.Contains(err.Error(), "isn't a pinned KMS root") {
 		t.Fatalf("unpinned key_provider_id: %v", err)
 	}
 }

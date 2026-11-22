@@ -59,6 +59,12 @@ type Host struct {
 	// key gets tk_ + HMAC(IDKey, space, user, key), so a repeated start finds the first task instead of making a
 	// second. nil: starts with a key are refused.
 	IDKey []byte
+	// ClaimStart, when set, records a once-only start's task id as used, lastingly, before the task runs (review 2,
+	// M2): agentd's claim in its sealed side state, saved synchronously, as event deliveries are. A start whose key was
+	// used before, but whose task neither this process nor its queue has (lost to a reboot, a memory-only queue's
+	// restart, or deleted), gets ErrStartUsed and runs nothing: never twice. Any other error refuses the start with
+	// nothing made (the claim wasn't recorded). nil: the live map and the queue are the only record (tests).
+	ClaimStart func(ctx context.Context, id string) error
 	// Keep is how long an ended task's result (its events) stays for its starter when nobody collects it; 0:
 	// DefaultKeep. A built-in agent's own keep (guard.AgentKeep) is capped by it. A result its starter collected goes
 	// DeliveredKeep after that (Delivered), and POST /tasks/delete deletes it at once.
@@ -66,11 +72,18 @@ type Host struct {
 	// DeliveredKeep is how long a task stays after its starter's event stream handed on its end (Delivered); 0:
 	// DefaultDeliveredKeep.
 	DeliveredKeep time.Duration
+	// TemporaryKeep is the most a temporary chat's task stays once nobody follows it (its tab closed); 0:
+	// DefaultTemporaryKeep.
+	TemporaryKeep time.Duration
 	// FlushEvery is how long events wait before they are written to the queue together; 0: 100 ms. A process that
 	// dies loses at most that much of a stream; the task's outcome and its journal are written as they happen.
 	FlushEvery time.Duration
 	// MaxOpen caps the tasks one user may have open through POST /tasks (not ended); 0: 8.
 	MaxOpen int
+	// Boot names the queue RT runs on (queue.OpenTmpfs, queue.NewBoot): the same across container restarts while the
+	// queue lives, new after a real boot. A task's state carries it, so its starter can tell a task lost to a restart
+	// from one that never was (app/tasks.go, task_unknown_after_restart). "": not said.
+	Boot string
 	// Forgotten, when set, is told each task Prune deleted (agentd deletes its approval records with it).
 	Forgotten func(id string)
 	// TriggeredDone, when set, is told when an unattended task (ViaTrigger) ended, once its last event is in the
@@ -88,8 +101,9 @@ type Host struct {
 
 	once    sync.Once
 	mu      sync.Mutex
-	live    map[string]*hosted // tasks this process serves (started here, or resumed)
-	billKey []byte             // Bill's key (from IDKey, or random per process without one)
+	live    map[string]*hosted     // tasks this process serves (started here, or resumed)
+	temp    map[string]*unfollowed // temporary chats' tasks: who follows them, and the timer that deletes them
+	billKey []byte                 // Bill's key (from IDKey, or random per process without one)
 }
 
 // hosted is one task this process serves: its guard session and its event stream.
@@ -135,9 +149,14 @@ var ErrNoTask = errors.New("no such task")
 // ErrTooMany: the person has as many open tasks as they may.
 var ErrTooMany = errors.New("too many open tasks")
 
+// ErrStartUsed: a once-only start whose key already started a task this VM no longer has (Host.ClaimStart): its
+// outcome is unknown here, and it never runs again by itself (the person decides).
+var ErrStartUsed = errors.New("this start's key was used by a task lost to a restart")
+
 func (h *Host) init() {
 	h.once.Do(func() {
 		h.live = map[string]*hosted{}
+		h.temp = map[string]*unfollowed{}
 		if len(h.IDKey) > 0 {
 			h.billKey, _ = hkdf.Key(sha256.New, h.IDKey, nil, "tacy/task-bill/v1", 32)
 		}
@@ -207,6 +226,94 @@ func (h *Host) deliveredKeep() time.Duration {
 	return DefaultDeliveredKeep
 }
 
+// DefaultTemporaryKeep is the most a temporary chat's task stays in the VM once nobody follows it (Host.TemporaryKeep):
+// an hour (2026-11-21). Its tab deletes it when the run ends; a tab closed mid-run or before it could
+// can't, and nothing else will ever ask for it (a temporary chat keeps nothing), so the VM deletes it itself: an
+// hour after its last follower left (or its start, if nobody followed it), cancelled first if it still runs. A tab
+// that comes back within the hour (a stream cut and resumed) starts the hour again.
+const DefaultTemporaryKeep = time.Hour
+
+func (h *Host) temporaryKeep() time.Duration {
+	if h.TemporaryKeep > 0 {
+		return h.TemporaryKeep
+	}
+	return DefaultTemporaryKeep
+}
+
+// unfollowed is a temporary chat's task's watch: its starter, how many of its event streams are open, and the timer
+// that deletes it TemporaryKeep after the last one closed.
+type unfollowed struct {
+	user  string
+	n     int
+	timer *time.Timer
+}
+
+// watchTemporary starts the hour for a temporary chat's task nobody follows yet (a no-op when it is watched).
+func (h *Host) watchTemporary(id, user string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.temp[id] != nil {
+		return
+	}
+	w := &unfollowed{user: user}
+	h.temp[id] = w
+	h.armLocked(id, w)
+}
+
+// armLocked (h.mu held) starts w's hour again.
+func (h *Host) armLocked(id string, w *unfollowed) {
+	if w.timer != nil {
+		w.timer.Stop()
+	}
+	w.timer = time.AfterFunc(h.temporaryKeep(), func() { h.expireTemporary(id, w) })
+}
+
+// unwatchLocked (h.mu held) forgets a task's watch (deleted or pruned).
+func (h *Host) unwatchLocked(id string) {
+	if w := h.temp[id]; w != nil {
+		if w.timer != nil {
+			w.timer.Stop()
+		}
+		delete(h.temp, id)
+	}
+}
+
+// expireTemporary deletes a temporary chat's task nobody followed for TemporaryKeep (cancelled first if it runs:
+// Delete), unless a stream opened meanwhile.
+func (h *Host) expireTemporary(id string, w *unfollowed) {
+	h.mu.Lock()
+	if h.temp[id] != w || w.n > 0 {
+		h.mu.Unlock()
+		return
+	}
+	delete(h.temp, id)
+	h.mu.Unlock()
+	h.Delete(id, w.user)
+}
+
+// followTemporary counts an event stream of a temporary chat's task (Follow): its hour stops while one is open and
+// starts again when the last one closes. The returned func ends the stream. Other tasks: nothing.
+func (h *Host) followTemporary(id string) func() {
+	h.init()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	w := h.temp[id]
+	if w == nil {
+		return func() {}
+	}
+	w.n++
+	if w.timer != nil {
+		w.timer.Stop()
+	}
+	return func() {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		if w.n--; w.n == 0 && h.temp[id] == w {
+			h.armLocked(id, w)
+		}
+	}
+}
+
 // keepFor is how long an ended task of agent is kept: its agent's keep (guard.AgentKeep), else Keep; never more
 // than Keep.
 func (h *Host) keepFor(agent string) time.Duration {
@@ -214,6 +321,15 @@ func (h *Host) keepFor(agent string) time.Duration {
 		return min(k, h.keep())
 	}
 	return h.keep()
+}
+
+// keepOf is how long an ended task with these options is kept: keepFor its agent, and at most TemporaryKeep for a
+// temporary chat's (Prune's backstop after a restart; the unfollowed timer deletes it sooner).
+func (h *Host) keepOf(o TaskOptions) time.Duration {
+	if o.Temporary {
+		return min(h.temporaryKeep(), h.keepFor(o.Agent))
+	}
+	return h.keepFor(o.Agent)
 }
 
 // minAgentKeep is the shortest keep any built-in agent has (Keep for those without one of their own).
@@ -347,6 +463,13 @@ type StartRequest struct {
 	// repeated start (a retry, a double click, a replayed request) finds the first one instead of making another.
 	Key string
 	Via string // ViaRun or ViaTasks
+	// Temporary: a temporary chat's task (its tab keeps it, nothing else does): deleted once nobody followed it for
+	// TemporaryKeep (2026-11-21: at most an hour after its tab closed, not its agent's day).
+	Temporary bool
+	// Before, when set, is called with the task's id and space once they are known and before the task runs, also
+	// when the start finds the task already started (v1: agentd passes the task's sealed mail login to the vault, so
+	// it is there for the first mail call). An error refuses the start (nothing is made).
+	Before func(id, space string) error
 }
 
 // Start checks a chat request and starts it as a task, returning its id. existed: the key named a task that was
@@ -362,13 +485,18 @@ func (h *Host) Start(ctx context.Context, sr StartRequest) (id string, existed b
 	if sr.Via != ViaTasks && !IsChat(opts.Agent) { // a /run task goes with its tab; an agent's task outlives it
 		return "", false, fmt.Errorf("%s starts through POST /tasks", opts.Agent)
 	}
-	opts.User, opts.Space, opts.Via = sr.User, start.Space, sr.Via
+	opts.User, opts.Space, opts.Via, opts.Temporary = sr.User, start.Space, sr.Via, sr.Temporary && sr.Via == ViaTasks
 	id = harness.NewTaskID()
 	if sr.Key != "" {
 		if len(h.IDKey) == 0 {
 			return "", false, errors.New("this VM can't make once-only task ids")
 		}
 		id = harness.DeriveTaskID(h.IDKey, "start", start.Space, sr.User, sr.Key)
+	}
+	if sr.Before != nil {
+		if err := sr.Before(id, start.Space); err != nil {
+			return "", false, err
+		}
 	}
 	l := &hosted{id: id, user: sr.User, via: sr.Via, start: start, opts: opts, changed: make(chan struct{}), st: h.RT.Store}
 	h.mu.Lock()
@@ -400,9 +528,20 @@ func (h *Host) Start(ctx context.Context, sr StartRequest) (id string, existed b
 	}
 	h.live[id] = l
 	h.mu.Unlock()
+	// Once-only across reboots (review 2, M2): the key's claim is lasting before anything runs. A concurrent start
+	// with the same key finds l in the live map above.
+	if sr.Key != "" && h.ClaimStart != nil {
+		if err := h.ClaimStart(ctx, id); err != nil {
+			h.drop(l)
+			return "", false, err
+		}
+	}
 	existed, err = h.launch(ctx, l, sr.Req.Model, sr.Req.Tools, "")
 	if err != nil {
 		return h.failed(l, err)
+	}
+	if opts.Temporary {
+		h.watchTemporary(id, sr.User)
 	}
 	if existed {
 		return id, true, nil
@@ -633,6 +772,7 @@ func (h *Host) Follow(ctx context.Context, id, user string, after int, fn func(E
 	if err := h.owned(id, user); err != nil {
 		return err
 	}
+	defer h.followTemporary(id)()
 	return h.follow(ctx, id, after, true, fn)
 }
 
@@ -782,6 +922,8 @@ type TaskState struct {
 	// Tainted: the task received outside content (web pages, search results); what it proposes from then on is
 	// marked tainted, and a tainted change or send will need a person's approval (docs/27 sections 4 and 5).
 	Tainted bool `json:"tainted,omitempty"`
+	// Boot is the queue's boot (Host.Boot): send it back with later calls on the task.
+	Boot string `json:"boot,omitempty"`
 }
 
 // Status is the task's state for its starter.
@@ -793,7 +935,8 @@ func (h *Host) Status(id, user string) (TaskState, error) {
 	if err != nil {
 		return TaskState{}, ErrNoTask
 	}
-	out := TaskState{Task: id, State: st.State, Sub: st.Sub, Attempt: st.Attempt, Held: len(st.Held), Tainted: st.Taint != ""}
+	out := TaskState{Task: id, State: st.State, Sub: st.Sub, Attempt: st.Attempt, Held: len(st.Held), Tainted: st.Taint != "",
+		Boot: h.Boot}
 	if st.Outcome != nil {
 		out.Outcome = st.Outcome.State
 	}
@@ -847,6 +990,9 @@ func (h *Host) Delete(id, user string) (refundable bool, err error) {
 		return false, err
 	}
 	h.init()
+	h.mu.Lock()
+	h.unwatchLocked(id)
+	h.mu.Unlock()
 	h.mu.Lock()
 	l := h.live[id]
 	h.mu.Unlock()
@@ -943,10 +1089,46 @@ func (h *Host) Resume(ids []string) (resumed, abandoned int) {
 		if r, ok := h.GW.(TaskFollower); ok { // its stream is live again: e.g. its permission prompts are shown again
 			r.TaskResumed(id, &start, opts, journal)
 		}
+		if opts.Temporary { // nobody follows it after the restart until its tab comes back: the hour starts again
+			h.watchTemporary(id, opts.User)
+		}
 		go h.finish(l)
 		resumed++
 	}
 	return resumed, abandoned
+}
+
+// ExpireEndedTemporary (final review L4) times the deletion of every ended temporary chat's task a previous process
+// left: at its end plus its keep (keepOf: at most TemporaryKeep), as the unfollowed timer would have, instead of at
+// the first hourly Prune after that (up to about two hours after its end). One already past it is deleted now.
+// agentd runs it at its start, after Resume (which re-watches the unfinished ones). Returns how many it deleted now
+// and how many it timed.
+func (h *Host) ExpireEndedTemporary(now time.Time) (deleted, timed int) {
+	h.init()
+	ids, err := h.RT.Store.EndedBefore(now.Add(time.Hour))
+	if err != nil {
+		return 0, 0
+	}
+	for _, id := range ids {
+		st, err := h.RT.Store.Task(id)
+		if err != nil || st == nil || st.Ended.IsZero() {
+			continue
+		}
+		var o TaskOptions
+		if json.Unmarshal(st.Options, &o) != nil || !o.Temporary {
+			continue
+		}
+		at := st.Ended.Add(h.keepOf(o))
+		if !at.After(now) {
+			if h.prune(id) {
+				deleted++
+			}
+			continue
+		}
+		time.AfterFunc(at.Sub(now), func() { h.prune(id) })
+		timed++
+	}
+	return deleted, timed
 }
 
 // Prune deletes the tasks that ended more than their keep ago (their start, journal and events: Keep, or their
@@ -964,7 +1146,7 @@ func (h *Host) Prune(now time.Time) int {
 			}
 		}
 	}
-	ids, err := h.RT.Store.EndedBefore(now.Add(-min(h.keep(), h.minAgentKeep())))
+	ids, err := h.RT.Store.EndedBefore(now.Add(-min(h.keep(), h.minAgentKeep(), h.temporaryKeep())))
 	if err != nil {
 		return n
 	}
@@ -972,7 +1154,7 @@ func (h *Host) Prune(now time.Time) int {
 		if st, err := h.RT.Store.Task(id); err == nil && st != nil {
 			var o TaskOptions
 			json.Unmarshal(st.Options, &o)
-			if !st.Ended.IsZero() && st.Ended.After(now.Add(-h.keepFor(o.Agent))) {
+			if !st.Ended.IsZero() && st.Ended.After(now.Add(-h.keepOf(o))) {
 				continue // its agent keeps it longer
 			}
 		}
@@ -991,6 +1173,7 @@ func (h *Host) prune(id string) bool {
 	}
 	h.mu.Lock()
 	delete(h.live, id)
+	h.unwatchLocked(id)
 	h.mu.Unlock()
 	return ok
 }

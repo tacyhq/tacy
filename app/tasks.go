@@ -31,7 +31,13 @@ import (
 //	POST /tasks          {model, messages, run_secret, ..., key?} -> {task, state, existing}. key makes the start
 //	                     once-only: the same user and key always name the same task (a retry finds it; nothing runs
 //	                     twice). X-Agent-Model as for /run. Refusals: 403 {error, code, activity?}; 429 too_many_tasks.
-//	POST /tasks/status   {task, mac} -> {task, state, sub, attempt, events, held, outcome}
+//	POST /tasks/status   {task, mac, boot?} -> {task, state, sub, attempt, events, held, outcome, boot}
+//	                     boot (every task's state carries it) names the queue the task is in: the same across
+//	                     container restarts (the queue is in a host tmpfs, queue.OpenTmpfs), new after a real boot.
+//	                     A call on a task this queue doesn't know, with a boot that isn't this one, answers 404
+//	                     {"error": "task_unknown_after_restart", "boot": <this one>}: the task was lost to a restart.
+//	                     The client asks the person whether to run it again; nothing re-runs by itself. Without
+//	                     boot (or with this one) it is 404 no_such_task, as before. Status, events, cancel, delete.
 //	POST /tasks/events   {task, after, mac} -> SSE: "id: <seq>" and "data: <proto.Event>" per event after seq after,
 //	                     as they come, then "data: [DONE]" once the task ended; reconnect with the last id seen.
 //	                     At most 8 streams at once per user, 64 in all.
@@ -69,6 +75,14 @@ import (
 type taskStartRequest struct {
 	proto.RunRequest
 	Key string `json:"key,omitempty"` // 1-128 printable characters
+	// Credentials (v1): the person's sealed mail login for this task (credentials.go). Passed to vaultd unopened,
+	// never kept here.
+	Credentials []TaskCredential `json:"credentials,omitempty"`
+	// Temporary (v1): a temporary chat's task. The VM deletes it an hour after its tab stopped following it
+	// (guard.DefaultTemporaryKeep) instead of keeping its result a day. Outside the identity's signature: it only
+	// shortens how long the person's own task is kept, and only they (through EHBP) can set it. An older release
+	// ignores it (lenient decoding here) and keeps the task its usual day.
+	Temporary bool `json:"temporary,omitempty"`
 }
 
 // taskRef names a task (POST /tasks/status, /events, /cancel), with the call's MAC (guard.TaskMAC).
@@ -76,6 +90,7 @@ type taskRef struct {
 	Task  string `json:"task"`
 	After int    `json:"after,omitempty"`
 	MAC   string `json:"mac"`
+	Boot  string `json:"boot,omitempty"` // the queue's boot the caller last saw for this task (guard.TaskState.Boot)
 }
 
 // maxFollowers bounds the event streams open at once (each is a long request); maxUserFollowers those of one user
@@ -94,6 +109,8 @@ func (s *server) taskRoutes(mux *http.ServeMux, id *ehbpidentity.Identity) {
 	mux.Handle("POST /tasks/delete", s.taskGuard(false, true, id.Middleware()(http.HandlerFunc(s.taskDelete))))
 	// A grant's MAC is its authorization; the tag is optional there, as the chat's relay sends it.
 	mux.Handle("POST /tasks/grant", s.taskGuard(false, false, id.Middleware()(http.HandlerFunc(s.taskGrant))))
+	// A mail login sent again (credentials.go): the run's MAC authorizes it, as a grant's.
+	mux.Handle("POST /tasks/credential", s.taskGuard(false, false, id.Middleware()(http.HandlerFunc(s.taskCredential))))
 	mux.HandleFunc("GET /tasks/open", s.tasksOpen)
 }
 
@@ -185,6 +202,9 @@ func (s *server) tasks() *guard.Host {
 		if s.host == nil {
 			s.host = &guard.Host{RT: s.rt, GW: s.agent}
 		}
+		if rg, ok := s.agent.(*recGateway); ok && rg.creds == nil { // mail calls wait for a login sent again
+			rg.creds = &guard.CredWaits{Emit: s.host.Emit}
+		}
 		s.follows = make(chan struct{}, maxFollowers)
 		s.userFollows = map[string]int{}
 	})
@@ -258,6 +278,14 @@ func (s *server) taskStart(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, "run_secret_required")
 		return
 	}
+	if err := checkCredentials(req.Credentials, req.Key); err != nil {
+		credFail(w, err)
+		return
+	}
+	if len(req.Credentials) > 0 && !mayUseMail(req.Tools) {
+		failDetail(w, 400, "bad_credential", "a mail credential with no mail tool")
+		return
+	}
 	if h := r.Header.Get(ModelHeader); h != cmp.Or(req.Model, proto.DefaultModel) {
 		fail(w, 400, "model_mismatch: the X-Agent-Model header doesn't match the task's model")
 		return
@@ -275,13 +303,37 @@ func (s *server) taskStart(w http.ResponseWriter, r *http.Request) {
 	}
 	var id string
 	var existed bool
+	credTask := "" // the task a login was passed on for (forgotten again if the start then fails)
 	if err == nil {
-		id, existed, err = s.tasks().Start(r.Context(), guard.StartRequest{User: userFrom(r.Context()), Req: &req.RunRequest,
-			Key: req.Key, Via: guard.ViaTasks})
+		sr := guard.StartRequest{User: userFrom(r.Context()), Req: &req.RunRequest, Key: req.Key, Via: guard.ViaTasks, Temporary: req.Temporary}
+		if len(req.Credentials) > 0 { // in vaultd before the task runs, so its first mail call has it
+			creds := req.Credentials
+			sr.Before = func(task, space string) error {
+				if err := s.putCredential(r.Context(), task, space, req.Identity, req.Key, creds[0]); err != nil {
+					return err
+				}
+				credTask = task
+				return nil
+			}
+		}
+		id, existed, err = s.tasks().Start(r.Context(), sr)
+	}
+	clear(req.Credentials)
+	if err != nil && credTask != "" {
+		s.endCredential(credTask)
+	}
+	if credFail(w, err) {
+		return
 	}
 	switch {
 	case errors.Is(err, guard.ErrTooMany):
 		fail(w, 429, "too_many_tasks")
+		return
+	case errors.Is(err, guard.ErrStartUsed): // the key's task was lost to a restart: never run again by itself
+		writeJSON(w, 409, map[string]string{"error": errTaskUnknownAfterRestart, "boot": s.tasks().Boot})
+		return
+	case errors.Is(err, errStartNotRecorded):
+		fail(w, 503, "start_not_recorded")
 		return
 	case errors.Is(err, guard.ErrDateNote): // the chat starts again with the date alone (its time's zone unknown here)
 		fail(w, 400, "bad_date_note")
@@ -313,10 +365,54 @@ func (s *server) taskStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	st.Existing = existed
+	if credTask != "" && st.Outcome != "" { // a repeated start of a task that already ended: nothing will use it
+		s.endCredential(credTask)
+	}
 	w.Header().Set(billHeader, s.tasks().Bill(id))
 	w.Header().Set(taskStartHeader, map[bool]string{true: "existing", false: "new"}[existed])
 	w.Header().Set(pricedHeader, "1") // the pricing headers were checked (CheckCharge above)
 	writeJSON(w, 200, st)
+}
+
+// startClaimStore is where once-only start keys are recorded as used: the side store's seen set (trigger.Store's
+// See, beside event deliveries), in the sealed side state.
+type startClaimStore interface {
+	See(trigger, delivery string, until time.Time) (bool, error)
+	Unsee(trigger, delivery string) error
+}
+
+// The seen set's name for start claims, and how long a claim is kept: far beyond the client's one resend after an
+// unknown outcome (it resends at once, with the same key), and beyond an ended task's keep (guard.DefaultKeep).
+const (
+	startClaimSet  = "start"
+	startClaimKeep = 48 * time.Hour
+)
+
+// errStartNotRecorded: the start's claim couldn't be saved, so nothing started (the client may send it again).
+var errStartNotRecorded = errors.New("start_not_recorded")
+
+// claimStart is guard.Host.ClaimStart (review 2, M2): the task id a once-only start derives (space, user, key) is
+// recorded as used in the side state and that saved (Keeper.SaveNow, sealed at the Worker) before the task runs, as
+// an event's delivery is (triggers.go). A start sent again after an unknown outcome, when the VM has lost its queue
+// since (a real reboot; agentd's restart with the queue in memory, as in the KMS fallback), or after its task was
+// deleted, then finds the claim and runs nothing: guard.ErrStartUsed, which taskStart answers as
+// task_unknown_after_restart. A claim that can't be saved is given back in memory and nothing starts.
+func (s *server) claimStart(ctx context.Context, id string) error {
+	if s.starts == nil {
+		return nil
+	}
+	fresh, err := s.starts.See(startClaimSet, id, time.Now().Add(startClaimKeep))
+	switch {
+	case err != nil:
+		return errStartNotRecorded
+	case !fresh:
+		return guard.ErrStartUsed
+	}
+	if err := s.saveSide(ctx); err != nil {
+		s.starts.Unsee(startClaimSet, id)
+		return errStartNotRecorded
+	}
+	return nil
 }
 
 // readRef reads a task call's body.
@@ -333,8 +429,17 @@ func readRef(w http.ResponseWriter, r *http.Request) (taskRef, bool) {
 	return ref, true
 }
 
-func taskFail(w http.ResponseWriter, err error) {
+// errTaskUnknownAfterRestart: a task call on a task this queue doesn't know, from a caller who saw it in another
+// queue boot (V1-DESIGN §6.2).
+const errTaskUnknownAfterRestart = "task_unknown_after_restart"
+
+func (s *server) taskFail(w http.ResponseWriter, ref taskRef, err error) {
 	if errors.Is(err, guard.ErrNoTask) {
+		// Only the boot decides (never whether some task has this id), so the answer says nothing about other tasks.
+		if boot := s.tasks().Boot; boot != "" && ref.Boot != "" && ref.Boot != boot {
+			writeJSON(w, 404, map[string]string{"error": errTaskUnknownAfterRestart, "boot": boot})
+			return
+		}
 		fail(w, 404, "no_such_task")
 		return
 	}
@@ -344,7 +449,7 @@ func taskFail(w http.ResponseWriter, err error) {
 // authorized checks a task call's MAC (guard.Host.Authorize); false: it answered 404.
 func (s *server) authorizedTask(w http.ResponseWriter, r *http.Request, ref taskRef, op string) bool {
 	if err := s.tasks().Authorize(ref.Task, userFrom(r.Context()), op, ref.MAC); err != nil {
-		taskFail(w, err)
+		s.taskFail(w, ref, err)
 		return false
 	}
 	return true
@@ -358,7 +463,7 @@ func (s *server) taskStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	st, err := s.tasks().Status(ref.Task, userFrom(r.Context()))
 	if err != nil {
-		taskFail(w, err)
+		s.taskFail(w, ref, err)
 		return
 	}
 	writeJSON(w, 200, st)
@@ -373,9 +478,10 @@ func (s *server) taskCancel(w http.ResponseWriter, r *http.Request) {
 	user := userFrom(r.Context())
 	refundable, err := s.tasks().Cancel(ref.Task, user)
 	if err != nil {
-		taskFail(w, err)
+		s.taskFail(w, ref, err)
 		return
 	}
+	s.endCredential(ref.Task) // no more mail calls: its login goes now
 	w.Header().Set(billHeader, s.tasks().Bill(ref.Task))
 	if refundable {
 		w.Header().Set(refundableHeader, "1")
@@ -383,7 +489,7 @@ func (s *server) taskCancel(w http.ResponseWriter, r *http.Request) {
 	// The cancel is in; the task ends within the brain's grace period.
 	st, err := s.tasks().Status(ref.Task, user)
 	if err != nil {
-		taskFail(w, err)
+		s.taskFail(w, ref, err)
 		return
 	}
 	writeJSON(w, 200, st)
@@ -397,9 +503,10 @@ func (s *server) taskDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	refundable, err := s.tasks().Delete(ref.Task, userFrom(r.Context()))
 	if err != nil {
-		taskFail(w, err)
+		s.taskFail(w, ref, err)
 		return
 	}
+	s.endCredential(ref.Task) // its mail login goes with it
 	w.Header().Set(billHeader, s.tasks().Bill(ref.Task))
 	if refundable {
 		w.Header().Set(refundableHeader, "1")
@@ -462,7 +569,7 @@ func (s *server) followDone(user string) {
 }
 
 // resumeTasks takes up the tasks a previous process left in the queue (POST /tasks ones go on; /run ones are
-// abandoned, as before), scrubs the ended ones it left (guard.Host.ScrubEnded: a process that stopped before it
+// abandoned, as before), times the deletion of the ended temporary ones it left, scrubs the ended ones it left (guard.Host.ScrubEnded: a process that stopped before it
 // could, or a release before scrubs) and prunes ended ones past their keep, now and every hour.
 func (s *server) resumeTasks(ctx context.Context, ids []string, logf func(string, ...any)) {
 	h := s.tasks()
@@ -471,6 +578,10 @@ func (s *server) resumeTasks(ctx context.Context, ids []string, logf func(string
 	}
 	if resumed, abandoned := h.Resume(ids); resumed+abandoned > 0 {
 		logf("tasks: resumed %d, ended %d runs a previous process left open", resumed, abandoned)
+	}
+	// The ended temporary chats' tasks it left: each deleted at its end plus its hour, not at the next hourly Prune.
+	if deleted, timed := h.ExpireEndedTemporary(time.Now()); deleted+timed > 0 {
+		logf("tasks: %d ended temporary tasks deleted, %d timed for deletion", deleted, timed)
 	}
 	go func() {
 		for {

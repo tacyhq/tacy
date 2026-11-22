@@ -17,6 +17,25 @@ import (
 	"github.com/tacyhq/tacy/safety"
 )
 
+// KMSFallbackRemoveBy is the date by which the KMS fallback is gone everywhere (the no-downtime plan row 27, the Fix B
+// switch-over; review M2): kms_fallback out of every signed policy (the holders' unlock policy, the key service's),
+// the fallback release's pin withdrawn, verifier.KMSRoots empty and pins.go KMSFallback deleted. While the fallback
+// is accepted anywhere, the host chooses which approved release boots, and may restart the VM into the one keyed
+// by its KMS. A placeholder until the owner sets the Fix B go-live; moving it later is a reviewed change.
+var KMSFallbackRemoveBy = time.Date(2027, 1, 15, 0, 0, 0, 0, time.UTC)
+
+// CheckKMSFallbackRemoval refuses a policy that still sets kms_fallback at or after KMSFallbackRemoveBy. kmsctl runs
+// it before it signs or approves any policy, and the agent VM's tests run the same date check on the tree
+// (TestKMSFallbackRemovalGate). Holders and kmsd never run it: a check without a person would stop a running service
+// on a date, against the no-downtime rule.
+func CheckKMSFallbackRemoval(kmsFallback bool, at time.Time) error {
+	if kmsFallback && !at.Before(KMSFallbackRemoveBy) {
+		return fmt.Errorf("kms_fallback is still on after %s, the date it was to be removed by (the no-downtime plan row 27): drop it, "+
+			"withdraw the fallback release, or move the date in a reviewed change", KMSFallbackRemoveBy.Format(time.DateOnly))
+	}
+	return nil
+}
+
 // Policy (KindPolicy, admin keys) is what kmsd releases to whom. Only a higher Seq replaces a loaded one.
 type Policy struct {
 	// KMSID and Epoch name the key service this policy is for; a replica refuses a policy for another. KMSID is ""

@@ -189,17 +189,56 @@ func (s *server) triggersEvent(w http.ResponseWriter, r *http.Request) {
 		fail(w, 403, err.Error())
 		return
 	}
-	existed, err := s.tasks().StartTriggered(r.Context(), f, s.safety.Firm())
+	// Never run twice (V1-DESIGN §6.3, review M5): the delivery is recorded as used, and that record saved, before
+	// the task starts. A reboot loses the task queue (TD memory) and any side change not saved yet; without this, a
+	// replay within the event's window after a reboot would find neither the mark nor the task, and run it again.
+	fresh, err := s.triggers.Claim(f)
 	switch {
-	case errors.Is(err, guard.ErrTooMany): // not recorded: the sender may deliver it again later
-		fail(w, 429, "too_many_tasks")
 	case err != nil:
 		fail(w, 500, "task_not_started")
+		return
+	case !fresh: // another call claimed it in the meantime
+		fail(w, 409, "replayed")
+		return
+	}
+	if err := s.saveSide(r.Context()); err != nil {
+		s.unclaim(r.Context(), f, false) // nothing ran and nothing lasting says it did: the sender may deliver it again
+		fail(w, 503, "delivery_not_recorded")
+		return
+	}
+	existed, err := s.tasks().StartTriggered(r.Context(), f, s.safety.Firm())
+	switch {
+	case errors.Is(err, guard.ErrTooMany): // given back: the sender may deliver it again later
+		s.unclaim(r.Context(), f, true)
+		fail(w, 429, "too_many_tasks")
+	case err != nil:
+		s.unclaim(r.Context(), f, true)
+		fail(w, 500, "task_not_started")
 	default:
-		if err := s.triggers.Delivered(f); err != nil {
-			log.Printf("triggers: delivery not recorded: %v", err) // the derived task id still makes a repeat find it
-		}
 		writeJSON(w, 200, map[string]any{"task": f.Task, "existed": existed})
+	}
+}
+
+// saveSide makes the side state's changes lasting now (sealed state: Keeper.SaveNow); memory only: nothing to do,
+// nothing outlives the process anyway.
+func (s *server) saveSide(ctx context.Context) error {
+	if s.saveState == nil {
+		return nil
+	}
+	return s.saveState(ctx, stateSide)
+}
+
+// unclaim gives an event's delivery back when its task didn't start; saved says the claim had been saved, so the
+// release is saved too. If that fails the delivery stays used: at most once, never twice.
+func (s *server) unclaim(ctx context.Context, f trigger.Fire, saved bool) {
+	if err := s.triggers.Unclaim(f); err != nil {
+		log.Printf("triggers: delivery not given back: %v", err)
+		return
+	}
+	if saved {
+		if err := s.saveSide(ctx); err != nil {
+			log.Printf("triggers: delivery given back in memory only: %v", err)
+		}
 	}
 }
 
@@ -227,7 +266,17 @@ func (s *server) runTriggers(ctx context.Context, every time.Duration) {
 // triggerTick is one pass: due schedule slots start their tasks (a derived id: a repeat finds the first), each
 // recorded as fired once started, found, or skipped for the agent's cap; an open unattended task whose sponsor was
 // revoked, left the space or whose sponsorship ended is cancelled ("sponsor_gone").
+//
+// While drained (drain.go) only the last check runs: no fire, and none of the engine's own writes.
 func (s *server) triggerTick(ctx context.Context) {
+	if s.drain.on(time.Now()) {
+		for id, o := range s.tasks().Triggered() {
+			if err := s.triggers.Sponsored(o.Space, o.Sponsor, o.NotAfter); err != nil {
+				s.rt.Cancel(id, "sponsor_gone")
+			}
+		}
+		return
+	}
 	// Stored files' keys of schedules that reached their end go first (trigger.Engine.ExpireFiles).
 	if err := s.triggers.ExpireFiles(); err != nil {
 		log.Printf("triggers: %v", err)
@@ -237,6 +286,11 @@ func (s *server) triggerTick(ctx context.Context) {
 		log.Printf("triggers: %v", err)
 	}
 	for _, f := range fires {
+		// Two unlocked VMs must never both fire a schedule (the keys plan §11.2): only the holder of the space's ownership
+		// row does. Not holding it leaves the slot unfired here, for the VM that does.
+		if s.owner != nil && f.Def != nil && !s.owner.Holds(ctx, f.Def.Space) {
+			continue
+		}
 		_, err := s.tasks().StartTriggered(ctx, f, s.safety.Firm())
 		if err != nil && !errors.Is(err, guard.ErrTooMany) {
 			log.Printf("triggers: a scheduled task wasn't started (trigger %s): %v", f.Trigger.ID, err)

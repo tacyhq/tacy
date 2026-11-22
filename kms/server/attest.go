@@ -36,6 +36,12 @@ type CheckOptions struct {
 	KMSIDs        map[string]string
 	// AllowE2EDiag: a staging key service whose policy lets e2e overlays in (their diag service; Config.Staging).
 	AllowE2EDiag bool
+	// Machines are the machines a VM may run on (verifier.Policy.Machines). A holder always sets them from its
+	// signed policy (never the built-in ones); nil (the key service, kmsctl) takes the verifier's built-in ones.
+	Machines *safety.MachineSet
+	// RequireUnlockd: the release must have unlockd (verifier.Policy.RequireUnlockd; a split-key holder sets it on
+	// every request, review L3).
+	RequireUnlockd bool
 }
 
 // Attested is what a verified attestation established.
@@ -114,7 +120,8 @@ func verifyAttestation(ctx context.Context, raw json.RawMessage, nonce []byte, p
 	}
 	vp := verifier.Policy{Compose: []byte(dc), AppComposeSHA256: []string{pin.AppComposeSHA256}, KMSFallback: pol.KMSFallback,
 		ProdImages: pol.OSImages, PreLaunch: pol.PreLaunch, Boot: bootSets(pol.Boot), KMSRoots: pol.KMSRoots, KMSIDs: o.KMSIDs,
-		AllowStaleTCB: o.AllowStaleTCB, SkipAttestation: o.DevLocal, VerifyQuote: o.VerifyQuote, Getter: o.Getter, Now: o.Now}
+		AllowStaleTCB: o.AllowStaleTCB, SkipAttestation: o.DevLocal, VerifyQuote: o.VerifyQuote, Getter: o.Getter, Now: o.Now,
+		KeyRelease: true, Machines: o.Machines, RequireUnlockd: o.RequireUnlockd && !isKMS}
 	if vp.KMSIDs == nil {
 		vp.KMSIDs = map[string]string{} // only the ids given: never the verifier's built-in list by default
 	}

@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/tacyhq/tacy/activity"
 	"github.com/tacyhq/tacy/approval"
@@ -28,19 +29,27 @@ import (
 // Sealed (newSealedState, the keys plan Stage C): the same stores in memory, and what must outlive a restart saved as
 // sealed snapshots (sealstate, under the key service's state/v1 key, stored outside the VM): the side store
 // (schedules: definitions, memory, holders, results, fired slots, seen deliveries, the clock, pins), the activity
-// chains, the safety floors and documents, the budgets' day counters and the notification switches. The queue and
-// the approvals stay memory only (a task ends with the boot; an effect waiting for approval is never kept).
+// chains, the safety floors and documents, the budgets' day counters and the notification switches. The approvals
+// stay memory only (an effect waiting for approval is never kept).
+//
+// The task queue (V1-DESIGN §6.2): in this process's memory, or with -tasks-dir in the host tmpfs made for agentd
+// alone (useTasksQueue, queue.OpenTmpfs): TD memory, so open tasks survive the hourly container restart and end with
+// a real boot.
 type agentState struct {
-	queue    harness.Store
-	activity activity.Store
-	side     sideStore
-	ledger   *safety.Ledger
-	notify   *notifier
+	queue harness.Store
+	// queueBoot names the queue (guard.Host.Boot): new with each memory queue, kept with a tmpfs one.
+	queueBoot string
+	activity  activity.Store
+	side      sideStore
+	ledger    *safety.Ledger
+	notify    *notifier
 	// safety is the signed controls' persistence (nil: memory only).
 	safety safety.Persister
 	// keeper saves the sealed snapshots (nil: memory only); schedules: the side store is kept, so schedules run.
 	keeper    *sealstate.Keeper
 	schedules bool
+	// tasksTmpfs is the host tmpfs the queue is in (nil: memory), for its heartbeat (beatTasks).
+	tasksTmpfs *queue.Tmpfs
 }
 
 // sideStore is what the side store holds: approvals, triggers' definitions and their marks, personal spaces'
@@ -58,8 +67,9 @@ type sideStore interface {
 func newAgentState() *agentState {
 	n, _ := openNotifier(nil) // memory: never fails
 	return &agentState{
-		queue:    harness.NewMemStore(),
-		activity: activity.NewMemStore(),
+		queue:     harness.NewMemStore(),
+		queueBoot: queue.NewBoot(),
+		activity:  activity.NewMemStore(),
 		side: memSide{approval.NewMemStore(), trigger.NewMemStore(), &trigger.MemHolders{}, &trigger.MemResults{}, &trigger.MemMemory{},
 			&runauth.MemPins{}},
 		ledger: &safety.Ledger{},
@@ -107,7 +117,7 @@ func newSealedState(ctx context.Context, st *sealstate.Store) (*agentState, erro
 		return b, nil
 	}
 	k := &sealstate.Keeper{Store: st}
-	kept := &agentState{queue: harness.NewMemStore(), keeper: k, schedules: true}
+	kept := &agentState{queue: harness.NewMemStore(), queueBoot: queue.NewBoot(), keeper: k, schedules: true}
 
 	b, err := load(stateSide)
 	if err != nil {
@@ -157,6 +167,38 @@ func newSealedState(ctx context.Context, st *sealstate.Store) (*agentState, erro
 	return kept, nil
 }
 
+// useTasksQueue puts the task queue in the host tmpfs t names (-tasks-dir; queue.OpenTmpfs refuses a directory that
+// isn't memory or isn't agentd's alone). Call it before the runtime restores the queue.
+func (k *agentState) useTasksQueue(t queue.Tmpfs) error {
+	q, boot, err := queue.OpenTmpfs(t)
+	if err != nil {
+		return err
+	}
+	k.queue, k.queueBoot, k.tasksTmpfs = q, boot, &t
+	return nil
+}
+
+// beatTasks keeps the tmpfs queue's heartbeat (queue.Tmpfs.Beat, review 2 M3) every queue.HeartbeatEvery until ctx
+// ends; nothing with the queue in memory. A queue another agentd finds with no heartbeat for queue.StaleAfter isn't
+// resumed.
+func (k *agentState) beatTasks(ctx context.Context, logf func(string, ...any)) {
+	if k.tasksTmpfs == nil {
+		return
+	}
+	t := time.NewTicker(queue.HeartbeatEvery)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if err := k.tasksTmpfs.Beat(k.queueBoot); err != nil {
+				logf("tasks: the queue's heartbeat: %v", err)
+			}
+		}
+	}
+}
+
 // booted is what agentd's keys and state are after boot (bootState).
 type booted struct {
 	kept   *agentState
@@ -185,6 +227,11 @@ func bootState(ctx context.Context, keys KeySource, backend sealstate.Backend, r
 		}
 		if reg != nil { // the key service's generation register: no older blob opens, every save is committed
 			st.WithRegister(reg)
+		}
+		if f, ok := keys.(interface{ floors() map[string]uint64 }); ok { // the rollback witness's head (unlockd)
+			for name, gen := range f.floors() {
+				st.Floor(name, gen)
+			}
 		}
 		if kept, err = newSealedState(ctx, st); err != nil {
 			return nil, err

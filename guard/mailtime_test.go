@@ -346,6 +346,7 @@ func gradeTZ(t *testing.T, srv *imaptest.Server, ref map[string]tzMsg, c tzCase)
 }
 
 func TestMailTimeScorecard(t *testing.T) {
+	withBackgroundMail(t) // the schedule cases: the zone logic kept for background email (off in v1)
 	srv, ref := tzMailbox(t)
 	var inRight, inOf, timeRight, timeOf, cases int
 	var gs []tzGrade
@@ -367,6 +368,7 @@ func TestMailTimeScorecard(t *testing.T) {
 }
 
 func TestMailZoneSources(t *testing.T) {
+	withBackgroundMail(t) // the schedule cases: the zone logic kept for background email (off in v1)
 	date := "Today is Thursday, October 29, 2026."
 	for _, c := range []struct {
 		ms   []proto.Message
@@ -441,4 +443,10 @@ func TestMailLocalTimes(t *testing.T) {
 			t.Errorf("ParseInternalDate(%q) = %s", in, got)
 		}
 	}
+}
+
+// withBackgroundMail turns unattended mail on for a test (backgroundMail; off in v1).
+func withBackgroundMail(t *testing.T) {
+	backgroundMail = true
+	t.Cleanup(func() { backgroundMail = false })
 }

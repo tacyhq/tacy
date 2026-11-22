@@ -381,6 +381,10 @@ func TestReaderInjectionCorpus(t *testing.T) {
 			if req["model"] != ReaderModel || req["reasoning_effort"] != "low" || req["tools"] != nil || req["max_tokens"] == nil {
 				t.Fatalf("reader request %v", req)
 			}
+			// The run has no cache_secret: the reader's scope is the space's, never the per-boot secret (cachescope.go).
+			if req["user_cache_secret"] != SpaceCacheSecret("boot", testSpace) {
+				t.Fatalf("reader request's cache scope %v", req["user_cache_secret"])
+			}
 			// The person's stream: the exact quotes, under the page's number.
 			var res *proto.Event
 			for i := range evs {

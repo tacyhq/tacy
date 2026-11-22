@@ -29,10 +29,13 @@ type Keeper struct {
 	// gone); the process must stop serving. nil: log.Fatalf.
 	OnFatal func(error)
 
-	mu    sync.Mutex
-	srcs  map[string]Source
-	saved map[string]uint64 // the Version saved last
-	order []string
+	// saving is held for a whole Flush or SaveNow, so two saves of one name never overlap.
+	saving    sync.Mutex
+	fatalOnce sync.Once
+	mu        sync.Mutex
+	srcs      map[string]Source
+	saved     map[string]uint64 // the Version saved last
+	order     []string
 }
 
 // Add keeps src as name, its current Version taken as already saved (it was just loaded, or is empty).
@@ -56,32 +59,60 @@ func (k *Keeper) Add(name string, src Source) error {
 
 // Flush saves every source that changed since its last save. It returns the first error (the others are tried).
 func (k *Keeper) Flush(ctx context.Context) error {
+	k.saving.Lock()
+	defer k.saving.Unlock()
 	k.mu.Lock()
 	names := append([]string(nil), k.order...)
 	k.mu.Unlock()
 	var errs []error
 	for _, name := range names {
-		k.mu.Lock()
-		src, last := k.srcs[name], k.saved[name]
-		k.mu.Unlock()
-		v := src.Version()
-		if v == last {
-			continue
-		}
-		b, err := src.Snapshot()
-		if err == nil {
-			err = k.Store.Save(ctx, name, b)
-			clear(b)
-		}
-		if err != nil {
+		if err := k.save(ctx, name); err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", name, err))
-			continue
 		}
-		k.mu.Lock()
-		k.saved[name] = v
-		k.mu.Unlock()
 	}
 	return errors.Join(errs...)
+}
+
+// SaveNow saves name's source now if it changed since its last save, and returns once the save is done (a change
+// that must be lasting before what follows it runs: an event's delivery before its task, V1-DESIGN §6.3). It waits
+// for a Flush in progress. An ErrFailed here stops the Keeper as Run's would.
+func (k *Keeper) SaveNow(ctx context.Context, name string) error {
+	k.saving.Lock()
+	defer k.saving.Unlock()
+	k.mu.Lock()
+	_, ok := k.srcs[name]
+	k.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("sealstate: %s isn't kept", name)
+	}
+	err := k.save(ctx, name)
+	if errors.Is(err, ErrFailed) {
+		k.fatal(err)
+	}
+	return err
+}
+
+// save saves name's source if it changed (k.saving held).
+func (k *Keeper) save(ctx context.Context, name string) error {
+	k.mu.Lock()
+	src, last := k.srcs[name], k.saved[name]
+	k.mu.Unlock()
+	v := src.Version()
+	if v == last {
+		return nil
+	}
+	b, err := src.Snapshot()
+	if err == nil {
+		err = k.Store.Save(ctx, name, b)
+		clear(b)
+	}
+	if err != nil {
+		return err
+	}
+	k.mu.Lock()
+	k.saved[name] = v
+	k.mu.Unlock()
+	return nil
 }
 
 // Run flushes every Every until ctx ends, then once more.
@@ -118,11 +149,13 @@ func (k *Keeper) Run(ctx context.Context) {
 }
 
 func (k *Keeper) fatal(err error) {
-	if k.OnFatal != nil {
-		k.OnFatal(err)
-		return
-	}
-	log.Fatalf("sealstate: %v", err)
+	k.fatalOnce.Do(func() {
+		if k.OnFatal != nil {
+			k.OnFatal(err)
+			return
+		}
+		log.Fatalf("sealstate: %v", err)
+	})
 }
 
 // ---- SQLite in memory -------------------------------------------------------------------------------------------

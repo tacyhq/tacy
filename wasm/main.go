@@ -6,7 +6,7 @@
 //
 // It registers globalThis.sealedAgentVM (name kept from before the rename; clients look it up) and stays running:
 //
-//	verifyRelease(attestationJSON, nonceHex, bundleJSON, fetchCollateral, nowISO?, lastSeenVersion?) -> Promise<string>
+//	verifyRelease(attestationJSON, nonceHex, bundleJSON, fetchCollateral, nowISO?, lastSeenVersion?, keepOverlap?) -> Promise<string>
 //	    Every check, and the VM's docker compose must be a signed release (package release): bundleJSON is the
 //	    Sigstore bundle for sha256(docker compose), as JSON: one "bundle" of GitHub's attestations API response for
 //	    that digest (an entry with only a bundle_url must be fetched and Snappy-decoded first, e.g. by a relay;
@@ -17,6 +17,9 @@
 //	    JSON {ok, error?, release?: {version, commit, compose_sha256, identity, run_url, log_index, signed_at}}.
 //	lastSeenVersion ("vX.Y.Z", optional, "" or undefined = none) is the newest release this client accepted
 //	    before (keep release.version / facts.release): an older release is refused (rollback protection).
+//	keepOverlap (optional, true only): the chat Worker's own check of the KMS-fallback release's VM, which it pushes
+//	    its API keys to for the app builds that can verify nothing else (verifier.Policy.KeepOverlap): a signed end of
+//	    the overlap doesn't apply to that check. Clients never pass it.
 //	verify(attestationJSON, nonceHex, fetchCollateral, nowISO?) -> Promise<string>
 //	    Deprecated: the older exact mode, against the compose.yaml embedded in this binary (tacy.Compose).
 //	releaseIdentity, minVersion, composeSha256: the pinned signer prefix, minimum version, embedded compose hash.
@@ -31,7 +34,7 @@
 // release. The deprecated exact mode checks the compose.yaml and app-compose.json embedded here (tacy.Compose,
 // tacy.AppCompose).
 //
-//	setTrustList(envelopeJSON, minSeq, nowISO?) -> string
+//	setTrustList(envelopeJSON, minSeq, nowISO?, seenJSON?) -> string
 //	    Takes a signed trust list (admin keys pinned in package verifier) for later checks: JSON verifier.TrustInfo,
 //	    with releaseEntries (the list's VM releases and their Sigstore bundles) for a client's bundle lookup. Each
 //	    later check applies the list again (it may have expired): its OS images, boot sets, pre-launch scripts and
@@ -145,7 +148,7 @@ func appComposeSum() string {
 }
 
 // run verifies an attestation. bundle nil = the deprecated exact mode against the embedded compose.
-func run(attJSON, nonceHex string, bundle []byte, fetch js.Value, now, lastSeen string) output {
+func run(attJSON, nonceHex string, bundle []byte, fetch js.Value, now, lastSeen string, keepOverlap bool) output {
 	out := output{Checks: []verifier.Check{}, Facts: map[string]string{}, ComposeSHA256: composeSum(), AppComposeSHA256: appComposeSum()}
 	fail := func(err error) output {
 		out.OK, out.Error, out.HPKEPublicKey = false, err.Error(), ""
@@ -160,7 +163,7 @@ func run(attJSON, nonceHex string, bundle []byte, fetch js.Value, now, lastSeen 
 		return fail(errors.New("nonce must be 32 bytes of hex"))
 	}
 	p := verifier.Policy{Bundle: bundle, Getter: jsGetter{fetch}, Release: release.Policy{LastSeen: lastSeen},
-		KMSFallback: tacy.KMSFallback}
+		KMSFallback: tacy.KMSFallback, KeepOverlap: keepOverlap}
 	if bundle == nil {
 		p.Compose, p.AppCompose = tacy.Compose, tacy.AppCompose
 	}
@@ -224,16 +227,17 @@ func main() {
 			return reject("verify(attestationJSON, nonceHex, fetchCollateral, nowISO?)")
 		}
 		att, nonce, fetch, now := a[0].String(), a[1].String(), a[2], optString(a, 3)
-		return promise(func() output { return run(att, nonce, nil, fetch, now, "") })
+		return promise(func() output { return run(att, nonce, nil, fetch, now, "", false) })
 	})
 	verifyRelease := js.FuncOf(func(_ js.Value, a []js.Value) any {
 		if len(a) < 4 || a[0].Type() != js.TypeString || a[1].Type() != js.TypeString || a[2].Type() != js.TypeString ||
 			a[3].Type() != js.TypeFunction {
-			return reject("verifyRelease(attestationJSON, nonceHex, bundleJSON, fetchCollateral, nowISO?, lastSeenVersion?)")
+			return reject("verifyRelease(attestationJSON, nonceHex, bundleJSON, fetchCollateral, nowISO?, lastSeenVersion?, keepOverlap?)")
 		}
 		att, nonce, bundle, fetch, now := a[0].String(), a[1].String(), []byte(a[2].String()), a[3], optString(a, 4)
 		lastSeen := optString(a, 5)
-		return promise(func() output { return run(att, nonce, bundle, fetch, now, lastSeen) })
+		keepOverlap := len(a) > 6 && a[6].Type() == js.TypeBoolean && a[6].Bool()
+		return promise(func() output { return run(att, nonce, bundle, fetch, now, lastSeen, keepOverlap) })
 	})
 	verifyReleaseBundle := js.FuncOf(func(_ js.Value, a []js.Value) any {
 		type out struct {
@@ -261,12 +265,15 @@ func main() {
 	api.Set("releaseIdentity", release.Policy{}.Identity())
 	api.Set("minVersion", release.Policy{}.Minimum())
 	api.Set("appComposeSha256", appComposeSum())
-	// setTrustList(envelopeJSON, minSeq, nowISO?) -> JSON verifier.TrustInfo: takes a signed trust list for later
-	// checks if it is signed by the pinned admin keys, not expired and its seq is at least minSeq ("" clears it). Its
-	// releaseEntries are the list's VM releases (with their Sigstore bundles) for a release-mode client's lookup.
+	// setTrustList(envelopeJSON, minSeq, nowISO?, seenJSON?) -> JSON verifier.TrustInfo: takes a signed trust list for
+	// later checks if it is signed by the pinned admin keys, not expired and its seq is at least minSeq ("" clears it).
+	// seenJSON is the caller's record of the list's items (the last answer's seen; none: every addition waits): only
+	// what has been listed for 24 h counts (safety/trustdelay.go); the answer's seen is the record to keep, its
+	// pending what doesn't count yet, its releaseEntries the list's VM releases that count (with their Sigstore
+	// bundles) for a release-mode client's lookup.
 	api.Set("setTrustList", js.FuncOf(func(_ js.Value, a []js.Value) any {
 		if len(a) < 2 || a[0].Type() != js.TypeString || a[1].Type() != js.TypeNumber {
-			b, _ := json.Marshal(verifier.TrustInfo{Error: "setTrustList(envelopeJSON, minSeq, nowISO?)"})
+			b, _ := json.Marshal(verifier.TrustInfo{Error: "setTrustList(envelopeJSON, minSeq, nowISO?, seenJSON?)"})
 			return string(b)
 		}
 		now := time.Now()
@@ -282,7 +289,11 @@ func main() {
 		if minSeq < 0 || minSeq > 1<<53 {
 			minSeq = 1 << 53
 		}
-		b, _ := json.Marshal(trust.Take([]byte(a[0].String()), uint64(minSeq), now))
+		var seen []byte
+		if len(a) > 3 && a[3].Type() == js.TypeString {
+			seen = []byte(a[3].String())
+		}
+		b, _ := json.Marshal(trust.TakeSeen([]byte(a[0].String()), uint64(minSeq), now, seen))
 		return string(b)
 	}))
 	js.Global().Set("sealedAgentVM", api)

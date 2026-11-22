@@ -178,16 +178,19 @@ func (p *Prompts) Hold(ti *harness.TaskInfo, id string, req any) string {
 	p.init()
 	composed := ComposedFetch(a.Name, a.Args, sources, opts.Links, p.tainted(ti, a.Call))
 	setting := PermissionSetting(opts, kind, p.cap(opts.Space, kind))
+	private := PrivateSearch(kind, ti) // after private content: this exact query is asked about (private.go)
 	switch {
+	case !isMailAction(kind) && RuleOfTwo(opts, ti): // an unattended run that may read mail: no web at all (gatewayd too)
+		p.outcomes[k] = PermissionOutcome{Outcome: PermRuleOfTwo}
 	case HiddenChars(value): // never sent, so never asked about (whatever the setting)
 		p.outcomes[k] = PermissionOutcome{Outcome: PermHidden}
 	case setting == safety.PermNever:
 		p.outcomes[k] = PermissionOutcome{Outcome: PermNeverSetting}
 	case composed: // never opened, so never asked about
 		p.outcomes[k] = PermissionOutcome{Outcome: PermNotFromResults}
-	case setting == safety.PermAlways:
+	case setting == safety.PermAlways && !private:
 		p.outcomes[k] = PermissionOutcome{Outcome: PermAlwaysSetting}
-	case p.always[ti.ID][kind] != nil:
+	case p.always[ti.ID][kind] != nil && !private:
 		p.grants[k] = p.always[ti.ID][kind]
 		p.outcomes[k] = PermissionOutcome{Outcome: PermAllowedAlways}
 	case !validRunSecret(opts.RunSecret):
@@ -352,10 +355,10 @@ func (p *Prompts) Attach(ctx context.Context, ti *harness.TaskInfo, id string, a
 		return ctx, nil // not held here (unusable arguments, or a rerun after a restart): gatewayd decides
 	}
 	switch o.Outcome {
-	case PermDenied, PermTimedOut, PermNeverSetting, PermUnavailable, PermHidden, PermNotFromResults:
+	case PermDenied, PermTimedOut, PermNeverSetting, PermUnavailable, PermHidden, PermNotFromResults, PermRuleOfTwo:
 		deny := PermissionDenial(kind, o.Outcome)
 		call := cmp.Or(a.Call, id)
-		if o.Outcome == PermNeverSetting || o.Outcome == PermUnavailable || o.Outcome == PermNotFromResults { // never asked: say why under the call
+		if o.Outcome == PermNeverSetting || o.Outcome == PermUnavailable || o.Outcome == PermNotFromResults || o.Outcome == PermRuleOfTwo { // never asked: say why under the call
 			value, _ := Outgoing(a.Name, a.Args, p.sources(ti.ID, kind))
 			p.Emit(ti.ID, proto.Event{Type: "permission", ID: call, Permission: &proto.Permission{Task: ti.ID, Request: id,
 				Kind: kind, Value: value, Decision: o.Outcome}})

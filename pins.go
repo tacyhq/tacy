@@ -20,13 +20,24 @@ var Compose []byte
 //go:embed app-compose.json
 var AppCompose []byte
 
-// KMSFallback: a release takes its keys from the pinned KMS root (key_provider kms) instead of making them in the VM
-// (key_provider none): on Phala a key_provider none CVM boots but its gateway can't route to it. So the VM keeps
-// nothing on its disk: every volume is memory (the verifier's KMS fallback rule). cmd/compose -kms-fallback must
-// match.
-const KMSFallback = true
+// KMSFallback: a release takes its keys from the pinned KMS root (key_provider kms) instead of making them in the
+// VM (key_provider none). False since Fix B (2026-11-21): key_provider none, no provider gateway (the VM dials out
+// through its tunnel), no pre-launch script, an ephemeral data disk under a key made inside the TD at boot. In the
+// fallback the VM keeps nothing on its disk (every volume memory, the images in TD memory). cmd/compose -kms-fallback
+// takes this as its default.
+const KMSFallback = false
 
-// ReleaseAppCompose is the app-compose.json a release of compose attests (no pre-launch script, the KMSFallback mode).
+// ReleaseAppCompose is the app-compose.json a release of compose attests (its pre-launch script, PreLaunch; the
+// KMSFallback mode).
 func ReleaseAppCompose(compose []byte) ([]byte, error) {
-	return verifier.ReleaseAppCompose(compose, nil, KMSFallback)
+	return verifier.ReleaseAppCompose(compose, PreLaunch(compose), KMSFallback)
+}
+
+// PreLaunch is a compose's pre-launch script: in the KMS fallback the memory-root one for a release with unlockd
+// (the image stores in TD memory), none before; with key_provider none, none.
+func PreLaunch(compose []byte) []byte {
+	if KMSFallback && verifier.HasUnlockd(string(compose)) {
+		return []byte(verifier.MemoryRootScript)
+	}
+	return nil
 }

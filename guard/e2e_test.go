@@ -290,7 +290,7 @@ func TestRunLikeApp(t *testing.T) {
 	if len(msgs) != 4 || msgs[3]["role"] != "tool" || msgs[3]["tool_call_id"] != "c1" {
 		t.Fatalf("messages %v", msgs)
 	}
-	if req["model"] != "gpt-oss-120b" || req["user_cache_secret"] != "boot-secret" || req["tools"] == nil ||
+	if req["model"] != "gpt-oss-120b" || req["user_cache_secret"] != SpaceCacheSecret("boot-secret", testSpace) || req["tools"] == nil ||
 		req["parallel_tool_calls"] != true {
 		t.Fatalf("request %v", req)
 	}

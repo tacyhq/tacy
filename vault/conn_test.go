@@ -32,6 +32,7 @@ type connRig struct {
 	v    *Vault
 	c    *Client
 	keep *sealstate.Keeper
+	slot *sealstate.Slot
 	mu   sync.Mutex
 	recs []Record
 }
@@ -48,6 +49,7 @@ func newConnRig(t *testing.T, dir string) *connRig {
 		t.Fatal(err)
 	}
 	r.keep = k
+	r.slot = p.(*sealstate.Slot)
 	v, err := New(nil, ChatGrants(""), func(rec Record) { r.mu.Lock(); r.recs = append(r.recs, rec); r.mu.Unlock() })
 	if err != nil {
 		t.Fatal(err)
@@ -73,7 +75,9 @@ func (r *connRig) leaseFor(space, host, pending string) (*Secret, error) {
 		Action: "s1.a0", Space: space, Conn: ConnEmail, Pending: pending})
 }
 
-func TestConnSealPutLeaseCommitReload(t *testing.T) {
+// Settings' test box (v1): pending for the test login only, leased only with its pending id, for its space, and
+// never kept: not listed, not leased as the space's account, gone once discarded; the sealed state stays empty.
+func TestConnTestBoxNeverKept(t *testing.T) {
 	dir := t.TempDir()
 	r := newConnRig(t, dir)
 	ctx := context.Background()
@@ -89,12 +93,11 @@ func TestConnSealPutLeaseCommitReload(t *testing.T) {
 	if err != nil || info.Host != "imap.gmail.com" || info.Address != "me@gmail.com" || info.Port != 993 {
 		t.Fatalf("put: %+v, %v", info, err)
 	}
-	// Pending: not listed, not leased as the space's account, but leased for its test login.
-	if l, _, _ := r.c.ConnList(ctx, "s_me"); len(l) != 0 {
+	if l, k2, _ := r.c.ConnList(ctx, "s_me"); len(l) != 0 || k2 != key {
 		t.Fatalf("a pending connection is listed: %v", l)
 	}
-	if _, err := r.leaseFor("s_me", "imap.gmail.com", ""); !errors.Is(err, ErrNotSet) {
-		t.Fatalf("lease before commit: %v", err)
+	if _, err := r.leaseFor("s_me", "imap.gmail.com", ""); !errors.Is(err, ErrLoginNeeded) {
+		t.Fatalf("lease without the pending id or a task login: %v", err)
 	}
 	s, err := r.leaseFor("s_me", "imap.gmail.com", pid)
 	if err != nil || string(s.Bytes()) != fakeAppPassword {
@@ -104,68 +107,33 @@ func TestConnSealPutLeaseCommitReload(t *testing.T) {
 	if _, err := r.leaseFor("s_other", "imap.gmail.com", pid); !errors.Is(err, ErrNotSet) {
 		t.Fatalf("another space's test lease: %v", err)
 	}
-	if _, err := r.c.ConnCommit(ctx, pid); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := r.c.ConnCommit(ctx, pid); err == nil {
-		t.Fatal("committed twice")
-	}
-	// Kept: listed (no password), leased to its host only, by the mail connector only, for its space only.
-	l, k2, err := r.c.ConnList(ctx, "s_me")
-	if err != nil || len(l) != 1 || l[0].ConnectedAt.IsZero() || k2 != key {
-		t.Fatalf("list: %+v %q %v", l, k2, err)
-	}
-	s, err = r.leaseFor("s_me", "imap.gmail.com", "")
-	if err != nil || string(s.Bytes()) != fakeAppPassword {
-		t.Fatalf("lease: %v", err)
-	}
-	s.Wipe()
-	if _, err := r.leaseFor("s_me", "evil.example.com", ""); !errors.Is(err, ErrHost) {
+	if _, err := r.leaseFor("s_me", "evil.example.com", pid); !errors.Is(err, ErrHost) {
 		t.Fatalf("other host: %v", err)
 	}
-	if _, err := r.leaseFor("s_other", "imap.gmail.com", ""); !errors.Is(err, ErrNotSet) {
-		t.Fatalf("other space: %v", err)
-	}
 	if _, err := r.c.Lease(ctx, Request{Secret: ConnSecret, Connector: "web", Host: "imap.gmail.com", Task: "t_1", Action: "a",
-		Space: "s_me", Conn: ConnEmail}); !errors.Is(err, ErrNoGrant) {
+		Space: "s_me", Conn: ConnEmail, Pending: pid}); !errors.Is(err, ErrNoGrant) {
 		t.Fatalf("web connector: %v", err)
 	}
 	if _, err := r.c.Lease(ctx, Request{Secret: ConnSecret, Connector: MailConnector, Host: "imap.gmail.com", Task: "t_1", Action: "a",
 		Space: "s_me"}); !errors.Is(err, ErrNoGrant) {
 		t.Fatalf("by name without the connection: %v", err)
 	}
-	// Saved sealed (the keeper's flush; on the VM within a second and on SIGTERM): one file, TACYSEAL1, nothing of
-	// the account in it in any encoding; a new vault (a restart) has the account; a box sealed to the old boot's key
-	// is stale.
+	if err := r.c.ConnDiscard(ctx, pid); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.leaseFor("s_me", "imap.gmail.com", pid); !errors.Is(err, ErrNotSet) {
+		t.Fatalf("after discard: %v", err)
+	}
 	if err := r.keep.Flush(ctx); err != nil {
 		t.Fatal(err)
 	}
-	sealedOnly(t, dir)
+	// A restart: a box sealed to the old boot's key is stale.
 	r2 := newConnRig(t, dir)
-	s, err = r2.leaseFor("s_me", "imap.gmail.com", "")
-	if err != nil || string(s.Bytes()) != fakeAppPassword {
-		t.Fatalf("after restart: %v", err)
-	}
-	s.Wipe()
 	if _, _, err := r2.c.ConnPut(ctx, "s_me", ConnEmail, box); !errors.Is(err, ErrStaleKey) {
 		t.Fatalf("old boot's box: %v", err)
 	}
-	// Remove: gone from memory and the file.
 	if err := r2.c.ConnRemove(ctx, "s_me", ConnEmail); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := r2.leaseFor("s_me", "imap.gmail.com", ""); !errors.Is(err, ErrNotSet) {
-		t.Fatalf("after remove: %v", err)
-	}
-	if err := r2.keep.Flush(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if r3 := newConnRig(t, dir); len(r3.v.ConnList("s_me")) != 0 {
-		t.Fatal("the removed account came back after a restart")
-	}
-	sealedOnly(t, dir)
-	if err := r2.c.ConnRemove(ctx, "s_me", ConnEmail); err != nil {
-		t.Fatalf("remove again: %v", err)
+		t.Fatalf("remove (nothing kept): %v", err)
 	}
 	// Records: names and ids, never the password, the address or the host.
 	for _, rig := range []*connRig{r, r2} {
@@ -230,25 +198,16 @@ func TestConnPutRefusals(t *testing.T) {
 	}
 }
 
-// Under a signed policy, a connection's password is leased only when the policy has the mail connector and its
+// Under a signed policy, a task's mail password is leased only when the policy has the mail connector and its
 // fetch patterns allow the account's host.
 func TestConnLeaseUnderPolicy(t *testing.T) {
-	ctx := context.Background()
 	r := newConnRig(t, t.TempDir())
 	st0, err := safety.NewState(safety.Config{Firm: "f_chat", Release: safety.ChatRelease("f_chat", "", nil, 300)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	r.v.SetSafety(st0)
-	key, _ := r.c.SealKey(ctx)
-	box, _ := SealConn(key, "s_me", ConnEmail, emailJSON(nil))
-	pid, _, err := r.c.ConnPut(ctx, "s_me", ConnEmail, box)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := r.c.ConnCommit(ctx, pid); err != nil {
-		t.Fatal(err)
-	}
+	r.putRun(t, "t_1", "s_me", "start-1", fakeAppPassword)
 	// The release ceiling alone (no admin keys pinned): the mail connector is in it.
 	s, err := r.leaseFor("s_me", "imap.gmail.com", "")
 	if err != nil {
@@ -292,5 +251,44 @@ func sealedOnly(t *testing.T, dir string) {
 				t.Errorf("%s holds the account (via %q)", e.Name(), f.Via)
 			}
 		}
+	}
+}
+
+// Per-account caps on shared VM limits: one space holds at most maxSpacePending test
+// logins at once, so one account can't fill the VM's maxPending; other spaces aren't affected, and a discarded one
+// frees its slot.
+func TestConnPutPerSpaceCap(t *testing.T) {
+	r := newConnRig(t, t.TempDir())
+	ctx := context.Background()
+	key, _ := r.c.SealKey(ctx)
+	put := func(space string) (string, error) {
+		box, err := SealConn(key, space, ConnEmail, emailJSON(nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		pid, _, err := r.c.ConnPut(ctx, space, ConnEmail, box)
+		return pid, err
+	}
+	var first string
+	for i := range maxSpacePending {
+		pid, err := put("s_me")
+		if err != nil {
+			t.Fatalf("test login %d: %v", i+1, err)
+		}
+		if i == 0 {
+			first = pid
+		}
+	}
+	if _, err := put("s_me"); !errors.Is(err, ErrRateLimited) {
+		t.Fatalf("one more than %d for one space: %v", maxSpacePending, err)
+	}
+	if _, err := put("s_other"); err != nil {
+		t.Fatalf("another space: %v", err)
+	}
+	if err := r.c.ConnDiscard(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := put("s_me"); err != nil {
+		t.Fatalf("after a discard: %v", err)
 	}
 }

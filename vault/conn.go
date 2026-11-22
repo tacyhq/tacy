@@ -8,11 +8,13 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"net/netip"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,13 +24,17 @@ import (
 	"github.com/tacyhq/tacy/sealstate"
 )
 
-// Connections (v0.19.0): a person's own accounts, the first an email account read by IMAP
+// Connections (v0.19.0; v1: the v1 design §5): a person's own accounts, the first an email account read by IMAP
 // with an app password. The browser seals the account (server, address, user name, password) to the vault's
-// per-boot key; only this process opens it. A new account is pending until the gateway's test login with it works
-// (Commit), then it is kept in memory and in a file on the vault's own volume of the encrypted disk, so scheduled
-// runs can read mail after the VM restarts. The gateway's IMAP connector leases the password for one call at a
-// time (Lease with Request.Conn), to the account's own host only, under the space's policy; every lease is recorded
-// without the value.
+// per-boot key; only this process opens it.
+//
+// v1: the vault keeps no account. The login lives only in the person's own apps, encrypted under their own key
+// (the mail-login/v1 item), and comes sealed with each task that may read mail (runcred.go): held in this process's
+// memory for that task only and forgotten when it ends. A box for Settings' test (ConnPut) is pending until the
+// gateway's test login with it is done, then dropped (ConnDiscard): nothing is kept. The "connections" sealed state
+// stays, and stays empty: what an older release kept there is wiped at the first load (EnableConns). The gateway's
+// IMAP connector leases the password for one call at a time (Lease with Request.Conn), to the account's own host
+// only, under the space's policy; every lease is recorded without the value.
 
 // ConnInfo is a connection without its password: what Settings shows and what the connector needs to connect.
 type ConnInfo struct {
@@ -63,7 +69,8 @@ const (
 	MailConnector = "mail"
 	pendingTTL    = 3 * time.Minute
 	maxPending    = 64
-	maxConns      = 10000
+	// maxSpacePending bounds one space's pending test logins, so one account can't take every slot of the VM's.
+	maxSpacePending = 4
 )
 
 // Errors of the connection ops (the gateway maps them to the person's words).
@@ -72,9 +79,12 @@ var (
 	ErrBadSealed = errors.New("vault: the sealed connection didn't open or isn't valid")
 	ErrNoConn    = errors.New("vault: no such connection")
 	ErrConnStore = errors.New("vault: the connections file failed")
+	// ErrLoginNeeded: no mail login for this task (none came with it, it was forgotten, or vaultd restarted): the
+	// client sends it again (runcred.go).
+	ErrLoginNeeded = errors.New("vault: no mail login for this task")
 )
 
-var connKnown = []error{ErrStaleKey, ErrBadSealed, ErrNoConn, ErrConnStore}
+var connKnown = []error{ErrStaleKey, ErrBadSealed, ErrNoConn, ErrConnStore, ErrLoginNeeded}
 
 type conn struct {
 	info     ConnInfo
@@ -87,15 +97,16 @@ type connState struct {
 	key     *ecdh.PrivateKey
 	pub     string
 	pending map[string]*conn
-	conns   map[string]*conn // space\x00connection
-	persist Persister        // nil: memory only
+	runs    map[string]*runCred // task -> its mail login (runcred.go): memory only
+	persist Persister           // the "connections" sealed state, kept empty (nil: none)
+	// wiped is how many accounts an older release had kept in the sealed state, dropped at load.
+	wiped int
 }
 
-func connKey(space, id string) string { return space + "\x00" + id }
-
-// EnableConns turns connections on: a fresh seal key for this boot, and the accounts p keeps (nil: memory only;
-// never a file: SealedConns on the VM). Accounts that can't be read are an error: the vault doesn't start with
-// someone's accounts silently dropped.
+// EnableConns turns connections on: a fresh seal key for this boot. p is the "connections" sealed state (nil:
+// none; never a file: SealedConns on the VM): v1 keeps nothing there, and an account an older release kept is
+// dropped and the state saved empty, at once. A state that can't be read is an error (the vault doesn't start over
+// it silently).
 func (v *Vault) EnableConns(p Persister) error {
 	k, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
@@ -107,16 +118,33 @@ func (v *Vault) EnableConns(p Persister) error {
 // EnableConnsKey is EnableConns with a given seal key (the golden vectors' tests; vaultd always makes a fresh one).
 func (v *Vault) EnableConnsKey(p Persister, k *ecdh.PrivateKey) error {
 	cs := &connState{key: k, pub: "x25519:" + base64.StdEncoding.EncodeToString(k.PublicKey().Bytes()),
-		pending: map[string]*conn{}, conns: map[string]*conn{}, persist: p}
+		pending: map[string]*conn{}, runs: map[string]*runCred{}, persist: p}
 	if p != nil {
 		if err := cs.load(); err != nil {
 			return err
+		}
+		if cs.wiped > 0 {
+			if err := cs.saveEmpty(); err != nil {
+				return err
+			}
 		}
 	}
 	v.mu.Lock()
 	v.conns = cs
 	v.mu.Unlock()
+	if cs.wiped > 0 {
+		v.recordConn("conn_wiped", "", "", strconv.Itoa(cs.wiped))
+	}
 	return nil
+}
+
+// Wiped is how many accounts an older release had kept, dropped when connections were enabled (a count only).
+func (v *Vault) Wiped() int {
+	cs := v.connState()
+	if cs == nil {
+		return 0
+	}
+	return cs.wiped
 }
 
 func (v *Vault) connState() *connState {
@@ -134,24 +162,48 @@ func (v *Vault) SealKey() string {
 	return cs.pub
 }
 
-// emailBox is the sealed plaintext (strict).
+// emailBox is the sealed plaintext (strict): a test's (EmailType), or a task's login (MailLoginType, with the
+// item's added_at).
 type emailBox struct {
-	Type     string `json:"type"`
-	Provider string `json:"provider"`
-	Host     string `json:"host"`
-	Port     int    `json:"port"`
-	Security string `json:"security"`
-	Address  string `json:"address"`
-	Username string `json:"username"`
-	Password string `json:"password"`
+	Type     string     `json:"type"`
+	Provider string     `json:"provider"`
+	Host     string     `json:"host"`
+	Port     int        `json:"port"`
+	Security string     `json:"security"`
+	Address  string     `json:"address"`
+	Username string     `json:"username"`
+	Password secretText `json:"password"`
+	AddedAt  string     `json:"added_at,omitzero"`
+}
+
+// secretText is a JSON string decoded straight into bytes this package zeroes (review 2, L7): a Go string can't be
+// cleared, and json would make one. The decoder reads it from the opened box, which its caller clears.
+type secretText []byte
+
+func (p *secretText) UnmarshalJSONFrom(d *jsontext.Decoder) error {
+	v, err := d.ReadValue()
+	if err != nil {
+		return err
+	}
+	if v.Kind() != '"' {
+		return errors.New("vault: password isn't a string")
+	}
+	b, err := jsontext.AppendUnquote(nil, v)
+	if err != nil {
+		clear(b)
+		return err
+	}
+	clear(*p)
+	*p = b
+	return nil
 }
 
 var providers = []string{"gmail", "icloud", "fastmail", "yahoo", "other"}
 
-// checkEmail checks an opened box's fields; the error names a field, never a value.
-func checkEmail(b *emailBox) error {
+// checkEmail checks an opened box's fields (typ: the box's type); the error names a field, never a value.
+func checkEmail(b *emailBox, typ string) error {
 	switch {
-	case b.Type != EmailType:
+	case b.Type != typ:
 		return errors.New("type")
 	case !slices.Contains(providers, b.Provider):
 		return errors.New("provider")
@@ -165,11 +217,14 @@ func checkEmail(b *emailBox) error {
 		return errors.New("address")
 	case !validText(b.Username, 254):
 		return errors.New("username")
-	case b.Password == "" || len(b.Password) > 256 || !utf8.ValidString(b.Password) || strings.ContainsAny(b.Password, "\r\n\x00"):
+	case len(b.Password) == 0 || len(b.Password) > 256 || !utf8.Valid(b.Password) || bytes.ContainsAny(b.Password, "\r\n\x00"):
 		return errors.New("password")
 	}
 	if _, err := netip.ParseAddr(b.Host); err == nil {
 		return errors.New("host")
+	}
+	if b.AddedAt != "" && (typ != MailLoginType || len(b.AddedAt) > 40) {
+		return errors.New("added_at")
 	}
 	return nil
 }
@@ -197,8 +252,8 @@ func validText(s string, max int) bool {
 	return true
 }
 
-// ConnPut opens a sealed connection for space and holds it as pending (until Commit, Discard, or pendingTTL). It
-// returns the pending id and the connection's info.
+// ConnPut opens a sealed connection for space and holds it as pending, for Settings' test login only (until
+// ConnDiscard, or pendingTTL; v1 never keeps it). It returns the pending id and the connection's info.
 func (v *Vault) ConnPut(space, id string, s Sealed) (string, ConnInfo, error) {
 	cs := v.connState()
 	if cs == nil {
@@ -219,18 +274,20 @@ func (v *Vault) ConnPut(space, id string, s Sealed) (string, ConnInfo, error) {
 	defer clear(pt)
 	var b emailBox
 	if err := json.Unmarshal(bytes.TrimRight(pt, " "), &b, json.RejectUnknownMembers(true)); err != nil {
+		clear(b.Password)
 		v.recordConn("conn_put", space, "", "bad_sealed")
 		return "", ConnInfo{}, fmt.Errorf("%w: not the connection's JSON", ErrBadSealed)
 	}
 	b.Host = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(b.Host), "."))
-	if err := checkEmail(&b); err != nil {
+	if err := checkEmail(&b, EmailType); err != nil {
+		clear(b.Password)
 		v.recordConn("conn_put", space, "", "bad_sealed")
 		return "", ConnInfo{}, fmt.Errorf("%w: %s", ErrBadSealed, err.Error())
 	}
 	c := &conn{info: ConnInfo{Space: space, Connection: id, Kind: "email", Provider: b.Provider, Address: b.Address,
 		Username: b.Username, Host: b.Host, Port: b.Port, Security: b.Security},
-		password: []byte(b.Password), expires: v.now().Add(pendingTTL)}
-	b.Password = ""
+		password: b.Password, expires: v.now().Add(pendingTTL)} // the decoded bytes themselves: no copy left behind
+	b.Password = nil
 	p := make([]byte, 12)
 	rand.Read(p)
 	pid := "p_" + hex.EncodeToString(p)
@@ -242,7 +299,13 @@ func (v *Vault) ConnPut(space, id string, s Sealed) (string, ConnInfo, error) {
 			delete(cs.pending, k)
 		}
 	}
-	if len(cs.pending) >= maxPending {
+	mine := 0
+	for _, c := range cs.pending {
+		if c.info.Space == space {
+			mine++
+		}
+	}
+	if len(cs.pending) >= maxPending || mine >= maxSpacePending {
 		cs.mu.Unlock()
 		clear(c.password)
 		return "", ConnInfo{}, ErrRateLimited
@@ -273,16 +336,7 @@ func ConnAAD(space, id string) []byte {
 
 // SealConn seals a connection's JSON to the vault key pub (the browser's job; tests and tools).
 func SealConn(pub, space, id string, plaintext []byte) (Sealed, error) {
-	raw, ok := strings.CutPrefix(pub, "x25519:")
-	b, err := base64.StdEncoding.DecodeString(raw)
-	if !ok || err != nil {
-		return Sealed{}, errors.New("vault: bad seal key")
-	}
-	pk, err := ecdh.X25519().NewPublicKey(b)
-	if err != nil {
-		return Sealed{}, err
-	}
-	hp, err := hpke.NewDHKEMPublicKey(pk)
+	hp, err := sealPub(pub)
 	if err != nil {
 		return Sealed{}, err
 	}
@@ -292,51 +346,6 @@ func SealConn(pub, space, id string, plaintext []byte) (Sealed, error) {
 	}
 	ct, err := sender.Seal(ConnAAD(space, id), plaintext)
 	return Sealed{Key: pub, Enc: enc, CT: ct}, err
-}
-
-// ConnCommit keeps a pending connection (its test login worked): it replaces the space's earlier one and is
-// written to the file.
-func (v *Vault) ConnCommit(pending string) (ConnInfo, error) {
-	cs := v.connState()
-	if cs == nil {
-		return ConnInfo{}, ErrNoConn
-	}
-	cs.mu.Lock()
-	c, ok := cs.pending[pending]
-	if !ok || v.now().After(c.expires) {
-		cs.mu.Unlock()
-		return ConnInfo{}, ErrNoConn
-	}
-	delete(cs.pending, pending)
-	c.expires = time.Time{}
-	c.info.ConnectedAt = v.now().UTC().Truncate(time.Second)
-	k := connKey(c.info.Space, c.info.Connection)
-	old := cs.conns[k]
-	if old == nil && len(cs.conns) >= maxConns {
-		cs.mu.Unlock()
-		clear(c.password)
-		return ConnInfo{}, ErrConnStore
-	}
-	cs.conns[k] = c
-	err := cs.save()
-	if err != nil {
-		if old != nil {
-			cs.conns[k] = old
-		} else {
-			delete(cs.conns, k)
-		}
-		cs.mu.Unlock()
-		clear(c.password)
-		v.recordConn("conn_commit", c.info.Space, pending, "store")
-		return ConnInfo{}, ErrConnStore
-	}
-	if old != nil {
-		clear(old.password)
-	}
-	info := c.info
-	cs.mu.Unlock()
-	v.recordConn("conn_commit", info.Space, pending, "")
-	return info, nil
 }
 
 // ConnDiscard drops a pending connection (its test login failed).
@@ -354,63 +363,14 @@ func (v *Vault) ConnDiscard(pending string) {
 	v.recordConn("conn_discard", "", pending, "")
 }
 
-// ConnGet is a space's connection's info (no password).
-func (v *Vault) ConnGet(space, id string) (ConnInfo, error) {
-	cs := v.connState()
-	if cs == nil {
-		return ConnInfo{}, ErrNoConn
-	}
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
-	c, ok := cs.conns[connKey(space, id)]
-	if !ok {
-		return ConnInfo{}, ErrNoConn
-	}
-	return c.info, nil
-}
+// ConnList is a space's kept connections: none in v1 (the login stays with the person; runcred.go). Kept for
+// Settings' list call, which also gives the seal key.
+func (v *Vault) ConnList(space string) []ConnInfo { return nil }
 
-// ConnList is a space's connections (no passwords).
-func (v *Vault) ConnList(space string) []ConnInfo {
-	cs := v.connState()
-	if cs == nil {
-		return nil
-	}
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
-	var out []ConnInfo
-	for _, c := range cs.conns {
-		if c.info.Space == space {
-			out = append(out, c.info)
-		}
-	}
-	slices.SortFunc(out, func(a, b ConnInfo) int { return strings.Compare(a.Connection, b.Connection) })
-	return out
-}
-
-// ConnRemove forgets a space's connection, in memory and in the file. Removing one that isn't there is fine.
+// ConnRemove forgets a space's kept connection: v1 keeps none, so there is nothing to do (Settings' disconnect
+// deletes the person's own item; an account's deletion its forget). Recorded.
 func (v *Vault) ConnRemove(space, id string) error {
-	cs := v.connState()
-	if cs == nil {
-		return nil
-	}
-	cs.mu.Lock()
-	k := connKey(space, id)
-	c, ok := cs.conns[k]
-	if !ok {
-		cs.mu.Unlock()
-		v.recordConn("conn_remove", space, "", "none")
-		return nil
-	}
-	delete(cs.conns, k)
-	if err := cs.save(); err != nil {
-		cs.conns[k] = c
-		cs.mu.Unlock()
-		v.recordConn("conn_remove", space, "", "store")
-		return ErrConnStore
-	}
-	clear(c.password)
-	cs.mu.Unlock()
-	v.recordConn("conn_remove", space, "", "")
+	v.recordConn("conn_remove", space, "", "none")
 	return nil
 }
 
@@ -425,9 +385,10 @@ func (v *Vault) recordConn(op, space, pending, reason string) {
 		Reason: reason, Lease: pending})
 }
 
-// leaseConn is Lease for a connection's password (Request.Conn set): the space's kept connection, or a pending one
-// (Request.Pending: the test login) of the same space; only to the mail connector, to the connection's own host,
-// under the space's policy (the mail connector on, the host among its fetch patterns) and the lease rates.
+// leaseConn is Lease for a connection's password (Request.Conn set): the task's own login (runcred.go: Request.Task
+// names it; another task's is never released), or a pending one (Request.Pending: Settings' test login) of the same
+// space; only to the mail connector, to the connection's own host, under the space's policy (the mail connector on,
+// the host among its fetch patterns) and the lease rates.
 func (v *Vault) leaseConn(r Request) ([]byte, string, error) {
 	cs := v.connState()
 	if cs == nil {
@@ -441,24 +402,38 @@ func (v *Vault) leaseConn(r Request) ([]byte, string, error) {
 		return nil, "", ErrBadRequest
 	}
 	cs.mu.Lock()
-	var c *conn
+	var info ConnInfo
+	var pw []byte
 	if r.Pending != "" {
-		c = cs.pending[r.Pending]
+		c := cs.pending[r.Pending]
 		if c != nil && v.now().After(c.expires) {
 			c = nil
 		}
+		if c == nil || c.info.Space != r.Space || c.info.Connection != r.Conn {
+			cs.mu.Unlock()
+			return nil, "", ErrNotSet
+		}
+		info, pw = c.info, c.password
 	} else {
-		c = cs.conns[connKey(r.Space, r.Conn)]
+		rc, err := cs.run(v.now(), r.Task, r.Space)
+		if err != nil {
+			cs.mu.Unlock()
+			return nil, "", err
+		}
+		if rc.info.Connection != r.Conn {
+			cs.mu.Unlock()
+			return nil, "", ErrNotSet
+		}
+		if rc.info.Host == r.Host {
+			cs.used(v, rc)
+		}
+		info, pw = rc.info, rc.password
 	}
-	if c == nil || c.info.Space != r.Space || c.info.Connection != r.Conn {
-		cs.mu.Unlock()
-		return nil, "", ErrNotSet
-	}
-	if c.info.Host != r.Host {
+	if info.Host != r.Host {
 		cs.mu.Unlock()
 		return nil, "", ErrHost
 	}
-	val := slices.Clone(c.password)
+	val := slices.Clone(pw)
 	cs.mu.Unlock()
 	v.mu.Lock()
 	err := v.checkConnSafety(r)
@@ -500,7 +475,7 @@ func (v *Vault) checkConnSafety(r Request) error {
 	return nil
 }
 
-// The file: JSON, 0600, written whole to a temporary file and renamed.
+// The state's document: JSON, the accounts an older release kept (v0.19.0 to v0.21.x). v1 writes it with none.
 type connFile struct {
 	Version     int         `json:"version"`
 	Connections []connEntry `json:"connections"`
@@ -511,6 +486,7 @@ type connEntry struct {
 	Password []byte `json:"password"`
 }
 
+// load reads the state and counts the accounts in it (wiped); nothing of them is kept, and their bytes are cleared.
 func (cs *connState) load() error {
 	b, err := cs.persist.Load()
 	if err != nil {
@@ -525,42 +501,26 @@ func (cs *connState) load() error {
 		return errors.New("vault: connections unreadable")
 	}
 	for _, e := range f.Connections {
-		if !safety.ValidID(e.Space) || e.Connection != ConnEmail || !validHost(e.Host) || len(e.Password) == 0 {
-			continue
-		}
-		cs.conns[connKey(e.Space, e.Connection)] = &conn{info: e.ConnInfo, password: e.Password}
+		clear(e.Password)
 	}
+	cs.wiped = len(f.Connections)
 	return nil
 }
 
-// save keeps every connection (cs.mu held): the whole set, to the Persister (sealed under the key service's conn/v1
-// key and stored outside the VM: SealedConns). No persister: memory only.
-func (cs *connState) save() error {
-	if cs.persist == nil {
-		return nil
-	}
-	f := connFile{Version: 1, Connections: []connEntry{}}
-	keys := make([]string, 0, len(cs.conns))
-	for k := range cs.conns {
-		keys = append(keys, k)
-	}
-	slices.Sort(keys)
-	for _, k := range keys {
-		c := cs.conns[k]
-		f.Connections = append(f.Connections, connEntry{ConnInfo: c.info, Password: c.password})
-	}
-	b, err := json.Marshal(f)
+// saveEmpty writes the state with no account (to the Persister: sealed under the key service's conn/v1 key and
+// stored outside the VM, SealedConns).
+func (cs *connState) saveEmpty() error {
+	b, err := json.Marshal(connFile{Version: 1, Connections: []connEntry{}})
 	if err != nil {
 		return err
 	}
-	defer clear(b)
 	return cs.persist.Save(b)
 }
 
 // SealedConns is the connections' Persister on the VM (the keys plan Stage D): the "connections" state of a sealstate
 // Store under connKey (the key service's conn/v1 purpose, never a provider's), loaded now, and the Keeper that saves
-// it (run it; flush on SIGTERM). A state there that doesn't open is an error: the vault doesn't start over people's
-// accounts silently.
+// it (run it; flush on SIGTERM). v1 keeps it empty (EnableConns wipes an older release's accounts). A state there
+// that doesn't open is an error: the vault doesn't start over it silently.
 func SealedConns(ctx context.Context, b sealstate.Backend, connKey []byte, binding string, reg sealstate.Register) (Persister, *sealstate.Keeper, error) {
 	st, err := sealstate.New(b, connKey, binding)
 	if err != nil {
@@ -585,5 +545,5 @@ func SealedConns(ctx context.Context, b sealstate.Backend, connKey []byte, bindi
 // ConnState is the connections' sealed state name.
 const ConnState = "connections"
 
-// Persister keeps the connections across restarts (sealstate.Slot); nil: memory only.
+// Persister is the connections' sealed state (sealstate.Slot); nil: none.
 type Persister = safety.Persister

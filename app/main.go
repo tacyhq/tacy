@@ -88,20 +88,23 @@ import (
 	"github.com/tacyhq/tacy/identity"
 	"github.com/tacyhq/tacy/internal/procinfo"
 	"github.com/tacyhq/tacy/internal/tinfoil"
-	"github.com/tacyhq/tacy/kms"
-	"github.com/tacyhq/tacy/kms/client"
-	"github.com/tacyhq/tacy/kmsvm"
 	"github.com/tacyhq/tacy/proto"
+	"github.com/tacyhq/tacy/queue"
 	"github.com/tacyhq/tacy/relay"
 	"github.com/tacyhq/tacy/runner"
 	"github.com/tacyhq/tacy/safety"
 	"github.com/tacyhq/tacy/sealstate"
 	"github.com/tacyhq/tacy/trigger"
+	"github.com/tacyhq/tacy/unlock"
 	"github.com/tacyhq/tacy/vault"
 )
 
 type server struct {
 	platform Platform
+	// attester makes /attest's evidence through unlockd (proto.VersionAgent); nil: the platform's (local runs).
+	attester func(ctx context.Context, nonce, key []byte) (json.RawMessage, json.RawMessage, error)
+	// owner holds the spaces' schedule ownership rows at the Worker (unlock/owner.go); nil: this VM fires them all.
+	owner    *unlock.Owner
 	id       *ehbpidentity.Identity
 	agent    guard.Gateway    // gatewayd over its socket (the CVM), or this process's guard (local development)
 	rt       *harness.Runtime // the harness/v1 runtime the brain connects to
@@ -110,6 +113,7 @@ type server struct {
 	lim      Limits
 	quotes   chan struct{} // concurrent /attest limit
 	runsDone atomic.Int64  // finished runs (local platform stats only)
+	drain    drainState    // the Worker's drain before a switch (drain.go)
 
 	rec         *activity.Recorder // the runs' activity records (activity.go, docs/24)
 	safety      *safety.State      // signed policies and stop lists agentd verified (step 6, safety.go)
@@ -129,6 +133,12 @@ type server struct {
 	searchSlots  chan struct{}
 	searchMu     sync.Mutex
 	userSearches map[string]int
+	// saveState saves one sealed state now (Keeper.SaveNow; nil: memory only): an event's delivery is lasting
+	// before its task starts (triggers.go, V1-DESIGN §6.3).
+	saveState func(ctx context.Context, name string) error
+	// starts records once-only start keys as used (claimStart, review 2 M2): the side store's seen set, saved with
+	// saveState before the task runs. nil: the live map and the queue are the only record.
+	starts startClaimStore
 	// Triggers and approvals (triggers.go): the identity directory (keys v2's key log; nil until it reaches this VM, and then
 	// nothing that needs a person's signature works), approvals (POST /approvals) and triggers (POST /triggers).
 	dir       identity.Directory
@@ -226,13 +236,20 @@ func (s *server) attest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	pub := s.id.MarshalPublicKey()
-	quote, info, err := s.platform.Evidence(r.Context(), proto.ReportData(nonce, pub))
+	version := proto.Version
+	var quote, info json.RawMessage
+	if s.attester != nil { // a release with unlockd: it alone has dstack's socket, and quotes agentd's key under agentd's label
+		version = proto.VersionAgent
+		quote, info, err = s.attester(r.Context(), nonce, pub)
+	} else {
+		quote, info, err = s.platform.Evidence(r.Context(), proto.ReportData(nonce, pub))
+	}
 	if err != nil {
 		fail(w, 502, "attestation evidence unavailable")
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	writeJSON(w, 200, proto.Attestation{Version: proto.Version, Platform: s.platform.Name(),
+	writeJSON(w, 200, proto.Attestation{Version: version, Platform: s.platform.Name(),
 		Nonce: hex.EncodeToString(nonce), HPKEPublicKey: hex.EncodeToString(pub), HPKESuite: proto.HPKESuite,
 		Quote: quote, Info: info, Booted: s.booted.Format(time.RFC3339)})
 }
@@ -467,6 +484,7 @@ func userFrom(ctx context.Context) string {
 }
 
 func main() {
+	started := time.Now() // the tmpfs queue's heartbeat is compared with this (queue.Tmpfs.Started)
 	addr := flag.String("addr", ":8080", "listen address (TCP)")
 	listenUnix := flag.String("listen-unix", "", "serve HTTP on this unix socket instead of -addr (the CVM: gatewayd forwards the published port to it)")
 	listenUID := flag.Int("listen-uid", -1, "the only uid allowed to connect to -listen-unix (gatewayd's); -1: no check")
@@ -475,9 +493,10 @@ func main() {
 	platformName := flag.String("platform", "dstack", "dstack | local (no attestation; development only)")
 	sock := flag.String("dstack-sock", "/var/run/dstack.sock", "dstack guest agent socket")
 	schedules := flag.Bool("schedules", false, "local only: schedules in memory (on the CVM they wait for sealed state, the keys plan Stage C)")
+	tasksDir := flag.String("tasks-dir", "", "the task queue in this host tmpfs (made by setup for agentd alone, 0700; refused unless statfs says tmpfs), "+
+		"so open tasks survive a container restart (V1-DESIGN §6.2); empty: the queue is in memory and ends with the process")
 	stateMode := flag.String("state", "memory", "memory (nothing outlives the process) | relay (sealed snapshots at the chat Worker through gatewayd; needs -kms-key) | dir (local only: sealed snapshots in -state-dir)")
-	kmsKey := flag.String("kms-key", "", "the Tacy key service's id, ed25519:<base64> (the compose pins it): agentd's keys come from it through gatewayd")
-	kmsHosts := flag.Int("kms-hosts", 1, "how many key service replicas gatewayd knows (its -kms-url, in order)")
+	unlockSocket := flag.String("unlock-socket", "", "unlockd's socket for agentd: its keys (from the split-key unlock) and its quotes")
 	stateDir := flag.String("state-dir", "", "-state dir (local only): the directory for the sealed snapshots")
 	devStateKey := flag.String("dev-state-key", "", "-state dir (local only): 64 hex, the seed of local lasting keys")
 	runnerSocket := flag.String("runner-socket", "", "runnerd's socket: the brain runs in a gVisor sandbox it starts (required on dstack); empty: the brain in this process (local only)")
@@ -504,6 +523,9 @@ func main() {
 	var sf safety.Flags
 	sf.Register(flag.CommandLine)
 	flag.Parse()
+	if flag.NArg() != 0 { // the attested command line is flags only (review 2, M1)
+		log.Fatalf("agentd: unexpected arguments %q", flag.Args())
+	}
 	log.Printf("agentd: %s", procinfo.Line())
 	var relayKey ed25519.PublicKey
 	if *relayAuth != "" {
@@ -549,50 +571,39 @@ func main() {
 	// outlive the process at the chat Worker (-state relay), checked against the key service's generation register.
 	// Without it, keys made at boot and everything in memory (the quick path; local runs).
 	var keys KeySource = newBootKeys()
-	var kk *kmsvm.Keys
+	var uk *unlock.Keys
+	var uc *unlock.Client
 	var gwc *gateway.Client
 	if *gatewaySocket != "" {
 		gwc = &gateway.Client{Path: *gatewaySocket}
 	}
-	if *kmsKey != "" {
-		kid, err := kms.ParseID(*kmsKey)
-		if err != nil {
-			log.Fatalf("-kms-key: %v", err)
-		}
+	if *unlockSocket != "" {
 		if gwc == nil {
-			log.Fatal("-kms-key needs -gateway-socket: agentd has no network, gatewayd carries its calls to the key service")
+			log.Fatal("-unlock-socket needs -gateway-socket: agentd has no network, gatewayd carries its sealed state")
 		}
-		ev := client.Evidence(p.Evidence)
-		if p.Name() == "local" {
-			host, _ := os.Hostname()
-			ev = kmsvm.LocalEvidence("local-" + host)
-		}
-		kk, err = kmsvm.Boot(context.Background(), kmsvm.Config{KMSID: kid, Hosts: *kmsHosts, Platform: p.Name(),
-			Purposes: agentPurposes, Holder: "agentd", Evidence: ev,
-			Transport: func(h int) client.Transport { return gateway.KMSTransport{D: gwc, Host: h} }})
+		uc = &unlock.Client{Path: *unlockSocket}
+		k, err := uc.Wait(context.Background(), log.Printf, agentPurposes...)
 		if err != nil {
 			log.Fatalf("keys: %v", err)
 		}
-		keys = kmsKeys{kk}
-		go kk.Renew(context.Background(), 0)
+		uk, keys = k, unlockKeys{k}
 	} else if p.Name() == "dstack" && *stateMode != "memory" {
-		log.Fatal("-state relay needs -kms-key: sealed state needs the key service's lasting keys")
+		log.Fatal("-state relay needs -unlock-socket: sealed state needs the split-key unlock's lasting keys")
 	}
 	var backend sealstate.Backend
-	var reg sealstate.Register
+	var reg sealstate.Register // none: the Worker's compare-and-set on the generation (D1) is the register
 	switch *stateMode {
 	case "memory":
 	case "relay":
-		if kk == nil {
-			log.Fatal("-state relay needs -kms-key (the key service's state key, register and store certificate)")
+		if uk == nil {
+			log.Fatal("-state relay needs -unlock-socket (the state key and its store certificate)")
 		}
-		auth, err := kk.StoreAuth(PurposeState)
+		auth, err := uk.StoreAuth(PurposeState, nil)
 		if err != nil {
 			log.Fatalf("state: %v", err)
 		}
 		// The chat Worker's sealed-state API (vm-state.ts) at gatewayd's -state-url: ciphertext only.
 		backend = &sealstate.Relay{Base: "https://state", Client: gateway.StateHTTP{D: gwc}, Auth: auth}
-		reg = kk.Register(PurposeState)
 	case "dir":
 		seed, err := hex.DecodeString(*devStateKey)
 		if p.Name() != "local" || *stateDir == "" || err != nil || len(seed) != 32 {
@@ -607,6 +618,12 @@ func main() {
 		log.Fatalf("state: %v", err)
 	}
 	kept := boot.kept
+	if *tasksDir != "" {
+		if err := kept.useTasksQueue(queue.Tmpfs{Dir: *tasksDir, Started: started}); err != nil {
+			log.Fatalf("tasks: %v", err)
+		}
+		go kept.beatTasks(context.Background(), log.Printf)
+	}
 	// Step 6: the signed controls; their floors sealed with the rest when the state is kept (else they come back
 	// from the signed documents gatewayd pulls).
 	scfg, err := sf.Config(guard.ReleasePolicy(sf.Firm, p.Secret("TINFOIL_ENCLAVE")), "")
@@ -686,7 +703,7 @@ func main() {
 	}
 	// Once-only task ids (docs/27): a key from the KeySource, per firm.
 	idKey := boot.idKey
-	host := &guard.Host{RT: rt, GW: rg, IDKey: idKey}
+	host := &guard.Host{RT: rt, GW: rg, IDKey: idKey, Boot: kept.queueBoot}
 	// Permission prompts: actions that send data out wait for the person's answer; the policy may cap their settings.
 	// OnWait stops the run's running-time clock while a prompt waits for the person (v0.8.1).
 	rg.prompts = &guard.Prompts{Release: rt.Release, Emit: host.Emit, Cap: permissionCap(st), OnWait: sg.waiting,
@@ -730,10 +747,33 @@ func main() {
 			log.Printf("triggers: %d agent definitions loaded", n)
 		}
 	}
-	s := &server{platform: p, id: id, agent: rg, rt: rt, rec: rec, needKeys: p.Name() != "local" || kk != nil, booted: time.Now().UTC(),
+	s := &server{platform: p, id: id, agent: rg, rt: rt, rec: rec, needKeys: p.Name() != "local" || uk != nil, booted: time.Now().UTC(),
 		sched: newScheduler(lim), lim: lim, quotes: make(chan struct{}, 8), safety: st, gw: gw, safetySlots: make(chan struct{}, 4),
 		host: host, prompts: rg.prompts, dir: directory, approvals: rg.approvals, triggers: engine, holders: holders, results: results,
 		memory: memory, ledger: sg.ledger}
+	if uc != nil {
+		s.attester = uc.Attest
+		// Schedule ownership (unlock/owner.go): this VM fires a space's schedules only while it holds the space's row
+		// at the Worker, named by its attested instance id.
+		auth, err := uk.StoreAuth(PurposeState, nil)
+		if err != nil {
+			log.Fatalf("owner: %v", err)
+		}
+		inst, err := instanceID(context.Background(), uc)
+		if err != nil {
+			log.Fatalf("owner: %v", err)
+		}
+		s.owner = &unlock.Owner{Client: gateway.StateHTTP{D: gwc}, Auth: auth, ID: inst}
+	}
+	if kept.keeper != nil { // a change that must be lasting before what follows it runs (an event's delivery)
+		s.saveState = kept.keeper.SaveNow
+	}
+	if sc, ok := side.(startClaimStore); ok { // both side stores can (queue.Side, trigger.MemStore)
+		s.starts = sc
+	} else {
+		log.Fatal("tasks: the side store can't record start keys")
+	}
+	host.ClaimStart = s.claimStart
 	host.TriggeredDone = s.triggeredDone
 	host.Memory = s.scheduleMemory
 	host.Allows = s.policyAllows
@@ -741,7 +781,13 @@ func main() {
 	s.notify = kept.notify
 	host.TaskEnded = s.taskEnded
 	rg.prompts.OnWait = s.onWait(rg.prompts.OnWait, sg.spaceOf)
+	if cw := s.credWaits(); cw != nil { // a call waiting for its mail login stops the run's clock, as a prompt does
+		cw.OnWait = s.onWait(sg.waiting, sg.spaceOf)
+	}
 	rg.approvals.OnWait = s.onWait(rg.approvals.OnWait, sg.spaceOf)
+	if kept.tasksTmpfs != nil { // a drain an earlier process of this boot kept (drain.go), before any schedule fires
+		s.drain.restore(kept.tasksTmpfs.Dir, time.Now())
+	}
 	ctx := context.Background()
 	s.resumeTasks(ctx, ids, log.Printf)
 	if d, ok := p.(*dstack); ok { // the first /attest after a cold start then waits for one guest agent call, not two
@@ -753,7 +799,7 @@ func main() {
 		go s.pruneResults(ctx)
 	}
 	go sg.enforce(ctx, 2*time.Second)
-	go pruneActivity(ctx, astore)
+	go pruneActivity(ctx, astore, func() bool { return s.drain.on(time.Now()) })
 	go func() { // gatewayd (and through it the vault) gets agentd's documents now and every 10 s
 		for {
 			s.pushSafety()
@@ -796,6 +842,7 @@ func main() {
 	s.connectionRoutes(mux, id)                                  // Settings → Connections (connections.go, the connections contract)
 	s.notifyRoutes(mux, id)                                      // run notifications (notify.go, the schedules contract)
 	s.secretsRoutes(mux)                                         // whether vaultd has the API keys (secrets.go)
+	s.drainRoutes(mux)                                           // the Worker's drain before a switch (drain.go)
 	mux.HandleFunc("POST /schedules/handoff", s.scheduleHandoff) // sealed results to the relay (handoff.go, the schedules contract)
 	mux.HandleFunc("GET /activity", s.activityOut)               // sealed activity records, for the relay (docs/24)
 	// Signed policies and stop lists; the signature is the authorization. Only served when the compose pins a key
@@ -824,14 +871,6 @@ func main() {
 			<-sig
 			stop()
 			<-done
-			if kk != nil {
-				// Free agentd's own lease for the next boot (vaultd drops its own after its last save).
-				dctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-				if err := kk.Drop(dctx); err != nil {
-					log.Printf("keys: lease drop: %v (the next boot waits for it to expire)", err)
-				}
-				cancel()
-			}
 			os.Exit(0)
 		}()
 	}
@@ -853,7 +892,7 @@ func main() {
 		log.Fatalf("listen: %v", err)
 	}
 	log.Printf("agent VM listening on %s (platform %s, hpke key %s, relay key set: %v, key service: %v, search %s, brain %s, state %s, limits %+v)",
-		where, p.Name(), id.MarshalPublicKeyHex(), relayKey != nil, kk != nil, searchName, cmp.Or(*runnerSocket, "in process"),
+		where, p.Name(), id.MarshalPublicKeyHex(), relayKey != nil, uk != nil, searchName, cmp.Or(*runnerSocket, "in process"),
 		*stateMode, lim)
 	log.Fatal(srv.Serve(l))
 }
@@ -935,4 +974,20 @@ func localBrain(ctx context.Context, rt *harness.Runtime) {
 		brain.Run(ctx, bc)
 		time.Sleep(100 * time.Millisecond)
 	}
+}
+
+// instanceID is this VM's attested instance id (dstack's Info, through unlockd): its schedule ownership rows' owner.
+func instanceID(ctx context.Context, uc *unlock.Client) (string, error) {
+	_, info, err := uc.Attest(ctx, make([]byte, 32), make([]byte, 32))
+	if err != nil {
+		return "", err
+	}
+	var i struct {
+		InstanceID string `json:"instance_id"`
+		AppID      string `json:"app_id"`
+	}
+	if err := json.Unmarshal(info, &i); err != nil || i.InstanceID == "" {
+		return "", errors.New("no instance id in the attested info")
+	}
+	return i.AppID + "/" + i.InstanceID, nil
 }

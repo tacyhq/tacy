@@ -2,6 +2,7 @@ package verifier
 
 import (
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
@@ -45,9 +46,9 @@ var BootMeasurements = []BootMeasurement{
 			"mkosi-os-v0.6.5 (sha256 f33965e0…, as the release lists; its sha256sum.txt hashes to the os-image-hash; " +
 			"metadata.json: version 0.6.5, is_dev false, the same ovmf.fd as 0.6.4, cmdline with systemd.gpt_auto=0 " +
 			"systemd.import_credentials=no) and the live CVM's vm_config (prod9) with the image swapped; RTMR2 also " +
-			"recomputed by hand from the command line and initramfs (TestDstack065CmdlineFix). Not yet compared with a " +
-			"0.6.5 quote: the live CVM, moved in place to 0.6.5 by Phala on prod9 on 2026-11-20, is stopped while agents " +
-			"are paused",
+			"recomputed by hand from the command line and initramfs (TestDstack065CmdlineFix). Equal to two genuine 0.6.5 " +
+			"quotes of key_provider none throwaways on Phala prod2 (tdx.small), 2026-11-21, the second after a restart, " +
+			"with Intel's collateral (testdata/attest-065-none.json, attest-065-none-restart.json; TestRecorded065None)",
 	},
 }
 
@@ -121,6 +122,34 @@ var RetiredBootMeasurements = []BootMeasurement{
 			"the GHSA-c79w-3x5w-gmm5 fix) and the live CVM's vm_config (prod9) with the image swapped; equal to the quote " +
 			"of a throwaway CVM moved in place from 0.6.1 to 0.6.4 on Phala prod5, 2026-11-15 (testdata/attest-064.json)",
 	},
+}
+
+// keysMadeInVM: the attested key-provider event (its payload, decoded) is exactly {"name":"none","id":""}, keys
+// from a seed made inside the TD at boot.
+func keysMadeInVM(payload []byte) bool {
+	var kp struct {
+		Name *string `json:"name"`
+		ID   *string `json:"id"`
+	}
+	if json.Unmarshal(payload, &kp) != nil || kp.Name == nil || kp.ID == nil {
+		return false
+	}
+	return *kp.Name == KeyProviderNone && *kp.ID == ""
+}
+
+// osImageFromBoot is the OS image of the one pinned set q's MRTD and RTMR0-2 all match (key provider none, where
+// dstack measures no os-image-hash). No match: matchBoot's error, which names the registers that differ.
+func osImageFromBoot(q *tdx.Quote, sets []BootMeasurement) (string, error) {
+	got := [4]string{hex.EncodeToString(q.MrTd), hex.EncodeToString(q.Rtmrs[0]), hex.EncodeToString(q.Rtmrs[1]),
+		hex.EncodeToString(q.Rtmrs[2])}
+	for _, s := range sets {
+		if strings.EqualFold(s.MRTD, got[0]) && strings.EqualFold(s.RTMR0, got[1]) && strings.EqualFold(s.RTMR1, got[2]) &&
+			strings.EqualFold(s.RTMR2, got[3]) {
+			return s.OSImage, nil
+		}
+	}
+	_, err := matchBoot(q, "", sets)
+	return "", fmt.Errorf("no os-image-hash event (key provider none) and %w", err)
 }
 
 // matchBoot returns the set q's MRTD and RTMR0-2 match, which must also be for osImage (the os-image-hash the

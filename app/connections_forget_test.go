@@ -15,7 +15,6 @@ import (
 
 	"github.com/tacyhq/tacy/identity"
 	"github.com/tacyhq/tacy/runauth"
-	"github.com/tacyhq/tacy/vault"
 )
 
 // forget posts the relay's POST /connections/forget; relayed: as from inside its signed envelope.
@@ -72,32 +71,13 @@ func TestConnForgetVector(t *testing.T) {
 	}
 }
 
-// Account deletion removes the person's email connection (v0.21.0): the relay hands over the forget the browser signed
-// before the deletion, and the VM removes the space's connection only when the signature is by the identity key the
-// space's holder proved at its connect. Nothing else removes it: not the relay alone (unrelayed, or a forget signed by
-// anyone else, or for another space), and another person's connection stays. A connection made more than a day after
-// the forget was signed stays too.
+// Account deletion and the relay's forget in v1: the VM keeps no email login (the person's app keeps it, and the
+// item goes with the account), so a forget always finds nothing to remove and is done, whatever its signature;
+// malformed calls and calls that aren't the relay's are still refused.
 func TestConnForgetOnAccountDeletion(t *testing.T) {
 	e, _, v := newConnEnv(t)
-	other, _ := runauth.NewAsker()
-	connect := func(a *runauth.Asker) {
-		t.Helper()
-		_, out := e.connList(a)
-		key, _ := out["seal_key"].(string)
-		if code, out := e.call(e.s.connPut, e.connPutBody(a, key, connUser, connPass)); code != 200 {
-			t.Fatalf("put %d %v", code, out)
-		}
-	}
-	connected := func(a *runauth.Asker) bool {
-		_, err := v.ConnGet(a.Space, vault.ConnEmail)
-		return err == nil
-	}
-	connect(e.me)
-	connect(other)
 	now := time.Now()
 	mine := forgetBy(e.me.Key, e.me.Space, e.me.Identity, now)
-
-	// The relay's only: not from a browser's call.
 	if code, _ := e.forget(false, connForgetRequest{Forgets: []connForgetEntry{mine}}); code != 401 {
 		t.Fatalf("not relayed %d", code)
 	}
@@ -114,55 +94,13 @@ func TestConnForgetOnAccountDeletion(t *testing.T) {
 			t.Fatalf("%s: %d", name, w.Code)
 		}
 	}
-
-	// Refused, and nothing removed: signed by another person's key (as mine, or as theirs, for my space), or over
-	// another time than it says.
-	stale := mine
-	stale.SignedAt++
-	for name, f := range map[string]connForgetEntry{
-		"another key":        forgetBy(other.Key, e.me.Space, e.me.Identity, now),
-		"another identity":   forgetBy(other.Key, e.me.Space, other.Identity, now),
-		"another time":       stale,
-		"unsigned (made up)": {Space: e.me.Space, Identity: e.me.Identity, SignedAt: now.UnixMilli(), Sig: make([]byte, 64)},
-	} {
-		code, out := e.forget(true, connForgetRequest{Forgets: []connForgetEntry{f}})
-		if code != 200 || len(doneOf(out)) != 0 || out["refused"] != 1.0 || !connected(e.me) {
-			t.Fatalf("%s: %d %v", name, code, out)
-		}
-	}
-
-	// Mine, signed by my identity: my connection goes (memory and the sealed state with it), the other person's stays.
-	code, out := e.forget(true, connForgetRequest{Forgets: []connForgetEntry{mine}})
-	if code != 200 || !slices.Equal(doneOf(out), []string{e.me.Space}) || out["refused"] != 0.0 {
+	other, _ := runauth.NewAsker()
+	junk := connForgetEntry{Space: other.Space, Identity: other.Identity, SignedAt: 1, Sig: make([]byte, 64)}
+	code, out := e.forget(true, connForgetRequest{Forgets: []connForgetEntry{mine, junk}})
+	if code != 200 || !slices.Equal(doneOf(out), []string{e.me.Space, other.Space}) || out["refused"] != 0.0 {
 		t.Fatalf("forget %d %v", code, out)
 	}
-	if connected(e.me) || !connected(other) {
-		t.Fatalf("after the forget: mine %v, theirs %v", connected(e.me), connected(other))
-	}
-	if _, out := e.connList(e.me); len(out["connections"].([]any)) != 0 {
-		t.Fatalf("still listed %v", out)
-	}
-	// Sent again (the relay didn't hear the answer): done, nothing else changes.
-	if code, out := e.forget(true, connForgetRequest{Forgets: []connForgetEntry{mine}}); code != 200 || !slices.Equal(doneOf(out), []string{e.me.Space}) || !connected(other) {
-		t.Fatalf("again %d %v", code, out)
-	}
-	// A space with nothing connected is done whatever the signature (nothing to remove, nothing learned).
-	nobody, _ := runauth.NewAsker()
-	junk := connForgetEntry{Space: nobody.Space, Identity: nobody.Identity, SignedAt: 1, Sig: make([]byte, 64)}
-	if code, out := e.forget(true, connForgetRequest{Forgets: []connForgetEntry{junk}}); code != 200 || !slices.Equal(doneOf(out), []string{nobody.Space}) {
-		t.Fatalf("nothing connected %d %v", code, out)
-	}
-
-	// A forget signed two days before the connection (kept from a deletion that didn't go through): the connection
-	// stays; the forget is done with.
-	connect(e.me)
-	old := forgetBy(e.me.Key, e.me.Space, e.me.Identity, now.Add(-48*time.Hour))
-	if code, out := e.forget(true, connForgetRequest{Forgets: []connForgetEntry{old}}); code != 200 || !slices.Equal(doneOf(out), []string{e.me.Space}) || !connected(e.me) {
-		t.Fatalf("an older forget %d %v, connected %v", code, out, connected(e.me))
-	}
-	// A browser clock up to a day slow still covers the connection it means.
-	slow := forgetBy(e.me.Key, e.me.Space, e.me.Identity, now.Add(-20*time.Hour))
-	if code, out := e.forget(true, connForgetRequest{Forgets: []connForgetEntry{slow}}); code != 200 || !slices.Equal(doneOf(out), []string{e.me.Space}) || connected(e.me) {
-		t.Fatalf("a slow clock %d %v, connected %v", code, out, connected(e.me))
+	if l := v.ConnList(e.me.Space); len(l) != 0 {
+		t.Fatalf("listed %v", l)
 	}
 }

@@ -856,6 +856,11 @@ func (s *Side) See(trigger, delivery string, until time.Time) (bool, error) {
 	return n == 1, nil
 }
 
+func (s *Side) Unsee(trigger, delivery string) error {
+	_, err := s.db.Exec(`DELETE FROM seen WHERE trigger = ? AND delivery = ?`, trigger, delivery)
+	return err
+}
+
 func (s *Side) Seen(trigger, delivery string) (bool, error) {
 	var n int
 	err := s.db.QueryRow(`SELECT count(*) FROM seen WHERE trigger = ? AND delivery = ?`, trigger, delivery).Scan(&n)

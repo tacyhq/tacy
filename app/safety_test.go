@@ -87,6 +87,9 @@ type safeOpts struct {
 	stored *guard.StoredConfig
 	// mail is the guard's way to the person's email (a stand-in IMAP server and an in-process vault); nil: none.
 	mail *guard.MailConfig
+	// queue is the task queue (nil: in memory); idKey the task host's once-only id key (nil: none).
+	queue harness.Store
+	idKey []byte
 }
 
 func newSafeEnvWith(t *testing.T, o safeOpts, replies ...string) *safeEnv {
@@ -157,7 +160,11 @@ func newSafeEnvWith(t *testing.T, o safeOpts, replies ...string) *safeEnv {
 	skb, _ := id.PrivateKey().Bytes()
 	e.vmKey, _ = ecdh.X25519().NewPrivateKey(skb)
 	rg := newRecGateway(sg, e.rec, e.vmKey) // the recorder on top, as in main (runs without record_to aren't recorded)
-	rt := newRuntime(rg, harness.NewMemStore(), lim)
+	var q harness.Store = harness.NewMemStore()
+	if o.queue != nil {
+		q = o.queue
+	}
+	rt := newRuntime(rg, q, lim)
 	sg.cancel = func(id, reason string) { rt.Cancel(id, reason) }
 	ctx, cancel := context.WithCancel(context.Background())
 	if o.behindRunner {
@@ -171,6 +178,10 @@ func newSafeEnvWith(t *testing.T, o safeOpts, replies ...string) *safeEnv {
 	go sg.enforce(ctx, 200*time.Millisecond)
 	e.s = &server{platform: local{}, id: id, agent: rg, rt: rt, rec: e.rec, booted: time.Now(), sched: newScheduler(lim),
 		lim: lim, quotes: make(chan struct{}, 4), safety: st, gw: g, safetySlots: make(chan struct{}, 2)}
+	if o.idKey != nil {
+		e.s.host = &guard.Host{RT: rt, GW: rg, IDKey: o.idKey}
+		e.s.host.TaskEnded = e.s.taskEnded
+	}
 	return e
 }
 

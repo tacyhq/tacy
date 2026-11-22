@@ -81,7 +81,7 @@ func personLinks(ms []proto.Message) []string {
 		if m.Role != "user" {
 			continue
 		}
-		for _, raw := range personLinkRe.FindAllString(m.Content, -1) {
+		for _, raw := range personLinkRe.FindAllString(withoutAttachments(m.Content), -1) { // an attachment's addresses aren't the person's (private.go)
 			raw = strings.TrimRight(raw, ".,;:!?)]}")
 			if strings.HasPrefix(strings.ToLower(raw), "www.") {
 				add("https://" + raw)

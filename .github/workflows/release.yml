@@ -58,12 +58,22 @@ jobs:
           else echo "KMS=" >> "$GITHUB_ENV"; fi
       - name: test
         run: go vet ./... && go test -short ./...
+      # gatewayd's image carries the patched cloudflared: its source is fetched here (git is on the runner, not in the
+      # Go container), by the pinned upstream commit with Tacy's patch (fetch.sh checks both), and both builds below
+      # rebuild it from that source, never a cached binary (as scripts/reproduce.sh does).
+      - name: cloudflared's source, by its pinned commit
+        if: env.KIND == 'vm'
+        run: |
+          mkdir "$RUNNER_TEMP/cfd"
+          sh cmd/compose/cloudflared/fetch.sh "$RUNNER_TEMP/cfd"
+          { echo "TACY_CLOUDFLARED_SRC=$RUNNER_TEMP/cfd/src"; echo "TACY_CLOUDFLARED_FRESH=1"; } >> "$GITHUB_ENV"
       - name: compose.yaml, release.json and the images, built in the pinned Go container
         if: env.KIND == 'vm'
         run: |
           image=$(grep -o 'golang:[^"]*@sha256:[0-9a-f]*' cmd/compose/main.go)
           mkdir -p dist
-          docker run --rm -v "$PWD:/src" -w /src -e GOFLAGS=-mod=readonly "$image" \
+          docker run --rm -v "$PWD:/src" -v "$RUNNER_TEMP/cfd:/cfd:ro" -w /src -e GOFLAGS=-mod=readonly \
+            -e TACY_CLOUDFLARED_SRC=/cfd/src -e TACY_CLOUDFLARED_FRESH=1 "$image" \
             go run ./cmd/compose --check --oci dist/oci --manifest dist/release.json --version "$GITHUB_REF_NAME" --commit "$GITHUB_SHA"
           sudo chown -R "$(id -u):$(id -g)" dist # the container wrote them as root (some blobs 0600)
           cp compose.yaml dist/compose.yaml

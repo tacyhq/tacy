@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 	"testing"
 
@@ -22,6 +21,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/types"
 	"go.yaml.in/yaml/v3"
 
+	agentvm "github.com/tacyhq/tacy"
 	"github.com/tacyhq/tacy/gateway"
 	"github.com/tacyhq/tacy/safety"
 	"github.com/tacyhq/tacy/sandbox"
@@ -34,11 +34,22 @@ func TestComposeCurrent(t *testing.T) {
 	if testing.Short() {
 		t.Skip("builds the binaries and fetches the base image")
 	}
-	if p := pinned(); p.relayAuthKey == "" || p.kmsID == "" || len(p.kmsURLs) == 0 {
-		t.Skip("RELEASE BLOCKER: relayAuthKey, kmsID and kmsURLs aren't pinned yet (the release's relay key and the key " +
+	if p := pinned(); p.relayAuthKey == "" || p.kmsID == "" {
+		t.Skip("RELEASE BLOCKER: relayAuthKey and kmsID aren't pinned yet (the release's relay key and the key " +
 			"service's genesis); compose.yaml is regenerated with them")
 	}
 	os.Chdir("../..")
+	cur, _ := os.ReadFile("compose.yaml")
+	slot, err := committedSlot(cur)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := setReleaseTunnel(false, slot); err != nil { // what main sets for the release (cloudflared.go)
+		t.Fatal(err)
+	}
+	defer func() {
+		cfd.bin, cfd.sha, cfd.config, cfd.access, cfd.secret, cfd.noListen = nil, "", nil, "", "", false
+	}()
 	rel, err := build()
 	if err != nil {
 		t.Fatal(err)
@@ -47,7 +58,6 @@ func TestComposeCurrent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cur, _ := os.ReadFile("compose.yaml")
 	if string(cur) != out {
 		t.Fatal("compose.yaml is stale: run go run ./cmd/compose")
 	}
@@ -68,7 +78,7 @@ func readCompose(t *testing.T) []byte {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p := pinned(); p.relayAuthKey != "" && p.kmsID != "" && len(p.kmsURLs) > 0 {
+	if p := pinned(); p.relayAuthKey != "" && p.kmsID != "" {
 		return out
 	}
 	gen, err := generateWith(releaseOf(t, out), devPins)
@@ -90,7 +100,7 @@ func releaseOf(t *testing.T, compose []byte) *Release {
 		t.Fatal(err)
 	}
 	r := &Release{}
-	for svc, bin := range map[string]string{"setup": "setup", "agentd": "agentd", "runner": "runnerd", "agentvm": "gatewayd", "vaultd": "vaultd"} {
+	for svc, bin := range map[string]string{"setup": "setup", "agentd": "agentd", "runner": "runnerd", "agentvm": "gatewayd", "vaultd": "vaultd", "unlockd": "unlockd"} {
 		r.Images = append(r.Images, Image{Name: bin, Ref: doc.Services[svc].Image})
 	}
 	for _, ln := range strings.Split(string(compose), "\n") {
@@ -124,7 +134,10 @@ type service struct {
 	MemLimit     string   `yaml:"mem_limit"`
 	MemswapLimit string   `yaml:"memswap_limit"`
 	PidsLimit    int      `yaml:"pids_limit"`
-	Logging      struct {
+	Ulimits      struct {
+		Core *int `yaml:"core"`
+	} `yaml:"ulimits"`
+	Logging struct {
 		Driver string `yaml:"driver"`
 	} `yaml:"logging"`
 }
@@ -163,6 +176,10 @@ func TestComposeNothingOnTheDisk(t *testing.T) {
 		if s.Logging.Driver != "none" {
 			t.Errorf("%s: logging %q", name, s.Logging.Driver)
 		}
+		// No core dumps (a crash would write the process's memory to its writable layer on the disk).
+		if s.Ulimits.Core == nil || *s.Ulimits.Core != 0 {
+			t.Errorf("%s: ulimits core isn't 0", name)
+		}
 		for k, v := range s.Environment {
 			if k != "HOME" || v != "/tmp" || name != "agentvm" {
 				t.Errorf("%s: env %s", name, k)
@@ -171,7 +188,13 @@ func TestComposeNothingOnTheDisk(t *testing.T) {
 		for _, v := range s.Volumes {
 			src := strings.SplitN(v, ":", 2)[0]
 			if strings.HasPrefix(src, "/") {
-				if src != "/var/run/dstack.sock" || (name != "agentd" && name != "vaultd") {
+				// Only unlockd binds a host path: dstack's socket and the host tmpfs of its keyring (TD memory); with
+				// key_provider none setup binds that tmpfs too, to give it to unlockd's uid (no pre-launch script).
+				ok := name == "unlockd" && (src == "/var/run/dstack.sock" || src == verifier.UnlockCacheDir)
+				ok = ok || (name == "setup" && src == verifier.UnlockCacheDir && !agentvm.KMSFallback)
+				// agentd's task queue (V1-DESIGN §6.2): the host tmpfs setup makes for agentd alone (key_provider none).
+				ok = ok || ((name == "setup" || name == "agentd") && src == verifier.TasksDir && !agentvm.KMSFallback)
+				if !ok {
 					t.Errorf("%s: host path %s", name, v)
 				}
 			} else if _, ok := vols[src]; !ok {
@@ -198,43 +221,52 @@ func TestComposeNothingOnTheDisk(t *testing.T) {
 	}
 }
 
-// the keys plan §2.4: agentd and vaultd take their keys from the pinned key service only, through gatewayd's fixed calls to
-// the pinned replicas; agentd keeps its state at the chat Worker (sealed); nothing from the provider (no GetKey user,
-// dstack's socket for quotes only). The verifier reads the same flags (checkKMSID).
+// the keys plan §11.2: agentd and vaultd take their keys from unlockd only, over their own sockets; unlockd pins the KMS
+// id and reaches the holders only through gatewayd's unlock socket; gatewayd reads the holders' URLs from the
+// policy (checked against the same KMS id) on our domain only; no key service (kmsd) is named; agentd keeps its state
+// at the chat Worker (sealed). Only unlockd has dstack's socket. The verifier reads the same flags (checkKMSID,
+// UnlockdRules).
 func TestComposeKeyService(t *testing.T) {
 	p := pinned()
 	if p.kmsID == "" {
 		p = devPins
 	}
 	svcs := services(t)
-	agentd, vaultd, gw := " "+strings.Join(svcs["agentd"].Command, " ")+" ", " "+strings.Join(svcs["vaultd"].Command, " ")+" ",
-		" "+strings.Join(svcs["agentvm"].Command, " ")+" "
-	hosts := strconv.Itoa(len(p.kmsURLs))
-	for name, cmd := range map[string]string{"agentd": agentd, "vaultd": vaultd} {
-		if !strings.Contains(cmd, " -kms-key "+p.kmsID+" ") || !strings.Contains(cmd, " -kms-hosts "+hosts+" ") || strings.Contains(cmd, "-kms-url") {
-			t.Errorf("%s: %s", name, cmd)
-		}
+	cmd := func(s string) string { return " " + strings.Join(svcs[s].Command, " ") + " " }
+	agentd, vaultd, gw, ud := cmd("agentd"), cmd("vaultd"), cmd("agentvm"), cmd("unlockd")
+	if !strings.Contains(agentd, " -unlock-socket /run/tacy/unlock/agentd.sock ") || !strings.Contains(agentd, " -state relay ") ||
+		strings.Contains(agentd, "-kms-") {
+		t.Errorf("agentd: %s", agentd)
 	}
-	if !strings.Contains(agentd, " -state relay ") || !strings.Contains(vaultd, " -ops-socket /run/tacy/ops/gateway.sock ") {
-		t.Errorf("agentd %s / vaultd %s", agentd, vaultd)
+	if !strings.Contains(vaultd, " -unlock-socket /run/tacy/unlockv/vaultd.sock ") || !strings.Contains(vaultd, " -ops-socket /run/tacy/ops/gateway.sock ") ||
+		strings.Contains(vaultd, "-kms-") {
+		t.Errorf("vaultd: %s", vaultd)
 	}
-	for _, u := range p.kmsURLs {
-		if !strings.Contains(gw, " -kms-url "+u+" ") || !strings.HasPrefix(u, "https://") {
-			t.Errorf("gatewayd lacks -kms-url %s", u)
-		}
+	if !strings.Contains(ud, " -kms-key "+p.kmsID+" ") || !strings.Contains(ud, " -gateway-socket /run/tacy/unlockgw/gateway.sock ") ||
+		!strings.Contains(ud, " -agent-uid "+agentdUID+" ") || !strings.Contains(ud, " -vault-uid "+vaultdUID+" ") ||
+		!strings.Contains(ud, " -cache-dir "+verifier.UnlockCacheDir+" ") || strings.Contains(ud, "-dev-") {
+		t.Errorf("unlockd: %s", ud)
 	}
-	if !strings.Contains(gw, " -state-url "+p.stateURL+" ") || !strings.Contains(gw, " -ops-socket /run/tacy/ops/gateway.sock -vault-uid "+vaultdUID+" ") ||
-		strings.Contains(gw, "-kms-key") || strings.Contains(gw, "-dev-fixed-http") {
+	if !strings.Contains(gw, " -state-url "+p.stateURL+" ") || !strings.Contains(gw, " -kms-key "+p.kmsID+" ") ||
+		!strings.Contains(gw, " -unlock-domain "+unlockDomain+" ") || !strings.Contains(gw, " -unlockd-uid "+unlockdUID+" ") ||
+		strings.Contains(gw, "-kms-url") || strings.Contains(gw, "-dev-fixed-http") {
 		t.Errorf("gatewayd: %s", gw)
 	}
+	for name, s := range svcs {
+		for _, v := range s.Volumes {
+			if strings.HasPrefix(v, "/var/run/dstack.sock") && name != "unlockd" {
+				t.Errorf("%s mounts dstack's socket", name)
+			}
+		}
+	}
 	keys, urls, err := composeKMSArgs(string(readCompose(t)))
-	if err != nil || len(keys) != 1 || keys[0] != p.kmsID || len(urls) != len(p.kmsURLs) {
+	if err != nil || len(keys) != 1 || keys[0] != p.kmsID || len(urls) != 0 {
 		t.Errorf("what the verifier reads: %v %v %v", keys, urls, err)
 	}
 	// Without the pins nothing is generated.
-	for _, bad := range []releasePins{{relayAuthKey: devPins.relayAuthKey}, {relayAuthKey: devPins.relayAuthKey, kmsID: devPins.kmsID, stateURL: "x"}} {
+	for _, bad := range []releasePins{{relayAuthKey: devPins.relayAuthKey}, {relayAuthKey: devPins.relayAuthKey, kmsID: devPins.kmsID}} {
 		if _, err := generateWith(releaseOf(t, readCompose(t)), bad); err == nil {
-			t.Errorf("a compose without the key service pins: %+v", bad)
+			t.Errorf("a compose without the key pins: %+v", bad)
 		}
 	}
 }
@@ -264,8 +296,8 @@ func composeKMSArgs(compose string) (keys, urls []string, err error) {
 	return keys, urls, nil
 }
 
-// The process layout (docs/21, docs/22): only gatewayd (service agentvm) has a network; agentd, the runner (the
-// brain's gVisor sandbox), vaultd and setup have none. The keys go to vaultd only, the run token to agentd only.
+// The process layout of docs/21 and the split-key unlock: only gatewayd (service agentvm) has a network; agentd,
+// the runner (the brain's gVisor sandbox), vaultd, unlockd and setup have none. Only unlockd has dstack's socket. The keys go to vaultd only, the run token to agentd only.
 // Every image is ours, by digest, and runs the binary of its name. Only setup adds capabilities; only the runner
 // has Docker's seccomp profile off.
 func TestComposeLayout(t *testing.T) {
@@ -278,7 +310,8 @@ func TestComposeLayout(t *testing.T) {
 		t.Fatal(err)
 	}
 	byName := services(t)
-	binOf := map[string]string{"setup": "setup", "agentd": "agentd", "runner": "runnerd", "agentvm": "gatewayd", "vaultd": "vaultd"}
+	binOf := map[string]string{"setup": "setup", "agentd": "agentd", "runner": "runnerd", "agentvm": "gatewayd", "vaultd": "vaultd",
+		"unlockd": "unlockd"}
 	if len(byName) != len(binOf) || len(images) != len(binOf) {
 		t.Fatalf("%d services", len(byName))
 	}
@@ -293,8 +326,8 @@ func TestComposeLayout(t *testing.T) {
 		if (s.NetworkMode == "none") != (name != "agentvm") {
 			t.Errorf("%s: network_mode %q", name, s.NetworkMode)
 		}
-		if (len(s.Ports) > 0) != (name == "agentvm") {
-			t.Errorf("%s: published ports", name)
+		if len(s.Ports) > 0 { // vm-v1: the tunnel is the only way in, so not even gatewayd publishes one
+			t.Errorf("%s: published ports %v", name, s.Ports)
 		}
 		sec := []string{"no-new-privileges:true"}
 		if name == "runner" {
@@ -303,7 +336,9 @@ func TestComposeLayout(t *testing.T) {
 		if !s.ReadOnly || len(s.CapDrop) != 1 || s.CapDrop[0] != "ALL" || strings.Join(s.SecurityOpt, ",") != strings.Join(sec, ",") {
 			t.Errorf("%s isn't hardened: %v", name, s.SecurityOpt)
 		}
-		if (len(s.CapAdd) > 0) != (name == "setup") {
+		// setup's three, and gatewayd's launcher's two (review H1: it starts gatewayd and cloudflared as their uids).
+		if (len(s.CapAdd) > 0) != (name == "setup" || name == "agentvm") ||
+			name == "agentvm" && strings.Join(s.CapAdd, ",") != "SETGID,SETUID" {
 			t.Errorf("%s: cap_add %v", name, s.CapAdd)
 		}
 		for _, env := range []string{"TINFOIL_API_KEY", "TAVILY_API_KEY", "BRAVE_SEARCH_API_KEY", "EXA_API_KEY", "AGENT_VM_TOKEN", "SEARCH_PROVIDER"} {
@@ -312,7 +347,7 @@ func TestComposeLayout(t *testing.T) {
 			}
 		}
 		for _, v := range s.Volumes {
-			if strings.Contains(v, "dstack.sock") && name != "agentd" && name != "vaultd" {
+			if strings.Contains(v, "dstack.sock") && name != "unlockd" {
 				t.Errorf("%s mounts dstack's socket", name)
 			}
 		}
@@ -322,23 +357,29 @@ func TestComposeLayout(t *testing.T) {
 			}
 			continue
 		}
-		// No long-running process is root; each waits for setup.
-		if s.User == "" || strings.HasPrefix(s.User, "0") || s.DependsOn["setup"].Condition != "service_completed_successfully" ||
+		// No long-running process is root but gatewayd's launcher (which runs gatewayd as gatewaydUID, with -tunnel-uid);
+		// each waits for setup.
+		launcher := name == "agentvm" && s.User == "0:0" && strings.Contains(strings.Join(s.Command, " "), "-tunnel-uid 10006 ")
+		if s.User == "" || strings.HasPrefix(s.User, "0") && !launcher || s.DependsOn["setup"].Condition != "service_completed_successfully" ||
 			s.Restart != "unless-stopped" {
 			t.Errorf("%s: user %q, depends_on %v, restart %q", name, s.User, s.DependsOn, s.Restart)
 		}
 	}
-	if !strings.Contains(strings.Join(byName["agentd"].Volumes, " "), "/var/run/dstack.sock:/var/run/dstack.sock") {
-		t.Error("agentd doesn't mount dstack's socket")
+	if !strings.Contains(strings.Join(byName["unlockd"].Volumes, " "), "/var/run/dstack.sock:/var/run/dstack.sock") {
+		t.Error("unlockd doesn't mount dstack's socket")
+	}
+	if byName["unlockd"].User != unlockdUID+":"+unlockdUID || strings.Join(byName["unlockd"].GroupAdd, ",") != gatewaydUID ||
+		strings.Join(byName["vaultd"].GroupAdd, ",") != unlockdUID {
+		t.Errorf("unlockd's uid or groups: %v %v %v", byName["unlockd"].User, byName["unlockd"].GroupAdd, byName["vaultd"].GroupAdd)
 	}
 	agentd, gw, setup := byName["agentd"], byName["agentvm"], strings.Join(byName["setup"].Command, " ")
 	if agentd.User != agentdUID+":"+agentdUID || !strings.Contains(strings.Join(gw.Command, " "), "-agent-uid "+agentdUID+" ") {
 		t.Error("agentd's uid and gatewayd's -agent-uid differ")
 	}
-	if byName["runner"].User != runnerdUID+":"+agentdUID || byName["vaultd"].User != vaultdUID+":"+gatewaydUID || gw.User != gatewaydUID+":"+gatewaydUID {
+	if byName["runner"].User != runnerdUID+":"+agentdUID || byName["vaultd"].User != vaultdUID+":"+gatewaydUID || gw.User != "0:0" {
 		t.Error("uids")
 	}
-	if strings.Join(agentd.GroupAdd, ",") != gatewaydUID {
+	if strings.Join(agentd.GroupAdd, ",") != gatewaydUID+","+unlockdUID {
 		t.Errorf("agentd's groups %v", agentd.GroupAdd)
 	}
 	// The socket directories, set by setup (and by their tmpfs options).
@@ -350,9 +391,10 @@ func TestComposeLayout(t *testing.T) {
 	}
 	// Each socket directory is mounted only by its two containers (and setup).
 	for vol, who := range map[string]string{"agentsock": "agentd agentvm setup", "vaultsock": "agentvm setup vaultd",
-		"runnersock": "agentd runner setup"} {
+		"runnersock": "agentd runner setup", "unlockagent": "agentd setup unlockd", "unlockvault": "setup unlockd vaultd",
+		"unlockgw": "agentvm setup unlockd"} {
 		var got []string
-		for _, name := range []string{"agentd", "agentvm", "runner", "setup", "vaultd"} {
+		for _, name := range []string{"agentd", "agentvm", "runner", "setup", "unlockd", "vaultd"} {
 			for _, v := range byName[name].Volumes {
 				if strings.HasPrefix(v, vol+":") {
 					got = append(got, name)
@@ -680,7 +722,7 @@ func flowArgs(a []string) string {
 // the keys plan §3.4: agentd checks the relay's signatures with the pinned public key (no token in any environment), and
 // gatewayd resolves names over TLS to the pinned resolver. The generator refuses to write a compose without the key.
 func TestTransportArgs(t *testing.T) {
-	a := " " + strings.Join(agentdArgs("ed25519:k", devPins.kmsID, 2), " ") + " "
+	a := " " + strings.Join(agentdArgs("ed25519:k"), " ") + " "
 	if !strings.Contains(a, " -relay-auth-key ed25519:k ") || !strings.Contains(a, " -listen-unix /run/tacy/agent/http.sock ") {
 		t.Fatalf("agentd: %s", a)
 	}

@@ -82,9 +82,15 @@ func (g *Guard) Action(ctx context.Context, ti *harness.TaskInfo, id string, req
 		g.record(Egress{Task: ti.ID, Action: id, Op: req.Name, Decision: "denied", Rule: NoEgressDenied})
 		return noEgressDenial(req.Name), nil
 	}
+	// The rule of two (the v1 design §5.6 R2): an unattended run that may read the person's mail never reaches the
+	// open web, before any other check, whatever its settings, its definition or a grant say.
+	if RuleOfTwo(t.opts, ti) {
+		g.record(Egress{Task: ti.ID, Action: id, Op: req.Name, Decision: "denied", Rule: PermRuleOfTwo})
+		return PermissionDenial(PermissionKind(req.Name), PermRuleOfTwo), nil
+	}
 	// The person's files never leave the VM (files_guard.go): a search or page read whose arguments carry a passage
 	// of them is refused before the person is asked and before anything is sent.
-	if t.fileTextInArgs(req.Args) {
+	if t.fileTextInArgs(req.Args) || attachmentTextInArgs(ti, req.Args) { // and of an attachment (private.go)
 		g.record(Egress{Task: ti.ID, Action: id, Op: req.Name, Decision: "denied", Rule: FileTextDenied})
 		return fileTextDenial(req.Name), nil
 	}

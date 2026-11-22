@@ -2,7 +2,6 @@ package guard
 
 import (
 	"bytes"
-	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -1082,7 +1081,7 @@ func (g *Guard) readCall(ctx context.Context, t *task, rc *ReaderConfig, d *read
 	if rc.Spans {
 		spans = splitSpansFor(segs, rc.Files) // a review's file part or whole file
 	}
-	raw := rc.request(d, t.opts.Question, spans, cmp.Or(t.opts.CacheSecret, g.cfg.CacheSecret))
+	raw := rc.request(d, t.opts.Question, spans, g.cacheScope(t.opts))
 	stream, err := g.cfg.Up.Stream(ctx, raw)
 	if err != nil {
 		FactsFrom(ctx).model(0, 0)

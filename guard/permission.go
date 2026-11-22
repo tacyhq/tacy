@@ -47,7 +47,40 @@ const (
 	// not asked: on a tainted task, a page address the model composed (ComposedFetch): never opened, whatever the
 	// setting or a grant says; the model is told to open results by number.
 	PermNotFromResults = "not_from_results"
+	// not asked: an unattended run that may read the person's mail (RuleOfTwo) never reaches the open web, whatever
+	// the settings, the definition's allow or a grant say (the v1 design §5.6 R2).
+	PermRuleOfTwo = "rule_of_two"
 )
+
+// RuleOfTwo: an unattended task (Via ViaTrigger) that may read the person's mail: its mail was reached (a done mail
+// action in its journal: MailTask), its start offers a mail tool, its settings name a mail kind, or its definition
+// lists one (MailDef). Such a task never gets any web kind (web.search, web.fetch, web.images): private data and the
+// open web don't meet without a person there to approve each query (the rule of two). Fails closed: an unattended
+// task with no start counts. Checked in gatewayd before any egress (Action, permit) and by agentd before asking
+// (Prompts.Hold); a prompt can't change it.
+func RuleOfTwo(opts TaskOptions, ti *harness.TaskInfo) bool {
+	if opts.Via != ViaTrigger {
+		return false
+	}
+	if opts.MailDef || ti == nil || ti.Start == nil || MailTask(ti) {
+		return true
+	}
+	for _, d := range ti.Start.Tools {
+		if isMailAction(d.Name) {
+			return true
+		}
+	}
+	for k := range opts.Permissions {
+		if isMailAction(k) {
+			return true
+		}
+	}
+	return false
+}
+
+// ruleOfTwoError is what the model sees for a PermRuleOfTwo web action.
+const ruleOfTwoError = PermRuleOfTwo + ": this unattended run can read the person's email, so it can't use the web " +
+	"(web search, page reading, image search); nothing was sent. Answer with what you have, and say you didn't check the web."
 
 // NotFromResultsError is what the model sees for a PermNotFromResults fetch.
 const NotFromResultsError = "not_from_results: only open addresses from your search results (their [n]) or the person's message; " +
@@ -323,6 +356,9 @@ func (g *Guard) permit(ctx context.Context, t *task, ti *harness.TaskInfo, id st
 	if kind == "" {
 		return req.Args, nil
 	}
+	if !isMailAction(kind) && RuleOfTwo(t.opts, ti) { // first, whatever a setting or a grant says
+		return nil, PermissionDenial(kind, PermRuleOfTwo)
+	}
 	sources := t.tools.sourceMap()
 	value, ok := Outgoing(req.Name, req.Args, sources)
 	if !ok {
@@ -348,14 +384,17 @@ func (g *Guard) permit(ctx context.Context, t *task, ti *harness.TaskInfo, id st
 	if ComposedFetch(req.Name, req.Args, sources, t.opts.Links, t.taintFor(ti, req.Call)) {
 		return nil, PermissionDenial(kind, PermNotFromResults)
 	}
-	if setting == safety.PermAlways {
+	// After private content (an attachment, the person's mail or files) a search goes out only on the person's
+	// approval of that one query (private.go): Always allow and an "always" grant don't cover it.
+	private := PrivateSearch(kind, ti)
+	if setting == safety.PermAlways && !private {
 		return args, nil
 	}
 	gr := GrantFrom(ctx)
 	switch {
 	case gr == nil || gr.Task != ti.ID || gr.Kind != kind || !gr.Verify(t.opts.RunSecret):
 		return nil, PermissionDenial(kind, "")
-	case gr.Decision == DecideOnce && gr.Request == id, gr.Decision == DecideAlways:
+	case gr.Decision == DecideOnce && gr.Request == id, gr.Decision == DecideAlways && !private:
 	default:
 		return nil, PermissionDenial(kind, "")
 	}
@@ -378,6 +417,9 @@ func (g *Guard) permit(ctx context.Context, t *task, ti *harness.TaskInfo, id st
 func PermissionDenial(kind, outcome string) *harness.ActionResult {
 	if outcome == PermNotFromResults {
 		return &harness.ActionResult{Status: harness.ActionDenied, Error: NotFromResultsError}
+	}
+	if outcome == PermRuleOfTwo {
+		return &harness.ActionResult{Status: harness.ActionDenied, Error: ruleOfTwoError}
 	}
 	what := kindLabel(kind)
 	checked := "didn't check the web for this"

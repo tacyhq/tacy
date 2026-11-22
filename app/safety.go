@@ -48,8 +48,11 @@ type safeGateway struct {
 	ledger *safety.Ledger
 	cancel func(task, reason string) // the runtime's Cancel (set once the runtime exists)
 	// firstHeard: how long a start waits, right after boot, for the first delivery of the operator's list (the pull
-	// reaches agentd within seconds of gatewayd starting); 0: no wait.
+	// reaches agentd within seconds of gatewayd starting); 0: no wait. The same window, counted from started, holds
+	// the kill switch's staleness cancels and lets a resumed task's calls wait (inGrace).
 	firstHeard time.Duration
+	// started is when this process's safety gateway was made (newSafeGateway): the start of the first-heard window.
+	started time.Time
 	// runTimeout is the chat's running-time limit (guard.RunTimeout; 0: that). Tests shorten it.
 	runTimeout time.Duration
 	// agentWork overrides a built-in agent's running-time limit (guard.AgentWork) by id. Tests shorten it.
@@ -74,7 +77,7 @@ var (
 )
 
 func newSafeGateway(inner guard.Gateway, st *safety.State, ledger *safety.Ledger) *safeGateway {
-	return &safeGateway{inner: inner, st: st, ledger: ledger, tasks: map[string]*safeTask{}}
+	return &safeGateway{inner: inner, st: st, ledger: ledger, tasks: map[string]*safeTask{}, started: time.Now()}
 }
 
 // people's wording for each code; the code itself goes in the event too.
@@ -249,6 +252,29 @@ func (g *safeGateway) waitFirstHeard() {
 	}
 	for end := time.Now().Add(g.firstHeard); g.st.Blocked() && !g.st.Heard() && time.Now().Before(end); {
 		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// inGrace: this process hasn't had the operator's list delivered since it started, and it started less than
+// firstHeard ago. A task an earlier agentd left in the queue (§6.2, §6.5) is taken up at once, before the first
+// pull or push lands, so in this window the kill switch doesn't cancel for staleness (CodeStale) and a call waits
+// for the list (waitHeardAtStart) instead of failing: nothing goes out meanwhile (every call is still Checked).
+// gate2 run 2: without it every task that survived an agentd restart was cancelled stop_list_stale by the first
+// sweep, though the list arrived seconds later.
+func (g *safeGateway) inGrace() bool {
+	// Blocked: an operator key is pinned (without one no list can arrive, and nothing waits for one).
+	return g.firstHeard > 0 && !g.st.Heard() && time.Since(g.started) < g.firstHeard && g.st.Blocked()
+}
+
+// waitHeardAtStart: in the first-heard window (inGrace), while the list is blocked, wait for its first delivery
+// (until the window ends); otherwise return at once.
+func (g *safeGateway) waitHeardAtStart(ctx context.Context) {
+	for g.inGrace() {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(200 * time.Millisecond):
+		}
 	}
 }
 
@@ -507,6 +533,7 @@ func pricedModels(ti *harness.TaskInfo, e *safety.Effective, asked string) []str
 const imageTokens = 2600
 
 func (g *safeGateway) ModelCall(ctx context.Context, ti *harness.TaskInfo, req *harness.ModelCall) (*harness.ModelResult, error) {
+	g.waitHeardAtStart(ctx)
 	e, err := g.st.Check(g.space(ti), guard.Effect(req))
 	if err != nil {
 		return nil, g.refuse(ti.ID, harness.CodeNotAllowed, err)
@@ -581,6 +608,7 @@ func (g *safeGateway) ModelCall(ctx context.Context, ti *harness.TaskInfo, req *
 }
 
 func (g *safeGateway) Action(ctx context.Context, ti *harness.TaskInfo, id string, req *harness.Action) (*harness.ActionResult, error) {
+	g.waitHeardAtStart(ctx)
 	e, err := g.st.Check(g.space(ti), guard.Effect(req))
 	if err != nil {
 		return nil, g.refuse(ti.ID, harness.CodeNotAllowed, err)
@@ -695,6 +723,7 @@ func (g *safeGateway) tripFromGuard(task string, err error) {
 }
 
 func (g *safeGateway) Exec(ctx context.Context, ti *harness.TaskInfo, id string, req *harness.Exec) (*harness.ExecResult, error) {
+	g.waitHeardAtStart(ctx)
 	if _, err := g.st.Check(g.space(ti), true); err != nil {
 		return nil, g.refuse(ti.ID, harness.CodeNotAllowed, err)
 	}
@@ -776,14 +805,19 @@ func readOutput(out []byte) bool {
 }
 
 // enforce is the kill switch: whenever the controls change, and every few seconds (staleness comes with time),
-// every running task whose space may no longer run is cancelled.
+// every running task whose space may no longer run is cancelled; a stale or silent list only after the first-heard
+// window of a fresh process (inGrace). A stop or a missing policy cancels at once.
 func (g *safeGateway) enforce(ctx context.Context, every time.Duration) {
 	for {
 		changed := g.st.Changed() // before the sweep: a change during it wakes the next one at once
 		g.mu.Lock()
 		var stop []string
+		grace := g.inGrace()
 		for id, t := range g.tasks {
 			if _, err := g.st.Check(t.space, false); err != nil {
+				if code, _ := coded(err); grace && code == safety.CodeStale {
+					continue // the first list hasn't landed since this process started (inGrace): not yet
+				}
 				if t.code == "" {
 					t.code, t.msg = coded(err)
 				}

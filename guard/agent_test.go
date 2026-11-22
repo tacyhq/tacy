@@ -147,7 +147,8 @@ func TestAgentLoop(t *testing.T) {
 	if len(msgs) != 4 || msgs[3].(map[string]any)["role"] != "tool" || msgs[3].(map[string]any)["tool_call_id"] != "c1" {
 		t.Fatalf("messages %v", msgs)
 	}
-	if req["model"] != "gpt-oss-120b" || req["user_cache_secret"] != "boot-secret" || req["tools"] == nil {
+	// No cache_secret: the per-boot secret scoped to the run's space, never the per-boot secret itself.
+	if req["model"] != "gpt-oss-120b" || req["user_cache_secret"] != SpaceCacheSecret("boot-secret", testSpace) || req["tools"] == nil {
 		t.Fatalf("request %v", req)
 	}
 	if !strings.Contains(msgs[0].(map[string]any)["content"].(string), "13 October 2026") {

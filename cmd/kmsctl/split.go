@@ -27,7 +27,7 @@ package main
 //	    policy with no grant is refused (approve couldn't pin a release in it), so the first policy takes -apps.
 //	    Each grant is summed up on stderr.
 //	kmsctl approve -base U.json [-release app=APP,version=vX.Y.Z,app-compose=F,compose=F] [-remove vX.Y.Z]
-//	        [-share-set F ...] [-trust-base T.json -trust-release R.json] -sign-key K [-trust-key K] -out DIR
+//	        [-share-set F ...] [-trust-base T.json -trust-release R.json] -sign-key K [-trust-key K] -out DIR -expect F
 //	        [-emergency REASON [-emergency-item ITEM ...] -share S -key pass -share S -key pass]
 //	    -emergency (the no-downtime plan row 13): the releases added unlock at once, without the holders' 24 h delay. It takes the
 //	    admin key and two passphrase shares (M signs the override with the KMS id), so the fix and the withdrawal
@@ -38,8 +38,10 @@ package main
 //	    carries the override alone: a release pinned earlier unlocks at once.
 //	    the next unlock policy (seq + 1; a release added or removed) and, with -trust-base, the next trust list with
 //	    the same release added or removed, both signed in one session: DIR/unlock-policy-<seq>.signed.json and
-//	    DIR/trust-list-<seq>.signed.json. -dry-run prints both unsigned (stdout) and signs and writes nothing (no
-//	    -sign-key, -out or -emergency): what a run without it would sign.
+//	    DIR/trust-list-<seq>.signed.json. -dry-run prints both unsigned (stdout: {"unlock_policy", "trust_list"}) and
+//	    signs and writes nothing (no -sign-key, -out or -emergency): what a run without it would sign. The run that
+//	    signs takes that output back (-expect F, required but with -emergency) and signs only if it derives the same
+//	    bytes again, issued_at aside. Both print each document's sha256 (issued_at left out) on stderr.
 //	    -machine-cert F (repeat) adds a machine certificate (machine-cert's output) to the policy and the trust list;
 //	    -revoke-machine HASH|F (repeat) revokes one: its hash joins machines_revoked in both, for good (holders keep
 //	    every revocation they have seen, clients the union of every list), and the certificate leaves machine_certs.
@@ -72,6 +74,7 @@ package main
 //	    -dev-master F (staging only) takes a dev M instead of shares.
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdh"
 	"crypto/ed25519"
@@ -147,6 +150,7 @@ func splitMain(cmd string, args []string) {
 	appsFile := fs.String("apps", "", "unlock-policy: the app grants file (kms/policies/agent-vm-v1.json), the policy's apps become exactly its; "+
 		"secrets-seal: the grants the bundle must carry every name of")
 	dryRun := fs.Bool("dry-run", false, "approve: print the unsigned policy and trust list it would sign; sign and write nothing")
+	expect := fs.String("expect", "", "approve: the -dry-run output (would-sign.json) this run must derive again, byte for byte but issued_at, before it signs")
 	previous := fs.String("previous", "", "unlock-policy: the last unsigned unlock policy before (another admin-key generation's): its machine revocations carry over")
 	var releases, removes multi
 	fs.Var(&releases, "release", "approve: app=APP,version=vX.Y.Z,app-compose=FILE,compose=FILE")
@@ -362,14 +366,23 @@ func splitMain(cmd string, args []string) {
 		}
 		if *dryRun {
 			describeApps(os.Stderr, np.Apps)
-			fmt.Fprintf(os.Stderr, "approve -dry-run: unlock policy seq %d (%d release(s)) and, below it, the trust list: unsigned, nothing written\n",
+			fmt.Fprintf(os.Stderr, "approve -dry-run: unlock policy seq %d (%d release(s)) and the trust list: unsigned, nothing written\n",
 				np.Seq, len(np.Releases))
-			printJSON(np)
-			if ntl != nil {
-				printJSON(ntl)
-			}
+			printDigests(os.Stderr, np, ntl)
+			os.Stdout.Write(wouldSign(np, ntl))
 			return
 		}
+		switch {
+		case *emergency == "" && *expect == "":
+			die("approve: -expect would-sign.json, the -dry-run output of this same command (it signs only what that showed)")
+		case *emergency != "" && *expect != "":
+			die("approve: -emergency has no dry run, so no -expect")
+		case *expect != "":
+			if err := matchDryRun(readFile(*expect), np, ntl); err != nil {
+				die("approve: %s: %v (nothing signed)", *expect, err)
+			}
+		}
+		printDigests(os.Stderr, np, ntl)
 		uk := readAdminKeys(*signKey)
 		var tk []ed25519.PrivateKey
 		if ntl != nil {
@@ -704,6 +717,81 @@ func unlockPolicy(base, fromKMS, kmsIDStr string, seq uint64, floor, holderURLs 
 		}
 	}
 	return &p, checkUnlockPolicy(&p)
+}
+
+// dryRunDoc is approve -dry-run's output: what the same command signs (approve -expect takes it back).
+type dryRunDoc struct {
+	UnlockPolicy *split.UnlockPolicy `json:"unlock_policy"`
+	TrustList    *safety.TrustList   `json:"trust_list,omitempty"`
+}
+
+// wouldSign is approve -dry-run's output for np and ntl.
+func wouldSign(np *split.UnlockPolicy, ntl *safety.TrustList) []byte {
+	b, _ := json.MarshalIndent(dryRunDoc{np, ntl}, "", "  ")
+	return append(b, '\n')
+}
+
+// matchDryRun is nil only when raw is exactly wouldSign(np, ntl) with each document's issued_at the dry run's (slots
+// review M2): an input changed between the dry run and this run (a base, a compose, a trust entry, a certificate) is
+// refused rather than signed unseen.
+func matchDryRun(raw []byte, np *split.UnlockPolicy, ntl *safety.TrustList) error {
+	var d struct {
+		UnlockPolicy *struct {
+			IssuedAt time.Time `json:"issued_at"`
+		} `json:"unlock_policy"`
+		TrustList *struct {
+			IssuedAt time.Time `json:"issued_at"`
+		} `json:"trust_list"`
+	}
+	if json.Unmarshal(raw, &d) != nil || d.UnlockPolicy == nil {
+		return errors.New("not approve -dry-run's output")
+	}
+	p := *np
+	p.IssuedAt = d.UnlockPolicy.IssuedAt
+	var tl *safety.TrustList
+	if ntl != nil {
+		c := *ntl
+		if d.TrustList != nil {
+			c.IssuedAt = d.TrustList.IssuedAt
+		}
+		tl = &c
+	}
+	if bytes.Equal(wouldSign(&p, tl), raw) {
+		return nil
+	}
+	var e dryRunDoc
+	json.Unmarshal(raw, &e)
+	what := "the unlock policy"
+	if e.UnlockPolicy != nil && digest(e.UnlockPolicy) == digest(np) {
+		what = "the trust list"
+	}
+	return fmt.Errorf("%s this run derives isn't the one the dry run showed: run -dry-run again and check it", what)
+}
+
+// digest is the sha256 of a policy or trust list as signed (canonical JSON) with its issued_at left out: the same in
+// approve -dry-run and the approve that signs it.
+func digest(v any) string {
+	switch d := v.(type) {
+	case *split.UnlockPolicy:
+		c := *d
+		c.IssuedAt = time.Time{}
+		v = &c
+	case *safety.TrustList:
+		c := *d
+		c.IssuedAt = time.Time{}
+		v = &c
+	}
+	b, _ := json.Marshal(v)
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:])
+}
+
+// printDigests prints both documents' digests (approve -dry-run, and the approve that signs: they must match).
+func printDigests(w io.Writer, np *split.UnlockPolicy, ntl *safety.TrustList) {
+	fmt.Fprintf(w, "unlock policy seq %d sha256 %s (issued_at left out)\n", np.Seq, digest(np))
+	if ntl != nil {
+		fmt.Fprintf(w, "trust list seq %d sha256 %s (issued_at left out)\n", ntl.Seq, digest(ntl))
+	}
 }
 
 // describeApps sums up each app grant, for the person about to sign it.
@@ -1058,7 +1146,7 @@ func bundleNames(values map[string]string, apps map[string]kms.AppPolicy) error 
 	}
 	var missing, extra []string
 	for n := range want {
-		if values[n] == "" {
+		if strings.TrimSpace(values[n]) == "" {
 			missing = append(missing, n)
 		}
 	}

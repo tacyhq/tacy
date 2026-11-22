@@ -378,7 +378,9 @@ func (u *Unlocker) loadSecrets(ctx context.Context, root Root, k *Keyring, names
 			if b.Seq < floor {
 				return fmt.Errorf("secrets seq %d is below the policy's floor %d", b.Seq, floor)
 			}
-			return k.SetSecrets(b, names)
+			err = k.SetSecrets(b, names)
+			clear(b.Values) // the names the grant leaves out (the other slot's tunnel token) go with the bundle
+			return err
 		}()
 		if err == nil {
 			u.cfg.Logf("unlock: API keys in (secrets seq %d)", k.SecretsSeq)
@@ -413,6 +415,10 @@ func (u *Unlocker) grantFor(ctx context.Context, pol *split.UnlockPolicy) (Grant
 			}
 			if u.cfg.Release != "" && u.cfg.Release != p.Version {
 				return Grant{}, fmt.Errorf("release %s claimed, %s pinned for this app-compose", u.cfg.Release, p.Version)
+			}
+			// Only this release's own tunnel token, of the two the grant names (tunnelslot.go).
+			if ap.Secrets, err = ownTunnel(ap.Secrets, ac); err != nil {
+				return Grant{}, err
 			}
 			return Grant{App: p.App, Release: p.Version, Policy: ap, PolicySeq: pol.Seq}, nil
 		}

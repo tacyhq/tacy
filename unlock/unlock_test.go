@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net"
@@ -11,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -558,6 +561,67 @@ func TestUnlockdGate(t *testing.T) {
 	} {
 		if a := ag.Fixed(context.Background(), c); a.Error != "bad_call" {
 			t.Fatalf("agentd's socket made %+v", c)
+		}
+	}
+}
+
+// Slots review M1: the agent VM's grant names both slots' tunnel tokens and the bundle carries both, but a VM keeps,
+// and vaultd gets, only the one its attested compose's gatewayd names (-tunnel-secret). The release compose (slot a)
+// gets CF_TUNNEL_TOKEN_VMA alone; the same compose on slot b, CF_TUNNEL_TOKEN_VMB alone. So no VM holds the other
+// slot's token, and no gatewayd can lease it.
+func TestOwnTunnelTokenOnly(t *testing.T) {
+	const a, b = "CF_TUNNEL_TOKEN_VMA", "CF_TUNNEL_TOKEN_VMB"
+	values := map[string]string{a: "tunnel-a-canary-6d5c4b3a29180716", b: "tunnel-b-canary-0f1e2d3c4b5a6978"}
+	for _, slot := range []struct{ own, other string }{{a, b}, {b, a}} {
+		r := newRig(t, []string{"cloudflare", "vercel"}, 2)
+		g := r.w.Policy.Apps[unlocktest.App]
+		g.Secrets = append(slices.Clone(g.Secrets), a, b)
+		r.w.Policy.Apps[unlocktest.App] = g
+		r.w.Secrets[a], r.w.Secrets[b] = values[a], values[b]
+		if slot.own == b {
+			dc := strings.Replace(r.w.VMCompose, `"-tunnel-secret", "`+a+`"`, `"-tunnel-secret", "`+b+`"`, 1)
+			if dc == r.w.VMCompose {
+				t.Fatal("compose.yaml names no -tunnel-secret " + a)
+			}
+			q, info, ac := r.w.Variant(func(m map[string]any) { m["docker_compose_file"] = dc })
+			r.w.VM = &unlocktest.Evidence{Quote: q, Info: info}
+			h := sha256.Sum256([]byte(dc))
+			pin := &r.w.Policy.Releases[len(r.w.Policy.Releases)-1]
+			pin.AppComposeSHA256, pin.ComposeSHA256 = ac, hex.EncodeToString(h[:])
+		}
+		r.worker.SetPolicy(r.w.PolicyEnv())
+		r.worker.SetSecrets(r.w.SecretsBundle(3))
+		u := r.unlocker(func(c *unlock.Config) { c.Cache = nil })
+		if st := r.run(u, 30*time.Second); st.State != unlock.StateReady || st.Reason != "" {
+			t.Fatalf("%s: status %+v", slot.own, st)
+		}
+		v := r.mustKeys(u, unlock.RoleVault)
+		if _, held := v.Secrets[slot.other]; held || v.Secrets[slot.own] != values[slot.own] || v.Secrets["EXA_API_KEY"] == "" {
+			t.Fatalf("compose on %s: vaultd got %s %t, %s %t", slot.own, slot.own, v.Secrets[slot.own] != "", slot.other, held)
+		}
+	}
+}
+
+func TestTunnelSecret(t *testing.T) {
+	ac := func(dc string) []byte { b, _ := json.Marshal(map[string]string{"docker_compose_file": dc}); return b }
+	for dc, want := range map[string]string{
+		"services:\n  agentvm:\n    command: [\"-x\", \"1\", \"-tunnel-secret\", \"CF_TUNNEL_TOKEN_VMB\"]\n": "CF_TUNNEL_TOKEN_VMB",
+		"services:\n  agentvm:\n    command: [\"--tunnel-secret=CF_TUNNEL_TOKEN_VMA\"]\n":                 "CF_TUNNEL_TOKEN_VMA",
+		"services:\n  agentvm:\n    command: -a -tunnel-secret CF_TUNNEL_TOKEN_VMB\n":                       "CF_TUNNEL_TOKEN_VMB",
+		"services:\n  agentvm:\n    command: [\"-socket\", \"/s\"]\n":                                       "",
+	} {
+		if got, err := unlock.TunnelSecret(ac(dc)); err != nil || got != want {
+			t.Fatalf("%q: %q %v, want %q", dc, got, err, want)
+		}
+	}
+	for _, dc := range []string{
+		"services:\n  agentvm:\n    command: [\"-tunnel-secret\", \"CF_TUNNEL_TOKEN_VMA\"]\n  other:\n    entrypoint: [\"-tunnel-secret\", \"CF_TUNNEL_TOKEN_VMB\"]\n",
+		"services:\n  agentvm:\n    command: [\"-tunnel-secret\"]\n",
+		"services: [\n",
+		"",
+	} {
+		if got, err := unlock.TunnelSecret(ac(dc)); err == nil {
+			t.Fatalf("%q: %q, want an error", dc, got)
 		}
 	}
 }

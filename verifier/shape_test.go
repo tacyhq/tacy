@@ -194,29 +194,25 @@ func TestReleaseShapeAcceptsTheGenerator(t *testing.T) {
 	}
 }
 
-// The Access pin (vm-v1-gate2; the team by value since the production app, 2026-11-22): the release names its Access
-// app on gatewayd's command line (-cloudflared-access <team>,<aud>). The team must be AccessTeam (our account's), the
-// audience a sha256-form value other than the all-zero placeholder: another app of our team (a staging release's)
-// passes, another team, the placeholders, the config-file form, a malformed pin, the pin twice and the e2e diag
+// The Access pin (vm-v1-gate2; by value since the production app, 2026-11-22): the release names its Access app on
+// gatewayd's command line (-cloudflared-access <team>,<aud>), which must be AccessTeam,AccessAUD exactly. Another app
+// of our team, another team, the placeholders, the config-file form, a malformed pin, the pin twice and the e2e diag
 // route (-e2e-diag, the e2e overlay's only) are each refused.
 func TestShapeAccessPinAndDiagFlag(t *testing.T) {
 	base := string(composeYAML(t))
 	if _, err := ComposeImages(base); err != nil {
 		t.Fatalf("the release compose: %v", err)
 	}
-	if AccessTeam != "baldcactus" {
-		t.Fatalf("AccessTeam %q: the production Access app's team is baldcactus", AccessTeam)
+	if AccessTeam != "baldcactus" || AccessAUD != "4b3edae68fd8b0f6913601a52763b6ab048dcf3981a9d5669efec249530bb00b" {
+		t.Fatalf("AccessTeam, AccessAUD %q, %q: not the production Access app (tacy-agent-vm)", AccessTeam, AccessAUD)
 	}
 	pin := `"-cloudflared-access", "baldcactus,4b3edae68fd8b0f6913601a52763b6ab048dcf3981a9d5669efec249530bb00b"`
-	other := edit(t, base, pin, `"-cloudflared-access", "baldcactus,`+strings.Repeat("ab", 32)+`"`)
-	if _, err := ComposeImages(other); err != nil {
-		t.Fatalf("another Access app of our team (a staging release's pin): %v", err)
-	}
-	if err := ReleaseShape(other); err != nil {
-		t.Fatalf("another Access app of our team, the release shape: %v", err)
+	if err := ReleaseShape(base); err != nil {
+		t.Fatalf("the release compose, the release shape: %v", err)
 	}
 	aud := "4b3edae68fd8b0f6913601a52763b6ab048dcf3981a9d5669efec249530bb00b"
 	for name, comp := range map[string]string{
+		"another app of our team":         edit(t, base, pin, `"-cloudflared-access", "baldcactus,`+strings.Repeat("ab", 32)+`"`),
 		"another team":                    edit(t, base, pin, `"-cloudflared-access", "kikosh,`+aud+`"`),
 		"another team, our team's prefix": edit(t, base, pin, `"-cloudflared-access", "baldcactus-x,`+aud+`"`),
 		"another team, a suffix of ours":  edit(t, base, pin, `"-cloudflared-access", "xbaldcactus,`+aud+`"`),

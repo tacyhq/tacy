@@ -47,15 +47,16 @@ var cfd struct {
 //     Worker's target, never DNS): a release goes on the slot the live one isn't on.
 //   - releaseAccessTeam, releaseAccessAUD: the Cloudflare Access app cloudflared checks the JWT of in the TD: the
 //     production app tacy-agent-vm over vm-a.tacy.dev and vm-b.tacy.dev (its one policy includes only the chat
-//     Worker's service token), made by scripts/ceremony-tunnels.sh on 2026-11-22. The team is verifier.AccessTeam
-//     (the verifiers pin it by value); the audience is the app's. Both public. Before then they were placeholders
-//     that fail closed (an all-zero audience), which --manifest still refuses (accessPinned).
+//     Worker's service token), made by scripts/ceremony-tunnels.sh on 2026-11-22: verifier.AccessTeam and
+//     verifier.AccessAUD, which the verifiers pin by value (verifier.AccessPinOK). Both public. Before then they were
+//     placeholders that fail closed (an all-zero audience); --manifest refuses anything but the pinned app
+//     (manifestPinsFor, the verifiers' own check).
 const (
 	ReleaseCloudflaredVersion = "2026.10.7-tacy2"
 	ReleaseCloudflaredCommit  = "872b241f94871665c1c157adefcf90c11f0ead96"
 	ReleaseCloudflaredSHA256  = "1c8c92c803f5d919c51bf01e1ce8d642d3ec05b51326c214eff756ed4221f0dd"
 	releaseAccessTeam         = verifier.AccessTeam
-	releaseAccessAUD          = "4b3edae68fd8b0f6913601a52763b6ab048dcf3981a9d5669efec249530bb00b"
+	releaseAccessAUD          = verifier.AccessAUD
 )
 
 // tunnelSlots are the release's tunnel slots and the vault secret each one's gatewayd leases its token from
@@ -105,17 +106,19 @@ func tunnelSlot(flagSlot string, follow, check bool, committed []byte) (string, 
 	return c, nil
 }
 
-// accessPinned says whether the release's Access app is pinned (not the placeholders).
-func accessPinned() bool {
-	return releaseAccessTeam != "unpinned" && releaseAccessAUD != strings.Repeat("0", 64)
+// accessPinned says whether the release's Access app is the one the verifiers pin (not a placeholder, not another app).
+func accessPinned() bool { return verifier.AccessPinOK(releaseAccessTeam + "," + releaseAccessAUD) }
+
+// manifestPins refuses a release manifest (what a tag needs) unless the release's Access app is the pinned one. The
+// key service's compose (--kms) has no tunnel, so it isn't held to it.
+func manifestPins(manifest string, kmsMode bool) error {
+	return manifestPinsFor(releaseAccessTeam+","+releaseAccessAUD, manifest, kmsMode)
 }
 
-// manifestPins refuses a release manifest (what a tag needs) while the release's Access app is a placeholder. The key
-// service's compose (--kms) has no tunnel, so it isn't held to it.
-func manifestPins(manifest string, kmsMode bool) error {
-	if manifest != "" && !kmsMode && !accessPinned() {
-		return fmt.Errorf("--manifest: the release's Access app isn't pinned yet (cmd/compose/cloudflared.go releaseAccessTeam, " +
-			"releaseAccessAUD: set at the Cloudflare setup); a release can't be cut with the placeholders")
+func manifestPinsFor(access, manifest string, kmsMode bool) error {
+	if manifest != "" && !kmsMode && !verifier.AccessPinOK(access) {
+		return fmt.Errorf("--manifest: the release's Access app isn't the pinned one (cmd/compose/cloudflared.go releaseAccessTeam, " +
+			"releaseAccessAUD must be verifier.AccessTeam, verifier.AccessAUD); a release can't be cut with placeholders or another app")
 	}
 	return nil
 }

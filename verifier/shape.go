@@ -35,12 +35,24 @@ const ReleaseShapeCheck = "a release with unlockd is exactly cmd/compose's shape
 // UnlockDomain is the only domain the holders may be on (gatewayd's -unlock-domain; cmd/compose's unlockDomain).
 const UnlockDomain = "tacy.io"
 
-// AccessTeam is the Cloudflare Zero Trust team whose Access app cloudflared checks the JWT of (gatewayd's
-// -cloudflared-access <team>,<aud>; cmd/compose's releaseAccessTeam): pinned by value, so a release can only name an
-// Access app of our own account (its certs at https://<team>.cloudflareaccess.com/cdn-cgi/access/certs). The audience
-// is taken by form (a staging release names its own app in the same team) but never the all-zero placeholder, which
-// no Access app has.
-const AccessTeam = "baldcactus"
+// AccessTeam and AccessAUD are the production Access app cloudflared checks the JWT of (gatewayd's
+// -cloudflared-access <team>,<aud>; cmd/compose's releaseAccessTeam and releaseAccessAUD): the app tacy-agent-vm over
+// vm-a.tacy.dev and vm-b.tacy.dev, whose one policy includes only the chat Worker's service token (made 2026-11-22),
+// its certs at https://<team>.cloudflareaccess.com/cdn-cgi/access/certs. Both are pinned by value (AccessPinOK), as
+// -unlock-domain is: a release names exactly this app, never another app of the account or another team. Staging
+// composes never reach the release shape (it runs only at the production level; their -unlock-domain is the
+// stand-in's anyway), so the gate's own Access app, of any team, is unaffected. The team is the Zero Trust
+// organization's name: renaming the organization changes it and takes every release that pins it offline (the no-downtime plan
+// row 31: never rename it). Changing either is a client and holder release first, then a VM release.
+const (
+	AccessTeam = "baldcactus"
+	AccessAUD  = "4b3edae68fd8b0f6913601a52763b6ab048dcf3981a9d5669efec249530bb00b"
+)
+
+// AccessPinOK says whether s (gatewayd's -cloudflared-access value) is the production Access app: AccessTeam and
+// AccessAUD, exactly. cmd/compose's --manifest uses the same check, so a release manifest and the verifiers can't
+// disagree.
+func AccessPinOK(s string) bool { return s == AccessTeam+","+AccessAUD }
 
 // val is a scalar the shape takes by form, not by value: ok says whether s is of the form; same, when set, names a
 // value that must be equal wherever it appears (part picks the compared piece; nil: all of it).
@@ -68,10 +80,7 @@ var (
 	isProvider = re(`^(exa|tavily|brave)$`)
 	isGVisor   = re(`^[0-9]{8}\.[0-9]+$`)
 	isTunnel   = re(`^CF_TUNNEL_TOKEN_VM[AB]$`)
-	isAccess   = func(s string) bool { // gateway/cftunnel.ParseAccess's <team>,<aud>: our team, a real audience
-		team, aud, ok := strings.Cut(s, ",")
-		return ok && team == AccessTeam && isHex64(aud) && aud != strings.Repeat("0", 64)
-	}
+	isAccess   = AccessPinOK // gateway/cftunnel.ParseAccess's <team>,<aud>, the production app by value
 )
 
 func key(same string) val                        { return val{what: "an ed25519 key", ok: isKey, same: same} }
@@ -188,7 +197,7 @@ func releaseShape(keysInVM bool) map[string]any {
 	// gatewayd: its launcher (GatewaydLaunchException) as root with SETUID and SETGID only, its own bridge network,
 	// HOME=/tmp and nothing else in its environment, no published port and no -listen, cloudflared as 10006, the Access
 	// app as a pin (-cloudflared-access: the launcher writes cloudflared's config from it; no config file in the
-	// image; the team by value, AccessTeam), never the e2e diag route (-e2e-diag: not in the shape, so refused).
+	// image; by value, AccessPinOK), never the e2e diag route (-e2e-diag: not in the shape, so refused).
 	gw := serviceShape("gatewayd", "0:0", true)
 	gw["cap_add"] = list("SETGID", "SETUID")
 	gw["tmpfs"] = list("/tmp:mode=0700,uid=10001,gid=10001", "/run/tunnel:size=1m,mode=0750,uid=10001,gid=10006")
@@ -202,7 +211,7 @@ func releaseShape(keysInVM bool) map[string]any {
 		trustShape(),
 		list("-safety-url", https(), "-keylog-url", https(), "-dns-tls", form("a DNS-over-TLS resolver", isDoT),
 			"-"+TunnelUIDFlag, "10006", "-cloudflared", "/tacy/cloudflared", "-cloudflared-sha256", hex64(""),
-			"-cloudflared-access", form("an Access app ("+AccessTeam+",aud)", isAccess), "-tunnel-secret", form("a tunnel token's name", isTunnel)))
+			"-cloudflared-access", form("the production Access app ("+AccessTeam+","+AccessAUD[:8]+"…)", isAccess), "-tunnel-secret", form("a tunnel token's name", isTunnel)))
 
 	vaultd := serviceShape("vaultd", "10002:10001", false)
 	vaultd["group_add"] = list("10005")

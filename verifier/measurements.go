@@ -21,9 +21,9 @@ import (
 //   - MRTD is the firmware (dstack's OVMF/TDVF), and with QEMU 8.x how its pages are added.
 //   - RTMR0 is the firmware's configuration: the TD HOB (memory size), ACPI tables (vCPUs, devices, hotplug,
 //     PCI layout, QEMU version) and the boot variables. It changes with the VM size, not only the image.
-//   - RTMR1 is the kernel (bzImage, with the setup header the firmware patches). It depended on the memory size
-//     before 0.6.5; 0.6.5's is the same on tdx.small, medium and large (computed with dstack-mr and observed,
-//     2026-11-23; its metadata.json says kernel_header_normalized).
+//   - RTMR1 is the kernel (bzImage, with the setup header the firmware patches). For an image whose metadata.json
+//     says kernel_header_normalized (0.6.4 and 0.6.5) it is the same on every shape (dstack-mr; 0.6.5 also observed
+//     on tdx.small, medium and large, 2026-11-23); for one without it, RTMR1 can depend on the memory size too.
 //   - RTMR2 is the kernel command line (which carries the dm-verity root hash of the root filesystem) and the
 //     initramfs.
 //
@@ -157,6 +157,7 @@ var BootMeasurements = []BootMeasurement{
 			"changed (2026-11-23); MRTD, RTMR1 and RTMR2 equal the tdx.small set's. Equal to Phala's tcb_info of a " +
 			"tdx.medium throwaway on prod5 (2026-11-23), and to genuine key_provider none quotes of the release on tdx.medium " +
 			"(prod5, 2026-11-23, a boot and a restart) with Intel's collateral" +
+			" (testdata/quote-shape-medium.hex, quote-shape-medium-restart.hex; TestShapeQuotes)" +
 			"",
 	},
 	{
@@ -171,6 +172,7 @@ var BootMeasurements = []BootMeasurement{
 			"changed (2026-11-23); MRTD, RTMR1 and RTMR2 equal the tdx.small set's. Equal to Phala's tcb_info of a " +
 			"tdx.large throwaway on prod5 (2026-11-23), and to genuine key_provider none quotes of the release on tdx.large " +
 			"(prod5, 2026-11-23, two CVMs, the second after a restart) with Intel's collateral" +
+			" (testdata/quote-shape-large.hex, quote-shape-large-restart.hex; TestShapeQuotes)" +
 			"",
 	},
 }

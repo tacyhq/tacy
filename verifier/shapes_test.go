@@ -2,14 +2,77 @@ package verifier
 
 import (
 	"context"
+	"encoding/hex"
+	"encoding/json"
+	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tacyhq/tacy/internal/tdx"
 )
 
 // The Phala shapes: tdx.small, tdx.medium and tdx.large are one image on three VM sizes, so their sets
 // differ only in RTMR0, and a quote is labelled with the set its registers match, never the first one.
+
+// testdata/quote-shape-*.hex are the raw TDX quotes of genuine attestations of the release (staging pins) on Phala
+// prod5, 2026-11-23: two boots of a tdx.medium CVM (the second after a stop and start) and of tdx.large CVMs, with
+// Intel's answers recorded at the time (intel-collateral-shapes-20261123.json).
+var shapeQuotes = []struct{ file, shape string }{
+	{"quote-shape-medium.hex", "tdx.medium"},
+	{"quote-shape-medium-restart.hex", "tdx.medium"},
+	{"quote-shape-large.hex", "tdx.large"},
+	{"quote-shape-large-restart.hex", "tdx.large"},
+}
+
+var shapeCollateralNow = time.Date(2026, 11, 23, 10, 0, 0, 0, time.UTC)
+
+func shapeCollateral(t *testing.T) collateral20261121 {
+	t.Helper()
+	raw, err := os.ReadFile("../testdata/intel-collateral-shapes-20261123.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var c collateral20261121
+	if err := json.Unmarshal(raw, &c); err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+// Each pinned bigger set is exactly what a genuine quote on that shape measured: the quote checked against Intel's
+// recorded chain, CRLs and TCB levels (UpToDate, debug off), then its MRTD and RTMR0-2 against its shape's set and no
+// other set.
+func TestShapeQuotes(t *testing.T) {
+	c := shapeCollateral(t)
+	for _, r := range shapeQuotes {
+		t.Run(r.file, func(t *testing.T) {
+			h, err := os.ReadFile("../testdata/" + r.file)
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw, err := hex.DecodeString(strings.TrimSpace(string(h)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			q, err := tdx.VerifyWith(context.Background(), raw, tdx.Options{Getter: c, Now: shapeCollateralNow})
+			if err != nil {
+				t.Fatalf("Intel's checks: %v", err)
+			}
+			if q.Debug || !strings.HasPrefix(q.TcbStatus, "UpToDate") {
+				t.Fatalf("debug %v, TCB %q", q.Debug, q.TcbStatus)
+			}
+			got := [4]string{hex.EncodeToString(q.MrTd), hex.EncodeToString(q.Rtmrs[0]), hex.EncodeToString(q.Rtmrs[1]), hex.EncodeToString(q.Rtmrs[2])}
+			s := phalaSet(t, r.shape)
+			if got != [4]string{s.MRTD, s.RTMR0, s.RTMR1, s.RTMR2} {
+				t.Fatalf("%s measured %v, the pinned %s set is %s %s %s %s", r.file, got, r.shape, s.MRTD, s.RTMR0, s.RTMR1, s.RTMR2)
+			}
+			if b, err := matchBoot(q, s.OSImage, BootMeasurements); err != nil || b.Name != s.Name {
+				t.Fatalf("matched %v %v", b, err)
+			}
+		})
+	}
+}
 
 func phalaSet(t *testing.T, shape string) BootMeasurement {
 	t.Helper()

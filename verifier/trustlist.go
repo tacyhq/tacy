@@ -192,7 +192,7 @@ func (p Policy) WithTrustList(l *safety.TrustList) (Policy, error) {
 // the OS image is the label of the set the registers match (osImageFromBoot), so a signed list that put a retired
 // image's kernel (RTMR1) or command line and initramfs (RTMR2, with the root filesystem's dm-verity hash) under a
 // current label would let that image boot unseen. MRTD and RTMR0 aren't compared: firmware and VM shape are shared
-// across images (0.6.0 to 0.6.5 have the same MRTD and RTMR0). The same image on another VM size has another RTMR1
+// across images (0.6.0 to 0.6.5 have the same MRTD and RTMR0). The same image on another VM size can have another RTMR1
 // but the same RTMR2, so RTMR2 alone catches it.
 func retiredBoot(rtmr1, rtmr2 string) string {
 	for _, r := range RetiredBootMeasurements {

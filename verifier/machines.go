@@ -102,9 +102,10 @@ const RegistryURL = "https://storage.googleapis.com/confidential-host-registry/"
 // the apps' WASM, whose fetches go through the chat Worker (gcp-prod review H1). Google's firmware endorsements are
 // signed under Google's root, which gcetcb checks, so a relay can only withhold one; the host registry is an unsigned
 // document, so a relay could say any PPID is a Google host, and a forged quote from any machine of that FMSPC would
-// pass a registry-mode certificate. So only endorsement URLs are fetched: a registry read fails, and a registry-mode
-// machine certificate never passes such a verifier's machine check (fail closed) until the registry answer reaches
-// it over a channel it trusts. The key holders fetch Google directly and don't use this.
+// pass a registry-mode certificate. So only endorsement URLs are fetched, the registry is never read, and a
+// registry-mode machine certificate passes such a verifier's machine check only with the VM's unlock proof
+// (unlockproof.go: both key holders read the registry themselves before they released their shares). The key
+// holders fetch Google directly and don't use this.
 func EndorsementsOnly(g trust.HTTPSGetter) trust.HTTPSGetter { return endorsementsOnly{g} }
 
 type endorsementsOnly struct{ g trust.HTTPSGetter }
@@ -141,7 +142,7 @@ func (r *Result) checkMachine(ctx context.Context, q *tdx.Quote, att *proto.Atte
 	}
 	if err != nil && errors.Is(err, safety.ErrMachineNotAllowed) && !phala {
 		for _, reg := range set.Registry(q.FMSPC) {
-			if rerr := registryCheck(ctx, p.GoogleGetter, reg, q, att); rerr == nil {
+			if rerr := r.proofOrRegistry(ctx, p, reg, quoteIDs{ppid: q.PPID, mrOwner: q.MrOwner}, att); rerr == nil {
 				m, err = &reg, nil
 				break
 			} else {
@@ -156,6 +157,9 @@ func (r *Result) checkMachine(ctx context.Context, q *tdx.Quote, att *proto.Atte
 			host = "host Google"
 		}
 		detail = fmt.Sprintf("%s (%s); %s: not defended by the machine list", m.Doc.Label, short(q.PPID), host)
+		if r.proof != nil {
+			detail += fmt.Sprintf("; Google's host registry: by both key holders (unlock proof, epoch %d)", r.proof.epoch)
+		}
 		r.Facts[FactMachine] = detail
 		r.Facts["machine certificate"] = m.Hash
 		r.Facts["machine source"] = m.Source
@@ -193,12 +197,28 @@ func onBootSet(q *tdx.Quote, p Policy, google bool) bool {
 	return false
 }
 
-// registryCheck is registry mode (only while the Google fallback runs, V1-DESIGN §2.7): the quote's PPID has a
-// document in Google's confidential-host registry, in the zone the VM names, and MR_OWNER is sha384 of the PZID
-// JSON for that VM in the certificate's project (Google writes it at launch; go-tdx-guest gce/pzid.go). The VM's
-// GCE instance id and zone come with its attestation info (gce_instance_id, gce_zone): unverified hints that only
-// MR_OWNER makes count.
-func registryCheck(ctx context.Context, g trust.HTTPSGetter, m safety.Machine, q *tdx.Quote, att *proto.Attestation) error {
+// ownerCheck is registry mode's MR_OWNER rule (only while the Google fallback runs, V1-DESIGN §2.7): MR_OWNER is
+// sha384 of the PZID JSON for the VM in the certificate's project (Google writes it at launch; go-tdx-guest
+// gce/pzid.go). The VM's GCE instance id and zone come with its attestation info (gce_instance_id, gce_zone):
+// unverified hints that only MR_OWNER makes count. mrOwner is the verified quote's.
+func ownerCheck(m safety.Machine, mrOwner string, att *proto.Attestation) error {
+	id, zone, err := gceHints(att)
+	if err != nil {
+		return err
+	}
+	proj, err := strconv.ParseUint(m.Doc.ProjectNumber, 10, 64)
+	if err != nil {
+		return errors.New("bad project number")
+	}
+	payload := fmt.Sprintf(`{"instanceId":%d,"numericalProjectId":%d,"zone":%s}`, id, proj, strconv.Quote(zone))
+	want := sha512.Sum384([]byte(payload))
+	if got, _ := hex.DecodeString(mrOwner); !bytes.Equal(got, want[:]) {
+		return errors.New("MR_OWNER isn't this project's PZID for the VM")
+	}
+	return nil
+}
+
+func gceHints(att *proto.Attestation) (uint64, string, error) {
 	var info struct {
 		InstanceID string `json:"gce_instance_id"`
 		Zone       string `json:"gce_zone"`
@@ -206,30 +226,32 @@ func registryCheck(ctx context.Context, g trust.HTTPSGetter, m safety.Machine, q
 	json.Unmarshal(att.Info, &info)
 	id, err := strconv.ParseUint(info.InstanceID, 10, 64)
 	if err != nil || !zoneRe.MatchString(info.Zone) {
-		return errors.New("the attestation names no GCE instance id and zone")
+		return 0, "", errors.New("the attestation names no GCE instance id and zone")
 	}
-	proj, err := strconv.ParseUint(m.Doc.ProjectNumber, 10, 64)
+	return id, info.Zone, nil
+}
+
+// registryRead is registry mode's registry rule, for a verifier that reads Google directly (the key holders): the
+// quote's PPID (from its Intel-verified PCK certificate) has a document in Google's confidential-host registry, in
+// the zone the VM names (ownerCheck bound that zone).
+func registryRead(ctx context.Context, g trust.HTTPSGetter, ppid string, att *proto.Attestation) error {
+	_, zone, err := gceHints(att)
 	if err != nil {
-		return errors.New("bad project number")
-	}
-	payload := fmt.Sprintf(`{"instanceId":%d,"numericalProjectId":%d,"zone":%s}`, id, proj, strconv.Quote(info.Zone))
-	want := sha512.Sum384([]byte(payload))
-	if got, _ := hex.DecodeString(q.MrOwner); !bytes.Equal(got, want[:]) {
-		return errors.New("MR_OWNER isn't this project's PZID for the VM")
+		return err
 	}
 	if g == nil {
 		g = &trust.SimpleHTTPSGetter{}
 	}
-	_, body, err := trust.GetWith(ctx, g, RegistryURL+q.PPID)
+	_, body, err := trust.GetWith(ctx, g, RegistryURL+ppid)
 	if err != nil {
-		return fmt.Errorf("Google's host registry has no document for %s: %v", short(q.PPID), err)
+		return fmt.Errorf("Google's host registry has no document for %s: %v", short(ppid), err)
 	}
 	var doc struct {
 		Timestamp time.Time `json:"timestamp"`
 		Zone      string    `json:"zone"`
 	}
-	if json.Unmarshal(body, &doc) != nil || doc.Timestamp.IsZero() || doc.Zone != info.Zone {
-		return fmt.Errorf("Google's host registry document for %s isn't for zone %s", short(q.PPID), info.Zone)
+	if json.Unmarshal(body, &doc) != nil || doc.Timestamp.IsZero() || doc.Zone != zone {
+		return fmt.Errorf("Google's host registry document for %s isn't for zone %s", short(ppid), zone)
 	}
 	return nil
 }

@@ -222,6 +222,9 @@ type Result struct {
 	HPKEPublicKey []byte            `json:"-"`
 	Facts         map[string]string `json:"facts"`
 	Checks        []Check           `json:"checks"`
+	// proof: the unlock proof a registry-mode machine was taken by (unlockproof.go), bound to the attested values
+	// at the end (checkUnlockProofBinding).
+	proof *unlockProof
 }
 
 func (r *Result) add(name string, err error, detail string) bool {
@@ -755,6 +758,9 @@ func Verify(ctx context.Context, att *proto.Attestation, nonce []byte, p Policy)
 		return failed()
 	}
 	if !r.checkUnlockd(ac.DockerComposeFile, ac.PreLaunchScript, mode, att.Version, p.KeyRelease) {
+		return failed()
+	}
+	if !r.checkUnlockProofBinding(ac.DockerComposeFile) {
 		return failed()
 	}
 	r.HPKEPublicKey = key

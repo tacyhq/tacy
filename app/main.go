@@ -103,6 +103,9 @@ type server struct {
 	platform Platform
 	// attester makes /attest's evidence through unlockd (proto.VersionAgent); nil: the platform's (local runs).
 	attester func(ctx context.Context, nonce, key []byte) (json.RawMessage, json.RawMessage, error)
+	// proof makes /attest's unlock proof (proto.UnlockProof) for the info unlockd returned: nil without an unlock
+	// (local runs) or an epoch certificate (a development root).
+	proof func(info json.RawMessage) *proto.UnlockProof
 	// owner holds the spaces' schedule ownership rows at the Worker (unlock/owner.go); nil: this VM fires them all.
 	owner    *unlock.Owner
 	id       *ehbpidentity.Identity
@@ -248,10 +251,14 @@ func (s *server) attest(w http.ResponseWriter, r *http.Request) {
 		fail(w, 502, "attestation evidence unavailable")
 		return
 	}
+	var proof *proto.UnlockProof
+	if s.attester != nil && s.proof != nil {
+		proof = s.proof(info) // this boot's key only (pub), for the info this quote came with
+	}
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, 200, proto.Attestation{Version: version, Platform: s.platform.Name(),
 		Nonce: hex.EncodeToString(nonce), HPKEPublicKey: hex.EncodeToString(pub), HPKESuite: proto.HPKESuite,
-		Quote: quote, Info: info, Booted: s.booted.Format(time.RFC3339)})
+		Quote: quote, Info: info, Booted: s.booted.Format(time.RFC3339), UnlockProof: proof})
 }
 
 // authorized says the request came in an envelope the relay signed (POST /v, ../relay; the keys plan §3.4). It replaces
@@ -756,6 +763,7 @@ func main() {
 		memory: memory, ledger: sg.ledger}
 	if uc != nil {
 		s.attester = uc.Attest
+		s.proof = unlockProofs(boot.signer, uk, id.MarshalPublicKey())
 		// Schedule ownership (unlock/owner.go): this VM fires a space's schedules only while it holds the space's row
 		// at the Worker, named by its attested instance id.
 		auth, err := uk.StoreAuth(PurposeState, nil)
@@ -993,4 +1001,22 @@ func instanceID(ctx context.Context, uc *unlock.Client) (string, error) {
 		return "", errors.New("no instance id in the attested info")
 	}
 	return i.AppID + "/" + i.InstanceID, nil
+}
+
+// unlockProofs makes /attest's unlock proofs (gcp-prod review H1): this boot's HPKE key pub (s.id's: never a key
+// agentd was handed), signed with the activity signer agentd derived from R_e, which clients check against the KMS
+// id's epoch certificate (uk.EpochCert). nil without a certificate (a development root).
+func unlockProofs(signer *activity.Signer, uk *unlock.Keys, pub []byte) func(info json.RawMessage) *proto.UnlockProof {
+	if signer == nil || uk == nil || len(uk.EpochCert) == 0 {
+		return nil
+	}
+	cert, kmsID, epoch, pub := uk.EpochCert, uk.KMSID, uk.Epoch, append([]byte(nil), pub...)
+	return func(info json.RawMessage) *proto.UnlockProof {
+		pr, err := unlock.NewUnlockProof(signer.SignLabeled, cert, kmsID, epoch, pub, info)
+		if err != nil {
+			log.Printf("attest: no unlock proof: %v", err)
+			return nil
+		}
+		return pr
+	}
 }

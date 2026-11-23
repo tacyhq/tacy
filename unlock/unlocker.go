@@ -272,6 +272,7 @@ func (u *Unlocker) unlockOnce(ctx context.Context) error {
 	var root Root
 	var g Grant
 	var set, epoch uint32
+	var epochCert json.RawMessage // the unlocked epoch's signed certificate, for agentd's unlock proof
 	var holders map[string]string
 	var floor uint64
 	if u.cfg.DevRoot != nil {
@@ -319,6 +320,7 @@ func (u *Unlocker) unlockOnce(ctx context.Context) error {
 			return err
 		}
 		root, set, epoch, floor = r, rep.Set, r.Epoch, pol.SecretsFloor
+		epochCert = EpochCertFor(pol, u.cfg.KMSID, epoch)
 	}
 	defer root.Drop() // R_e lives no longer than this function
 	k, err := Derive(root, kms.IDString(u.cfg.KMSID), epoch, set, g, u.cfg.Now())
@@ -326,6 +328,7 @@ func (u *Unlocker) unlockOnce(ctx context.Context) error {
 		u.set(StateRefused, err.Error(), holders)
 		return err
 	}
+	k.EpochCert = epochCert
 	if d, ok := root.(*devRoot); ok { // a development VM: its dev API keys came with the root
 		k.Secrets, k.NeedsSecrets = d.secrets, false
 	}

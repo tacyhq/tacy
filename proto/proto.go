@@ -3,8 +3,11 @@
 package proto
 
 import (
+	"crypto/sha256"
 	"crypto/sha512"
+	"encoding/binary"
 	"encoding/json"
+	"strconv"
 	"time"
 )
 
@@ -61,6 +64,53 @@ type Attestation struct {
 	Info json.RawMessage `json:"info,omitempty"`
 	// Booted is when this process started (RFC 3339, from the CVM's clock; informational).
 	Booted string `json:"booted"`
+	// UnlockProof (releases with unlockd, once unlocked) shows this boot's HPKE key belongs to a VM that rebuilt the
+	// epoch root R_e from the key holders' shares (UnlockProof). Absent before the unlock and on older releases.
+	UnlockProof *UnlockProof `json:"unlock_proof,omitempty"`
+}
+
+// UnlockProofLabel names the unlock proof's signed statement (gcp-prod review H1, design review H1-1). It is signed
+// with the epoch's activity signer as a labeled statement (activity.Signer.SignLabeled: label ‖ 0x00 ‖ digest), so
+// it never makes the bytes of an activity record ("tacy-activity/v1" ‖ 0x00 ‖ …) nor of another labeled statement
+// ("tacy/v2/schedule-handoff").
+const UnlockProofLabel = "tacy-agent/unlock-proof/v1"
+
+// UnlockProof is agentd's statement, signed with the activity signer it derived from R_e (the key the KMS id's
+// epoch certificate names, purpose "activity-sign/v1"): "this boot's HPKE key is mine, and I run app-compose
+// AppComposeSHA256 as app AppID, instance InstanceID". Only a VM both key holders released their shares to can sign
+// it, and the holders check the VM's host themselves (on Google Cloud: Google's host registry), so a client that
+// reads the registry through a relay it doesn't trust accepts a Google VM by this proof instead. A copied proof is
+// worthless: it names another boot's HPKE key, which only that boot can open.
+type UnlockProof struct {
+	// EpochCert is the KMS id's split.SignedEpochCert for the epoch that unlocked ({"doc","sig"}, base64).
+	EpochCert        json.RawMessage `json:"epoch_cert"`
+	AppID            string          `json:"app_id"`
+	InstanceID       string          `json:"instance_id"`
+	AppComposeSHA256 string          `json:"app_compose_sha256"`
+	// GCEInstanceID and GCEZone are the Google Cloud VM the info's hints name (gateway/gce.go; "" elsewhere): the
+	// verifier compares them with the hints MR_OWNER binds, so the proof is for this one Google VM too.
+	GCEInstanceID string `json:"gce_instance_id"`
+	GCEZone       string `json:"gce_zone"`
+	Sig           []byte `json:"sig"` // Ed25519 over UnlockProofLabel ‖ 0x00 ‖ Digest(...)
+}
+
+// Digest is what an unlock proof signs: sha256 over the label, a 0 byte and, each length-prefixed (u32
+// big-endian), the HPKE key (32 bytes), the KMS id ("ed25519:<base64>"), the epoch (decimal), the app id, the
+// instance id, the app-compose.json sha256 (lowercase hex), the GCE instance id and the GCE zone.
+func (p *UnlockProof) Digest(hpkePublicKey []byte, kmsID string, epoch uint32) [32]byte {
+	h := sha256.New()
+	h.Write([]byte(UnlockProofLabel))
+	h.Write([]byte{0})
+	for _, s := range []string{string(hpkePublicKey), kmsID, strconv.FormatUint(uint64(epoch), 10), p.AppID, p.InstanceID,
+		p.AppComposeSHA256, p.GCEInstanceID, p.GCEZone} {
+		var n [4]byte
+		binary.BigEndian.PutUint32(n[:], uint32(len(s)))
+		h.Write(n[:])
+		h.Write([]byte(s))
+	}
+	var out [32]byte
+	copy(out[:], h.Sum(nil))
+	return out
 }
 
 // Message is one chat message: plain text (earlier tool calls come back as assistant text), and on a person's

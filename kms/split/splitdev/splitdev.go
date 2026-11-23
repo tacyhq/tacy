@@ -8,7 +8,10 @@ package splitdev
 import (
 	"crypto/ecdh"
 	"crypto/ed25519"
+	"crypto/hkdf"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"time"
 
@@ -85,7 +88,19 @@ func New(holders []string, threshold int, now time.Time) (*Dev, error) {
 	if err != nil {
 		return nil, err
 	}
-	if d.Cert, err = split.NewEpochCert(d.Master, d.KMSID, d.Epoch, App, Firm, map[string]string{split.WitnessPurpose: wpub}, now); err != nil {
+	// The activity signer too, as the key ceremony certifies it (cmd/kmsctl epochCert; production's epoch 1
+	// certificate names it): clients check activity records and the VM's unlock proof (proto.UnlockProof) with it.
+	ak, err := split.RootKey(d.Root, App, Firm, "activity-sign/v1", d.Epoch)
+	if err != nil {
+		return nil, err
+	}
+	signer, err := activitySigner(ak, Firm)
+	clear(ak)
+	if err != nil {
+		return nil, err
+	}
+	if d.Cert, err = split.NewEpochCert(d.Master, d.KMSID, d.Epoch, App, Firm,
+		map[string]string{"activity-sign/v1": signer, split.WitnessPurpose: wpub}, now); err != nil {
 		return nil, err
 	}
 	d.Policy = split.UnlockPolicy{
@@ -152,4 +167,19 @@ func (d *Dev) HolderConfig(id string) holder.Config {
 // SealSecrets seals dev API keys under the dev root (seq 1).
 func (d *Dev) SealSecrets(values map[string]string) ([]byte, error) {
 	return split.SealSecrets(d.Root, split.SecretsBundle{KMSID: d.KMSID, Epoch: d.Epoch, Seq: 1, Values: values})
+}
+
+// activitySigner is activity.DeriveSigner(ikm, firm).Public() (HKDF-SHA256(ikm, info "tacy-activity/v1/signing-key\x00"
+// ‖ firm) as the Ed25519 seed), without package activity (its store needs SQLite, which the holders' builds don't
+// take). app TestAttestUnlockProof checks the two agree.
+func activitySigner(ikm []byte, firm string) (string, error) {
+	seed, err := hkdf.Key(sha256.New, ikm, nil, "tacy-activity/v1/signing-key\x00"+firm, ed25519.SeedSize)
+	if err != nil {
+		return "", err
+	}
+	k := ed25519.NewKeyFromSeed(seed)
+	clear(seed)
+	pub := k.Public().(ed25519.PublicKey)
+	clear(k)
+	return "ed25519:" + base64.StdEncoding.EncodeToString(pub), nil
 }

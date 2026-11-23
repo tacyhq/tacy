@@ -508,7 +508,7 @@ func TestGCPRegistryMode(t *testing.T) {
 }
 
 // A verifier behind a relay (the WASM: EndorsementsOnly, gcp-prod review H1) never reads the host registry: the same
-// registered quote that passes TestGCPRegistryMode is refused at the machine check, with no registry request, while
+// registered quote that passes TestGCPRegistryMode is refused at the machine check without an unlock proof (unlockproof_test.go: with one), with no registry request, while
 // a ppid-mode Google certificate still passes (the endorsement is still fetched, through the relay).
 func TestGCPRegistryNotThroughRelay(t *testing.T) {
 	a, nonce, p, _ := gcpPolicy(t, gcpRecordings[0])
@@ -535,7 +535,7 @@ func TestGCPRegistryNotThroughRelay(t *testing.T) {
 	}
 	q.Machines = &safety.MachineSet{Machines: []safety.Machine{{Doc: reg, Hash: h, Source: "test"}}, Revoked: map[string]bool{}}
 	res, err := Verify(context.Background(), a, nonce, q)
-	mustRefuse(t, "registry mode through a relay", res, err, "isn't read through a relay")
+	mustRefuse(t, "registry mode through a relay, no unlock proof", res, err, "has no unlock proof")
 	if g.asked != "" {
 		t.Fatalf("the registry was asked through the relay: %q", g.asked)
 	}

@@ -191,11 +191,18 @@ func TestGCPSetIsTheRecordings(t *testing.T) {
 			t.Fatalf("%s: the recording isn't the pinned set (apps %v)", name, apps)
 		}
 	}
-	// The shapes share the firmware and the UKI: only RTMR0 differs.
-	c3, c4 := GCPBootMeasurements[0], GCPBootMeasurements[1]
-	if c3.RTMR1 != c4.RTMR1 || c3.RTMR2 != c4.RTMR2 || c3.UKI != c4.UKI || c3.OSImage != c4.OSImage || c3.RTMR0 == c4.RTMR0 ||
-		!slices.Equal(c3.GoogleMRTDs, c4.GoogleMRTDs) {
-		t.Fatal("the c3 and c4 sets should differ in RTMR0 only")
+	// The shapes share the firmware and the UKI: only RTMR0 differs, and no two shapes share one.
+	c3 := GCPBootMeasurements[0]
+	rtmr0 := map[string]string{}
+	for _, s := range GCPBootMeasurements {
+		if s.RTMR1 != c3.RTMR1 || s.RTMR2 != c3.RTMR2 || s.UKI != c3.UKI || s.OSImage != c3.OSImage || s.MRTD != c3.MRTD ||
+			s.MinFirmwareSVN != c3.MinFirmwareSVN || !slices.Equal(s.GoogleMRTDs, c3.GoogleMRTDs) {
+			t.Fatalf("%s should differ from %s in RTMR0 only", s.Name, c3.Name)
+		}
+		if other, ok := rtmr0[s.RTMR0]; ok {
+			t.Fatalf("%s and %s share RTMR0", s.Name, other)
+		}
+		rtmr0[s.RTMR0] = s.Name
 	}
 	for h := range GCPImages {
 		if _, ok := ProdImages[h]; ok {
@@ -580,7 +587,12 @@ func TestGCPOtherShapeRefused(t *testing.T) {
 	for _, c := range []struct {
 		rec  string
 		only BootMeasurement
-	}{{"gcp-066-c4-us-east4-c-1.json", GCPBootMeasurements[0]}, {"gcp-066-c3-us-east1-c.json", GCPBootMeasurements[1]}} {
+	}{{"gcp-066-c4-us-east4-c-1.json", GCPBootMeasurements[0]}, {"gcp-066-c3-us-east1-c.json", GCPBootMeasurements[1]},
+		// The bigger C3 shapes: each refused with only c3-standard-4's set, or only the other's.
+		{"gcp-066-c3s8-us-central1-a.json", GCPBootMeasurements[0]}, {"gcp-066-c3s22-us-central1-a.json", GCPBootMeasurements[0]},
+		{"gcp-066-c3s8-us-east1-c.json", gcpSetOf("gcp-066-c3s22-")}, {"gcp-066-c3s22-us-central1-a.json", gcpSetOf("gcp-066-c3s8-")},
+		// And c3-standard-4 refused with only a bigger set.
+		{"gcp-066-c3-us-central1-a.json", gcpSetOf("gcp-066-c3s8-")}} {
 		a, nonce, p, g := gcpPolicy(t, c.rec)
 		p.Boot = append(slices.Clone(BootMeasurements), c.only)
 		_, err := Verify(context.Background(), a, nonce, p)

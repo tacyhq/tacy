@@ -11,6 +11,20 @@ import (
 // ComposeImages, the check every production verifier (clients, holders, the key service) runs.
 
 // edit is compose with old replaced by new once (the test fails if old isn't there).
+// slotToken is the tunnel secret the committed compose's gatewayd leases (its slot's: a release on either slot).
+func slotToken(t *testing.T, compose string) string {
+	t.Helper()
+	a, b := strings.Contains(compose, `"-tunnel-secret", "CF_TUNNEL_TOKEN_VM`+"A"+`"]`), strings.Contains(compose, `"-tunnel-secret", "CF_TUNNEL_TOKEN_VM`+"B"+`"]`)
+	switch {
+	case a && !b:
+		return "CF_TUNNEL_TOKEN_VM" + "A"
+	case b && !a:
+		return "CF_TUNNEL_TOKEN_VM" + "B"
+	}
+	t.Fatal("compose.yaml leases no single tunnel slot")
+	return ""
+}
+
 func edit(t *testing.T, compose, old, new string) string {
 	t.Helper()
 	if !strings.Contains(compose, old) {
@@ -52,6 +66,7 @@ func refusedEverywhere(t *testing.T, name, compose string) {
 // The review's probes, verbatim in effect (vprobe/main.go A to F, main2.go G).
 func TestReviewProbeComposesRefused(t *testing.T) {
 	base := string(composeYAML(t))
+	tok := slotToken(t, base)
 	if _, err := ComposeImages(base); err != nil {
 		t.Fatalf("the release compose: %v", err)
 	}
@@ -72,7 +87,7 @@ func TestReviewProbeComposesRefused(t *testing.T) {
 	f := edit(t, base, "    user: \"0:0\"\n    read_only: true\n    cap_drop: [ALL]\n    cap_add: [SETGID, SETUID]", "    read_only: true\n    cap_drop: [ALL]\n    cap_add: [SETGID, SETUID]")
 	// G: agentvm with SSL_CERT_FILE=/proc/self/cmdline and a PEM CA as an extra argument.
 	g := edit(t, base, "    environment:\n      HOME: /tmp\n", "    environment:\n      HOME: /tmp\n      SSL_CERT_FILE: /proc/self/cmdline\n")
-	g = edit(t, g, `"-tunnel-secret", "CF_TUNNEL_TOKEN_VMA"]`, `"-tunnel-secret", "CF_TUNNEL_TOKEN_VMA", "\n-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----\n"]`)
+	g = edit(t, g, `"-tunnel-secret", "`+tok+`"]`, `"-tunnel-secret", "`+tok+`", "\n-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----\n"]`)
 	for name, comp := range map[string]string{
 		"A agentd host network + TCP :8080":        a,
 		"B agentvm host network":                   b,
@@ -82,7 +97,7 @@ func TestReviewProbeComposesRefused(t *testing.T) {
 		"F agentvm without user:":                  f,
 		"G agentvm SSL_CERT_FILE + PEM argument":   g,
 		"G1 SSL_CERT_FILE alone":                   edit(t, base, "      HOME: /tmp\n", "      HOME: /tmp\n      SSL_CERT_FILE: /proc/self/cmdline\n"),
-		"G2 a PEM argument alone":                  edit(t, base, `"-tunnel-secret", "CF_TUNNEL_TOKEN_VMA"]`, `"-tunnel-secret", "CF_TUNNEL_TOKEN_VMA", "x"]`),
+		"G2 a PEM argument alone":                  edit(t, base, `"-tunnel-secret", "`+tok+`"]`, `"-tunnel-secret", "`+tok+`", "x"]`),
 		"A1 agentd without -listen-unix":           edit(t, base, `"-listen-unix", "/run/tacy/agent/http.sock", `, ""),
 		"A2 networks: on agentd":                   inService(t, base, "agentd", "    network_mode: none\n", "    network_mode: none\n    networks: [hostnet]\n") + hostnet,
 		"A3 top-level networks: alone":             base + hostnet,
@@ -200,6 +215,7 @@ func TestReleaseShapeAcceptsTheGenerator(t *testing.T) {
 // route (-e2e-diag, the e2e overlay's only) are each refused.
 func TestShapeAccessPinAndDiagFlag(t *testing.T) {
 	base := string(composeYAML(t))
+	tok := slotToken(t, base)
 	if _, err := ComposeImages(base); err != nil {
 		t.Fatalf("the release compose: %v", err)
 	}
@@ -225,12 +241,12 @@ func TestShapeAccessPinAndDiagFlag(t *testing.T) {
 		"a short audience":                edit(t, base, pin, `"-cloudflared-access", "baldcactus,0000"`),
 		"no team":                         edit(t, base, pin, `"-cloudflared-access", ",`+aud+`"`),
 		"the pin twice":                   edit(t, base, pin, pin+", "+pin),
-		"the e2e diag route": edit(t, base, `"-tunnel-secret", "CF_TUNNEL_TOKEN_VMA"]`,
-			`"-tunnel-secret", "CF_TUNNEL_TOKEN_VMA", "-`+E2EDiagFlag+`", "http://e2ediag:8082"]`),
-		"the diag route, --flag": edit(t, base, `"-tunnel-secret", "CF_TUNNEL_TOKEN_VMA"]`,
-			`"-tunnel-secret", "CF_TUNNEL_TOKEN_VMA", "--`+E2EDiagFlag+`", "http://e2ediag:8082"]`),
-		"the diag route, =value": edit(t, base, `"-tunnel-secret", "CF_TUNNEL_TOKEN_VMA"]`,
-			`"-tunnel-secret", "CF_TUNNEL_TOKEN_VMA", "-`+E2EDiagFlag+`=http://e2ediag:8082"]`),
+		"the e2e diag route": edit(t, base, `"-tunnel-secret", "`+tok+`"]`,
+			`"-tunnel-secret", "`+tok+`", "-`+E2EDiagFlag+`", "http://e2ediag:8082"]`),
+		"the diag route, --flag": edit(t, base, `"-tunnel-secret", "`+tok+`"]`,
+			`"-tunnel-secret", "`+tok+`", "--`+E2EDiagFlag+`", "http://e2ediag:8082"]`),
+		"the diag route, =value": edit(t, base, `"-tunnel-secret", "`+tok+`"]`,
+			`"-tunnel-secret", "`+tok+`", "-`+E2EDiagFlag+`=http://e2ediag:8082"]`),
 		"the diag route in place of a pin": edit(t, base, pin, `"-`+E2EDiagFlag+`", "http://e2ediag:8082"`),
 		"the diag flag in the environment": edit(t, base, "    environment:\n      HOME: /tmp\n",
 			"    environment:\n      HOME: /tmp\n      GATEWAYD_ARGS: -"+E2EDiagFlag+"=http://e2ediag:8082\n"),

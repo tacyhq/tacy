@@ -507,6 +507,50 @@ func TestGCPRegistryMode(t *testing.T) {
 	}
 }
 
+// A verifier behind a relay (the WASM: EndorsementsOnly, gcp-prod review H1) never reads the host registry: the same
+// registered quote that passes TestGCPRegistryMode is refused at the machine check, with no registry request, while
+// a ppid-mode Google certificate still passes (the endorsement is still fetched, through the relay).
+func TestGCPRegistryNotThroughRelay(t *testing.T) {
+	a, nonce, p, _ := gcpPolicy(t, gcpRecordings[0])
+	q0, _ := tdx.Parse(rawQuote(t, a))
+	const project, instance, zone = "123456789012", "4815162342", "us-central1-a"
+	digest := sha512.Sum384([]byte(fmt.Sprintf(`{"instanceId":%s,"numericalProjectId":%s,"zone":"%s"}`, instance, project, zone)))
+	inner := p.VerifyQuote
+	var info map[string]any
+	json.Unmarshal(a.Info, &info)
+	info["gce_instance_id"], info["gce_zone"] = instance, zone
+	a.Info, _ = json.Marshal(info)
+	reg := safety.MachineDoc{Type: safety.MachineType, Platform: "dstack", Host: safety.MachineHostGoogle, Mode: safety.MachineModeRegistry,
+		FMSPC: q0.FMSPC, ProjectNumber: project, Label: "gcp c3 (registry)", IssuedAt: listNow}
+	h, _ := safety.MachineDocHash(reg)
+	g := &registryFiles{doc: `{"timestamp":"2026-11-20T21:53:55Z","zone":"us-central1-a"}`, inner: p.GoogleGetter}
+	q := p
+	q.GoogleGetter = EndorsementsOnly(g)
+	q.VerifyQuote = func(ctx context.Context, b []byte) (*tdx.Quote, error) {
+		x, err := inner(ctx, b)
+		if x != nil {
+			x.MrOwner = hex.EncodeToString(digest[:])
+		}
+		return x, err
+	}
+	q.Machines = &safety.MachineSet{Machines: []safety.Machine{{Doc: reg, Hash: h, Source: "test"}}, Revoked: map[string]bool{}}
+	res, err := Verify(context.Background(), a, nonce, q)
+	mustRefuse(t, "registry mode through a relay", res, err, "isn't read through a relay")
+	if g.asked != "" {
+		t.Fatalf("the registry was asked through the relay: %q", g.asked)
+	}
+	// A ppid-mode Google certificate for the same quote: passes, the endorsement fetched through the wrapper.
+	ppid := safety.MachineDoc{Type: safety.MachineType, Platform: "dstack", Host: safety.MachineHostGoogle, Mode: safety.MachineModePPID,
+		PPID: q0.PPID, FMSPC: q0.FMSPC, Label: "gcp c3 (ppid)", IssuedAt: listNow}
+	hp, _ := safety.MachineDocHash(ppid)
+	q.Machines = &safety.MachineSet{Machines: []safety.Machine{{Doc: ppid, Hash: hp, Source: "test"}}, Revoked: map[string]bool{}}
+	res, err = Verify(context.Background(), a, nonce, q)
+	if err != nil {
+		t.Fatalf("ppid mode through the relay: %v", err)
+	}
+	mustPass(t, "ppid mode through the relay", res)
+}
+
 // registryFiles serves one registry document (none: 404) and passes every other URL on.
 type registryFiles struct {
 	doc   string

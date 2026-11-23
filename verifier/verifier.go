@@ -197,7 +197,9 @@ type Policy struct {
 	Getter trust.HTTPSGetter
 	// GoogleGetter fetches Google's firmware launch endorsements (internal/gcetcb), only for a quote whose RTMR0-2
 	// match a Google Cloud set (WithGCP); nil = net/http straight to Google's bucket. Google's signature is checked
-	// against the compiled-in root, so a relay or cache can withhold an endorsement but can't forge one.
+	// against the compiled-in root, so a relay or cache can withhold an endorsement but can't forge one. It also reads
+	// Google's host registry (registry-mode machines), which is unsigned: a verifier behind a relay passes
+	// EndorsementsOnly(its getter), so the registry is read only straight from Google (the key holders).
 	GoogleGetter trust.HTTPSGetter
 	// Now is when certificates and collateral must be valid; zero = now. Only tests set it (recorded collateral).
 	Now time.Time

@@ -86,7 +86,7 @@ func TestHolderCheckGoogleRecorded(t *testing.T) {
 
 			off := o
 			off.GCP = false
-			if _, err := VerifyVM(context.Background(), raw, nonce, pol, off); err == nil || !strings.HasPrefix(err.Error(), "attestation: ") {
+			if _, err := VerifyVM(context.Background(), raw, nonce, pol, off); err == nil || !strings.Contains(err.Error(), "match no pinned set") {
 				t.Fatalf("GCP off (a policy without dstack-gcp): %v", err)
 			}
 			none := o

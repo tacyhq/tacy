@@ -16,6 +16,7 @@ import (
 
 	"github.com/google/go-tdx-guest/verify/trust"
 
+	"github.com/tacyhq/tacy/internal/gcetcb"
 	"github.com/tacyhq/tacy/internal/tdx"
 	"github.com/tacyhq/tacy/proto"
 	"github.com/tacyhq/tacy/safety"
@@ -96,6 +97,28 @@ var nodeLabelRe = regexp.MustCompile(`^phala (prod[0-9]{1,4})$`)
 // RegistryURL is Google's confidential-host registry: one unsigned JSON document per host PPID
 // ({"timestamp", "zone"}), trusted only as far as Google's TLS for storage.googleapis.com (2026-11-21 probe).
 const RegistryURL = "https://storage.googleapis.com/confidential-host-registry/"
+
+// EndorsementsOnly is g for a verifier that reads Google's files through a relay it doesn't trust: the browser's and
+// the apps' WASM, whose fetches go through the chat Worker (gcp-prod review H1). Google's firmware endorsements are
+// signed under Google's root, which gcetcb checks, so a relay can only withhold one; the host registry is an unsigned
+// document, so a relay could say any PPID is a Google host, and a forged quote from any machine of that FMSPC would
+// pass a registry-mode certificate. So only endorsement URLs are fetched: a registry read fails, and a registry-mode
+// machine certificate never passes such a verifier's machine check (fail closed) until the registry answer reaches
+// it over a channel it trusts. The key holders fetch Google directly and don't use this.
+func EndorsementsOnly(g trust.HTTPSGetter) trust.HTTPSGetter { return endorsementsOnly{g} }
+
+type endorsementsOnly struct{ g trust.HTTPSGetter }
+
+func (e endorsementsOnly) Get(url string) (map[string][]string, []byte, error) {
+	return e.GetContext(context.Background(), url)
+}
+
+func (e endorsementsOnly) GetContext(ctx context.Context, url string) (map[string][]string, []byte, error) {
+	if !strings.HasPrefix(url, gcetcb.URLPrefix) {
+		return nil, nil, fmt.Errorf("%s isn't read through a relay here (an unsigned document a relay could forge)", url)
+	}
+	return trust.GetWith(ctx, e.g, url)
+}
 
 // checkMachine is the allowlist check (MachineCheck) on a verified quote.
 func (r *Result) checkMachine(ctx context.Context, q *tdx.Quote, att *proto.Attestation, p Policy) bool {

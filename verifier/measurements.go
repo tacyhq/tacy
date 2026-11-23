@@ -155,7 +155,9 @@ var BootMeasurements = []BootMeasurement{
 		Source: "computed with dstack-mr (the tdx.small set's build: mkosi-os-v0.6.5, commit 350a0a7; dstack-0.6.5.tar.gz, " +
 			"sha256 f33965e0…) from the tdx.small set's vm_config with cpu_count 2 and memory_size 4 GiB, nothing else " +
 			"changed (2026-11-23); MRTD, RTMR1 and RTMR2 equal the tdx.small set's. Equal to Phala's tcb_info of a " +
-			"tdx.medium throwaway on prod5 (2026-11-23)",
+			"tdx.medium throwaway on prod5 (2026-11-23), and to genuine key_provider none quotes of the release on tdx.medium " +
+			"(prod5, 2026-11-23, a boot and a restart) with Intel's collateral" +
+			"",
 	},
 	{
 		Name:    "dstack-0.6.5, 4 vCPU, 8 GiB (Phala tdx.large, QEMU 8.2.2)",
@@ -167,7 +169,9 @@ var BootMeasurements = []BootMeasurement{
 		Source: "computed with dstack-mr (the tdx.small set's build: mkosi-os-v0.6.5, commit 350a0a7; dstack-0.6.5.tar.gz, " +
 			"sha256 f33965e0…) from the tdx.small set's vm_config with cpu_count 4 and memory_size 8 GiB, nothing else " +
 			"changed (2026-11-23); MRTD, RTMR1 and RTMR2 equal the tdx.small set's. Equal to Phala's tcb_info of a " +
-			"tdx.large throwaway on prod5 (2026-11-23)",
+			"tdx.large throwaway on prod5 (2026-11-23), and to genuine key_provider none quotes of the release on tdx.large " +
+			"(prod5, 2026-11-23, two CVMs, the second after a restart) with Intel's collateral" +
+			"",
 	},
 }
 

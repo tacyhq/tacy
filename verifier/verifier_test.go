@@ -65,8 +65,14 @@ func TestRetiredImagesRefused(t *testing.T) {
 		}
 	}
 	if len(ProdImages) != 1 || ProdImages["4771a29e03e93f0e2d5e37174cd8bb1112942c9689deb36b16c5df9e183d8623"] != "dstack-0.6.5" ||
-		len(BootMeasurements) != 1 || BootMeasurements[0].OSImage != "4771a29e03e93f0e2d5e37174cd8bb1112942c9689deb36b16c5df9e183d8623" {
+		len(BootMeasurements) != 3 {
 		t.Fatalf("accepted images %v, %d sets", ProdImages, len(BootMeasurements))
+	}
+	// One set per Phala shape (tdx.small, medium, large), all of the one accepted image.
+	for _, b := range BootMeasurements {
+		if b.OSImage != "4771a29e03e93f0e2d5e37174cd8bb1112942c9689deb36b16c5df9e183d8623" {
+			t.Fatalf("%s is for OS image %s", b.Name, b.OSImage)
+		}
 	}
 }
 

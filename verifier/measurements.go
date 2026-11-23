@@ -21,7 +21,9 @@ import (
 //   - MRTD is the firmware (dstack's OVMF/TDVF), and with QEMU 8.x how its pages are added.
 //   - RTMR0 is the firmware's configuration: the TD HOB (memory size), ACPI tables (vCPUs, devices, hotplug,
 //     PCI layout, QEMU version) and the boot variables. It changes with the VM size, not only the image.
-//   - RTMR1 is the kernel (bzImage, with the setup header the firmware patches; it depends on memory size too).
+//   - RTMR1 is the kernel (bzImage, with the setup header the firmware patches). It depended on the memory size
+//     before 0.6.5; 0.6.5's is the same on tdx.small, medium and large (computed with dstack-mr and observed,
+//     2026-11-23; its metadata.json says kernel_header_normalized).
 //   - RTMR2 is the kernel command line (which carries the dm-verity root hash of the root filesystem) and the
 //     initramfs.
 //
@@ -140,6 +142,32 @@ var BootMeasurements = []BootMeasurement{
 			"recomputed by hand from the command line and initramfs (TestDstack065CmdlineFix). Equal to two genuine 0.6.5 " +
 			"quotes of key_provider none throwaways on Phala prod2 (tdx.small), 2026-11-21, the second after a restart, " +
 			"with Intel's collateral (testdata/attest-065-none.json, attest-065-none-restart.json; TestRecorded065None)",
+	},
+	// The bigger Phala shapes: the same image, firmware, kernel, command line and initramfs as tdx.small,
+	// so MRTD, RTMR1 and RTMR2 are its; only RTMR0 (the TD HOB's memory, the ACPI tables' vCPUs) is the shape's.
+	{
+		Name:    "dstack-0.6.5, 2 vCPU, 4 GiB (Phala tdx.medium, QEMU 8.2.2)",
+		OSImage: "4771a29e03e93f0e2d5e37174cd8bb1112942c9689deb36b16c5df9e183d8623",
+		MRTD:    "2a674327c50218dba880066b349b8d559d749ed68dce33fd651c184a877d084b07a9e583767a7ad5da13ed91deec2b70",
+		RTMR0:   "027b610ab0555482f8a3868524093bdf3cdbe2539f81dfeeb886864654cb2fe3422f7fc36d4bab6fa46683aad11d1ba7",
+		RTMR1:   "2f72a4db2f7de90adeabe55607b0c1cf209fc243bc773f5862d1b00d3bb198e835e99d502e90a24005f0d1368dd24f29",
+		RTMR2:   "3d9910a33a26a769c5146dea31bea0d2924a7746ad09e121dabe709eddd5c647716f4d89279e0e24d8dbb93f9cdb605b",
+		Source: "computed with dstack-mr (the tdx.small set's build: mkosi-os-v0.6.5, commit 350a0a7; dstack-0.6.5.tar.gz, " +
+			"sha256 f33965e0…) from the tdx.small set's vm_config with cpu_count 2 and memory_size 4 GiB, nothing else " +
+			"changed (2026-11-23); MRTD, RTMR1 and RTMR2 equal the tdx.small set's. Equal to Phala's tcb_info of a " +
+			"tdx.medium throwaway on prod5 (2026-11-23)",
+	},
+	{
+		Name:    "dstack-0.6.5, 4 vCPU, 8 GiB (Phala tdx.large, QEMU 8.2.2)",
+		OSImage: "4771a29e03e93f0e2d5e37174cd8bb1112942c9689deb36b16c5df9e183d8623",
+		MRTD:    "2a674327c50218dba880066b349b8d559d749ed68dce33fd651c184a877d084b07a9e583767a7ad5da13ed91deec2b70",
+		RTMR0:   "fb14dc139f33d6fcf474bc8332cac001259fb31cfbcb6b34d4ceeb552a2c4466884a0cbde45ad98a05c5c060c23ad65a",
+		RTMR1:   "2f72a4db2f7de90adeabe55607b0c1cf209fc243bc773f5862d1b00d3bb198e835e99d502e90a24005f0d1368dd24f29",
+		RTMR2:   "3d9910a33a26a769c5146dea31bea0d2924a7746ad09e121dabe709eddd5c647716f4d89279e0e24d8dbb93f9cdb605b",
+		Source: "computed with dstack-mr (the tdx.small set's build: mkosi-os-v0.6.5, commit 350a0a7; dstack-0.6.5.tar.gz, " +
+			"sha256 f33965e0…) from the tdx.small set's vm_config with cpu_count 4 and memory_size 8 GiB, nothing else " +
+			"changed (2026-11-23); MRTD, RTMR1 and RTMR2 equal the tdx.small set's. Equal to Phala's tcb_info of a " +
+			"tdx.large throwaway on prod5 (2026-11-23)",
 	},
 }
 

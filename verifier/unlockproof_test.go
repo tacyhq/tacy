@@ -165,7 +165,7 @@ func TestUnlockProofAcceptsRegistryVM(t *testing.T) {
 	if countCheck(res, UnlockProofCheck) != 1 || countCheck(res, MachineCheck) != 1 {
 		t.Fatalf("checks: %+v", res.Checks)
 	}
-	if f := res.Facts[FactMachine]; !strings.Contains(f, "by both key holders (unlock proof, epoch 1)") || !strings.Contains(f, "host Google: not defended") {
+	if f := res.Facts[FactMachine]; !strings.Contains(f, "by the key holders' unlock (unlock proof, epoch 1)") || !strings.Contains(f, "host Google: not defended") {
 		t.Fatalf("machine fact %q", f)
 	}
 	// The proof doesn't replace MR_OWNER: another project's VM with a valid proof is refused.
@@ -394,19 +394,87 @@ func TestComposeMinEpoch(t *testing.T) {
 			t.Fatalf("%q: %d, %v", c.compose, got, err)
 		}
 	}
-	// A proof below it is refused at the binding check.
-	r := &Result{Facts: map[string]string{"app id": "a", "instance id": "i", "compose hash": "c"},
-		proof: &unlockProof{kmsID: "ed25519:k", epoch: 2, appID: "a", instance: "i", appComposeSHA256: "c"}}
-	if r.checkUnlockProofBinding("services:\n  unlockd:\n    command: [\"-min-epoch\", \"3\", \"-kms-key\", \"ed25519:k\"]\n") {
-		t.Fatal("epoch 2 under min-epoch 3: accepted")
+	// The binding check on an agent VM compose shape: unlockd's -kms-key and -min-epoch, agentd's -firm (default
+	// f_chat), the trust list's min_unlock_epoch.
+	const unlockd = "  unlockd:\n    command: [\"-min-epoch\", \"%d\", \"-kms-key\", \"%s\"]\n"
+	compose := func(min int, kms, firm string) string {
+		c := "services:\n" + fmt.Sprintf(unlockd, min, kms)
+		if firm != "" {
+			c += "  agentd:\n    command: [\"-firm\", \"" + firm + "\"]\n"
+		}
+		return c
 	}
-	r.Checks = nil
-	if !r.checkUnlockProofBinding("services:\n  unlockd:\n    command: [\"-min-epoch\", \"2\", \"-kms-key\", \"ed25519:k\"]\n") {
-		t.Fatalf("epoch 2 under min-epoch 2: %+v", r.Checks)
+	for _, c := range []struct {
+		name     string
+		compose  string
+		trustMin uint32
+		ok       bool
+	}{
+		{"epoch 2 under min-epoch 2", compose(2, "ed25519:k", ""), 0, true},
+		{"epoch 2 under min-epoch 3", compose(3, "ed25519:k", ""), 0, false},
+		{"epoch 2, the trust list retired epochs below 3", compose(1, "ed25519:k", ""), 3, false},
+		{"epoch 2, the trust list's minimum 2", compose(1, "ed25519:k", ""), 2, true},
+		{"unlockd names another KMS id", compose(1, "ed25519:other", ""), 0, false},
+		{"another firm (agentd's -firm)", compose(1, "ed25519:k", "f_firm1"), 0, false},
+		{"the same firm, named", compose(1, "ed25519:k", "f_chat"), 0, true},
+		{"unlockd names no KMS id", "services:\n  unlockd:\n    command: [\"-min-epoch\", \"1\"]\n", 0, false},
+		{"another service names another KMS id (no unlockd)", "services:\n  gatewayd:\n    command: [\"-kms-key\", \"ed25519:other\"]\n", 0, false},
+		{"unlockd's KMS id named twice, differently", "services:\n  unlockd:\n    command: [\"-kms-key\", \"ed25519:k\", \"-kms-key\", \"ed25519:other\"]\n", 0, false},
+	} {
+		r := &Result{Facts: map[string]string{"app id": "a", "instance id": "i", "compose hash": "c"},
+			proof: &unlockProof{kmsID: "ed25519:k", epoch: 2, firm: "f_chat", appID: "a", instance: "i", appComposeSHA256: "c"}}
+		if got := r.checkUnlockProofBinding(c.compose, c.trustMin); got != c.ok {
+			t.Fatalf("%s: %v (%+v)", c.name, got, r.Checks)
+		}
 	}
-	r.Checks = nil
-	if r.checkUnlockProofBinding("services:\n  gatewayd:\n    command: [\"-kms-key\", \"ed25519:other\"]\n") {
-		t.Fatal("a proof of another KMS id than the compose's: accepted")
+}
+
+// The trust list's min_unlock_epoch (an optional member: builds that don't read it accept no proof at all) reaches
+// the policy, and a malformed one refuses the list (TrustState keeps the last good one).
+func TestTrustListMinUnlockEpoch(t *testing.T) {
+	var l safety.TrustList
+	if e, err := l.MinUnlockEpoch(); e != 0 || err != nil {
+		t.Fatalf("none: %d %v", e, err)
+	}
+	if err := l.SetMinUnlockEpoch(0); err == nil {
+		t.Fatal("epoch 0 taken")
+	}
+	l.SetMinUnlockEpoch(3)
+	p, err := Policy{MinUnlockEpoch: 1}.WithTrustList(&l)
+	if err != nil || p.MinUnlockEpoch != 3 {
+		t.Fatalf("%d %v", p.MinUnlockEpoch, err)
+	}
+	l.Optional[safety.TrustMinUnlockEpochMember] = []byte(`"3"`)
+	if _, err := (Policy{}).WithTrustList(&l); err == nil {
+		t.Fatal("a malformed min_unlock_epoch taken")
+	}
+	// End to end: a retired epoch's proof on a registry VM is refused at the binding check.
+	c := newProofCase(t)
+	c.a.UnlockProof = c.e.proof(t, c.a)
+	c.p.MinUnlockEpoch = 2
+	res, err := c.verify()
+	if last := res.Checks[len(res.Checks)-1]; err == nil || last.Name != UnlockProofCheck || !strings.Contains(last.Detail, "retired") {
+		t.Fatalf("a retired epoch's proof: %v, %+v", err, last)
+	}
+}
+
+// The epoch certificate is read strictly: an unknown member (or a renamed one) refuses the proof.
+func TestUnlockProofCertStrict(t *testing.T) {
+	c := newProofCase(t)
+	pr := c.e.proof(t, c.a)
+	var sc struct{ Doc, Sig []byte }
+	json.Unmarshal(pr.EpochCert, &sc)
+	if _, err := openUnlockProof(&proto.Attestation{HPKEPublicKey: c.a.HPKEPublicKey, UnlockProof: pr}, c.p.KMSIDs); err != nil {
+		t.Fatalf("the genuine certificate: %v", err)
+	}
+	var m map[string]any
+	json.Unmarshal(sc.Doc, &m)
+	m["extra"] = 1
+	doc, _ := json.Marshal(m)
+	bad := *pr
+	bad.EpochCert, _ = json.Marshal(map[string][]byte{"doc": doc, "sig": sc.Sig})
+	if _, err := openUnlockProof(&proto.Attestation{HPKEPublicKey: c.a.HPKEPublicKey, UnlockProof: &bad}, c.p.KMSIDs); err == nil || !strings.Contains(err.Error(), "doesn't parse") {
+		t.Fatalf("an unknown member: %v", err)
 	}
 }
 

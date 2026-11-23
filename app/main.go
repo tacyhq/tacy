@@ -763,7 +763,10 @@ func main() {
 		memory: memory, ledger: sg.ledger}
 	if uc != nil {
 		s.attester = uc.Attest
-		s.proof = unlockProofs(boot.signer, uk, id.MarshalPublicKey())
+		if s.proof = unlockProofs(boot.signer, uk, id.MarshalPublicKey()); s.proof == nil {
+			// Clients that read Google through a relay refuse a registry-mode Google VM without it (fail closed).
+			log.Printf("attest: no unlock proof (unlockd gave no epoch certificate): clients will refuse this VM on a Google registry-mode machine")
+		}
 		// Schedule ownership (unlock/owner.go): this VM fires a space's schedules only while it holds the space's row
 		// at the Worker, named by its attested instance id.
 		auth, err := uk.StoreAuth(PurposeState, nil)

@@ -158,7 +158,7 @@ func (r *Result) checkMachine(ctx context.Context, q *tdx.Quote, att *proto.Atte
 		}
 		detail = fmt.Sprintf("%s (%s); %s: not defended by the machine list", m.Doc.Label, short(q.PPID), host)
 		if r.proof != nil {
-			detail += fmt.Sprintf("; Google's host registry: by both key holders (unlock proof, epoch %d)", r.proof.epoch)
+			detail += fmt.Sprintf("; Google's host registry: by the key holders' unlock (unlock proof, epoch %d)", r.proof.epoch)
 		}
 		r.Facts[FactMachine] = detail
 		r.Facts["machine certificate"] = m.Hash

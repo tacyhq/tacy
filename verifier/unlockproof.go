@@ -9,6 +9,9 @@ import (
 	"strconv"
 	"strings"
 
+	"encoding/json/jsontext"
+	jsonv2 "encoding/json/v2"
+
 	"github.com/google/go-tdx-guest/verify/trust"
 	"go.yaml.in/yaml/v3"
 
@@ -28,16 +31,19 @@ import (
 //     activity signer ("activity-sign/v1"), the key agentd derives from R_e;
 //   - that signer signed UnlockProofLabel over this attestation's HPKE key (the one report_data binds), the KMS id,
 //     the epoch, and the app id, instance id and app-compose sha256 the proof names;
-//   - those three are the attested ones (RTMR3), the KMS id is the one the compose names (-kms-key), and the epoch
-//     is at least the compose's unlockd -min-epoch (so a release that raised it after a leaked root refuses the old
-//     epoch's proofs): checkUnlockProofBinding, after the compose checks;
-//   - MR_OWNER is still the certificate's project's PZID for the VM's instance and zone (ownerCheck).
+//   - those three are the attested ones (RTMR3), the KMS id is the one unlockd's -kms-key names, the certificate's
+//     firm is agentd's -firm, and the epoch is at least both unlockd's -min-epoch and the trust list's
+//     min_unlock_epoch (safety.TrustMinUnlockEpochMember: after a leaked root and the re-split, the list retires the
+//     old epoch's proofs at once, whatever release a forged quote claims): checkUnlockProofBinding, after the compose
+//     checks;
+//   - MR_OWNER is still the certificate's project's PZID for the VM's instance and zone (ownerCheck), and the proof
+//     names the same GCE instance and zone.
 //
 // What forging takes: an attestation key from a TDX machine of the FMSPC, plus a VM that unlocked, so both holders'
 // shares (Cloudflare and Vercel), or the admin's break-glass. A forged quote carrying a genuine VM's proof binds
-// that VM's HPKE key, which only that VM can open, and must claim exactly its app id, instance and release. There
-// is no expiry to manage: the proof is for one boot's key, and the host check is the holders' at that unlock (as
-// for the shares themselves).
+// that VM's HPKE key, which only that VM can open, and must claim exactly its app id, release and GCE instance (and
+// its dstack instance id where RTMR3 measures one). There is no expiry to manage: the proof is for one boot's key,
+// and the host check is the holders' at that unlock (as for the shares themselves).
 
 // UnlockProofCheck is the binding check's name (only for a VM on a registry-mode machine, through a relay).
 const UnlockProofCheck = "unlock proof: the VM's key belongs to a VM both key holders unlocked (they checked Google's host registry)"
@@ -59,15 +65,21 @@ func proofMode(g trust.HTTPSGetter) bool {
 type unlockProof struct {
 	kmsID            string
 	epoch            uint32
+	firm             string // the epoch certificate's (its activity signer is this firm's)
 	appID, instance  string
 	appComposeSHA256 string
 }
 
-// epochCertDoc is the part of split.EpochCert the proof needs.
+// epochCertDoc is split.EpochCert as signed (read strictly: every member, exact names, nothing else).
 type epochCertDoc struct {
-	KMSID   string            `json:"kms_id"`
-	Epoch   uint32            `json:"epoch"`
-	Signers map[string]string `json:"signers"`
+	KMSID      string                     `json:"kms_id"`
+	Epoch      uint32                     `json:"epoch"`
+	Root       string                     `json:"root"`
+	App        string                     `json:"app"`
+	Firm       string                     `json:"firm"`
+	StoreCerts map[string]jsontext.Value  `json:"store_certs"`
+	Signers    map[string]string          `json:"signers"`
+	IssuedAt   jsontext.Value             `json:"issued_at"`
 }
 
 // openUnlockProof checks att's unlock proof up to its signature: the epoch certificate under a pinned KMS id, the
@@ -85,7 +97,7 @@ func openUnlockProof(att *proto.Attestation, ids map[string]string) (*unlockProo
 		return nil, errors.New("unlock proof: the epoch certificate isn't one")
 	}
 	var doc epochCertDoc
-	if err := json.Unmarshal(sc.Doc, &doc); err != nil || doc.Epoch == 0 {
+	if err := jsonv2.Unmarshal(sc.Doc, &doc, jsonv2.RejectUnknownMembers(true)); err != nil || doc.Epoch == 0 {
 		return nil, errors.New("unlock proof: the epoch certificate doesn't parse")
 	}
 	if ids[doc.KMSID] == "" {
@@ -108,7 +120,8 @@ func openUnlockProof(att *proto.Attestation, ids map[string]string) (*unlockProo
 	if len(pr.Sig) != ed25519.SignatureSize || !ed25519.Verify(signer, append(append([]byte(proto.UnlockProofLabel), 0), d[:]...), pr.Sig) {
 		return nil, errors.New("unlock proof: not signed by the epoch's activity signer over this VM's key (a proof for another boot or VM)")
 	}
-	return &unlockProof{kmsID: doc.KMSID, epoch: doc.Epoch, appID: pr.AppID, instance: pr.InstanceID, appComposeSHA256: pr.AppComposeSHA256}, nil
+	return &unlockProof{kmsID: doc.KMSID, epoch: doc.Epoch, firm: doc.Firm, appID: pr.AppID, instance: pr.InstanceID,
+		appComposeSHA256: pr.AppComposeSHA256}, nil
 }
 
 func hexKey(s string) ([]byte, error) {
@@ -128,8 +141,9 @@ func hexKey(s string) ([]byte, error) {
 
 // checkUnlockProofBinding is the proof's binding to what was attested (only when the machine check took a
 // registry-mode certificate by proof): the app id, instance id and app-compose hash from the RTMR3 replay, the KMS
-// id the compose names, and the compose's minimum epoch.
-func (r *Result) checkUnlockProofBinding(compose string) bool {
+// id unlockd's -kms-key names, agentd's firm, and the minimum epoch (unlockd's -min-epoch and minEpoch, the trust
+// list's min_unlock_epoch).
+func (r *Result) checkUnlockProofBinding(compose string, minEpoch uint32) bool {
 	pr := r.proof
 	if pr == nil {
 		return true
@@ -144,16 +158,17 @@ func (r *Result) checkUnlockProofBinding(compose string) bool {
 		err = fmt.Errorf("the proof is for app-compose %s, the VM attests %s", short(pr.appComposeSHA256), short(r.Facts["compose hash"]))
 	}
 	if err == nil {
-		keys, _, kerr := composeKMS(compose)
-		switch {
-		case kerr != nil:
-			err = kerr
-		case len(keys) == 0:
-			// A VM unlocks only from the Tacy KMS its compose names, so a proof for one naming none is another VM's.
-			// (Also what keeps a trust list's added KMS id from certifying keys for a signed release that names ours.)
-			err = errors.New("the compose names no Tacy KMS (-kms-key), so this VM can't have unlocked")
-		case !contains(keys, pr.kmsID):
-			err = fmt.Errorf("the proof's epoch is Tacy KMS %s's, the compose names %s", short(pr.kmsID), strings.Join(keys, ", "))
+		err = proofKMS(compose, pr.kmsID)
+	}
+	if err == nil {
+		firm, ferr := serviceFlag(compose, "agentd", "firm")
+		if firm == "" {
+			firm = "f_chat" // agentd's default (safety/flags.go)
+		}
+		if ferr != nil {
+			err = ferr
+		} else if pr.firm != firm {
+			err = fmt.Errorf("the proof's epoch certificate is for firm %q, agentd serves %q", pr.firm, firm)
 		}
 	}
 	if err == nil {
@@ -162,6 +177,8 @@ func (r *Result) checkUnlockProofBinding(compose string) bool {
 			err = merr
 		} else if pr.epoch < min {
 			err = fmt.Errorf("the proof is of epoch %d, below the compose's minimum %d", pr.epoch, min)
+		} else if pr.epoch < minEpoch {
+			err = fmt.Errorf("the proof is of epoch %d, which the trust list retired (min_unlock_epoch %d)", pr.epoch, minEpoch)
 		}
 	}
 	return r.add(UnlockProofCheck, err, fmt.Sprintf("epoch %d of Tacy KMS %s", pr.epoch, short(pr.kmsID)))
@@ -176,15 +193,45 @@ func contains(list []string, s string) bool {
 	return false
 }
 
-// composeMinEpoch is unlockd's -min-epoch in the compose (1 when unlockd or the flag is absent: unlockd's default).
-func composeMinEpoch(compose string) (uint32, error) {
+// proofKMS: the proof's KMS id is the one unlockd's -kms-key names, the only Tacy KMS a VM unlocks from. A compose
+// without unlockd can't have unlocked: the proof must then be of a KMS id its services name (composeKMS), and none
+// named is refused. (Also what keeps a trust list's added KMS id from certifying keys for a signed release that names
+// ours.)
+func proofKMS(compose, kmsID string) error {
+	if HasUnlockd(compose) {
+		k, err := serviceFlag(compose, UnlockdService, "kms-key")
+		switch {
+		case err != nil:
+			return err
+		case k == "":
+			return errors.New("unlockd names no Tacy KMS (-kms-key), so this VM can't have unlocked")
+		case k != kmsID:
+			return fmt.Errorf("the proof's epoch is Tacy KMS %s's, unlockd's -kms-key is %s", short(kmsID), short(k))
+		}
+		return nil
+	}
+	keys, _, err := composeKMS(compose)
+	switch {
+	case err != nil:
+		return err
+	case len(keys) == 0:
+		return errors.New("the compose names no Tacy KMS (-kms-key), so this VM can't have unlocked")
+	case !contains(keys, kmsID):
+		return fmt.Errorf("the proof's epoch is Tacy KMS %s's, the compose names %s", short(kmsID), strings.Join(keys, ", "))
+	}
+	return nil
+}
+
+// serviceFlag is service's -name value in the compose ("" when absent; an error when it is named twice with
+// different values or has none).
+func serviceFlag(compose, service, name string) (string, error) {
 	var doc struct {
 		Services map[string]map[string]any `yaml:"services"`
 	}
 	if err := yaml.Unmarshal([]byte(compose), &doc); err != nil {
-		return 0, fmt.Errorf("docker compose isn't YAML: %w", err)
+		return "", fmt.Errorf("docker compose isn't YAML: %w", err)
 	}
-	svc := doc.Services[UnlockdService]
+	svc := doc.Services[service]
 	var args []string
 	for _, k := range []string{"entrypoint", "command"} {
 		switch v := svc[k].(type) {
@@ -196,25 +243,40 @@ func composeMinEpoch(compose string) (uint32, error) {
 			}
 		}
 	}
-	min := uint64(1)
+	out := ""
 	for i, a := range args {
-		name, val, eq := strings.Cut(strings.TrimPrefix(strings.TrimPrefix(a, "-"), "-"), "=")
-		if !strings.HasPrefix(a, "-") || name != "min-epoch" {
+		n, val, eq := strings.Cut(strings.TrimPrefix(strings.TrimPrefix(a, "-"), "-"), "=")
+		if !strings.HasPrefix(a, "-") || n != name {
 			continue
 		}
 		if !eq {
 			if i+1 >= len(args) {
-				return 0, errors.New("unlockd's -min-epoch has no value")
+				return "", fmt.Errorf("%s's -%s has no value", service, name)
 			}
 			val = args[i+1]
 		}
-		v, err := strconv.ParseUint(val, 10, 32)
-		if err != nil || v == 0 {
-			return 0, fmt.Errorf("unlockd's -min-epoch %q isn't an epoch", val)
+		if out != "" && out != val {
+			return "", fmt.Errorf("%s names -%s twice", service, name)
 		}
-		min = max(min, v)
+		out = val
 	}
-	return uint32(min), nil
+	return out, nil
+}
+
+// composeMinEpoch is unlockd's -min-epoch in the compose (1 when unlockd or the flag is absent: unlockd's default).
+func composeMinEpoch(compose string) (uint32, error) {
+	val, err := serviceFlag(compose, UnlockdService, "min-epoch")
+	if err != nil {
+		return 0, err
+	}
+	if val == "" {
+		return 1, nil
+	}
+	v, err := strconv.ParseUint(val, 10, 32)
+	if err != nil || v == 0 {
+		return 0, fmt.Errorf("unlockd's -min-epoch %q isn't an epoch", val)
+	}
+	return uint32(v), nil
 }
 
 // proofOrRegistry is the registry part of a registry-mode machine: by proof of unlock through a relay, else the

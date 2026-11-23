@@ -175,6 +175,11 @@ func (p Policy) WithTrustList(l *safety.TrustList) (Policy, error) {
 		return slices.Contains(l.RevokedReleases, r.Version) || !dstackRelease(r)
 	})
 	p.ReleaseFloor = NewerVersion(p.ReleaseFloor, l.VMReleaseFloor)
+	me, err := l.MinUnlockEpoch()
+	if err != nil {
+		return p, err
+	}
+	p.MinUnlockEpoch = max(p.MinUnlockEpoch, me)
 	if slices.Contains(l.Platforms, PlatformDstackGCP) {
 		// The Google Cloud fallback, on only by a signed list (the app carries the sets, off): no app update needed.
 		p = p.WithGCP()

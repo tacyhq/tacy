@@ -179,6 +179,9 @@ type Policy struct {
 	// nor does the rule that the overlap needs a trust list in force, so those builds keep it until KMSOverlapUntil.
 	// No client sets it: an ended overlap, or one with no list, ends there.
 	KeepOverlap bool
+	// MinUnlockEpoch is the lowest key epoch whose unlock proof a registry-mode machine counts by (a trust list's
+	// min_unlock_epoch; unlockproof.go). 0: only the compose's unlockd -min-epoch.
+	MinUnlockEpoch uint32
 	// ReleaseFloor (vX.Y.Z) is the oldest signed VM release the release mode accepts on top of Release's minimum
 	// (a trust list's vm_release_floor); unused by the exact mode.
 	ReleaseFloor string
@@ -760,7 +763,7 @@ func Verify(ctx context.Context, att *proto.Attestation, nonce []byte, p Policy)
 	if !r.checkUnlockd(ac.DockerComposeFile, ac.PreLaunchScript, mode, att.Version, p.KeyRelease) {
 		return failed()
 	}
-	if !r.checkUnlockProofBinding(ac.DockerComposeFile) {
+	if !r.checkUnlockProofBinding(ac.DockerComposeFile, p.MinUnlockEpoch) {
 		return failed()
 	}
 	r.HPKEPublicKey = key

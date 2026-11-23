@@ -122,6 +122,38 @@ var GCPBootMeasurements = []BootMeasurement{
 		MinFirmwareSVN: 2,
 		GoogleMRTDs:    []string{mrtdGoogle20260731},
 	},
+	// The bigger C3 shapes (2026-11-23): only RTMR0 differs from c3-standard-4's set, in its TD HOB (memory) and ACPI
+	// table events.
+	{
+		Name:    "dstack-0.6.6, GCP c3-standard-8 TDX (8 vCPU, 32 GB)",
+		OSImage: "5aa762ee7cddc62174c13e1081d56f7ab2a9aebc513973a1d63b3775fda250ec",
+		MRTD:    MRTDGoogleEndorsed,
+		RTMR0:   "2074615297d6e87ec1dbbb764635ee3bb06b00b0fbc13f35bead969b811355f749156b1a88f9716300db68b1ddae1f71",
+		RTMR1:   "09328a31bcc05f3c0f1f40a52f822b3a19fb987f67179f569cecef0500e9444a3387518849b0e231b12173371dfdac1a",
+		RTMR2:   "97c2b630118d3b027eb2ed399df39d10be6d03a502ebeaf14a40459ff0789ffa2e7ef4d657265c01ec0497df19d2fefc",
+		UKI:     "440fa6cac8d3fc19d6f7dbd1340fc7fc1a847539d2c41a8da82de5d38e8ec008c27ae889df05561732043cb9f748515a",
+		Source: "observed on all 12 c3-standard-8 throwaway VMs in tacy-test (us-central1-a 4, -b 3, -c 3, us-east1-c 2; " +
+			"2026-11-23; testdata/gcp-066-c3s8-*.json), each verified in full with Intel and Google live, dstack 0.6.6 as " +
+			"the c3-standard-4 set, 10 GiB pd-balanced boot disk; MRTD, RTMR1 and RTMR2 equal the c3-standard-4 set's (the " +
+			"same firmware and UKI), RTMR0 is the shape's (its TD HOB and ACPI table events differ)",
+		MinFirmwareSVN: 2,
+		GoogleMRTDs:    []string{mrtdGoogle20260731},
+	},
+	{
+		Name:    "dstack-0.6.6, GCP c3-standard-22 TDX (22 vCPU, 88 GB)",
+		OSImage: "5aa762ee7cddc62174c13e1081d56f7ab2a9aebc513973a1d63b3775fda250ec",
+		MRTD:    MRTDGoogleEndorsed,
+		RTMR0:   "b1a5e2e167a01af91a68edf14fe9b9845127502b1a58117f4fa13eb55883b5073d8bb36f784fa2d1e2d2e40fc7812b0a",
+		RTMR1:   "09328a31bcc05f3c0f1f40a52f822b3a19fb987f67179f569cecef0500e9444a3387518849b0e231b12173371dfdac1a",
+		RTMR2:   "97c2b630118d3b027eb2ed399df39d10be6d03a502ebeaf14a40459ff0789ffa2e7ef4d657265c01ec0497df19d2fefc",
+		UKI:     "440fa6cac8d3fc19d6f7dbd1340fc7fc1a847539d2c41a8da82de5d38e8ec008c27ae889df05561732043cb9f748515a",
+		Source: "observed on all 5 c3-standard-22 throwaway VMs in tacy-test (us-central1-a 2, -b 2, -c 1; 2026-11-23; " +
+			"testdata/gcp-066-c3s22-us-central1-a.json), each verified in full with Intel and Google live, dstack 0.6.6 as " +
+			"the c3-standard-4 set, 10 GiB pd-balanced boot disk; MRTD, RTMR1 and RTMR2 equal the c3-standard-4 set's, " +
+			"RTMR0 is the shape's (its TD HOB and ACPI table events differ)",
+		MinFirmwareSVN: 2,
+		GoogleMRTDs:    []string{mrtdGoogle20260731},
+	},
 }
 
 // BootMeasurements are the measurement sets a VM may boot with. Add a set when the dstack image or the VM size

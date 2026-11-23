@@ -84,6 +84,8 @@ var gcpShapes = []struct {
 }{
 	{"c3-standard-4", "pd-balanced", []string{"us-central1-a", "us-central1-b", "us-central1-c", "us-east1-c", "us-east1-d"}},
 	{"c4-standard-2", "hyperdisk-balanced", []string{"us-central1-f", "us-east4-c"}},
+	{"c3-standard-8", "pd-balanced", []string{"us-central1-a", "us-central1-b", "us-central1-c", "us-east1-c"}},
+	{"c3-standard-22", "pd-balanced", []string{"us-central1-a", "us-central1-b", "us-central1-c"}},
 }
 
 func gcpPlatform() GCPPlatform {

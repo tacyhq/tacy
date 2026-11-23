@@ -27,17 +27,31 @@ import (
 // c4-standard-2 in the two zones that had stock). All:
 // dstack 0.6.6 booted from its UKI on Google's firmware, key provider none, an ephemeral data disk, the throwaway
 // attest app (app A, not the agent VM). Intel's answers for both platforms' FMSPCs were recorded at gcpCollateralNow (testdata/intel-collateral-gcp-20261121.json); Google's endorsements
-// are internal/gcetcb/testdata's, as Google's bucket served them the same day.
+// are internal/gcetcb/testdata's, as Google's bucket served them the same day. gcp-066-c3s8-us-central1-a.json,
+// gcp-066-c3s8-us-east1-c.json (c3-standard-8) and gcp-066-c3s22-us-central1-a.json (c3-standard-22) are the same app
+// on bigger C3 shapes in project tacy-test, 2026-11-23; the same Intel answers and Google endorsement verify them.
 
 var gcpRecordings = []string{"gcp-066-c3-us-central1-a.json", "gcp-066-c3-us-central1-b.json", "gcp-066-c3-us-central1-c.json",
-	"gcp-066-c3-us-east1-c.json", "gcp-066-c4-us-east4-c-1.json", "gcp-066-c4-us-central1-f.json"}
+	"gcp-066-c3-us-east1-c.json", "gcp-066-c4-us-east4-c-1.json", "gcp-066-c4-us-central1-f.json",
+	"gcp-066-c3s8-us-central1-a.json", "gcp-066-c3s8-us-east1-c.json", "gcp-066-c3s22-us-central1-a.json"}
 
-// gcpSetOf is the GCP set a recording's name says it is (c3-standard-4 or c4-standard-2).
+// gcpSetOf is the GCP set a recording's name says it is (c3-standard-4, c4-standard-2, c3-standard-8, c3-standard-22).
 func gcpSetOf(name string) BootMeasurement {
-	if strings.Contains(name, "-c4-") {
-		return GCPBootMeasurements[1]
+	shape := "c3-standard-4"
+	switch {
+	case strings.Contains(name, "-c4-"):
+		shape = "c4-standard-2"
+	case strings.Contains(name, "-c3s8-"):
+		shape = "c3-standard-8"
+	case strings.Contains(name, "-c3s22-"):
+		shape = "c3-standard-22"
 	}
-	return GCPBootMeasurements[0]
+	for _, b := range GCPBootMeasurements {
+		if strings.Contains(b.Name, " "+shape+" ") {
+			return b
+		}
+	}
+	panic("no GCP set for " + shape)
 }
 
 var gcpCollateralNow = time.Date(2026, 11, 21, 5, 24, 52, 0, time.UTC)

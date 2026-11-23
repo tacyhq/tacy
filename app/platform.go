@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/tacyhq/tacy/gateway"
 )
 
 // Platform is everything host-specific: how attestation evidence is produced, and (local development only) where
@@ -46,6 +48,9 @@ type dstack struct {
 	infoMu    sync.Mutex
 	info      json.RawMessage
 	infoRTMR3 []byte
+
+	// gce adds the Google Cloud host hints to the info on Google only (gateway/gce.go); nil: none.
+	gce *gateway.GCEHinter
 }
 
 func newDstack(sock string) *dstack {
@@ -92,13 +97,13 @@ func (d *dstack) Evidence(ctx context.Context, reportData []byte) (json.RawMessa
 	}
 	rtmr3 := quoteRTMR3(q)
 	if info := d.cachedInfo(rtmr3); info != nil {
-		return q, info, nil
+		return q, d.gce.Augment(ctx, info), nil
 	}
 	info, err := d.fetchInfo(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
-	return q, info, nil
+	return q, d.gce.Augment(ctx, info), nil
 }
 
 // cachedInfo is the kept /Info when its RTMR3 is rtmr3 (nil otherwise, or when rtmr3 is unknown).

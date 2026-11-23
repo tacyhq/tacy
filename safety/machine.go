@@ -42,12 +42,12 @@ const MachineType = "tacy.machine/v1"
 // sigMachine is the KMS id's Ed25519 label for a machine certificate: label ‖ 0 ‖ doc.
 const sigMachine = "tacy-split/machine/v1"
 
-// The machine mode and host: one Phala machine by its PPID and FMSPC, the only kind of certificate (the Google Cloud
-// host fallback, with its "gcp-registry" mode and "google" host, was taken out of v1: the v1 Google host removal). A certificate
-// of any other mode or host doesn't validate, so a document carrying one is refused whole.
+// Machine modes and hosts.
 const (
-	MachineModePPID  = "ppid" // one machine: its PPID and FMSPC
-	MachineHostPhala = "phala"
+	MachineModePPID     = "ppid"         // one machine: its PPID and FMSPC
+	MachineModeRegistry = "gcp-registry" // Google Cloud: any host in Google's confidential-host registry, one project
+	MachineHostPhala    = "phala"
+	MachineHostGoogle   = "google"
 )
 
 // The trust list's optional members that carry the machine allowlist.
@@ -70,13 +70,17 @@ type MachineDoc struct {
 	Type     string `json:"type"`
 	KMSID    string `json:"kms_id"`
 	Platform string `json:"platform"` // "dstack"
-	Host     string `json:"host"`     // "phala"
-	Mode     string `json:"mode"`     // MachineModePPID
-	// PPID (16 bytes) and FMSPC (6 bytes), lowercase hex, as in the PCK certificate's SGX extension.
-	PPID     string    `json:"ppid,omitzero"`
-	FMSPC    string    `json:"fmspc"`
-	Label    string    `json:"label"` // "phala prod5"
-	IssuedAt time.Time `json:"issued_at"`
+	Host     string `json:"host"`     // "phala", "google"
+	Mode     string `json:"mode"`     // MachineModePPID or MachineModeRegistry
+	// PPID (16 bytes) and FMSPC (6 bytes), lowercase hex, as in the PCK certificate's SGX extension. Registry mode
+	// names no PPID (Google's registry lists the hosts) and one FMSPC per certificate (a machine family: c3, c4).
+	PPID  string `json:"ppid,omitzero"`
+	FMSPC string `json:"fmspc"`
+	// ProjectNumber (registry mode only): the Google Cloud project whose VMs count; the quote's MR_OWNER must be
+	// sha384 of the PZID JSON for this project (Google writes it).
+	ProjectNumber string    `json:"project_number,omitzero"`
+	Label         string    `json:"label"` // "phala prod5"
+	IssuedAt      time.Time `json:"issued_at"`
 }
 
 // SignedMachineCert is a MachineDoc's exact JSON (its canonical form: MarshalMachineDoc) and the KMS id's signature
@@ -88,8 +92,9 @@ type SignedMachineCert struct {
 }
 
 var (
-	hex32 = regexp.MustCompile(`^[0-9a-f]{32}$`)
-	hex12 = regexp.MustCompile(`^[0-9a-f]{12}$`)
+	hex32        = regexp.MustCompile(`^[0-9a-f]{32}$`)
+	hex12        = regexp.MustCompile(`^[0-9a-f]{12}$`)
+	projectNumRe = regexp.MustCompile(`^[1-9][0-9]{0,19}$`)
 )
 
 // Validate checks a machine document's form.
@@ -103,14 +108,17 @@ func (d *MachineDoc) Validate() error {
 	if !hex12.MatchString(d.FMSPC) {
 		return errors.New("machine certificate: fmspc must be 6 bytes of lowercase hex")
 	}
-	if d.Mode != MachineModePPID {
-		return fmt.Errorf("machine certificate: unknown mode %q (only %q)", d.Mode, MachineModePPID)
-	}
-	if d.Host != MachineHostPhala {
-		return fmt.Errorf("machine certificate: unknown host %q (only %q)", d.Host, MachineHostPhala)
-	}
-	if !hex32.MatchString(d.PPID) {
-		return errors.New("machine certificate: ppid must be 16 bytes of lowercase hex")
+	switch d.Mode {
+	case MachineModePPID:
+		if !hex32.MatchString(d.PPID) || d.ProjectNumber != "" || (d.Host != MachineHostPhala && d.Host != MachineHostGoogle) {
+			return errors.New("machine certificate: ppid mode names a host, a 16-byte lowercase hex ppid and no project")
+		}
+	case MachineModeRegistry:
+		if d.Host != MachineHostGoogle || d.PPID != "" || !projectNumRe.MatchString(d.ProjectNumber) {
+			return errors.New("machine certificate: gcp-registry mode is host google, a project number and no ppid")
+		}
+	default:
+		return fmt.Errorf("machine certificate: unknown mode %q", d.Mode)
 	}
 	return nil
 }
@@ -221,11 +229,30 @@ func (s *MachineSet) Match(ppid, fmspc string) (*Machine, error) {
 	return nil, fmt.Errorf("%w: platform %s (FMSPC %s) has no machine certificate", ErrMachineNotAllowed, ppid, fmspc)
 }
 
-// Allows says whether a quote naming ppid and fmspc can pass: an unrevoked certificate names it. The holders'
-// pre-gate runs it before any collateral.
+// Registry are the unrevoked registry-mode machines for fmspc.
+func (s *MachineSet) Registry(fmspc string) []Machine {
+	if s == nil {
+		return nil
+	}
+	var out []Machine
+	for _, m := range s.Machines {
+		if m.Doc.Mode == MachineModeRegistry && m.Doc.FMSPC == fmspc && !s.Revoked[m.Hash] {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// Allows says whether a quote naming ppid and fmspc can pass: a PPID-mode match, or a registry-mode machine for
+// fmspc (its registry and MR_OWNER checks come later, after the Intel chain). The holders' pre-gate runs it before
+// any collateral.
 func (s *MachineSet) Allows(ppid, fmspc string) error {
-	_, err := s.Match(ppid, fmspc)
-	return err
+	if _, err := s.Match(ppid, fmspc); err == nil {
+		return nil
+	} else if len(s.Registry(fmspc)) == 0 {
+		return err
+	}
+	return nil
 }
 
 // FMSPCs are the FMSPCs of the unrevoked machines, sorted (the collateral the holders' cron keeps).
@@ -241,6 +268,11 @@ func (s *MachineSet) FMSPCs() []string {
 	}
 	sort.Strings(out)
 	return slices.Compact(out)
+}
+
+// HasRegistry says whether any unrevoked machine is registry mode.
+func (s *MachineSet) HasRegistry() bool {
+	return s != nil && slices.ContainsFunc(s.Machines, func(m Machine) bool { return m.Doc.Mode == MachineModeRegistry && !s.Revoked[m.Hash] })
 }
 
 // ValidRevocations checks a revocation list: at most MaxMachinesRevoked distinct lowercase sha256 hashes.
@@ -259,9 +291,10 @@ func ValidRevocations(hashes []string) error {
 }
 
 // OpenMachineCerts opens every certificate under kmsID (any that doesn't verify refuses the whole document, as a bad
-// share set or emergency override does) and returns the set without the revoked hashes' machines counted. Only Phala
-// certificates open (MachineDoc.Validate): one of another host or mode refuses the document.
-func OpenMachineCerts(kmsID ed25519.PublicKey, certs []SignedMachineCert, revoked []string, source string) (*MachineSet, error) {
+// share set or emergency override does) and returns the set without the revoked hashes' machines counted. A
+// Google certificate (registry mode, or one Google host) is refused unless registryOK (the document names the Google
+// fallback): V1-DESIGN §2.7, no Google certificate while the VM runs on Phala, so only one host can forge.
+func OpenMachineCerts(kmsID ed25519.PublicKey, certs []SignedMachineCert, revoked []string, registryOK bool, source string) (*MachineSet, error) {
 	if len(certs) > MaxMachineCerts {
 		return nil, fmt.Errorf("machine_certs: at most %d", MaxMachineCerts)
 	}
@@ -276,6 +309,9 @@ func OpenMachineCerts(kmsID ed25519.PublicKey, certs []SignedMachineCert, revoke
 		d, err := c.Open(kmsID)
 		if err != nil {
 			return nil, fmt.Errorf("machine_certs[%d]: %w", i, err)
+		}
+		if d.Host == MachineHostGoogle && !registryOK {
+			return nil, fmt.Errorf("machine_certs[%d]: a Google certificate (%s) is allowed only while the Google fallback runs (the document must name platform dstack-gcp)", i, d.Mode)
 		}
 		h := c.Hash()
 		if slices.ContainsFunc(s.Machines, func(m Machine) bool { return m.Hash == h }) {

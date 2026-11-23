@@ -109,6 +109,26 @@ const (
 
 var holderRe = regexp.MustCompile(`^[a-z][a-z0-9-]{0,31}$`)
 
+// hostHoldsNoShare: the VM host holds no share ("Keys", design review H4; gcp-host review M4): a policy that
+// lets the VM run on Google Cloud names no Google-run holder.
+func (p *UnlockPolicy) hostHoldsNoShare() error {
+	if !p.AllowsPlatform(PlatformGCP) {
+		return nil
+	}
+	for _, h := range p.Holders {
+		if GoogleHolder(h.Holder) {
+			return fmt.Errorf("split: unlock policy: names %s and the Google holder %q: the VM's host may not hold a share", PlatformGCP, h.Holder)
+		}
+	}
+	return nil
+}
+
+// GoogleHolder says whether a holder id is a Google Cloud holder's ("gcp", the Google holder's id in code, or any id
+// starting "gcp-" or "google").
+func GoogleHolder(id string) bool {
+	return id == "gcp" || strings.HasPrefix(id, "gcp-") || strings.HasPrefix(id, "google")
+}
+
 // ValidHolder is a holder id's syntax ("cloudflare", "vercel", "gcp").
 func ValidHolder(s string) bool { return holderRe.MatchString(s) }
 
@@ -338,13 +358,17 @@ type UnlockPolicy struct {
 	MachinesRevoked []string                   `json:"machines_revoked,omitzero"`
 }
 
+// PlatformGCP is the platform name that turns on the Google Cloud fallback (verifier.PlatformDstackGCP): a Google
+// machine certificate is valid only in a policy that names it (V1-DESIGN §2.7).
+const PlatformGCP = "dstack-gcp"
+
 // OpenMachines checks every machine certificate is the KMS id's (a policy with one that isn't is refused whole) and
 // returns the policy's machines without its revoked ones. A holder also refuses the revocations its store kept.
 func (p *UnlockPolicy) OpenMachines(kmsID ed25519.PublicKey) (*safety.MachineSet, error) {
 	if len(p.MachineCerts) == 0 {
 		return nil, errors.New("split: unlock policy: no machine certificates (machine_certs is required)")
 	}
-	s, err := safety.OpenMachineCerts(kmsID, p.MachineCerts, p.MachinesRevoked, fmt.Sprintf("unlock policy %d", p.Seq))
+	s, err := safety.OpenMachineCerts(kmsID, p.MachineCerts, p.MachinesRevoked, p.AllowsPlatform(PlatformGCP), fmt.Sprintf("unlock policy %d", p.Seq))
 	if err != nil {
 		return nil, fmt.Errorf("split: unlock policy: %w", err)
 	}
@@ -455,6 +479,9 @@ func (p *UnlockPolicy) Validate() error {
 		if !holderRe.MatchString(pl) {
 			return fmt.Errorf("split: unlock policy: bad platform %q", pl)
 		}
+	}
+	if err := p.hostHoldsNoShare(); err != nil {
+		return err
 	}
 	for _, list := range [][]string{p.StartTicketKeys, p.NextAdminKeys} {
 		for _, k := range list {

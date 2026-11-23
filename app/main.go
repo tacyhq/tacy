@@ -576,6 +576,9 @@ func main() {
 	var gwc *gateway.Client
 	if *gatewaySocket != "" {
 		gwc = &gateway.Client{Path: *gatewaySocket}
+		if d, ok := p.(*dstack); ok {
+			d.gce = &gateway.GCEHinter{D: gwc} // Google Cloud only: the registry-mode hints (gateway/gce.go)
+		}
 	}
 	if *unlockSocket != "" {
 		if gwc == nil {

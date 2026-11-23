@@ -141,6 +141,36 @@ func TestReview2HugeSeqRefused(t *testing.T) {
 	}
 }
 
+// L1: a Google machine certificate doesn't count at a client while platform dstack-gcp is still pending.
+func TestReview2GoogleCertWaitsForPlatform(t *testing.T) {
+	admin, kms := testAdmin(t), testKMS(t)
+	c5 := signCert(t, kms, phalaDoc(prod5PPID, "phala prod5", listNow.Add(-48*time.Hour)))
+	g := safety.MachineDoc{Type: safety.MachineType, Platform: safety.PlatformDstack, Host: safety.MachineHostGoogle,
+		Mode: safety.MachineModePPID, PPID: strings.Repeat("ab", 16), FMSPC: "00906ed50000", Label: "gcp host", IssuedAt: listNow.Add(-48 * time.Hour)}
+	gc := signCert(t, kms, g)
+	l := listWithMachines(t, 5, []safety.SignedMachineCert{c5, gc}, nil)
+	l.Platforms = []string{"dstack", PlatformDstackGCP}
+	var s TrustState
+	i := s.Take(signedList(t, admin, l), 0, listNow)
+	if !i.OK {
+		t.Fatal(i.Error)
+	}
+	p, _ := s.Apply(Policy{}, listNow)
+	if _, err := p.Machines.Match(g.PPID, g.FMSPC); err == nil {
+		t.Fatal("the Google certificate matched while dstack-gcp is pending")
+	}
+	if _, err := p.Machines.Match(prod5PPID, phalaFMSPC); err != nil {
+		t.Fatalf("prod5 should still match: %v", err)
+	}
+	if slices.Contains(i.Machines, "gcp host") {
+		t.Fatalf("the Google machine is reported in force: %v", i.Machines)
+	}
+	p, _ = s.Apply(Policy{}, listNow.Add(safety.TrustDelay))
+	if _, err := p.Machines.Match(g.PPID, g.FMSPC); err != nil {
+		t.Fatalf("the Google certificate once dstack-gcp counts: %v", err)
+	}
+}
+
 // L4: a record whose items can't be kept (oversized) or whose member is unreadable keeps its revocations: they are
 // read on their own, outside the item map.
 func TestReview2SeenResetKeepsRevocations(t *testing.T) {

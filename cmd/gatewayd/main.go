@@ -150,6 +150,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("gatewayd: %v", err)
 	}
+	// The Google Cloud hints for agentd's and unlockd's attestations (gateway/gce.go): answered only on a Google
+	// Compute Engine VM (DMI), from its metadata server; elsewhere no_target, nothing sent.
+	fixed.GCE = &gateway.GCEMeta{}
 	if *unlockSocket != "" {
 		id, err := kms.ParseID(*kmsKey)
 		if err != nil {

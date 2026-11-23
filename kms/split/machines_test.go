@@ -4,7 +4,6 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
-	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -100,37 +99,21 @@ func TestProductionPolicyNeedsMachineCerts(t *testing.T) {
 	_ = m
 }
 
-// No Google Cloud host (the v1 Google host removal): a policy carrying a certificate of the old Google modes (gcp-registry, or one
-// host "google"), validly signed by the KMS id, doesn't open, whatever platforms it names. Before the change, one
-// opened when the policy named "dstack-gcp".
-func TestPolicyMachineCertsPhalaOnly(t *testing.T) {
+// No Google certificate while the VM runs on Phala (V1-DESIGN §2.7, N3): a policy carrying one (registry mode or one
+// Google host) opens only when it names the Google fallback (platform dstack-gcp); and the name is the verifier's.
+func TestNoRegistryCertWhileOnPhalaPolicy(t *testing.T) {
 	m, id, p := machinePolicy(t)
-	k, err := kms.DeriveID(m)
+	reg, err := NewMachineCert(m, p.KMSID, safety.MachineDoc{Type: safety.MachineType, Platform: "dstack", Host: safety.MachineHostGoogle,
+		Mode: safety.MachineModeRegistry, FMSPC: "00806f050000", ProjectNumber: "123456789012", Label: "gcp c3", IssuedAt: time.Now()})
 	if err != nil {
 		t.Fatal(err)
 	}
-	sign := func(doc string) safety.SignedMachineCert {
-		return safety.SignedMachineCert{Doc: []byte(doc), Sig: ed25519.Sign(k, append([]byte("tacy-split/machine/v1\x00"), doc...))}
+	p.MachineCerts = append(p.MachineCerts, *reg)
+	if _, err := p.OpenMachines(id); err == nil || !strings.Contains(err.Error(), "Google fallback") {
+		t.Fatalf("a registry certificate on Phala: %v", err)
 	}
-	if c := sign(string(p.MachineCerts[0].Doc)); string(c.Sig) != string(p.MachineCerts[0].Sig) {
-		t.Fatal("the test's signing isn't the KMS id's (the refusals below would prove nothing)")
-	}
-	at := time.Now().UTC().Format(time.RFC3339)
-	for name, doc := range map[string]string{
-		"registry": `{"type":"tacy.machine/v1","kms_id":"` + p.KMSID + `","platform":"dstack","host":"google","mode":"gcp-registry",` +
-			`"fmspc":"00806f050000","project_number":"123456789012","label":"gcp c3","issued_at":"` + at + `"}`,
-		"one Google host": `{"type":"tacy.machine/v1","kms_id":"` + p.KMSID + `","platform":"dstack","host":"google","mode":"ppid",` +
-			`"ppid":"` + strings.Repeat("ab", 16) + `","fmspc":"00806f050000","label":"gcp host","issued_at":"` + at + `"}`,
-	} {
-		for _, plats := range [][]string{nil, {"dstack"}, {"dstack", "dstack-gcp"}} {
-			q := p
-			q.MachineCerts, q.Platforms = append(slices.Clone(p.MachineCerts), sign(doc)), plats
-			if _, err := q.OpenMachines(id); err == nil || !strings.Contains(err.Error(), "machine certificate") {
-				t.Fatalf("%s, platforms %v: %v", name, plats, err)
-			}
-		}
-	}
-	if _, err := p.OpenMachines(id); err != nil {
-		t.Fatalf("the Phala certificates alone: %v", err)
+	p.Platforms = []string{"dstack", PlatformGCP}
+	if s, err := p.OpenMachines(id); err != nil || !s.HasRegistry() {
+		t.Fatalf("with the fallback named: %v", err)
 	}
 }

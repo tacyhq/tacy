@@ -98,18 +98,19 @@ func (p Policy) Revoked(version string) bool {
 }
 
 // WithTrustList returns p with l's values added to what p uses (its own, or the built-in ones where p has none):
-// OS images, boot measurement sets, pre-launch scripts, KMS ids, VM releases (MergeReleases), and the higher of the
-// two release floors. It never removes a value, and refuses a list that brings back a retired OS image, adds a set
+// OS images, boot measurement sets, pre-launch scripts, KMS ids, VM releases (MergeReleases), the higher of the
+// two release floors, and the Google Cloud sets (WithGCP) when its platforms name PlatformDstackGCP. It never
+// removes a value, and refuses a list that brings back a retired OS image, adds a set
 // for an unknown image, or adds a set with a retired image's kernel or command line (retiredBoot), under any label.
-// It also refuses a list naming a platform other than dstack, the only one this verifier has checks for (KnownPlatform):
-// fail closed, so a list can't switch on a host this build doesn't know (the v1 Google host removal: "dstack-gcp" is unknown).
 func (p Policy) WithTrustList(l *safety.TrustList) (Policy, error) {
 	if l == nil {
 		return p, nil
 	}
+	// Fail closed on platforms (kept from the v1 Google host removal): a list naming a platform this build has no checks for is
+	// refused whole, so a list can't switch on a host this build doesn't know.
 	for _, pl := range l.Platforms {
 		if !KnownPlatform(pl) {
-			return p, fmt.Errorf("trust list %d: unknown platform %q (this verifier checks only %q)", l.Seq, pl, safety.PlatformDstack)
+			return p, fmt.Errorf("trust list %d: unknown platform %q (this verifier checks only %q and %q)", l.Seq, pl, safety.PlatformDstack, PlatformDstackGCP)
 		}
 	}
 	images := maps.Clone(cmpOr(p.ProdImages, ProdImages))
@@ -131,6 +132,9 @@ func (p Policy) WithTrustList(l *safety.TrustList) (Policy, error) {
 		}
 		if why := retiredBoot(b.RTMR1, b.RTMR2); why != "" {
 			return p, fmt.Errorf("trust list %d: boot measurements %q have %s", l.Seq, b.Name, why)
+		}
+		if why := GCPShaped(BootMeasurement{OSImage: b.OSImage, MRTD: b.MRTD, RTMR1: b.RTMR1}); why != "" {
+			return p, fmt.Errorf("trust list %d: boot measurements %q are Google Cloud's (%s): Google is on only by platforms %q", l.Seq, b.Name, why, PlatformDstackGCP)
 		}
 		boot = append(boot, BootMeasurement{Name: b.Name, OSImage: b.OSImage, MRTD: b.MRTD, RTMR0: b.RTMR0, RTMR1: b.RTMR1,
 			RTMR2: b.RTMR2, Source: fmt.Sprintf("signed trust list %d: %s", l.Seq, b.Source)})
@@ -171,6 +175,10 @@ func (p Policy) WithTrustList(l *safety.TrustList) (Policy, error) {
 		return slices.Contains(l.RevokedReleases, r.Version) || !dstackRelease(r)
 	})
 	p.ReleaseFloor = NewerVersion(p.ReleaseFloor, l.VMReleaseFloor)
+	if slices.Contains(l.Platforms, PlatformDstackGCP) {
+		// The Google Cloud fallback, on only by a signed list (the app carries the sets, off): no app update needed.
+		p = p.WithGCP()
+	}
 	p.trust = l
 	return p, nil
 }
@@ -194,15 +202,17 @@ func retiredBoot(rtmr1, rtmr2 string) string {
 }
 
 // dstackRelease: r runs on dstack, the one platform this verifier checks.
+// KnownPlatform: name is a platform this verifier has checks for: dstack (Phala) and dstack-gcp (the Google Cloud
+// boot sets, off unless a signed document names it). A signed trust list naming any other is refused whole
+// (WithTrustList); kmsctl signs no unlock policy or trust list naming one; a holder refuses a policy naming one
+// (kms/split/holder parsePolicy).
+func KnownPlatform(name string) bool {
+	return name == safety.PlatformDstack || name == PlatformDstackGCP
+}
+
 func dstackRelease(r safety.TrustRelease) bool {
 	return r.Platform == "" || r.Platform == safety.PlatformDstack
 }
-
-// KnownPlatform: name is an attestation platform this verifier has checks for. Only dstack on Phala (the Google
-// Cloud host fallback, "dstack-gcp", was taken out of v1: the v1 Google host removal). A signed trust list naming any other is
-// refused whole (WithTrustList), and kmsctl signs no unlock policy or trust list naming one; a holder refuses a policy
-// naming a platform it has no checks for (kms/split/holder, Config.Platforms).
-func KnownPlatform(name string) bool { return name == safety.PlatformDstack }
 
 // WithTCBGrace is p accepting a TCB status other than UpToDate when the trust list p took grants a grace window that
 // is open at now (tcb_grace, safety.TCBGrace.Allows: at most 30 days), and only for the TCB and QE
@@ -382,7 +392,7 @@ func (s *TrustState) TakeSeen(env []byte, minSeq uint64, now time.Time, seen []b
 		em, err = trustEmergency(l)
 	}
 	if err == nil {
-		_, err = trustMachines(l, nil) // a machine certificate that doesn't verify refuses the list, as a bad override does
+		_, err = trustMachines(l, l.Platforms, nil) // a machine certificate that doesn't verify refuses the list, as a bad override does
 	}
 	if err != nil {
 		return TrustInfo{Error: err.Error()}
@@ -401,7 +411,7 @@ func (s *TrustState) TakeSeen(env []byte, minSeq uint64, now time.Time, seen []b
 	if em != nil {
 		i.Emergency = em.Reason
 	}
-	if ms, err := trustMachines(l, s.seen.RevokedMachines); err == nil {
+	if ms, err := trustMachines(l, in.Platforms, s.seen.RevokedMachines); err == nil {
 		i.Machines, i.MachinesRevoked = machineSummary(ms), len(ms.Revoked)
 	}
 	return i
@@ -444,7 +454,7 @@ func (s *TrustState) Apply(p Policy, now time.Time) (Policy, *TrustInfo) {
 		s.mu.Unlock()
 		var q Policy
 		var ms *safety.MachineSet
-		if ms, err = trustMachines(l, kept); err == nil {
+		if ms, err = trustMachines(l, in.Platforms, kept); err == nil {
 			q, err = p.WithTrustList(in)
 		}
 		if err == nil {

@@ -1,7 +1,10 @@
 # Release: on a tag, build the release, push its images to ghcr.io, check that each one pulls without credentials,
 # sign everything with Sigstore through GitHub artifact attestations, and publish it. Two kinds of tag:
 #   vX.Y.Z      the agent VM: compose.yaml naming one OCI image per process by digest (agentd, runnerd with the brain
-#               and gVisor, gatewayd, vaultd and setup), release.json and the images as OCI layouts; and, when
+#               and gVisor, gatewayd, vaultd and setup), release.json and the images as OCI layouts; when
+#               cmd/compose has --gcp-out, the Google Cloud files too (gcp-boot.tar.gz, gcp-data.tar.gz,
+#               gcp-sys-config.json: dstack's published OS image, made into what Compute Engine imports, and its boot
+#               measurements in release.json's "gcp", computed from the image; cmd/compose/gcp.go); and, when
 #               kms-compose.yaml is committed, the key service too (below), in the same signature.
 #   kms-vX.Y.Z  the key service only: kms-compose.yaml (one image, kmsd, by digest), kms-app-compose.json (the CVM
 #               manifest its policy pins by sha256), kms-release.json and the kmsd image. The agent VM verifier
@@ -67,21 +70,38 @@ jobs:
           mkdir "$RUNNER_TEMP/cfd"
           sh cmd/compose/cloudflared/fetch.sh "$RUNNER_TEMP/cfd"
           { echo "TACY_CLOUDFLARED_SRC=$RUNNER_TEMP/cfd/src"; echo "TACY_CLOUDFLARED_FRESH=1"; } >> "$GITHUB_ENV"
+      # The Google Cloud files come from dstack's OS release tarball, fetched once here by its pinned URL and sha256
+      # (cmd/compose --gcp-fetch checks it) and read by both builds below.
+      - name: dstack's OS image for Google Cloud, by its pinned sha256
+        if: env.KIND == 'vm' && hashFiles('cmd/compose/gcp.go') != ''
+        run: |
+          mkdir "$RUNNER_TEMP/dstack"
+          src=$(go run ./cmd/compose --gcp-fetch "$RUNNER_TEMP/dstack" | tail -1)
+          { echo "GCP=1"; echo "TACY_DSTACK_GCP_SRC=$src"; echo "GCP_SRC_NAME=$(basename "$src")"; } >> "$GITHUB_ENV"
       - name: compose.yaml, release.json and the images, built in the pinned Go container
         if: env.KIND == 'vm'
         run: |
           image=$(grep -o 'golang:[^"]*@sha256:[0-9a-f]*' cmd/compose/main.go)
           mkdir -p dist
-          docker run --rm -v "$PWD:/src" -v "$RUNNER_TEMP/cfd:/cfd:ro" -w /src -e GOFLAGS=-mod=readonly \
+          gcp=() gcpmount=()
+          if [ "${GCP:-}" = 1 ]; then
+            gcp=(--gcp-out dist/gcp)
+            gcpmount=(-v "$RUNNER_TEMP/dstack:/dstack:ro" -e "TACY_DSTACK_GCP_SRC=/dstack/$GCP_SRC_NAME")
+          fi
+          docker run --rm -v "$PWD:/src" -v "$RUNNER_TEMP/cfd:/cfd:ro" "${gcpmount[@]}" -w /src -e GOFLAGS=-mod=readonly \
             -e TACY_CLOUDFLARED_SRC=/cfd/src -e TACY_CLOUDFLARED_FRESH=1 "$image" \
-            go run ./cmd/compose --check --oci dist/oci --manifest dist/release.json --version "$GITHUB_REF_NAME" --commit "$GITHUB_SHA"
+            go run ./cmd/compose --check --oci dist/oci --manifest dist/release.json --version "$GITHUB_REF_NAME" --commit "$GITHUB_SHA" "${gcp[@]}"
           sudo chown -R "$(id -u):$(id -g)" dist # the container wrote them as root (some blobs 0600)
           cp compose.yaml dist/compose.yaml
+          cp app-compose.json dist/app-compose.json
       - name: same result on the runner (reproducible binaries and image digests)
         if: env.KIND == 'vm'
         run: |
-          go run ./cmd/compose --check --oci "$RUNNER_TEMP/oci" --manifest "$RUNNER_TEMP/release.json" --version "$GITHUB_REF_NAME" --commit "$GITHUB_SHA"
+          gcp=()
+          if [ "${GCP:-}" = 1 ]; then gcp=(--gcp-out "$RUNNER_TEMP/gcp"); fi
+          go run ./cmd/compose --check --oci "$RUNNER_TEMP/oci" --manifest "$RUNNER_TEMP/release.json" --version "$GITHUB_REF_NAME" --commit "$GITHUB_SHA" "${gcp[@]}"
           diff dist/release.json "$RUNNER_TEMP/release.json"
+          if [ "${GCP:-}" = 1 ]; then for f in dist/gcp/*; do cmp "$f" "$RUNNER_TEMP/gcp/$(basename "$f")"; done; fi
           for d in dist/oci/*/; do n=$(basename "$d"); diff -r "$d" "$RUNNER_TEMP/oci/$n"; done
       - name: kms-compose.yaml, kms-app-compose.json, kms-release.json and the kmsd image, built in the pinned Go container
         if: env.KMS == '1'
@@ -155,6 +175,23 @@ jobs:
               { echo "dist/oci/$name isn't $ref"; exit 1; }
           done
           [ "$(grep -c '^    image: ' dist/compose.yaml)" = "$(jq '.images | length' dist/release.json)" ] || { echo "compose.yaml names other images"; exit 1; }
+          # app-compose.json, the VM's exact manifest (cmd/e2e create --production and --gcp take it from the release):
+          # the one release.json names, holding exactly compose.yaml.
+          jq -e --arg s "$(sha256sum dist/app-compose.json | cut -d' ' -f1)" '.app_compose_sha256 == $s' dist/release.json >/dev/null ||
+            { echo "app-compose.json isn't the one release.json names"; exit 1; }
+          jq -e --rawfile c dist/compose.yaml '.docker_compose_file == $c' dist/app-compose.json >/dev/null ||
+            { echo "app-compose.json isn't compose.yaml's"; exit 1; }
+          # The Google Cloud files: exactly the three release.json names, each with the sha256 it says.
+          if jq -e .gcp dist/release.json >/dev/null; then
+            jq -e '.gcp.schema == "tacy-gcp/v1" and (.gcp.guest.files | keys) == ["gcp-boot.tar.gz","gcp-data.tar.gz","gcp-sys-config.json"]' dist/release.json
+            [ "$(ls dist/gcp | sort | tr '\n' ' ')" = "gcp-boot.tar.gz gcp-data.tar.gz gcp-sys-config.json " ] || { echo "dist/gcp holds other files"; exit 1; }
+            for f in gcp-boot.tar.gz gcp-data.tar.gz gcp-sys-config.json; do
+              jq -e --arg f "$f" --arg s "$(sha256sum "dist/gcp/$f" | cut -d' ' -f1)" '.gcp.guest.files[$f] == $s' dist/release.json >/dev/null ||
+                { echo "dist/gcp/$f isn't the one release.json names"; exit 1; }
+            done
+          else
+            [ ! -e dist/gcp ] || { echo "dist/gcp without release.json's gcp"; exit 1; }
+          fi
       - name: key service manifest matches the files, the tag, the commit and the image
         if: hashFiles('dist/kms-release.json') != ''
         run: |
@@ -220,8 +257,11 @@ jobs:
       - name: subjects (the composes, the manifests and each image by digest)
         run: |
           {
-            for f in compose.yaml release.json kms-compose.yaml kms-app-compose.json kms-release.json; do
+            for f in compose.yaml app-compose.json release.json kms-compose.yaml kms-app-compose.json kms-release.json; do
               [ ! -f "dist/$f" ] || sha256sum "dist/$f" | sed 's#  dist/#  #'
+            done
+            for f in gcp-boot.tar.gz gcp-data.tar.gz gcp-sys-config.json; do
+              [ ! -f "dist/gcp/$f" ] || sha256sum "dist/gcp/$f" | sed 's#  dist/gcp/#  #'
             done
             while read -r manifest _; do
               jq -r '.images[] | "\(.[index("@sha256:")+8:])  \(.[:index("@")])"' "$manifest"
@@ -242,7 +282,8 @@ jobs:
           files=() notes="" latest=()
           if [ -f dist/release.json ]; then
             cp "$BUNDLE" dist/compose.sigstore.json
-            files+=(dist/compose.yaml dist/release.json dist/compose.sigstore.json)
+            files+=(dist/compose.yaml dist/app-compose.json dist/release.json dist/compose.sigstore.json)
+            if [ -d dist/gcp ]; then files+=(dist/gcp/gcp-boot.tar.gz dist/gcp/gcp-data.tar.gz dist/gcp/gcp-sys-config.json); fi
             sum=$(jq -r .compose_sha256 dist/release.json)
             images=$(jq -r '.images | to_entries[] | "- `\(.value)`"' dist/release.json)
             notes="compose sha256 \`$sum\`. Images:

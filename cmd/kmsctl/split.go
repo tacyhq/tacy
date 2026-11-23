@@ -52,15 +52,20 @@ package main
 //	    never re-allow (a revoked machine needs a new certificate). With only these (nothing else changed), the next
 //	    seq of both documents carries the change. With -trust-base, the trust list always carries the policy's
 //	    machine_certs and the union of both documents' machines_revoked.
+//	    -add-platform dstack-gcp / -remove-platform dstack-gcp: the Google Cloud host on or off in both documents (on:
+//	    a delayed item at holders and clients, so 24 h; off: at once, and the policy's registry-mode certificates go
+//	    with it). With only these, the next seq of both documents carries the change. Give the registry certificates
+//	    (-machine-cert) in the same run as -add-platform: they are valid only beside it.
 //	    -end-overlap (needs -trust-base): the trust list ends the KMS-fallback overlap ("overlap_ended": true,
 //	    safety/overlapend.go): a Fix B client that verified it refuses v0.20.0 at once and for good. With only it, the
 //	    next seq of both documents carries it. A trust base that has it keeps it: there is no flag to turn it off.
 //	kmsctl machine-cert -kms-id ID -share S -key pass -share S -key pass (-builtin prod5|prod9 | -ppid HEX -fmspc HEX
-//	        -label "phala prodN") [-issued-at T] -out F
+//	        -label "phala prodN" [-host phala|google] [-mode ppid|gcp-registry -project-number N]) [-issued-at T] -out F
 //	    a machine certificate (V1-DESIGN §3.2) signed by the KMS id (M from two passphrase shares; -dev-master for
 //	    staging): F (new) and its hash on stdout. -builtin signs exactly the document this build has built in
-//	    (verifier.MachineDocs, issued 2026-11-21), so the certificate's hash is the built-in one's. Every certificate
-//	    is one Phala machine (host phala, mode ppid); the Google Cloud host modes are gone (the v1 Google host removal).
+//	    (verifier.MachineDocs, issued 2026-11-21), so the certificate's hash is the built-in one's. A gcp-registry or
+//	    Google certificate is for the Google fallback only: a policy carries it only when it names dstack-gcp, and the
+//	    admin issues it on the day of a switch to Google and revokes it on the way back (F9 a).
 //	kmsctl sign -kind kms-unlock-policy -key K DOC.json   (checked as an unlock policy first)
 //	kmsctl holder-push -in U.signed.json -worker URL -native native-addresses.json [-url HOLDER_URL]
 //	    in order: the Worker first (POST /api/vm/unlock-policy), then a check that a VM's fetch (GET) returns that
@@ -175,10 +180,16 @@ func splitMain(cmd string, args []string) {
 	fs.Var(&machineCerts, "machine-cert", "unlock-policy, approve: a machine certificate file (machine-cert's output), repeat")
 	fs.Var(&revokeMachines, "revoke-machine", "approve: a machine certificate's hash (or its file) to revoke for good, repeat")
 	endOverlap := fs.Bool("end-overlap", false, "approve: the trust list ends the KMS-fallback overlap (needs -trust-base; for good)")
+	var addPlatforms, removePlatforms multi
+	fs.Var(&addPlatforms, "add-platform", "approve: a platform the policy and the trust list name from this seq (dstack-gcp: the Google Cloud host; under the 24 h delay)")
+	fs.Var(&removePlatforms, "remove-platform", "approve: a platform the policy and the trust list stop naming (dstack-gcp, on the way back to Phala only; at once)")
 	builtin := fs.String("builtin", "", "machine-cert: prod5 or prod9, the document this build has built in")
 	ppid := fs.String("ppid", "", "machine-cert: the machine's PPID (16 bytes, hex)")
 	fmspc := fs.String("fmspc", "", "machine-cert: its FMSPC (6 bytes, hex)")
 	label := fs.String("label", "", `machine-cert: its label ("phala prod5")`)
+	host := fs.String("host", safety.MachineHostPhala, "machine-cert: phala or google")
+	mode := fs.String("mode", safety.MachineModePPID, "machine-cert: ppid or gcp-registry")
+	project := fs.String("project-number", "", "machine-cert -mode gcp-registry: the Google Cloud project number")
 	issuedAt := fs.String("issued-at", "", "machine-cert: the issue time (RFC 3339; default now, -builtin its own)")
 	fs.BoolVar(&devPlainKeys, "dev-plain-keys", false, "development only: read plaintext (base64 seed) admin key files")
 	fs.Parse(args)
@@ -322,13 +333,23 @@ func splitMain(cmd string, args []string) {
 		var np *split.UnlockPolicy
 		var ntl *safety.TrustList
 		mAdd, mRevoke := readMachineCerts(machineCerts), revocationHashes(revokeMachines)
+		// A platform change is in both documents or neither (review M4 of the Google release path): the holders and
+		// the clients must agree on whether Google may host the VM.
+		if (len(addPlatforms) > 0 || len(removePlatforms) > 0) && *trustBase == "" {
+			die("approve: -add-platform and -remove-platform need -trust-base (the clients' trust list must change with the policy)")
+		}
+		machineOrPlatform := len(mAdd) > 0 || len(mRevoke) > 0 || len(addPlatforms) > 0 || len(removePlatforms) > 0
 		switch {
-		case expediteOnly(*emergency, emergencyItems, adds, removes, sets, grace):
+		case expediteOnly(*emergency, emergencyItems, adds, removes, sets, grace) && !machineOrPlatform:
 			np, err = nextSeq(p, now) // the override alone: a release pinned earlier unlocks at once from this seq
-		case len(adds) == 0 && len(removes) == 0 && len(sets) == 0 && grace == nil && (len(mAdd) > 0 || len(mRevoke) > 0 || *endOverlap):
+		case len(adds) == 0 && len(removes) == 0 && len(sets) == 0 && grace == nil &&
+			(len(mAdd) > 0 || len(mRevoke) > 0 || *endOverlap || len(addPlatforms) > 0 || len(removePlatforms) > 0):
 			np, ntl, err = nextSeqs(p, tl, now) // a machine change, or the overlap's end, alone
 		default:
 			np, ntl, err = approve(p, tl, adds, removes, entry, sets, certs, grace, now)
+		}
+		if err == nil {
+			err = changePlatforms(np, ntl, addPlatforms, removePlatforms)
 		}
 		if err == nil {
 			err = changeMachines(np, ntl, mAdd, mRevoke)
@@ -457,7 +478,7 @@ func splitMain(cmd string, args []string) {
 		if *out == "" {
 			die("machine-cert: -out F (a new file)")
 		}
-		doc, err := machineDoc(*builtin, *ppid, *fmspc, *label, *issuedAt, now)
+		doc, err := machineDoc(*builtin, *ppid, *fmspc, *label, *host, *mode, *project, *issuedAt, now)
 		if err != nil {
 			die("%v", err)
 		}
@@ -475,6 +496,9 @@ func splitMain(cmd string, args []string) {
 			die("%v", err)
 		}
 		fmt.Printf("machine certificate %s (%s %s, PPID %s, FMSPC %s): %s\n", c.Hash(), doc.Host, doc.Label, orDash(doc.PPID), doc.FMSPC, *out)
+		if doc.Host == safety.MachineHostGoogle {
+			fmt.Println("a Google certificate: only for the day of a switch to Google (the policy must name dstack-gcp); revoke it on the way back")
+		}
 	case "break-glass":
 		var env safety.Envelope
 		readJSON(*policyPath, &env)
@@ -854,14 +878,14 @@ func checkUnlockPolicy(p *split.UnlockPolicy) error {
 	if _, err = p.OpenShareSets(id); err != nil {
 		return err
 	}
-	if _, err = p.OpenMachines(id); err != nil { // every certificate the KMS id's, every one a Phala machine
+	if _, err = p.OpenMachines(id); err != nil { // every certificate the KMS id's; a Google one only with the fallback named
 		return err
 	}
-	// Fail closed on platforms (the v1 Google host removal): holders built from this tree check only dstack and refuse a policy
-	// naming any other (kms/split/holder), so kmsctl doesn't sign one ("dstack-gcp" included).
+	// Fail closed on platforms: holders built from this tree refuse a policy naming a platform they have no checks
+	// for, so kmsctl doesn't sign one.
 	for _, pl := range p.Platforms {
 		if !verifier.KnownPlatform(pl) {
-			return fmt.Errorf("unlock policy: unknown platform %q (holders check only %q)", pl, safety.PlatformDstack)
+			return fmt.Errorf("unlock policy: unknown platform %q (holders check only %q and %q)", pl, safety.PlatformDstack, verifier.PlatformDstackGCP)
 		}
 	}
 	return nil
@@ -1475,10 +1499,10 @@ func pinBuilds(p *split.UnlockPolicy, pins []string) error {
 // ---- the machine allowlist (V1-DESIGN §3) ----
 
 // machineDoc is machine-cert's document: a built-in one exactly as this build has it, or one from the flags.
-func machineDoc(builtin, ppid, fmspc, label, issuedAt string, now time.Time) (safety.MachineDoc, error) {
+func machineDoc(builtin, ppid, fmspc, label, host, mode, project, issuedAt string, now time.Time) (safety.MachineDoc, error) {
 	if builtin != "" {
-		if ppid != "" || fmspc != "" || label != "" || issuedAt != "" {
-			return safety.MachineDoc{}, errors.New("machine-cert: -builtin takes the document as built in (no -ppid, -fmspc, -label or -issued-at)")
+		if ppid != "" || fmspc != "" || label != "" || project != "" || issuedAt != "" {
+			return safety.MachineDoc{}, errors.New("machine-cert: -builtin takes the document as built in (no -ppid, -fmspc, -label, -project-number or -issued-at)")
 		}
 		for _, d := range verifier.MachineDocs {
 			if verifier.MachineNode(d) == builtin {
@@ -1495,8 +1519,8 @@ func machineDoc(builtin, ppid, fmspc, label, issuedAt string, now time.Time) (sa
 		}
 		at = t
 	}
-	d := safety.MachineDoc{Type: safety.MachineType, Platform: safety.PlatformDstack, Host: safety.MachineHostPhala,
-		Mode: safety.MachineModePPID, PPID: strings.ToLower(ppid), FMSPC: strings.ToLower(fmspc), Label: label, IssuedAt: at.UTC()}
+	d := safety.MachineDoc{Type: safety.MachineType, Platform: safety.PlatformDstack, Host: host, Mode: mode, PPID: strings.ToLower(ppid),
+		FMSPC: strings.ToLower(fmspc), ProjectNumber: project, Label: label, IssuedAt: at.UTC()}
 	d.KMSID = verifier.ReleaseKMSID // replaced by the signing key's id
 	return d, d.Validate()
 }
@@ -1600,15 +1624,58 @@ func changeMachines(np *split.UnlockPolicy, ntl *safety.TrustList, add []safety.
 		return err
 	}
 	id, _ := kms.ParseID(np.KMSID)
-	if _, err := safety.OpenMachineCerts(id, np.MachineCerts, revoked, "trust list"); err != nil {
+	registryOK := slices.Contains(ntl.Platforms, verifier.PlatformDstackGCP)
+	if _, err := safety.OpenMachineCerts(id, np.MachineCerts, revoked, registryOK, "trust list"); err != nil {
 		return fmt.Errorf("approve: the trust list's machines: %w", err)
 	}
 	for _, pl := range ntl.Platforms {
 		if !verifier.KnownPlatform(pl) { // clients refuse the whole list (verifier.WithTrustList): fail closed here too
-			return fmt.Errorf("approve: the trust list names unknown platform %q (clients check only %q)", pl, safety.PlatformDstack)
+			return fmt.Errorf("approve: the trust list names unknown platform %q (clients check only %q and %q)", pl, safety.PlatformDstack, verifier.PlatformDstackGCP)
 		}
 	}
 	return ntl.Validate()
+}
+
+// changePlatforms adds and removes platforms in the next policy and trust list (Google Cloud: dstack-gcp). Only
+// known platforms (verifier.KnownPlatform); dstack itself stays (Phala is never turned off this way). Removing
+// dstack-gcp also drops the policy's registry-mode (Google) machine certificates, which are valid only beside it.
+func changePlatforms(np *split.UnlockPolicy, ntl *safety.TrustList, add, remove []string) error {
+	if len(add) == 0 && len(remove) == 0 {
+		return nil
+	}
+	for _, pl := range append(slices.Clone(add), remove...) {
+		if !verifier.KnownPlatform(pl) || pl == safety.PlatformDstack {
+			return fmt.Errorf("approve: -add-platform/-remove-platform take %q only (got %q)", verifier.PlatformDstackGCP, pl)
+		}
+		if slices.Contains(add, pl) && slices.Contains(remove, pl) {
+			return fmt.Errorf("approve: %s both added and removed", pl)
+		}
+	}
+	edit := func(pls []string) []string {
+		out := slices.Clone(pls)
+		if len(out) == 0 {
+			out = []string{safety.PlatformDstack}
+		}
+		for _, pl := range add {
+			if !slices.Contains(out, pl) {
+				out = append(out, pl)
+			}
+		}
+		out = slices.DeleteFunc(out, func(pl string) bool { return slices.Contains(remove, pl) })
+		slices.Sort(out)
+		return out
+	}
+	np.Platforms = edit(np.Platforms)
+	if slices.Contains(remove, verifier.PlatformDstackGCP) {
+		np.MachineCerts = slices.DeleteFunc(slices.Clone(np.MachineCerts), func(c safety.SignedMachineCert) bool {
+			d, err := machineDocOf(c)
+			return err == nil && d.Mode == safety.MachineModeRegistry
+		})
+	}
+	if ntl != nil {
+		ntl.Platforms = edit(ntl.Platforms)
+	}
+	return nil
 }
 
 // carryRevocations adds prev's machines_revoked to p (a policy for a new admin-key generation, review2 L2) and drops

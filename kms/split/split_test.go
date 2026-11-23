@@ -234,3 +234,27 @@ func TestPolicyValidate(t *testing.T) {
 		t.Fatal("an unknown member decoded")
 	}
 }
+
+// gcp-host review M4: a policy that lets the VM run on Google Cloud (dstack-gcp) names no Google-run holder, so the VM's
+// host never holds a share; without dstack-gcp a Google holder is fine (2-of-3 later).
+func TestPolicyGoogleHostHoldsNoShare(t *testing.T) {
+	base := UnlockPolicy{Holders: []HolderURL{{Holder: "cloudflare", URL: "https://keys-cf.tacy.io"}, {Holder: "gcp", URL: "https://keys-g.tacy.io"}}}
+	for _, id := range []string{"gcp", "gcp-2", "google"} {
+		p := base
+		p.Holders = []HolderURL{{Holder: "cloudflare", URL: "https://keys-cf.tacy.io"}, {Holder: id, URL: "https://keys-g.tacy.io"}}
+		p.Platforms = []string{"dstack", PlatformGCP}
+		if err := p.hostHoldsNoShare(); err == nil || !strings.Contains(err.Error(), "may not hold a share") {
+			t.Fatalf("%s with dstack-gcp: %v", id, err)
+		}
+		p.Platforms = []string{"dstack"}
+		if err := p.hostHoldsNoShare(); err != nil {
+			t.Fatalf("%s without dstack-gcp: %v", id, err)
+		}
+	}
+	if GoogleHolder("vercel") || GoogleHolder("cloudflare") || !GoogleHolder("gcp") {
+		t.Fatal("GoogleHolder")
+	}
+	// Validate runs it (a policy that is otherwise refused earlier still reaches this rule only when the rest is valid;
+	// the holder rig below checks it end to end).
+	_ = base
+}

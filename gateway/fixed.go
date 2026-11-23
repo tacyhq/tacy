@@ -128,6 +128,10 @@ func CheckFixed(call *FixedCall) error {
 		if !ok || m != call.Method || query != "" || call.Host != 0 || !validHolderID(call.Holder) {
 			return fmt.Errorf("%s %s isn't a holder call", call.Method, path)
 		}
+	case TargetGCE:
+		if call.Method != "GET" || path != GCEPath || query != "" || call.Host != 0 || call.Holder != "" || len(call.Header) > 0 {
+			return fmt.Errorf("%s %s isn't the Google Cloud hints call", call.Method, path)
+		}
 	default:
 		return fmt.Errorf("unknown target %q", call.Target)
 	}
@@ -149,6 +153,8 @@ type Fixed struct {
 	AllowHTTP bool
 	// Unlock is where the holders are (the unlock policy's URLs, unlock.go); nil: no unlock target.
 	Unlock *UnlockHosts
+	// GCE answers the Google Cloud hints call (gce.go); nil: no_target.
+	GCE *GCEMeta
 }
 
 // NewFixed checks the hosts.
@@ -203,6 +209,9 @@ func (f *Fixed) Fixed(ctx context.Context, call *FixedCall) *FixedAnswer {
 			return &FixedAnswer{Error: "too_large"}
 		}
 		return &FixedAnswer{Error: "bad_call"}
+	}
+	if call.Target == TargetGCE { // answered here, never forwarded
+		return f.GCE.answer(ctx)
 	}
 	bases := f.bases(ctx, call)
 	if len(bases) == 0 {

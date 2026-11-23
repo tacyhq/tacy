@@ -413,6 +413,10 @@ func (h *Holder) unlock(ctx context.Context, req split.UnlockRequest, ev *Event)
 		return nil, refuse(http.StatusForbidden, "attestation platform %q isn't one this holder checks under this policy", head.Platform)
 	}
 	o := h.cfg.Check
+	// The Google Cloud fallback (vm-v1): only when the signed policy names verifier.PlatformDstackGCP beside
+	// "dstack" (the VM's attestation says "dstack" on either host). Off otherwise, whatever the holder's settings;
+	// the policy item counts only after the pin delay (relied).
+	o.GCP = head.Platform == "dstack" && pol.AllowsPlatform(verifier.PlatformDstackGCP)
 	// Shares go only to a release with unlockd, the only service with dstack's socket (review L3): an older release
 	// where another service holds the socket could quote for any key.
 	o.RequireUnlockd = true
@@ -609,6 +613,11 @@ func relied(pol *split.UnlockPolicy, a *server.Attested, platform string, graceU
 	if len(pol.Platforms) > 0 {
 		out = append(out, split.ItemPlatform+platform)
 	}
+	if f[verifier.FactPlatformSet] == verifier.PlatformDstackGCP || f[verifier.FactMachineHost] == safety.MachineHostGoogle {
+		// A Google Cloud boot set, or a Google machine certificate (review M1): the policy's dstack-gcp item, under the
+		// pin delay like any widening.
+		out = append(out, split.ItemPlatform+verifier.PlatformDstackGCP)
+	}
 	if graceUsed {
 		out = append(out, split.ItemTCBGrace+split.TCBGraceItem(pol))
 	}
@@ -695,11 +704,11 @@ func (h *Holder) parsePolicy(raw json.RawMessage, now time.Time) (*parsedPolicy,
 	if pol.KMSID != h.cfg.KMSID {
 		return nil, refuse(http.StatusForbidden, "policy is for another KMS id")
 	}
-	// Fail closed on platforms (the v1 Google host removal): a policy naming one this holder has no checks for (Config.Platforms;
-	// "dstack" by default) is refused whole, never read as "the rest of it applies". So "dstack-gcp", the Google Cloud
-	// host fallback taken out of v1, is refused as unknown.
+	// Fail closed on platforms: a policy naming one this holder has no checks for (Config.Platforms, "dstack" by
+	// default, plus "dstack-gcp", which turns the Google Cloud boot sets on for a "dstack" attestation) is refused
+	// whole, never read as "the rest of it applies".
 	for _, pl := range pol.Platforms {
-		if _, ok := h.cfg.Platforms[pl]; !ok {
+		if _, ok := h.cfg.Platforms[pl]; !ok && pl != verifier.PlatformDstackGCP {
 			return nil, refuse(http.StatusForbidden, "policy names platform %q, which this holder has no checks for", pl)
 		}
 	}

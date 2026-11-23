@@ -13,6 +13,9 @@
 //     key provider none, which measures no os-image-hash, the image of the pinned boot set the measurements match
 //   - the boot measurements (MRTD, RTMR0-2: firmware, its configuration and the VM shape, kernel, command line
 //     with the root filesystem hash, initramfs) are one of the pinned sets (BootMeasurements), for that OS image
+//   - on Google Cloud (only with Policy.WithGCP): the MRTD is a Google build we reviewed (pinned per set) that
+//     Google's signed firmware endorsement (gcetcb) also lists, and RTMR0-2 are a pinned GCP set whose firmware log
+//     holds the dstack UKI; Phala quotes never get this check
 //   - the VM's keys are made inside it at boot (key provider none), or in the explicit KMS fallback come from a
 //     pinned dstack KMS root (KMSRoots, the attested key-provider event): never keys a provider can derive at will
 //   - app-compose.json is exactly the release's, after a check of each setting on its own (appcompose.go: no
@@ -192,6 +195,10 @@ type Policy struct {
 	// Getter fetches Intel PCS collateral; nil = net/http straight to Intel. The browser (WebAssembly) build passes
 	// one that goes through the chat's same-origin relay; Intel's signatures on the collateral are still checked.
 	Getter trust.HTTPSGetter
+	// GoogleGetter fetches Google's firmware launch endorsements (internal/gcetcb), only for a quote whose RTMR0-2
+	// match a Google Cloud set (WithGCP); nil = net/http straight to Google's bucket. Google's signature is checked
+	// against the compiled-in root, so a relay or cache can withhold an endorsement but can't forge one.
+	GoogleGetter trust.HTTPSGetter
 	// Now is when certificates and collateral must be valid; zero = now. Only tests set it (recorded collateral).
 	Now time.Time
 	// legacy (tests only) checks recordings from before app-compose pinning: keys from a pinned KMS root, the old
@@ -400,6 +407,22 @@ func Verify(ctx context.Context, att *proto.Attestation, nonce []byte, p Policy)
 		sets = BootMeasurements
 	}
 	osHash, hasOSEvent := rt.Values["os-image-hash"]
+	// Google Cloud (WithGCP): a quote whose RTMR0-2 match a GCP set gets one more check, and that set's MRTD becomes
+	// the quote's once Google's signed endorsement lists it. A quote that matches no GCP set (every Phala quote) skips
+	// this: no fetch, no extra check, the same checks as before.
+	sets, gcpSet, gcpDetail, err := gcpBoot(ctx, quote, ev, sets, kp, hasOSEvent, p.GoogleGetter, p.Now)
+	if gcpSet != nil {
+		// What the measurements show, not where the VM runs: any TDX host loading Google's firmware with the same
+		// inputs measures the same (review L2). Nothing should decide on it.
+		r.Facts["boot chain"] = "Google's TDX firmware and the dstack UKI (a GCP set; the host itself isn't attested)"
+		r.Facts[FactPlatformSet] = PlatformDstackGCP
+		if err == nil {
+			r.Facts["firmware"] = gcpDetail
+		}
+		if !r.add(GCPBootCheck, err, gcpDetail) {
+			return failed()
+		}
+	}
 	err = nil
 	osDetail, osCheck := "", OSImageCheck
 	if !hasOSEvent && keysMadeInVM(kp) {

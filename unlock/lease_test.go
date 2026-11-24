@@ -6,7 +6,7 @@ import (
 	"github.com/tacyhq/tacy/kmsvm"
 )
 
-// The writer lease's row name: the VM's (app/lease.go leaseScope), the stand-in's (kmsvm) and the Worker's (apps/chat
+// The writer lease's row name: the VM's (app/lease.go leaseScope), the stand-in's (kmsvm) and the Worker's (the chat's
 // vm-lease.ts leaseName; test/worker/vm-lease.test.ts holds the same constant) are one.
 func TestLeaseNameShared(t *testing.T) {
 	const want = "o8d69409813c77f0a37ed602a5e390485f749002c5e20ecb7"

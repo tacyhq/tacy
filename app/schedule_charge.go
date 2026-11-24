@@ -29,7 +29,7 @@ import (
 // $0.40 since this release, $0.25 before).
 //
 // The price tables are the chat's too (packages/client-core shared/schedule-charge.ts); both are tested against the
-// same vectors (schedule_charge_test.go, apps/chat test/unit/agent-charge.test.ts).
+// same vectors (schedule_charge_test.go and the chat's own test).
 const (
 	scheduleChargeHeader = "X-Schedule-Charge"
 	scheduleAgentHeader  = "X-Schedule-Agent"
@@ -43,7 +43,7 @@ const (
 //
 //   - read: cmd/digestlab measured a page-read digest at $0.070 a run (2026-10-20), and $0.065 to $0.089 at this
 //     release's limits (2026-11-23): $0.07.
-//   - files (v0.17.0, D79): the quarantined reader on its files and the acting model reading what it found. An
+//   - files (v0.17.0): the quarantined reader on its files and the acting model reading what it found. An
 //     estimate from the scheduled run's cap of 24 parts (about 96,000 characters; at most about $0.08 of reader
 //     calls), not yet measured on real scheduled runs: re-measure with cmd/digestlab once a digest with files runs there.
 //   - mail (v0.19.0, the connections contract "Scheduled tasks": any mail tool allowed always): the quarantined reader
@@ -57,7 +57,7 @@ const scheduleMeasuredModel = "deepseek-v4-1-flash"
 var (
 	// schedulePricesV1 is v0.16.0 to v0.22.0's (at most 6 searches and $0.25 a run; one that may search $0.15): what
 	// every shipped client sends, so this release accepts it beside V2. Drop it once the clients send V2 and no VM
-	// they reach is older than this release (RELEASE-QUEUE.md; the no-downtime plan row 77).
+	// they reach is older than this release (the no-downtime plan row 77).
 	schedulePricesV1 = scheduleTable{readModel: 30_000, readFixed: 40_000, searchModel: 50_000, searchFixed: 100_000,
 		filesModel: 10_000, filesFixed: 40_000, mailModel: 10_000, mailFixed: 40_000, cap: 250_000}
 	// schedulePricesV2 is this release's (15 searches and $0.40 a run, guard/agents.go scheduledDef): one that may

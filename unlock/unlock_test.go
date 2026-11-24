@@ -568,7 +568,7 @@ func TestUnlockdGate(t *testing.T) {
 // Slots review M1: the agent VM's grant names both slots' tunnel tokens and the bundle carries both, but a VM keeps,
 // and vaultd gets, only the one its attested compose's gatewayd names (-tunnel-secret). The release compose (slot a)
 // gets CF_TUNNEL_TOKEN_VMA alone; the same compose on slot b, CF_TUNNEL_TOKEN_VMB alone. So no VM holds the other
-// slot's token, and no gatewayd can lease it.
+// slot's token, and no gatewayd can lease it. Either slot's compose may be the tree's.
 func TestOwnTunnelTokenOnly(t *testing.T) {
 	const a, b = "CF_TUNNEL_TOKEN_VMA", "CF_TUNNEL_TOKEN_VMB"
 	values := map[string]string{a: "tunnel-a-canary-6d5c4b3a29180716", b: "tunnel-b-canary-0f1e2d3c4b5a6978"}
@@ -578,10 +578,12 @@ func TestOwnTunnelTokenOnly(t *testing.T) {
 		g.Secrets = append(slices.Clone(g.Secrets), a, b)
 		r.w.Policy.Apps[unlocktest.App] = g
 		r.w.Secrets[a], r.w.Secrets[b] = values[a], values[b]
-		if slot.own == b {
-			dc := strings.Replace(r.w.VMCompose, `"-tunnel-secret", "`+a+`"`, `"-tunnel-secret", "`+b+`"`, 1)
+		// The tree's compose names one slot (a release leases the slot the live one isn't on): the other slot's run
+		// is the same compose with the other token.
+		if !strings.Contains(r.w.VMCompose, `"-tunnel-secret", "`+slot.own+`"`) {
+			dc := strings.Replace(r.w.VMCompose, `"-tunnel-secret", "`+slot.other+`"`, `"-tunnel-secret", "`+slot.own+`"`, 1)
 			if dc == r.w.VMCompose {
-				t.Fatal("compose.yaml names no -tunnel-secret " + a)
+				t.Fatal("compose.yaml names no -tunnel-secret " + slot.other)
 			}
 			q, info, ac := r.w.Variant(func(m map[string]any) { m["docker_compose_file"] = dc })
 			r.w.VM = &unlocktest.Evidence{Quote: q, Info: info}

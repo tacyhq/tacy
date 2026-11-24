@@ -21,7 +21,7 @@ import (
 // switch, a rollback, a failover and its switch back) both saved, the second save conflicted and that agentd stopped
 // and restarted (a new key: tasks cut, vm_restarted): seen live in the gad drills. So only the lease's holder saves:
 //
-//   - The lease is one row at the Worker (POST /api/vm/lease/<unlock.LeaseName(leaseScope)>, apps/chat vm-lease.ts),
+//   - The lease is one row at the Worker (POST /api/vm/lease/<unlock.LeaseName(leaseScope)>, the chat Worker's lease route),
 //     held by this boot's holder id, "<app id>/<instance id>/<boot>" (boot: random, kept in the task queue's tmpfs so
 //     the hourly container restart keeps it; every VM boot differs, also two VMs of one Google target). The Worker
 //     gives it on a claim only when there is none, it is this holder's, or it lapsed and was the same app's (this VM's

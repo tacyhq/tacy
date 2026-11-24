@@ -130,7 +130,7 @@ var agentDefs = map[string]*AgentDef{AgentChat: &chatDef, AgentResearch: &resear
 // Searches 6 -> 15 and $0.25 -> $0.40 (2026-11-23): a Pro user's morning digest spent its searches in its
 // first round and said its digest rested on that one set of results. The run's note (triggered.go searchNote) asks it
 // to pace them: a few broad searches first, the rest to follow up where coverage is thin. Tool calls 40 -> 50 keeps the
-// room the old 6 + 25 left for stored files and image search. Measured with cmd/digestlab news (SCHEDULES.md).
+// room the old 6 + 25 left for stored files and image search. Measured with cmd/digestlab news.
 var scheduledDef = AgentDef{ID: AgentScheduled, Version: "1", Tools: []string{"web_search", "fetch_page", "image_search"},
 	Steps: 20, Searches: 15, Reads: 25, Work: 10 * time.Minute,
 	Run: safety.Limits{Tokens: 4_000_000, ToolCalls: 50, WallSeconds: 10 * 60, CostMicros: 400_000},

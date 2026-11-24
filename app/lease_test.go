@@ -13,7 +13,7 @@ import (
 	"github.com/tacyhq/tacy/unlock"
 )
 
-// leaseRow is the Worker's lease row (apps/chat vm-lease.ts serveLease's rule: written when there is none, it is the
+// leaseRow is the Worker's lease row (the chat Worker's serveLease rule: written when there is none, it is the
 // claimant's, or it lapsed and was the same app's; never "legacy"; until < now lapses), on a shared clock.
 type leaseRow struct {
 	mu     sync.Mutex
@@ -237,7 +237,7 @@ func TestLeaseTakenOverStops(t *testing.T) {
 	// A failover's forced switch gives the row to B while A still runs (unreachable through its tunnel only).
 	r.assign(holderB)
 	// A's next save renews first once its last renewal is leaseFresh old: refused, A stops (no save). Its saves in
-	// between are the Worker's fence's to refuse (vm-lease.ts; apps/chat test vm-lease.test.ts).
+	// between are the Worker's fence's to refuse (the chat Worker's lease route and its tests).
 	r.advance(leaseFresh)
 	if a.l.Writer(ctx) {
 		t.Fatal("A saved after the takeover")

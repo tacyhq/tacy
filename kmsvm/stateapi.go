@@ -111,7 +111,7 @@ func CheckAuth(kmsID ed25519.PublicKey, now time.Time, method, name, certH, auth
 	return c.App + "/" + Tag(c.Purpose)
 }
 
-// serveLease is POST /api/vm/lease/{name} as the Worker serves it (apps/chat vm-lease.ts): a claim takes the row
+// serveLease is POST /api/vm/lease/{name} as the Worker serves it (its lease route): a claim takes the row
 // when there is none, it is the claimant's, or it lapsed and was the same app's (never the legacy row); a takeover
 // ("from": the Worker's switch's order, carried by the VM) only from the holder it names.
 func (a *StateAPI) serveLease(w http.ResponseWriter, r *http.Request, name string, now time.Time) {

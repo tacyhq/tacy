@@ -111,7 +111,7 @@ func LeaseName(scope string) string {
 // ErrNoOwnerRoute: the Worker (or stand-in) has no such route (404, 405): one built before it.
 var ErrNoOwnerRoute = errors.New("owner: the Worker has no such route")
 
-// LeaseRow is the writer lease's row as the Worker answers it (apps/chat vm-lease.ts).
+// LeaseRow is the writer lease's row as the Worker answers it (its lease route).
 type LeaseRow struct {
 	Holder string `json:"holder"`
 	Until  int64  `json:"until"`

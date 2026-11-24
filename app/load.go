@@ -18,7 +18,7 @@ import (
 )
 
 // GET /load (docs/41 §9, build step 3): how busy this VM is, for the Worker's minute cron, which keeps a rolling day
-// of it per VM for Admin and its alerts (apps/chat src/worker/vm-load.ts). In the relay's envelope like /tasks/open
+// of it per VM for Admin and its alerts (the chat Worker's load poll). In the relay's envelope like /tasks/open
 // (authorized: a request without one is 401), plaintext JSON inside it. It passes while drained and as a standby (a
 // GET), and before the keys arrive (keyless): it needs none.
 //

@@ -156,6 +156,9 @@ type Relay struct {
 		Do(*http.Request) (*http.Response, error)
 	}
 	Auth func(*http.Request) // adds the VM's authentication
+	// Writer is the saving VM's writer-lease holder id, sent with each save (X-Tacy-Writer: the Worker refuses a
+	// save from anyone but the lease's holder once the app has one). nil or "": none (no lease, as before it).
+	Writer func() string
 }
 
 func (r *Relay) url(name string) (string, error) {
@@ -217,6 +220,11 @@ func (r *Relay) Put(ctx context.Context, name string, blob []byte, prev uint64) 
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("X-Tacy-Gen", strconv.FormatUint(gen, 10))
 	req.Header.Set("X-Tacy-Prev-Gen", strconv.FormatUint(prev, 10))
+	if r.Writer != nil {
+		if w := r.Writer(); w != "" {
+			req.Header.Set("X-Tacy-Writer", w) // the writer lease's fence (app/lease.go; the Worker's vm-lease.ts)
+		}
+	}
 	res, err := r.do(req)
 	if err != nil {
 		return err

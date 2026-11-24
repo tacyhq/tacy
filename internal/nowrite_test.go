@@ -48,7 +48,10 @@ var writeAllowed = map[string]string{
 	// The Worker's drain (app/drain.go): its end time, one number, beside the queue in the same host tmpfs, so the
 	// hourly container restart doesn't end a drain early. Only with -tasks-dir (the directory OpenTmpfs checked).
 	"app/drain.go:drainState.keep": "the drain's end time (a unix second, nothing of anyone's) in the task queue's host tmpfs (TD memory), checked by OpenTmpfs",
-	tasksTmpfsKey:                  "agentd's task queue (its boot marker) into its host tmpfs (TD memory), checked to be tmpfs first",
+	// The writer lease's boot id (app/lease.go leaseBoot): 16 random hex beside the queue in the same host tmpfs, so a
+	// restarted agentd of the same boot keeps its lease.
+	"app/lease.go:leaseBoot": "the lease's boot id (random, nothing of anyone's) in the task queue's host tmpfs (TD memory), checked by OpenTmpfs",
+	tasksTmpfsKey:            "agentd's task queue (its boot marker) into its host tmpfs (TD memory), checked to be tmpfs first",
 	// Before v0.20.0 these kept state on the CVM's disk. Since the quick path nothing in the mains opens them
 	// (TestMainsOpenNoFileStores); they move onto sealstate's snapshots (the keys plan §3.2, Stage C) and leave this list.
 	"activity/store.go:OpenStore":  "legacy file store, unused by the mains",

@@ -174,7 +174,7 @@ func TestApprove(t *testing.T) {
 	d.AddRelease("v0.21.0", strings.Repeat("a", 64), "")
 	dir := t.TempDir()
 	ac, cy := filepath.Join(dir, "app-compose.json"), filepath.Join(dir, "compose.yaml")
-	os.WriteFile(ac, []byte(`{"name":"agent-vm"}`), 0o644)
+	os.WriteFile(ac, []byte(`{"name":"agent-vm","docker_compose_file":"services: {}\n"}`), 0o644)
 	os.WriteFile(cy, []byte("services: {}\n"), 0o644)
 	tl := &safety.TrustList{Type: safety.TrustListType, Seq: 3, IssuedAt: now.Add(-24 * time.Hour), Expires: now.Add(89 * 24 * time.Hour),
 		Releases: []safety.TrustRelease{{Version: "v0.21.0", Commit: strings.Repeat("1", 40), ComposeSHA256: strings.Repeat("2", 64), Bundle: []byte(`{}`)}}}
@@ -185,7 +185,7 @@ func TestApprove(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	np, ntl, err := approve(d.Policy, tl, []releaseSpec{add}, []string{"v0.21.0"}, entry, nil, nil, grace, now)
+	np, ntl, err := approve(d.Policy, tl, []releaseSpec{add}, []string{"v0.21.0"}, []safety.TrustRelease{*entry}, nil, nil, grace, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -218,7 +218,7 @@ func TestApprove(t *testing.T) {
 	}
 	other := *entry
 	other.ComposeSHA256 = strings.Repeat("4", 64)
-	if _, _, err := approve(d.Policy, tl, []releaseSpec{add}, nil, &other, nil, nil, nil, now); err == nil {
+	if _, _, err := approve(d.Policy, tl, []releaseSpec{add}, nil, []safety.TrustRelease{other}, nil, nil, nil, now); err == nil {
 		t.Fatal("a trust entry for another compose")
 	}
 	if _, _, err := approve(d.Policy, tl, []releaseSpec{add}, nil, nil, nil, nil, nil, now); err == nil {
@@ -342,7 +342,7 @@ func TestApproveEmergency(t *testing.T) {
 	d, _ := splitdev.New([]string{"cloudflare", "vercel"}, 2, now.Add(-time.Hour))
 	dir := t.TempDir()
 	ac := filepath.Join(dir, "app-compose.json")
-	os.WriteFile(ac, []byte(`{"name":"agent-vm","fix":true}`), 0o644)
+	os.WriteFile(ac, []byte(`{"name":"agent-vm","fix":true,"docker_compose_file":"services: {}\n"}`), 0o644)
 	add := releaseSpec{App: splitdev.App, Version: "v0.22.1", AppCompose: ac}
 	np, _, err := approve(d.Policy, nil, []releaseSpec{add}, nil, nil, nil, nil, nil, now)
 	if err != nil {
@@ -445,7 +445,7 @@ func TestApproveKMSFallbackRemovalDate(t *testing.T) {
 			}
 			d.Policy.KMSFallback = c.fallback
 			ac := filepath.Join(t.TempDir(), "app-compose.json")
-			os.WriteFile(ac, []byte(`{"name":"agent-vm"}`), 0o644)
+			os.WriteFile(ac, []byte(`{"name":"agent-vm","docker_compose_file":"services: {}\n"}`), 0o644)
 			_, _, err = approve(d.Policy, nil, []releaseSpec{{App: splitdev.App, Version: "v0.22.0", AppCompose: ac}}, nil, nil, nil, nil, nil, c.at)
 			if c.ok && err != nil {
 				t.Fatal(err)
@@ -468,13 +468,13 @@ func TestApproveTrustEmergency(t *testing.T) {
 	}
 	dir := t.TempDir()
 	ac, cy := filepath.Join(dir, "app-compose.json"), filepath.Join(dir, "compose.yaml")
-	os.WriteFile(ac, []byte(`{"name":"agent-vm","fix":true}`), 0o644)
+	os.WriteFile(ac, []byte(`{"name":"agent-vm","fix":true,"docker_compose_file":"services: {}\n"}`), 0o644)
 	os.WriteFile(cy, []byte("services: {}\n"), 0o644)
 	tl := &safety.TrustList{Type: safety.TrustListType, Seq: 3, IssuedAt: now.Add(-24 * time.Hour),
 		OSImages: map[string]string{strings.Repeat("c", 64): "dstack-0.6.9 (test)"}}
 	entry := &safety.TrustRelease{Version: "v0.22.1", Commit: strings.Repeat("3", 40), ComposeSHA256: fileSHA256(cy), Bundle: []byte(`{}`)}
 	add := releaseSpec{App: splitdev.App, Version: "v0.22.1", AppCompose: ac, Compose: cy}
-	np, ntl, err := approve(d.Policy, tl, []releaseSpec{add}, nil, entry, nil, nil, nil, now)
+	np, ntl, err := approve(d.Policy, tl, []releaseSpec{add}, nil, []safety.TrustRelease{*entry}, nil, nil, nil, now)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -446,7 +446,7 @@ func (s *TrustState) Apply(p Policy, now time.Time) (Policy, *TrustInfo) {
 	env := s.env
 	s.mu.Unlock()
 	if env == nil {
-		return p, nil
+		return s.keptRevocations(p), nil
 	}
 	l, err := ParseTrustList(env, 0, now)
 	if err == nil {
@@ -473,7 +473,25 @@ func (s *TrustState) Apply(p Policy, now time.Time) (Policy, *TrustInfo) {
 			return q.WithTCBGrace(now), &i
 		}
 	}
-	return p, &TrustInfo{Error: err.Error()}
+	return s.keptRevocations(p), &TrustInfo{Error: err.Error()}
+}
+
+// keptRevocations is p with the machine revocations this verifier kept (TrustSeen.RevokedMachines) applied to the
+// built-in machines, for a verification with no list in force (none given, or the one given refused): a revoked
+// machine stays revoked whatever the server serves (vm-v2 clients review L2). p's own machines, if set, as they are.
+func (s *TrustState) keptRevocations(p Policy) Policy {
+	s.mu.Lock()
+	kept := slices.Clone(s.seen.RevokedMachines)
+	s.mu.Unlock()
+	if p.Machines != nil || len(kept) == 0 {
+		return p
+	}
+	set := BuiltinMachines()
+	for _, h := range kept {
+		set.Revoked[h] = true
+	}
+	p.Machines = set
+	return p
 }
 
 func cmpOr(m, def map[string]string) map[string]string {

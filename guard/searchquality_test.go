@@ -104,9 +104,10 @@ func TestReaderReserveCoversTheLargestSearch(t *testing.T) {
 	rc := DefaultReader
 	question := strings.Repeat("𝔻", maxQuestionRunes)
 	bytes := len(rc.system()) + len(d.prompt(question, spans))
-	// One call for the whole search (a call that reached the model without counts is counted at this).
+	// One call for the whole search (a call that reached the model without counts is counted at this; a grouped call
+	// reads fewer results).
 	p, c := ReaderCallMax("web.search")
-	if c != readerMaxOut || p < int64(bytes)/3+16 {
+	if c != max(readerMaxOut, groupMaxOut) || p < int64(bytes)/3+16 { // a grouped call's completion cap is the larger
 		t.Fatalf("a call at most %d prompt tokens for %d bytes", p, bytes)
 	}
 	// Split (one call a result, each on the model and again on the fallback): every result's call at its largest.

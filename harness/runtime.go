@@ -229,6 +229,8 @@ type Runtime struct {
 	holds map[string]*hold // held requests waiting in this process, by task\x00id
 	// decided are decisions for requests held by an earlier process that no brain has re-sent yet, by task\x00id.
 	decided map[string]decision
+	// ends are the latest tasks' end times and durations (load.go), at most endsKept: no ids.
+	ends []taskEnd
 }
 
 type task struct {
@@ -259,6 +261,9 @@ type task struct {
 	// claimed is which action carries out each of those tool calls, call id -> action request id: one action per
 	// tool call (a second id naming the same call is refused). Rebuilt from the journal with every model result.
 	claimed map[string]string
+	// added is when this process queued the task (StartTainted); zero for one restored from the Store, whose start
+	// this process didn't see: its time isn't measured (Load).
+	added time.Time
 }
 
 // call is a request running in this process; a repeat of its id waits for it.
@@ -423,6 +428,7 @@ func (r *Runtime) StartTainted(id string, s Start, opts jsontext.Value, taint st
 	}
 	r.addLocked(id, s, opts.Clone(), 0, 0, nil, nil)
 	r.tasks[id].taint = taint
+	r.tasks[id].added = time.Now()
 	r.dispatchLocked()
 	return nil
 }
@@ -736,6 +742,7 @@ func (r *Runtime) endLocked(t *task, o Outcome) {
 	}
 	t.lc = Lifecycle{State: EndState(o.State)}
 	t.outcome, t.sess = o, nil
+	r.noteEndLocked(t)
 	r.Store.EndTask(t.id, o) // best effort: a task the store still has open is restored and resumed once more
 	// What only the run needed goes now (best effort too: guard.Host.ScrubEnded repeats it at a start).
 	r.Store.Scrub(t.id, r.keptOptions(t.info.Options))

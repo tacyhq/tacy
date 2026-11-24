@@ -122,15 +122,21 @@ const researchFileParts = 60
 
 var agentDefs = map[string]*AgentDef{AgentChat: &chatDef, AgentResearch: &researchDef, AgentReview: &reviewDef}
 
-// scheduledDef is AgentScheduled: at most 20 steps and $0.25 per run (the
-// definition's max_steps may ask for fewer), 10 page reads and 5 searches per step budget's worth, 10 minutes of work.
-// No site icons or card pictures. Its result is sealed to the space's seal key when it ends and kept 7 days (agentd's
-// schedules.go); the task itself (its plaintext) is then forgotten at once.
+// scheduledDef is AgentScheduled: at most 20 steps and $0.40 per run (the definition's max_steps may ask for fewer),
+// 15 searches and 25 page reads, 10 minutes of work. No site icons or card pictures. Its result is sealed to the
+// space's seal key when it ends and kept 7 days (agentd's schedules.go); the task itself (its plaintext) is then
+// forgotten at once.
+//
+// Searches 6 -> 15 and $0.25 -> $0.40 (2026-11-23): a Pro user's morning digest spent its searches in its
+// first round and said its digest rested on that one set of results. The run's note (triggered.go searchNote) asks it
+// to pace them: a few broad searches first, the rest to follow up where coverage is thin. Tool calls 40 -> 50 keeps the
+// room the old 6 + 25 left for stored files and image search. Measured with cmd/digestlab news (SCHEDULES.md).
 var scheduledDef = AgentDef{ID: AgentScheduled, Version: "1", Tools: []string{"web_search", "fetch_page", "image_search"},
-	Steps: 20, Searches: 6, Reads: 25, Work: 10 * time.Minute,
-	Run: safety.Limits{Tokens: 4_000_000, ToolCalls: 40, WallSeconds: 10 * 60, CostMicros: 250_000},
-	// Kept for the digest's last answer over a long conversation (a cent or two on the default model).
-	FinalReserve: 30_000,
+	Steps: 20, Searches: 15, Reads: 25, Work: 10 * time.Minute,
+	Run: safety.Limits{Tokens: 4_000_000, ToolCalls: 50, WallSeconds: 10 * 60, CostMicros: 400_000},
+	// Kept for the digest's last answer over a long conversation: a few cents on the default model with 15 searches'
+	// results in it (30,000 at $0.25, scaled with the budget).
+	FinalReserve: 50_000,
 	// A definition with stored files (since v0.17.0) reads them as research reads the person's files, at most
 	// scheduledFileParts parts; one without has no files tools.
 	Files: true, FilesOptional: true, FileParts: scheduledFileParts,
@@ -139,7 +145,7 @@ var scheduledDef = AgentDef{ID: AgentScheduled, Version: "1", Tools: []string{"w
 	MailSearches: 6, MailReads: 12}
 
 // scheduledFileParts is the most parts of its stored files a scheduled run reads (about 96,000 characters, about
-// $0.08 of reader calls, inside the run's $0.25).
+// $0.08 of reader calls, inside the run's $0.40).
 const scheduledFileParts = 24
 
 // internalDefs are definitions a request can't name (Startable is false): only the VM starts their tasks.

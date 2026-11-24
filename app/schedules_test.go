@@ -411,11 +411,11 @@ func TestScheduledRunRecordedAndSealed(t *testing.T) {
 	}
 }
 
-// The per-run budget ($0.25): a run whose model calls use it up ends with budget_exceeded, counted in the schedule's
+// The per-run budget ($0.40): a run whose model calls use it up ends with budget_exceeded, counted in the schedule's
 // own bucket (not the person's).
 func TestScheduledRunBudgetCutoff(t *testing.T) {
-	const bigPrompt = 500_000 // deepseek-v4-1-flash: about $0.33, under the run's 4M tokens
-	if c := safety.ModelCost("deepseek-v4-1-flash", bigPrompt, 0); c <= 250_000 {
+	const bigPrompt = 700_000 // deepseek-v4-1-flash: about $0.46, under the run's 4M tokens
+	if c := safety.ModelCost("deepseek-v4-1-flash", bigPrompt, 0); c <= guard.RunBudget(guard.AgentScheduled).CostMicros {
 		t.Fatalf("the test's call costs only %d micro-USD", c)
 	}
 	big := `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"` + modelTool("fetch_page") +

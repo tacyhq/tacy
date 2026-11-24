@@ -93,6 +93,14 @@ var quickPathOff = []offRoute{
 func (s *server) gate(next http.Handler, off []offRoute) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
+		if !drainPasses(r) { // new work: counted (before the drain check) until answered, so a release waits for it
+			s.drain.admitting.Add(1)
+			defer s.drain.admitting.Add(-1)
+		}
+		if s.drain.standby.Load() && !standbyPasses(r) { // lease.go: not the state's writer
+			failDetail(w, 503, "standby", "this VM isn't the active one: new work goes to the active one")
+			return
+		}
 		if s.drain.on(time.Now()) && !drainPasses(r) { // drain.go: nothing new on a VM being replaced
 			failDetail(w, 503, "draining", "this VM is being replaced: new work goes to the active one")
 			return
@@ -115,7 +123,7 @@ func (s *server) gate(next http.Handler, off []offRoute) http.Handler {
 // keyless: routes that work before the keys arrived.
 func keyless(p string) bool {
 	switch p {
-	case "/", "/attest", "/health", ehbpproto.KeysPath, "/safety", "/keylog", "/secrets/status", "/drain", "/undrain":
+	case "/", "/attest", "/health", ehbpproto.KeysPath, "/safety", "/keylog", "/secrets/status", "/drain", "/undrain", "/load":
 		return true
 	}
 	return false

@@ -63,8 +63,14 @@ func TestUnlockProofFromBoot(t *testing.T) {
 	}
 	// No proof without a certificate, a key of 32 bytes or an app-compose in the info.
 	for name, f := range map[string]func() error{
-		"no certificate": func() error { _, err := unlock.NewUnlockProof(signer.SignLabeled, nil, a.KMSID, a.Epoch, k.PublicKey().Bytes(), info); return err },
-		"short key":      func() error { _, err := unlock.NewUnlockProof(signer.SignLabeled, a.EpochCert, a.KMSID, a.Epoch, []byte{1}, info); return err },
+		"no certificate": func() error {
+			_, err := unlock.NewUnlockProof(signer.SignLabeled, nil, a.KMSID, a.Epoch, k.PublicKey().Bytes(), info)
+			return err
+		},
+		"short key": func() error {
+			_, err := unlock.NewUnlockProof(signer.SignLabeled, a.EpochCert, a.KMSID, a.Epoch, []byte{1}, info)
+			return err
+		},
 		"no app-compose": func() error {
 			_, err := unlock.NewUnlockProof(signer.SignLabeled, a.EpochCert, a.KMSID, a.Epoch, k.PublicKey().Bytes(), json.RawMessage(`{"app_id":"a"}`))
 			return err

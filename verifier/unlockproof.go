@@ -72,15 +72,18 @@ type unlockProof struct {
 
 // epochCertDoc is split.EpochCert as signed (read strictly: every member, exact names, nothing else).
 type epochCertDoc struct {
-	KMSID      string                     `json:"kms_id"`
-	Epoch      uint32                     `json:"epoch"`
-	Root       string                     `json:"root"`
-	App        string                     `json:"app"`
-	Firm       string                     `json:"firm"`
-	StoreCerts map[string]jsontext.Value  `json:"store_certs"`
-	Signers    map[string]string          `json:"signers"`
-	IssuedAt   jsontext.Value             `json:"issued_at"`
+	KMSID      string                    `json:"kms_id"`
+	Epoch      uint32                    `json:"epoch"`
+	Root       string                    `json:"root"`
+	App        string                    `json:"app"`
+	Firm       string                    `json:"firm"`
+	StoreCerts map[string]jsontext.Value `json:"store_certs"`
+	Signers    map[string]string         `json:"signers"`
+	IssuedAt   jsontext.Value            `json:"issued_at"`
 }
+
+// ProofApp is the app whose epoch certificate an agent VM's unlock proof must be under.
+const ProofApp = "agent-vm"
 
 // openUnlockProof checks att's unlock proof up to its signature: the epoch certificate under a pinned KMS id, the
 // activity signer it names, the signature over att's HPKE key. ids are the pinned KMS ids.
@@ -99,6 +102,12 @@ func openUnlockProof(att *proto.Attestation, ids map[string]string) (*unlockProo
 	var doc epochCertDoc
 	if err := jsonv2.Unmarshal(sc.Doc, &doc, jsonv2.RejectUnknownMembers(true)); err != nil || doc.Epoch == 0 {
 		return nil, errors.New("unlock proof: the epoch certificate doesn't parse")
+	}
+	// The agent VM's app (the unlock policy's grant, kms/policies agent-vm-v1.json): another app granted under the
+	// same KMS id and firm has its own signer and certificate, and its VMs must not vouch for an agent VM's key
+	// (vm-v2 clients review M2).
+	if doc.App != ProofApp {
+		return nil, fmt.Errorf("unlock proof: the epoch certificate is for app %q, not the agent VM's %q", doc.App, ProofApp)
 	}
 	if ids[doc.KMSID] == "" {
 		return nil, fmt.Errorf("unlock proof: the epoch certificate is for Tacy KMS %s, which isn't a pinned one", short(doc.KMSID))

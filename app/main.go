@@ -17,6 +17,7 @@
 //	                              point, cancel it. EHBP bodies, as /run. Billing witness headers for the relay
 //	                              (X-Agent-Task, X-Agent-Bill, X-Agent-Refundable), inside the envelope.
 //	GET  /tasks/open              {"open": n}: open tasks, for the relay's idle timer (a count only).
+//	GET  /load                    how busy the VM is: CPU, memory, run slots and queue, task times; numbers only (load.go).
 //	POST /run                     EHBP-encrypted proto.RunRequest -> EHBP-encrypted SSE stream of proto.Event: a
 //	                              shim over the task API (start, then follow; cancelled when the tab goes away).
 //	                              Kept one release after the chat moved to /tasks (temporary chats still use it).
@@ -107,7 +108,9 @@ type server struct {
 	// (local runs) or an epoch certificate (a development root).
 	proof func(info json.RawMessage) *proto.UnlockProof
 	// owner holds the spaces' schedule ownership rows at the Worker (unlock/owner.go); nil: this VM fires them all.
-	owner    *unlock.Owner
+	owner *unlock.Owner
+	// lease is the sealed state's writer lease (lease.go); nil: memory-only state, or no ownership route client.
+	lease    *stateLease
 	id       *ehbpidentity.Identity
 	agent    guard.Gateway    // gatewayd over its socket (the CVM), or this process's guard (local development)
 	rt       *harness.Runtime // the harness/v1 runtime the brain connects to
@@ -117,6 +120,7 @@ type server struct {
 	quotes   chan struct{} // concurrent /attest limit
 	runsDone atomic.Int64  // finished runs (local platform stats only)
 	drain    drainState    // the Worker's drain before a switch (drain.go)
+	load     loadMeter     // GET /load's /proc readings (load.go)
 
 	rec         *activity.Recorder // the runs' activity records (activity.go, docs/24)
 	safety      *safety.State      // signed policies and stop lists agentd verified (step 6, safety.go)
@@ -613,7 +617,7 @@ func main() {
 			log.Fatalf("state: %v", err)
 		}
 		// The chat Worker's sealed-state API (vm-state.ts) at gatewayd's -state-url: ciphertext only.
-		backend = &sealstate.Relay{Base: "https://state", Client: gateway.StateHTTP{D: gwc}, Auth: auth}
+		backend = &sealstate.Relay{Base: "https://state", Client: gateway.StateHTTP{D: gwc}, Auth: auth, Writer: func() string { return leaseHolder.Load().(string) }}
 	case "dir":
 		seed, err := hex.DecodeString(*devStateKey)
 		if p.Name() != "local" || *stateDir == "" || err != nil || len(seed) != 32 {
@@ -782,6 +786,41 @@ func main() {
 	if kept.keeper != nil { // a change that must be lasting before what follows it runs (an event's delivery)
 		s.saveState = kept.keeper.SaveNow
 	}
+	if kept.keeper != nil && s.owner != nil {
+		// The sealed state's writer lease (lease.go): only the VM holding it saves; without it this VM is a standby.
+		keeper, owner := kept.keeper, s.owner
+		dir := ""
+		if kept.tasksTmpfs != nil {
+			dir = kept.tasksTmpfs.Dir
+		}
+		holder := owner.ID + "/" + leaseBoot(dir)
+		leaseHolder.Store(holder) // every save says it (the Worker's fence)
+		name := unlock.LeaseName(leaseScope)
+		s.lease = &stateLease{
+			holder: holder,
+			claim: func(ctx context.Context, from string, ttl time.Duration) (unlock.LeaseRow, bool, error) {
+				return owner.ClaimLease(ctx, name, holder, from, ttl)
+			},
+			handoff: func(ctx context.Context) error {
+				row, ok, err := owner.ClaimLease(ctx, name, unlock.LegacyHolder, holder, time.Second)
+				if err == nil && !ok {
+					err = fmt.Errorf("the row is %s's", row.Holder)
+				}
+				return err
+			},
+			stale:    func(ctx context.Context) (bool, error) { return keeper.Store.Stale(ctx, keeper.Names()) },
+			flush:    keeper.Flush,
+			open:     func() int { return s.tasks().Open() },
+			inflight: s.drain.admitting.Load,
+			drained:  func() bool { return s.drain.byWorker(time.Now()) },
+			standby:  s.drain.standby.Store,
+			released: func() { owner.Release(context.Background()) },
+			restart: func(reason string) {
+				log.Fatalf("state: %s (restarting to load it as a standby or the writer)", reason)
+			},
+		}
+		keeper.Writer = s.lease.Writer
+	}
 	if sc, ok := side.(startClaimStore); ok { // both side stores can (queue.Side, trigger.MemStore)
 		s.starts = sc
 	} else {
@@ -803,6 +842,10 @@ func main() {
 		s.drain.restore(kept.tasksTmpfs.Dir, time.Now())
 	}
 	ctx := context.Background()
+	if s.lease != nil { // before any task resumes or schedule fires: the writer, or a standby
+		s.lease.boot(ctx)
+		go s.lease.run(ctx)
+	}
 	s.resumeTasks(ctx, ids, log.Printf)
 	if d, ok := p.(*dstack); ok { // the first /attest after a cold start then waits for one guest agent call, not two
 		go d.PrefetchInfo(ctx, 2*time.Second, 3*time.Minute)
@@ -857,6 +900,7 @@ func main() {
 	s.notifyRoutes(mux, id)                                      // run notifications (notify.go, the schedules contract)
 	s.secretsRoutes(mux)                                         // whether vaultd has the API keys (secrets.go)
 	s.drainRoutes(mux)                                           // the Worker's drain before a switch (drain.go)
+	s.loadRoutes(mux)                                            // how busy this VM is, for the Worker (load.go)
 	mux.HandleFunc("POST /schedules/handoff", s.scheduleHandoff) // sealed results to the relay (handoff.go, the schedules contract)
 	mux.HandleFunc("GET /activity", s.activityOut)               // sealed activity records, for the relay (docs/24)
 	// Signed policies and stop lists; the signature is the authorization. Only served when the compose pins a key
@@ -989,6 +1033,9 @@ func localBrain(ctx context.Context, rt *harness.Runtime) {
 		time.Sleep(100 * time.Millisecond)
 	}
 }
+
+// leaseHolder is this boot's writer-lease holder id once known (lease.go), for the relay's saves; "" before.
+var leaseHolder = func() *atomic.Value { v := &atomic.Value{}; v.Store(""); return v }()
 
 // instanceID is this VM's attested instance id (dstack's Info, through unlockd): its schedule ownership rows' owner.
 func instanceID(ctx context.Context, uc *unlock.Client) (string, error) {

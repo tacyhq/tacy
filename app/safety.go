@@ -639,16 +639,35 @@ func (g *safeGateway) Action(ctx context.Context, ti *harness.TaskInfo, id strin
 	// A built-in agent keeps part of its cost budget for its answer (guard.FinalReserve): a search or read that
 	// would eat into it is refused, and the model told to write its answer now. A document (document.create) and a
 	// "nothing changed" (schedule.no_change) cost nothing and are the answer: they aren't held to the reserve.
-	if keep := guard.FinalReserve(agent); keep > 0 && !guard.IsDocumentAction(req.Name) && !guard.IsNoChangeAction(req.Name) {
-		if left := g.ledger.CostLeft(ti.ID, b); left >= 0 && left-want.CostMicros-reader.CostMicros < keep {
+	keep := guard.FinalReserve(agent)
+	if guard.IsDocumentAction(req.Name) || guard.IsNoChangeAction(req.Name) {
+		keep = 0
+	}
+	var commit func(safety.Usage)
+	for {
+		c, held, err := g.ledger.ReserveKeeping(ti.ID, addUsage(want, reader), b, keep)
+		if err != nil {
+			return nil, g.refuse(ti.ID, harness.CodeLimit, err)
+		}
+		if held == nil {
+			commit = c
+			break
+		}
+		// What stands between this action and the reserve may be only what the task's own searches and reads in
+		// flight hold: each reserves its reader at its largest (a search about $0.15) and settles at what it used
+		// (about $0.02). Then it waits for one of them to settle and looks again, instead of telling the model the
+		// budget is used up while most of it is still there (2026-11-23: a scheduled digest's parallel first searches
+		// were refused this way and it stopped after one). Otherwise the budget is used up.
+		if held.Held == 0 || held.Left+held.Held-want.CostMicros-reader.CostMicros < keep {
 			return &harness.ActionResult{Status: harness.ActionDenied, Error: safety.CodeBudgetExceeded +
 				": this task's budget for searches and page reads is used up (the rest is kept for the answer); nothing was sent. " +
 				"Don't call any more tools: write your answer now from what you have, and say what you couldn't check."}, nil
 		}
-	}
-	commit, err := g.ledger.Reserve(ti.ID, addUsage(want, reader), b)
-	if err != nil {
-		return nil, g.refuse(ti.ID, harness.CodeLimit, err)
+		select {
+		case <-held.Settled:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 	f := guard.FactsFrom(ctx)
 	if f == nil {

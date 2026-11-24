@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -99,6 +100,82 @@ func (o *Owner) Holds(ctx context.Context, space string) bool {
 	return now().Before(o.held[name])
 }
 
+// LeaseName is the row name of a sealed-state writer lease (app/lease.go): the same route and row form as a space's
+// ownership row, under its own prefix, so no name is both. scope: "state/all" (every state of the app, v1), later one
+// per shard ("state/s07", docs/41).
+func LeaseName(scope string) string {
+	h := sha256.Sum256([]byte("tacy/state-lease/v1\x00" + scope))
+	return "o" + hex.EncodeToString(h[:24])
+}
+
+// ErrNoOwnerRoute: the Worker (or stand-in) has no such route (404, 405): one built before it.
+var ErrNoOwnerRoute = errors.New("owner: the Worker has no such route")
+
+// LeaseRow is the writer lease's row as the Worker answers it (apps/chat vm-lease.ts).
+type LeaseRow struct {
+	Holder string `json:"holder"`
+	Until  int64  `json:"until"`
+}
+
+// LegacyHolder is the lease row of a VM built before the lease (the Worker writes it at such a VM's first save, and a
+// lease VM hands the lease to it when the Worker switches back to one): never lapses, never claimed on its own.
+const LegacyHolder = "legacy"
+
+// ClaimLease claims or renews the writer lease row name for holder (POST /api/vm/lease/<name>, the same client and
+// signature as the ownership rows): the row as it stands, and whether it is holder's now. The Worker gives it only
+// when there is none, it is holder's, or it lapsed and was the same app's. from: a takeover the Worker's switch
+// ordered (in its signed undrain or drain): the row moves only if it is from's (compare and set); "": none.
+func (o *Owner) ClaimLease(ctx context.Context, name, holder, from string, ttl time.Duration) (LeaseRow, bool, error) {
+	if ttl < time.Second {
+		ttl = time.Second
+	}
+	c := map[string]any{"holder": holder, "ttl": int(ttl / time.Second)}
+	if from != "" {
+		c["from"] = from
+	}
+	body, _ := json.Marshal(c)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://state/api/vm/lease/"+name, bytes.NewReader(body))
+	if err != nil {
+		return LeaseRow{}, false, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if o.Auth != nil {
+		o.Auth(req)
+	}
+	res, err := o.Client.Do(req)
+	if err != nil {
+		return LeaseRow{}, false, err
+	}
+	defer res.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(res.Body, 4096))
+	if res.StatusCode == http.StatusNotFound || res.StatusCode == http.StatusMethodNotAllowed {
+		return LeaseRow{}, false, ErrNoOwnerRoute
+	}
+	if res.StatusCode != http.StatusOK && res.StatusCode != http.StatusConflict {
+		return LeaseRow{}, false, fmt.Errorf("lease: HTTP %d", res.StatusCode)
+	}
+	var row LeaseRow
+	if err := json.Unmarshal(b, &row); err != nil {
+		return LeaseRow{}, false, err
+	}
+	return row, res.StatusCode == http.StatusOK && row.Holder == holder, nil
+}
+
+// Release gives up every ownership row this VM holds (a drained VM's, so the VM taking over fires the spaces'
+// schedules at once rather than when the rows lapse): each claimed again for one second.
+func (o *Owner) Release(ctx context.Context) {
+	o.mu.Lock()
+	names := make([]string, 0, len(o.held))
+	for n := range o.held {
+		names = append(names, n)
+	}
+	o.held = nil
+	o.mu.Unlock()
+	for _, n := range names {
+		o.claim(ctx, n, time.Second) //nolint:errcheck // best effort: the row lapses within OwnerTTL anyway
+	}
+}
+
 func (o *Owner) claim(ctx context.Context, name string, ttl time.Duration) (*OwnerRow, bool, error) {
 	body, _ := json.Marshal(OwnerClaim{Owner: o.ID, TTL: int(ttl / time.Second)})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://state/api/vm/owner/"+name, bytes.NewReader(body))
@@ -116,6 +193,9 @@ func (o *Owner) claim(ctx context.Context, name string, ttl time.Duration) (*Own
 	defer res.Body.Close()
 	var row OwnerRow
 	b, _ := io.ReadAll(io.LimitReader(res.Body, 4096))
+	if res.StatusCode == http.StatusNotFound || res.StatusCode == http.StatusMethodNotAllowed {
+		return nil, false, ErrNoOwnerRoute
+	}
 	if res.StatusCode != http.StatusOK && res.StatusCode != http.StatusConflict {
 		return nil, false, fmt.Errorf("owner: HTTP %d", res.StatusCode)
 	}

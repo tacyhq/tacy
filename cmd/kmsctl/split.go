@@ -27,7 +27,7 @@ package main
 //	    policy with no grant is refused (approve couldn't pin a release in it), so the first policy takes -apps.
 //	    Each grant is summed up on stderr.
 //	kmsctl approve -base U.json [-release app=APP,version=vX.Y.Z,app-compose=F,compose=F] [-remove vX.Y.Z]
-//	        [-share-set F ...] [-trust-base T.json -trust-release R.json] -sign-key K [-trust-key K] -out DIR -expect F
+//	        [-share-set F ...] [-trust-base T.json -trust-release R.json ...] [-min-unlock-epoch E] -sign-key K [-trust-key K] -out DIR -expect F
 //	        [-emergency REASON [-emergency-item ITEM ...] -share S -key pass -share S -key pass]
 //	    -emergency (the no-downtime plan row 13): the releases added unlock at once, without the holders' 24 h delay. It takes the
 //	    admin key and two passphrase shares (M signs the override with the KMS id), so the fix and the withdrawal
@@ -56,6 +56,13 @@ package main
 //	    a delayed item at holders and clients, so 24 h; off: at once, and the policy's registry-mode certificates go
 //	    with it). With only these, the next seq of both documents carries the change. Give the registry certificates
 //	    (-machine-cert) in the same run as -add-platform: they are valid only beside it.
+//	    Several builds in one approval (one per tunnel slot): a -release and a -trust-release for each, each build its
+//	    own version (a trust list lists a version once); with -trust-base each -release needs compose=, its entry must
+//	    be for that compose and its app-compose must embed it.
+//	    -min-unlock-epoch E (needs -trust-base; the no-downtime plan row 67, after a leaked epoch root and the re-split): the trust
+//	    list's min_unlock_epoch becomes E, so clients refuse older epochs' unlock proofs at once. Only raised, never
+//	    past the policy's epoch, and only once every share set in the policy is of epoch E or later. With only it, the
+//	    next seq of both documents carries it.
 //	    -end-overlap (needs -trust-base): the trust list ends the KMS-fallback overlap ("overlap_ended": true,
 //	    safety/overlapend.go): a Fix B client that verified it refuses v0.20.0 at once and for good. With only it, the
 //	    next seq of both documents carries it. A trust base that has it keeps it: there is no flag to turn it off.
@@ -96,6 +103,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"math"
 	neturl "net/url"
 	"os"
 	"path/filepath"
@@ -164,7 +172,9 @@ func splitMain(cmd string, args []string) {
 	fs.Var(&releases, "release", "approve: app=APP,version=vX.Y.Z,app-compose=FILE,compose=FILE")
 	fs.Var(&removes, "remove", "approve: a release version to withdraw")
 	trustBase := fs.String("trust-base", "", "approve: the current unsigned trust list")
-	trustRelease := fs.String("trust-release", "", "approve: the release's releases.json entry (version, commit, compose_sha256, bundle)")
+	var trustReleases multi
+	fs.Var(&trustReleases, "trust-release", "approve: a release's releases.json entry (version, commit, compose_sha256, bundle), one per -release added (repeat: each build its own version)")
+	minEpoch := fs.Uint("min-unlock-epoch", 0, "approve: the trust list's min_unlock_epoch (needs -trust-base; only raised, never past the policy's share sets' epoch: after a leaked epoch root and the re-split)")
 	signKey := fs.String("sign-key", "", "admin key file(s) for the unlock policy (kms-admin)")
 	trustKey := fs.String("trust-key", "", "admin key file(s) for the trust list (the safety admin key)")
 	adminKeys := fs.String("admin-keys", "", "admin public keys (ed25519:<base64>, comma-separated)")
@@ -299,11 +309,48 @@ func splitMain(cmd string, args []string) {
 			tl = &safety.TrustList{}
 			readJSON(*trustBase, tl)
 		}
-		var entry *safety.TrustRelease
-		if *trustRelease != "" {
-			entry = &safety.TrustRelease{}
-			if err := json.Unmarshal(readFile(*trustRelease), entry); err != nil {
-				die("%s: %v", *trustRelease, err)
+		var entries []safety.TrustRelease
+		for _, f := range trustReleases {
+			var e safety.TrustRelease
+			if err := kms.Strict(readFile(f), &e); err != nil { // review I1: strict, as the rest of the tree
+				die("%s: %v", f, err)
+			}
+			entries = append(entries, e)
+		}
+		if *minEpoch > 0 && *trustBase == "" {
+			die("approve: -min-unlock-epoch needs -trust-base (it is a trust-list member)")
+		}
+		if *minEpoch > math.MaxUint32 {
+			die("approve: -min-unlock-epoch %d isn't an epoch (at most %d)", *minEpoch, uint32(math.MaxUint32))
+		}
+		// Review M2: the epoch retired must be one no served policy still unlocks with, so never in the run that
+		// changes the share sets (the VMs haven't unlocked from the new ones yet).
+		if *minEpoch > 0 && (len(shareSets) > 0 || len(epochCerts) > 0) {
+			die("approve: -min-unlock-epoch with -share-set or -epoch-cert: retire an epoch in its own approval, after the share sets " +
+				"moved past it were served and every Google VM restarted on them (the no-downtime plan row 67)")
+		}
+		// Re-review M1': a share-set change always knows the epochs the trust list retired (-trust-base), so it can't
+		// sign a retired epoch's set again on the policy-only path.
+		if (len(shareSets) > 0 || len(epochCerts) > 0) && *trustBase == "" {
+			die("approve: -share-set and -epoch-cert need -trust-base (its min_unlock_epoch: no share set of a retired epoch is signed again)")
+		}
+		// Re-review M2': the epoch is retired against the policy as served (signed), not a base that was changed and
+		// never served (unlock-policy -base … -share-set): -policy, the served signed policy, must open under
+		// -admin-keys and be -base exactly.
+		if *minEpoch > 0 {
+			if *policyPath == "" || *adminKeys == "" {
+				die("approve: -min-unlock-epoch needs -policy (the served signed unlock policy) and -admin-keys: the epoch is retired against what VMs unlocked with")
+			}
+			var env safety.Envelope
+			readJSON(*policyPath, &env)
+			var served split.UnlockPolicy
+			if err := (kms.AdminKeys{Keys: parseKeysOrNil(*adminKeys), Threshold: *adminThreshold}).Open(&env, split.KindUnlockPolicy, &served); err != nil {
+				die("approve: -policy %s: %v", *policyPath, err)
+			}
+			a, _ := json.Marshal(served)
+			b, _ := json.Marshal(p)
+			if !bytes.Equal(a, b) {
+				die("approve: -base isn't the served policy (-policy %s, seq %d): retire an epoch only against what is served", *policyPath, served.Seq)
 			}
 		}
 		var adds []releaseSpec
@@ -341,18 +388,36 @@ func splitMain(cmd string, args []string) {
 		machineOrPlatform := len(mAdd) > 0 || len(mRevoke) > 0 || len(addPlatforms) > 0 || len(removePlatforms) > 0
 		switch {
 		case expediteOnly(*emergency, emergencyItems, adds, removes, sets, grace) && !machineOrPlatform:
+			// Review L2: the policy's override alone; nothing for the trust list may be silently dropped.
+			if len(entries) > 0 || *trustBase != "" || *minEpoch > 0 || *endOverlap || len(certs) > 0 {
+				die("approve: -emergency with only -emergency-item signs the policy's override alone: no -trust-base, -trust-release, " +
+					"-min-unlock-epoch, -end-overlap or -epoch-cert here (kmsctl has no trust-list-only expedite: a trust-list " +
+					"change goes with what it changes, in an approval of its own)")
+			}
 			np, err = nextSeq(p, now) // the override alone: a release pinned earlier unlocks at once from this seq
 		case len(adds) == 0 && len(removes) == 0 && len(sets) == 0 && grace == nil &&
-			(len(mAdd) > 0 || len(mRevoke) > 0 || *endOverlap || len(addPlatforms) > 0 || len(removePlatforms) > 0):
-			np, ntl, err = nextSeqs(p, tl, now) // a machine change, or the overlap's end, alone
+			(len(mAdd) > 0 || len(mRevoke) > 0 || *endOverlap || len(addPlatforms) > 0 || len(removePlatforms) > 0 || *minEpoch > 0):
+			if len(entries) > 0 {
+				die("approve: -trust-release without a -release it is the entry of")
+			}
+			if len(certs) > 0 { // re-review L-b: never silently dropped
+				die("approve: -epoch-cert goes with the -share-set it certifies")
+			}
+			np, ntl, err = nextSeqs(p, tl, now) // a machine change, the overlap's end or the minimum epoch, alone
 		default:
-			np, ntl, err = approve(p, tl, adds, removes, entry, sets, certs, grace, now)
+			np, ntl, err = approve(p, tl, adds, removes, entries, sets, certs, grace, now)
 		}
 		if err == nil {
 			err = changePlatforms(np, ntl, addPlatforms, removePlatforms)
 		}
 		if err == nil {
 			err = changeMachines(np, ntl, mAdd, mRevoke)
+		}
+		if err == nil && *minEpoch > 0 {
+			err = raiseMinUnlockEpoch(&p, np, ntl, uint32(*minEpoch), os.Stderr)
+		}
+		if err == nil {
+			err = epochFloorHolds(np, ntl) // review M1: whatever else changed, no share set below the list's retired epochs
 		}
 		if err == nil && *endOverlap {
 			if ntl == nil {
@@ -935,13 +1000,25 @@ func fileSHA256(p string) string {
 
 // approve is the next unlock policy (seq + 1) and, with tl, the next trust list (seq + 1): the releases added, the
 // versions removed, the share sets replaced when given. The two always change together.
-func approve(p split.UnlockPolicy, tl *safety.TrustList, adds []releaseSpec, removes []string, entry *safety.TrustRelease,
+func approve(p split.UnlockPolicy, tl *safety.TrustList, adds []releaseSpec, removes []string, entries []safety.TrustRelease,
 	sets []split.SignedShareSet, certs []split.SignedEpochCert, grace *safety.TCBGrace, now time.Time) (*split.UnlockPolicy, *safety.TrustList, error) {
 	if len(adds) == 0 && len(removes) == 0 && len(sets) == 0 && grace == nil {
 		return nil, nil, errors.New("approve: nothing to change (-release, -remove, -share-set or -tcb-grace)")
 	}
-	if tl != nil && len(adds) > 0 && entry == nil {
-		return nil, nil, errors.New("approve: a release added to the trust list needs its -trust-release entry")
+	sums, err := buildSums(adds)
+	if err != nil {
+		return nil, nil, err
+	}
+	// Review L3, I5: a version is one build. One already pinned isn't pinned again, not even with -remove in the same
+	// run (that would re-point it to another compose with no revocation): a new build is a new version.
+	for _, a := range adds {
+		if slices.ContainsFunc(p.Releases, func(r kms.ReleasePin) bool { return r.Version == a.Version }) {
+			return nil, nil, fmt.Errorf("approve: %s is pinned already (a version is one build: a new build is a new version; a withdrawal is its own approval)", a.Version)
+		}
+	}
+	entries, err = matchTrustEntries(tl, adds, sums, removes, entries)
+	if err != nil {
+		return nil, nil, err
 	}
 	np := p
 	np.Seq++
@@ -955,12 +1032,8 @@ func approve(p split.UnlockPolicy, tl *safety.TrustList, adds []releaseSpec, rem
 			return nil, nil, fmt.Errorf("approve: %s isn't pinned", v)
 		}
 	}
-	for _, a := range adds {
-		pin := kms.ReleasePin{App: a.App, Version: a.Version, AppComposeSHA256: fileSHA256(a.AppCompose)}
-		if a.Compose != "" {
-			pin.ComposeSHA256 = fileSHA256(a.Compose)
-		}
-		np.Releases = append(np.Releases, pin)
+	for i, a := range adds {
+		np.Releases = append(np.Releases, kms.ReleasePin{App: a.App, Version: a.Version, AppComposeSHA256: sums[i].appCompose, ComposeSHA256: sums[i].compose})
 	}
 	if len(sets) > 0 {
 		np.ShareSets = sets
@@ -1002,20 +1075,170 @@ func approve(p split.UnlockPolicy, tl *safety.TrustList, adds []releaseSpec, rem
 	ntl.RevokedReleases = slices.DeleteFunc(ntl.RevokedReleases, func(v string) bool {
 		return slices.ContainsFunc(adds, func(a releaseSpec) bool { return a.Version == v })
 	})
-	if entry != nil {
-		if !slices.ContainsFunc(adds, func(a releaseSpec) bool { return a.Version == entry.Version }) {
-			return nil, nil, fmt.Errorf("approve: the trust-release entry is %s, not a -release added", entry.Version)
-		}
-		if a := adds[slices.IndexFunc(adds, func(a releaseSpec) bool { return a.Version == entry.Version })]; a.Compose != "" &&
-			fileSHA256(a.Compose) != entry.ComposeSHA256 {
-			return nil, nil, errors.New("approve: the trust-release entry's compose isn't the -release compose")
-		}
-		ntl.Releases = append(ntl.Releases, *entry)
-	}
+	ntl.Releases = append(ntl.Releases, entries...) // matchTrustEntries: exactly one per release added, in -release order
 	if err := ntl.Validate(); err != nil {
 		return nil, nil, err
 	}
 	return &np, &ntl, nil
+}
+
+// buildFile is one -release's files as hashed once (review I3: the pin and the trust entry are of the same bytes).
+type buildFile struct{ appCompose, compose string }
+
+// buildSums hashes each -release's app-compose and compose once, and checks (review I4: whenever compose= is given)
+// that the app-compose embeds that compose, so a pin never names a compose its app-compose doesn't carry.
+func buildSums(adds []releaseSpec) ([]buildFile, error) {
+	out := make([]buildFile, len(adds))
+	for i, a := range adds {
+		ac := readFile(a.AppCompose)
+		h := sha256.Sum256(ac)
+		out[i].appCompose = hex.EncodeToString(h[:])
+		if a.Compose == "" {
+			continue
+		}
+		c := readFile(a.Compose)
+		h = sha256.Sum256(c)
+		out[i].compose = hex.EncodeToString(h[:])
+		var doc struct {
+			DockerComposeFile *string `json:"docker_compose_file"`
+		}
+		if json.Unmarshal(ac, &doc) != nil || doc.DockerComposeFile == nil || *doc.DockerComposeFile != string(c) {
+			return nil, fmt.Errorf("approve: -release %s: its app-compose doesn't embed its compose (another build's files?)", a.Version)
+		}
+	}
+	return out, nil
+}
+
+// matchTrustEntries pairs each release added with its trust-list entry (hook TWO-BUILDS: one approval signs one build
+// per tunnel slot, each its own version, since a trust list lists a version once). Without a trust base there must be
+// no entry. With one, every release added has exactly one entry and every entry is a release added, each version
+// once; the entry is for the -release's compose (compose= is required; buildSums checked the app-compose embeds it),
+// so the holders' pin and the clients' entry describe the same build; and no compose is listed under two versions
+// (review L4: the entries, and the base list's that stay). It returns the entries in -release order (anything else
+// is refused: nothing is signed).
+func matchTrustEntries(tl *safety.TrustList, adds []releaseSpec, sums []buildFile, removes []string, entries []safety.TrustRelease) ([]safety.TrustRelease, error) {
+	for i, a := range adds {
+		if slices.ContainsFunc(adds[:i], func(b releaseSpec) bool { return b.Version == a.Version }) {
+			return nil, fmt.Errorf("approve: -release %s given twice (each build is its own version: a trust list lists a version once)", a.Version)
+		}
+	}
+	if tl == nil {
+		if len(entries) > 0 {
+			return nil, errors.New("approve: -trust-release needs -trust-base (the trust list it adds to)")
+		}
+		return nil, nil
+	}
+	for i, e := range entries {
+		if slices.ContainsFunc(entries[:i], func(o safety.TrustRelease) bool { return o.Version == e.Version }) {
+			return nil, fmt.Errorf("approve: -trust-release %s given twice (a trust list lists a version once: each build is its own version)", e.Version)
+		}
+		if !slices.ContainsFunc(adds, func(a releaseSpec) bool { return a.Version == e.Version }) {
+			return nil, fmt.Errorf("approve: the -trust-release entry %s isn't a -release added", e.Version)
+		}
+	}
+	listed := map[string]string{} // compose -> version, of the base list's entries that stay
+	for _, r := range tl.Releases {
+		if !slices.Contains(removes, r.Version) {
+			listed[r.ComposeSHA256] = r.Version
+		}
+	}
+	out := make([]safety.TrustRelease, 0, len(adds))
+	for k, a := range adds {
+		i := slices.IndexFunc(entries, func(e safety.TrustRelease) bool { return e.Version == a.Version })
+		if i < 0 {
+			return nil, fmt.Errorf("approve: %s is added to the trust list without its -trust-release entry (one per build)", a.Version)
+		}
+		if a.Compose == "" {
+			return nil, fmt.Errorf("approve: -release %s needs compose=FILE: its -trust-release entry is checked against it", a.Version)
+		}
+		if got := sums[k].compose; got != entries[i].ComposeSHA256 {
+			return nil, fmt.Errorf("approve: the -trust-release entry %s is for another compose than its -release's (entry %.12s…, file %.12s…)",
+				a.Version, entries[i].ComposeSHA256, got)
+		}
+		if v, ok := listed[entries[i].ComposeSHA256]; ok {
+			return nil, fmt.Errorf("approve: %s's compose is listed already as %s (one compose, one version)", a.Version, v)
+		}
+		listed[entries[i].ComposeSHA256] = a.Version
+		out = append(out, entries[i])
+	}
+	return out, nil
+}
+
+// raiseMinUnlockEpoch names n as ntl's min_unlock_epoch (hook MIN-EPOCH; the no-downtime plan row 67: after a leaked epoch root
+// R_e and the re-split to e+1): clients count a Google VM's unlock proof only of epoch n or later, at once. Only
+// raised (an epoch once retired stays retired; clients keep the highest they saw anyway), and never past what the
+// VMs can prove: n at most np's epoch, and every share set of np of epoch n or later (a set of an older epoch still
+// in the policy unlocks VMs whose proofs clients would then refuse: an outage).
+func raiseMinUnlockEpoch(p, np *split.UnlockPolicy, ntl *safety.TrustList, n uint32, w io.Writer) error {
+	if ntl == nil {
+		return errors.New("approve: -min-unlock-epoch needs -trust-base (it is a trust-list member)")
+	}
+	cur, err := ntl.MinUnlockEpoch()
+	if err != nil {
+		return err
+	}
+	switch {
+	case n < cur:
+		return fmt.Errorf("approve: -min-unlock-epoch %d is below the trust list's %d: an epoch once retired stays retired", n, cur)
+	case n == cur:
+		return fmt.Errorf("approve: the trust list's min_unlock_epoch is %d already (-min-unlock-epoch names a raise)", n)
+	case n > np.Epoch:
+		return fmt.Errorf("approve: -min-unlock-epoch %d is past the policy's epoch %d: every VM's unlock proof would be refused", n, np.Epoch)
+	}
+	id, err := kms.ParseID(np.KMSID)
+	if err != nil {
+		return err
+	}
+	// Review M2: the base (the policy served now, the one VMs unlocked with) as well as the one signed.
+	for _, d := range []*split.UnlockPolicy{p, np} {
+		sets, err := d.OpenShareSets(id)
+		if err != nil {
+			return err
+		}
+		for _, s := range sets {
+			if s.Epoch < n {
+				return fmt.Errorf("approve: policy seq %d's share set %d is of epoch %d: the VMs it unlocks prove epoch %d, which -min-unlock-epoch %d "+
+					"retires. First a policy whose share sets are all of epoch %d or later, served, and every Google VM restarted on it "+
+					"(the no-downtime plan row 67; approve doesn't move the policy's epoch itself: unlock-policy -base … -share-set makes that policy)",
+					d.Seq, s.Set, s.Epoch, s.Epoch, n, n)
+			}
+		}
+	}
+	ntl.Optional = maps.Clone(ntl.Optional) // never the base list's map
+	if err := ntl.SetMinUnlockEpoch(n); err != nil {
+		return err
+	}
+	fmt.Fprintf(w, "approve: the trust list's min_unlock_epoch %d -> %d: clients refuse unlock proofs of older epochs at once. Before "+
+		"it ships, every Google VM must have restarted since policy seq %d (its share sets are all of epoch %d or later): kmsctl "+
+		"can't check that (the no-downtime plan row 67)\n", cur, n, p.Seq, n)
+	return ntl.Validate()
+}
+
+// epochFloorHolds (review M1): with a trust list, no share set of the policy is of an epoch the list retires
+// (min_unlock_epoch), whatever else the run changed: a VM unlocked from it would prove a retired epoch, refused by
+// every client at once, and the holders would serve shares of an epoch declared leaked.
+func epochFloorHolds(np *split.UnlockPolicy, ntl *safety.TrustList) error {
+	if ntl == nil {
+		return nil
+	}
+	floor, err := ntl.MinUnlockEpoch()
+	if err != nil || floor == 0 {
+		return err
+	}
+	id, err := kms.ParseID(np.KMSID)
+	if err != nil {
+		return err
+	}
+	sets, err := np.OpenShareSets(id)
+	if err != nil {
+		return err
+	}
+	for _, s := range sets {
+		if s.Epoch < floor {
+			return fmt.Errorf("approve: share set %d is of epoch %d, which the trust list retired (min_unlock_epoch %d): nothing signed", s.Set, s.Epoch, floor)
+		}
+	}
+	return nil
 }
 
 // writeApproved signs both documents and writes them into out (a new folder).

@@ -47,6 +47,10 @@ func (c *readCache) put(key [32]byte, r *readerResult) {
 func (r *readerResult) clone() *readerResult {
 	c := &readerResult{out: r.out, quotes: slices.Clone(r.quotes), items: r.items, err: r.err, strict: r.strict}
 	for _, p := range r.parts {
+		if p == nil { // a grouped answer's result read alone instead (reader_group.go)
+			c.parts = append(c.parts, nil)
+			continue
+		}
 		c.parts = append(c.parts, p.clone())
 	}
 	return c

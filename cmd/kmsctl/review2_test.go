@@ -25,12 +25,12 @@ func TestReview2ApproveUnrevokes(t *testing.T) {
 	}
 	dir := t.TempDir()
 	ac, cy := filepath.Join(dir, "app-compose.json"), filepath.Join(dir, "compose.yaml")
-	os.WriteFile(ac, []byte(`{"name":"agent-vm"}`), 0o644)
+	os.WriteFile(ac, []byte(`{"name":"agent-vm","docker_compose_file":"services: {}\n"}`), 0o644)
 	os.WriteFile(cy, []byte("services: {}\n"), 0o644)
 	tl := &safety.TrustList{Type: safety.TrustListType, Seq: 3, IssuedAt: now.Add(-24 * time.Hour), RevokedReleases: []string{"v0.22.1", "v0.20.0"}}
 	entry := &safety.TrustRelease{Version: "v0.22.1", Commit: strings.Repeat("3", 40), ComposeSHA256: fileSHA256(cy), Bundle: []byte(`{}`)}
 	add := releaseSpec{App: splitdev.App, Version: "v0.22.1", AppCompose: ac, Compose: cy}
-	np, ntl, err := approve(d.Policy, tl, []releaseSpec{add}, nil, entry, nil, nil, nil, now)
+	np, ntl, err := approve(d.Policy, tl, []releaseSpec{add}, nil, []safety.TrustRelease{*entry}, nil, nil, nil, now)
 	if err != nil {
 		t.Fatalf("approving a revoked version again: %v", err)
 	}

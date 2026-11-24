@@ -69,6 +69,8 @@ var (
 	stateName = regexp.MustCompile(`^/api/vm/state/[a-z0-9][a-z0-9_-]{0,63}$`)
 	// ownerName: a schedule ownership row (unlock/owner.go): POST only.
 	ownerName = regexp.MustCompile(`^/api/vm/owner/[a-z0-9][a-z0-9_-]{0,63}$`)
+	// leaseName: the sealed state's writer lease row (app/lease.go, unlock.LeaseName): POST only.
+	leaseName = regexp.MustCompile(`^/api/vm/lease/o[0-9a-f]{48}$`)
 	// unlockState: what unlockd reads from and tells the chat Worker (the newest unlock policy, secrets.sealed, its
 	// unlock report): path -> method.
 	unlockState = map[string]string{UnlockPolicyPath: "GET", UnlockSecretsPath: "GET", UnlockReportPath: "POST", StartTicketPath: "GET"}
@@ -78,7 +80,7 @@ var (
 		"/v1/status": "GET", "/v1/challenge": "GET", "/v1/release": "POST", "/v1/lease/renew": "POST",
 		"/v1/lease/drop": "POST", "/v1/gen/commit": "POST", "/v1/gen": "GET",
 	}
-	fixedRequestHeaders  = []string{"Content-Type", "X-Tacy-Gen", "X-Tacy-Prev-Gen", "X-Tacy-Cert", "X-Tacy-Auth"}
+	fixedRequestHeaders  = []string{"Content-Type", "X-Tacy-Gen", "X-Tacy-Prev-Gen", "X-Tacy-Cert", "X-Tacy-Auth", "X-Tacy-Writer"}
 	fixedResponseHeaders = []string{"Content-Type", "X-Tacy-Gen"}
 )
 
@@ -119,6 +121,7 @@ func CheckFixed(call *FixedCall) error {
 			return fmt.Errorf("%s %s isn't a sealed-state call", call.Method, path)
 		case stateName.MatchString(path) && (call.Method == "GET" || call.Method == "PUT"):
 		case ownerName.MatchString(path) && call.Method == "POST":
+		case leaseName.MatchString(path) && call.Method == "POST":
 		case unlock && call.Method == m:
 		default:
 			return fmt.Errorf("%s %s isn't a sealed-state call", call.Method, path)
@@ -127,6 +130,10 @@ func CheckFixed(call *FixedCall) error {
 		m, ok := unlockCalls[path]
 		if !ok || m != call.Method || query != "" || call.Host != 0 || !validHolderID(call.Holder) {
 			return fmt.Errorf("%s %s isn't a holder call", call.Method, path)
+		}
+	case TargetGCE:
+		if call.Method != "GET" || path != GCEPath || query != "" || call.Host != 0 || call.Holder != "" || len(call.Header) > 0 {
+			return fmt.Errorf("%s %s isn't the Google Cloud hints call", call.Method, path)
 		}
 	default:
 		return fmt.Errorf("unknown target %q", call.Target)
@@ -149,6 +156,8 @@ type Fixed struct {
 	AllowHTTP bool
 	// Unlock is where the holders are (the unlock policy's URLs, unlock.go); nil: no unlock target.
 	Unlock *UnlockHosts
+	// GCE answers the Google Cloud hints call (gce.go); nil: no_target.
+	GCE *GCEMeta
 }
 
 // NewFixed checks the hosts.
@@ -203,6 +212,9 @@ func (f *Fixed) Fixed(ctx context.Context, call *FixedCall) *FixedAnswer {
 			return &FixedAnswer{Error: "too_large"}
 		}
 		return &FixedAnswer{Error: "bad_call"}
+	}
+	if call.Target == TargetGCE { // answered here, never forwarded
+		return f.GCE.answer(ctx)
 	}
 	bases := f.bases(ctx, call)
 	if len(bases) == 0 {

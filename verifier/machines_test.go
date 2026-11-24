@@ -1,13 +1,15 @@
 package verifier
 
 import (
-	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha512"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
+	"errors"
 	"fmt"
 	"os"
 	"reflect"
@@ -125,6 +127,27 @@ func listWithMachines(t *testing.T, seq uint64, certs []safety.SignedMachineCert
 		t.Fatal(err)
 	}
 	return l
+}
+
+// gcpMachines are the GCP recordings' hosts as one-host certificates (the tests' stand-in for registry mode, whose
+// MR_OWNER binding the recordings can't show: TestGCPRegistryMode does it on an edited quote).
+func gcpMachines(t *testing.T) *safety.MachineSet {
+	t.Helper()
+	s := &safety.MachineSet{Revoked: map[string]bool{}}
+	for _, name := range gcpRecordings {
+		a, _, _, _ := loadNone(t, name)
+		q, err := tdx.Parse(rawQuote(t, a))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if slices.ContainsFunc(s.Machines, func(m safety.Machine) bool { return m.Doc.PPID == q.PPID }) {
+			continue
+		}
+		s.Machines = append(s.Machines, safety.Machine{Doc: safety.MachineDoc{Type: safety.MachineType, Platform: "dstack",
+			Host: safety.MachineHostGoogle, Mode: safety.MachineModePPID, PPID: q.PPID, FMSPC: q.FMSPC, Label: "gcp " + name},
+			Hash: strings.Repeat("0", 63) + fmt.Sprint(len(s.Machines)%10), Source: "test"})
+	}
+	return s
 }
 
 // The built-in machines: prod5 and prod9 (Intel PCK PPIDs, FMSPC 20a06f000000), valid documents, distinct hashes,
@@ -394,71 +417,158 @@ func TestTrustListMembersUnchanged(t *testing.T) {
 	}
 }
 
-// No Google Cloud host (the v1 Google host removal): every built-in machine is a Phala host in ppid mode; a trust list carrying a
-// certificate of the old Google modes (gcp-registry, or one host "google"), validly signed by the pinned KMS id, is
-// refused whole, whether or not it names "dstack-gcp"; and a list naming "dstack-gcp" (or any platform but dstack)
-// is refused as an unknown platform, even with only Phala certificates. Before the change, the first two were taken
-// with the fallback named, and the third took the list and turned Google Cloud's boot sets on.
-func TestMachineCertsPhalaOnly(t *testing.T) {
+// No Google certificate while the VM runs on Phala (V1-DESIGN §2.7, second review N3): none is built in, and a
+// trust list that carries one (registry mode or one Google host) without naming the Google fallback (platform
+// dstack-gcp) is refused whole. With the fallback named, a client takes it, counting the Google certificate once the
+// fallback counts (24 h later).
+func TestNoRegistryCertWhileOnPhala(t *testing.T) {
 	for _, d := range MachineDocs {
 		if d.Host != safety.MachineHostPhala || d.Mode != safety.MachineModePPID {
 			t.Fatalf("a built-in non-Phala machine: %+v", d)
 		}
 	}
 	admin, kms := testAdmin(t), testKMS(t)
+	reg := signCert(t, kms, safety.MachineDoc{Type: safety.MachineType, Platform: "dstack", Host: safety.MachineHostGoogle,
+		Mode: safety.MachineModeRegistry, FMSPC: "00806f050000", ProjectNumber: "123456789012", Label: "gcp c3", IssuedAt: listNow})
+	host := signCert(t, kms, safety.MachineDoc{Type: safety.MachineType, Platform: "dstack", Host: safety.MachineHostGoogle,
+		Mode: safety.MachineModePPID, PPID: strings.Repeat("ab", 16), FMSPC: "00806f050000", Label: "gcp host", IssuedAt: listNow})
 	p5 := signCert(t, kms, phalaDoc(prod5PPID, "phala prod5", listNow))
-	if r := rawMachineCert(kms, string(p5.Doc)); !bytes.Equal(r.Sig, p5.Sig) {
-		t.Fatal("rawMachineCert doesn't sign as the KMS id does (the refusals below would prove nothing)")
-	}
-	at := listNow.UTC().Format(time.RFC3339)
-	id := safety.KeyString(kms.Public().(ed25519.PublicKey))
-	google := map[string]safety.SignedMachineCert{
-		"registry": rawMachineCert(kms, `{"type":"tacy.machine/v1","kms_id":"`+id+`","platform":"dstack","host":"google",`+
-			`"mode":"gcp-registry","fmspc":"00806f050000","project_number":"123456789012","label":"gcp c3","issued_at":"`+at+`"}`),
-		"one Google host": rawMachineCert(kms, `{"type":"tacy.machine/v1","kms_id":"`+id+`","platform":"dstack","host":"google",`+
-			`"mode":"ppid","ppid":"`+strings.Repeat("ab", 16)+`","fmspc":"00806f050000","label":"gcp host","issued_at":"`+at+`"}`),
-	}
-	for name, c := range google {
-		for _, plats := range [][]string{nil, {"dstack"}, {"dstack", "dstack-gcp"}} {
-			l := listWithMachines(t, 12, []safety.SignedMachineCert{p5, c}, nil)
-			l.Platforms = plats
-			var s TrustState
-			want := "machine certificate" // with dstack-gcp named, the platform refuses the list first
-			if slices.Contains(plats, "dstack-gcp") {
-				want = "unknown platform"
-			}
-			if info := s.Take(signedList(t, admin, l), 0, listNow); info.OK || !strings.Contains(info.Error, want) {
-				t.Fatalf("%s, platforms %v: %+v", name, plats, info)
-			}
-			if _, info := s.Apply(Policy{}, listNow.Add(safety.TrustDelay)); info != nil {
-				t.Fatalf("%s, platforms %v: a refused list applied: %+v", name, plats, info)
-			}
+	for name, c := range map[string]safety.SignedMachineCert{"registry": reg, "one Google host": host} {
+		l := listWithMachines(t, 12, []safety.SignedMachineCert{p5, c}, nil)
+		if info := (&TrustState{}).Take(signedList(t, admin, l), 0, listNow); info.OK || !strings.Contains(info.Error, "Google fallback") {
+			t.Fatalf("%s without dstack-gcp: %+v", name, info)
 		}
-	}
-	for _, plats := range [][]string{{"dstack-gcp"}, {"dstack", "dstack-gcp"}, {"dstack", "tdx-other"}} {
-		l := listWithMachines(t, 13, []safety.SignedMachineCert{p5}, nil)
-		l.Platforms = plats
-		if info := (&TrustState{}).Take(signedList(t, admin, l), 0, listNow); info.OK || !strings.Contains(info.Error, "unknown platform") {
-			t.Fatalf("platforms %v: %+v", plats, info)
+		l.Platforms = []string{"dstack", PlatformDstackGCP}
+		// Taken, but the Google certificate counts only once dstack-gcp does (its 24 h delay, review2 L1).
+		var s TrustState
+		if info := s.Take(signedList(t, admin, l), 0, listNow); !info.OK || len(info.Machines) != 1 {
+			t.Fatalf("%s with the fallback named: %+v", name, info)
 		}
-		if _, err := (Policy{}).WithTrustList(&l); err == nil || !strings.Contains(err.Error(), "unknown platform") {
-			t.Fatalf("WithTrustList, platforms %v: %v", plats, err)
-		}
-	}
-	// The Phala path as before: a list naming dstack, or no platform, with Phala certificates.
-	for _, plats := range [][]string{nil, {"dstack"}} {
-		l := listWithMachines(t, 14, []safety.SignedMachineCert{p5}, nil)
-		l.Platforms = plats
-		if info := (&TrustState{}).Take(signedList(t, admin, l), 0, listNow); !info.OK || len(info.Machines) != 1 {
-			t.Fatalf("platforms %v: %+v", plats, info)
+		if _, info := s.Apply(Policy{}, listNow.Add(safety.TrustDelay)); info == nil || !info.OK || len(info.Machines) != 2 {
+			t.Fatalf("%s with the fallback in force: %+v", name, info)
 		}
 	}
 }
 
-// rawMachineCert signs doc's exact bytes as the KMS id signs a machine certificate (safety.SignMachineCert, which
-// now refuses to sign a non-Phala document): what a certificate made before the change, or by hand, looks like.
-func rawMachineCert(k ed25519.PrivateKey, doc string) safety.SignedMachineCert {
-	return safety.SignedMachineCert{Doc: []byte(doc), Sig: ed25519.Sign(k, append([]byte("tacy-split/machine/v1\x00"), doc...))}
+// Registry mode (F9(a): shipped, issued only on the day of a switch to Google): a GCP quote passes when Google's
+// host registry has its PPID in the VM's zone and MR_OWNER is the PZID digest of the VM in the certificate's
+// project. The recordings' MR_OWNER can't be matched (no instance id recorded), so the quote's MR_OWNER is set to
+// the digest of a stated instance: what is shown is the rule, on a real PCK certificate and registry document form.
+func TestGCPRegistryMode(t *testing.T) {
+	a, nonce, p, _ := gcpPolicy(t, gcpRecordings[0])
+	q0, _ := tdx.Parse(rawQuote(t, a))
+	const project, instance, zone = "123456789012", "4815162342", "us-central1-a"
+	payload := fmt.Sprintf(`{"instanceId":%s,"numericalProjectId":%s,"zone":"%s"}`, instance, project, zone)
+	digest := sha512.Sum384([]byte(payload))
+	inner := p.VerifyQuote
+	withOwner := func(owner string) func(context.Context, []byte) (*tdx.Quote, error) {
+		return func(ctx context.Context, b []byte) (*tdx.Quote, error) {
+			q, err := inner(ctx, b)
+			if q != nil {
+				q.MrOwner = owner
+			}
+			return q, err
+		}
+	}
+	var info map[string]any
+	json.Unmarshal(a.Info, &info)
+	info["gce_instance_id"], info["gce_zone"] = instance, zone
+	a.Info, _ = json.Marshal(info)
+	reg := safety.MachineDoc{Type: safety.MachineType, Platform: "dstack", Host: safety.MachineHostGoogle, Mode: safety.MachineModeRegistry,
+		FMSPC: q0.FMSPC, ProjectNumber: project, Label: "gcp c3 (registry)", IssuedAt: listNow}
+	h, _ := safety.MachineDocHash(reg)
+	for _, c := range []struct {
+		name, owner, registry string
+		want                  string
+	}{
+		{"registered, this project", hex.EncodeToString(digest[:]), `{"timestamp":"2026-11-20T21:53:55Z","zone":"us-central1-a"}`, ""},
+		{"another project's VM", strings.Repeat("00", 48), `{"timestamp":"2026-11-20T21:53:55Z","zone":"us-central1-a"}`, "MR_OWNER isn't this project's PZID"},
+		{"not in the registry", hex.EncodeToString(digest[:]), "", "host registry has no document"},
+		{"another zone", hex.EncodeToString(digest[:]), `{"timestamp":"2026-11-20T21:53:55Z","zone":"us-east1-c"}`, "isn't for zone us-central1-a"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			g := &registryFiles{doc: c.registry, inner: p.GoogleGetter}
+			q := p
+			q.GoogleGetter, q.VerifyQuote = g, withOwner(c.owner)
+			q.Machines = &safety.MachineSet{Machines: []safety.Machine{{Doc: reg, Hash: h, Source: "test"}}, Revoked: map[string]bool{}}
+			res, err := Verify(context.Background(), a, nonce, q)
+			if c.want == "" {
+				mustPass(t, c.name, res)
+				if err != nil || !strings.Contains(res.Facts[FactMachine], "host Google: not defended") || g.asked != RegistryURL+q0.PPID {
+					t.Fatalf("%v; facts %v; asked %q", err, res.Facts, g.asked)
+				}
+				return
+			}
+			mustRefuse(t, c.name, res, err, c.want)
+			q.Machines.Revoked[h] = true
+			res, err = Verify(context.Background(), a, nonce, q)
+			mustRefuse(t, c.name+", revoked", res, err, "has no machine certificate")
+		})
+	}
+}
+
+// A verifier behind a relay (the WASM: EndorsementsOnly, gcp-prod review H1) never reads the host registry: the same
+// registered quote that passes TestGCPRegistryMode is refused at the machine check without an unlock proof (unlockproof_test.go: with one), with no registry request, while
+// a ppid-mode Google certificate still passes (the endorsement is still fetched, through the relay).
+func TestGCPRegistryNotThroughRelay(t *testing.T) {
+	a, nonce, p, _ := gcpPolicy(t, gcpRecordings[0])
+	q0, _ := tdx.Parse(rawQuote(t, a))
+	const project, instance, zone = "123456789012", "4815162342", "us-central1-a"
+	digest := sha512.Sum384([]byte(fmt.Sprintf(`{"instanceId":%s,"numericalProjectId":%s,"zone":"%s"}`, instance, project, zone)))
+	inner := p.VerifyQuote
+	var info map[string]any
+	json.Unmarshal(a.Info, &info)
+	info["gce_instance_id"], info["gce_zone"] = instance, zone
+	a.Info, _ = json.Marshal(info)
+	reg := safety.MachineDoc{Type: safety.MachineType, Platform: "dstack", Host: safety.MachineHostGoogle, Mode: safety.MachineModeRegistry,
+		FMSPC: q0.FMSPC, ProjectNumber: project, Label: "gcp c3 (registry)", IssuedAt: listNow}
+	h, _ := safety.MachineDocHash(reg)
+	g := &registryFiles{doc: `{"timestamp":"2026-11-20T21:53:55Z","zone":"us-central1-a"}`, inner: p.GoogleGetter}
+	q := p
+	q.GoogleGetter = EndorsementsOnly(g)
+	q.VerifyQuote = func(ctx context.Context, b []byte) (*tdx.Quote, error) {
+		x, err := inner(ctx, b)
+		if x != nil {
+			x.MrOwner = hex.EncodeToString(digest[:])
+		}
+		return x, err
+	}
+	q.Machines = &safety.MachineSet{Machines: []safety.Machine{{Doc: reg, Hash: h, Source: "test"}}, Revoked: map[string]bool{}}
+	res, err := Verify(context.Background(), a, nonce, q)
+	mustRefuse(t, "registry mode through a relay, no unlock proof", res, err, "has no unlock proof")
+	if g.asked != "" {
+		t.Fatalf("the registry was asked through the relay: %q", g.asked)
+	}
+	// A ppid-mode Google certificate for the same quote: passes, the endorsement fetched through the wrapper.
+	ppid := safety.MachineDoc{Type: safety.MachineType, Platform: "dstack", Host: safety.MachineHostGoogle, Mode: safety.MachineModePPID,
+		PPID: q0.PPID, FMSPC: q0.FMSPC, Label: "gcp c3 (ppid)", IssuedAt: listNow}
+	hp, _ := safety.MachineDocHash(ppid)
+	q.Machines = &safety.MachineSet{Machines: []safety.Machine{{Doc: ppid, Hash: hp, Source: "test"}}, Revoked: map[string]bool{}}
+	res, err = Verify(context.Background(), a, nonce, q)
+	if err != nil {
+		t.Fatalf("ppid mode through the relay: %v", err)
+	}
+	mustPass(t, "ppid mode through the relay", res)
+}
+
+// registryFiles serves one registry document (none: 404) and passes every other URL on.
+type registryFiles struct {
+	doc   string
+	asked string
+	inner interface {
+		Get(string) (map[string][]string, []byte, error)
+	}
+}
+
+func (r *registryFiles) Get(url string) (map[string][]string, []byte, error) {
+	if !strings.HasPrefix(url, RegistryURL) {
+		return r.inner.Get(url)
+	}
+	r.asked = url
+	if r.doc == "" {
+		return nil, nil, errors.New("HTTP 404")
+	}
+	return nil, []byte(r.doc), nil
 }
 
 // The built-in machines' certificate hashes, which the KMS ceremony's certificates must have (kmsctl

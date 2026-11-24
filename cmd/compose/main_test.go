@@ -38,7 +38,7 @@ func TestComposeCurrent(t *testing.T) {
 		t.Skip("RELEASE BLOCKER: relayAuthKey and kmsID aren't pinned yet (the release's relay key and the key " +
 			"service's genesis); compose.yaml is regenerated with them")
 	}
-	os.Chdir("../..")
+	t.Chdir("../..") // restored after the test: later tests read ../../compose.yaml (TestManifestAccessPin)
 	cur, _ := os.ReadFile("compose.yaml")
 	slot, err := committedSlot(cur)
 	if err != nil {

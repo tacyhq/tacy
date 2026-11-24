@@ -36,6 +36,11 @@ type CheckOptions struct {
 	KMSIDs        map[string]string
 	// AllowE2EDiag: a staging key service whose policy lets e2e overlays in (their diag service; Config.Staging).
 	AllowE2EDiag bool
+	// GCP: the verifier also accepts dstack on Google Cloud (verifier.Policy.WithGCP), with Google's firmware
+	// endorsements fetched through GoogleGetter (nil: net/http). A holder sets it per request, only when the signed
+	// unlock policy names verifier.PlatformDstackGCP (holder.Holder; vm-v1, from branch cfd-google's HOLDER_GCP).
+	GCP          bool
+	GoogleGetter trust.HTTPSGetter
 	// Machines are the machines a VM may run on (verifier.Policy.Machines). A holder always sets them from its
 	// signed policy (never the built-in ones); nil (the key service, kmsctl) takes the verifier's built-in ones.
 	Machines *safety.MachineSet
@@ -118,12 +123,20 @@ func verifyAttestation(ctx context.Context, raw json.RawMessage, nonce []byte, p
 			return nil, refuse(http.StatusForbidden, "docker compose isn't the pinned release's")
 		}
 	}
+	boot, err := bootSets(pol.Boot)
+	if err != nil {
+		return nil, refuse(http.StatusForbidden, "%v", err)
+	}
 	vp := verifier.Policy{Compose: []byte(dc), AppComposeSHA256: []string{pin.AppComposeSHA256}, KMSFallback: pol.KMSFallback,
-		ProdImages: pol.OSImages, PreLaunch: pol.PreLaunch, Boot: bootSets(pol.Boot), KMSRoots: pol.KMSRoots, KMSIDs: o.KMSIDs,
+		ProdImages: pol.OSImages, PreLaunch: pol.PreLaunch, Boot: boot, KMSRoots: pol.KMSRoots, KMSIDs: o.KMSIDs,
 		AllowStaleTCB: o.AllowStaleTCB, SkipAttestation: o.DevLocal, VerifyQuote: o.VerifyQuote, Getter: o.Getter, Now: o.Now,
-		KeyRelease: true, Machines: o.Machines, RequireUnlockd: o.RequireUnlockd && !isKMS}
+		KeyRelease: true, Machines: o.Machines, GoogleGetter: o.GoogleGetter, RequireUnlockd: o.RequireUnlockd && !isKMS}
 	if vp.KMSIDs == nil {
 		vp.KMSIDs = map[string]string{} // only the ids given: never the verifier's built-in list by default
+	}
+	if o.GCP && !isKMS {
+		vp = vp.WithGCP()
+		vp.GoogleGetter = o.GoogleGetter
 	}
 	if isKMS {
 		vp.Services, vp.Port = []string{KMSService}, KMSPort
@@ -270,16 +283,22 @@ func (s *Server) sameFlags(a *Attested) error {
 	return nil
 }
 
-func bootSets(b []kms.BootSet) []verifier.BootMeasurement {
+// bootSets are a signed policy's boot sets, refusing one shaped like a Google Cloud set (verifier.GCPShaped, review
+// L2): Google is on only by the policy's platforms naming verifier.PlatformDstackGCP, with Google's checks.
+func bootSets(b []kms.BootSet) ([]verifier.BootMeasurement, error) {
 	if b == nil {
-		return nil
+		return nil, nil
 	}
 	out := make([]verifier.BootMeasurement, 0, len(b))
 	for _, s := range b {
-		out = append(out, verifier.BootMeasurement{Name: s.Name, OSImage: s.OSImage, MRTD: s.MRTD, RTMR0: s.RTMR0,
-			RTMR1: s.RTMR1, RTMR2: s.RTMR2, Source: "kms policy"})
+		m := verifier.BootMeasurement{Name: s.Name, OSImage: s.OSImage, MRTD: s.MRTD, RTMR0: s.RTMR0,
+			RTMR1: s.RTMR1, RTMR2: s.RTMR2, Source: "kms policy"}
+		if why := verifier.GCPShaped(m); why != "" {
+			return nil, fmt.Errorf("policy boot set %q is Google Cloud's (%s): Google is on only by platforms %q", s.Name, why, verifier.PlatformDstackGCP)
+		}
+		out = append(out, m)
 	}
-	return out
+	return out, nil
 }
 
 // checkKMSAppCompose: the key service's app-compose.json gives it no swap, no deployer env and no public logs (the

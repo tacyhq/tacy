@@ -121,7 +121,7 @@ func TestTrustListAddsOS(t *testing.T) {
 	}
 	if res.Facts["OS image"] != "dstack-0.6.6 (test)" || !strings.HasPrefix(res.Facts["trust list"], "signed list 4") ||
 		p.ProdImages["4771a29e03e93f0e2d5e37174cd8bb1112942c9689deb36b16c5df9e183d8623"] != "dstack-0.6.5" ||
-		len(ProdImages) != 1 || len(BootMeasurements) != 1 {
+		len(ProdImages) != 1 || len(BootMeasurements) != 3 {
 		t.Fatalf("facts %v; built-in values changed: %v", res.Facts, ProdImages)
 	}
 

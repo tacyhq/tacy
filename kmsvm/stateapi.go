@@ -2,7 +2,9 @@ package kmsvm
 
 import (
 	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -30,9 +32,31 @@ type StateAPI struct {
 
 	mu    sync.Mutex
 	blobs map[string][]byte // app/tag/name -> blob
+	// leases: the sealed state's writer lease rows, app/tag/name -> row (the Worker's vm-lease.ts, in memory).
+	leases map[string]leaseRow
 	// Puts counts the stored puts (tests).
 	Puts int
 }
+
+type leaseRow struct {
+	Holder string `json:"holder"`
+	Until  int64  `json:"until"`
+}
+
+// legacyHolder: the row of a VM built before the lease (unlock.LegacyHolder).
+const legacyHolder = "legacy"
+
+// leaseOf is the app's writer lease row (unlock.LeaseName("state/all")), if any (a.mu held).
+func (a *StateAPI) leaseOf(ns string) (leaseRow, bool) {
+	r, ok := a.leases[ns+"/"+LeaseAllName]
+	return r, ok
+}
+
+// LeaseAllName is unlock.LeaseName("state/all") (unlock imports this package; checked in unlock/lease_test.go).
+var LeaseAllName = func() string {
+	h := sha256.Sum256([]byte("tacy/state-lease/v1\x00state/all"))
+	return "o" + hex.EncodeToString(h[:24])
+}()
 
 // AuthWindow is how far a request's time may be from the Worker's.
 const AuthWindow = 2 * time.Minute
@@ -87,7 +111,65 @@ func CheckAuth(kmsID ed25519.PublicKey, now time.Time, method, name, certH, auth
 	return c.App + "/" + Tag(c.Purpose)
 }
 
+// serveLease is POST /api/vm/lease/{name} as the Worker serves it (its lease route): a claim takes the row
+// when there is none, it is the claimant's, or it lapsed and was the same app's (never the legacy row); a takeover
+// ("from": the Worker's switch's order, carried by the VM) only from the holder it names.
+func (a *StateAPI) serveLease(w http.ResponseWriter, r *http.Request, name string, now time.Time) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, 4096))
+	if err != nil || r.Method != "POST" {
+		w.WriteHeader(400)
+		return
+	}
+	ns := CheckAuth(a.KMSID, now, "POST", name, r.Header.Get("X-Tacy-Cert"), r.Header.Get("X-Tacy-Auth"), "", "", body)
+	if ns == "" || !strings.HasSuffix(ns, "/state") {
+		w.WriteHeader(401)
+		return
+	}
+	var c struct {
+		Holder string `json:"holder"`
+		TTL    int64  `json:"ttl"`
+		From   string `json:"from"`
+	}
+	if json.Unmarshal(body, &c) != nil || c.Holder == "" || c.TTL < 1 || c.TTL > 300 || (c.Holder == legacyHolder && c.From == "") {
+		w.WriteHeader(400)
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.leases == nil {
+		a.leases = map[string]leaseRow{}
+	}
+	key, nowS := ns+"/"+name, now.Unix()
+	row, ok := a.leases[key]
+	app := func(h string) string { s, _, _ := strings.Cut(h, "/"); return s }
+	take := !ok || row.Holder == c.Holder
+	if c.From != "" {
+		take = !ok || row.Holder == c.From || row.Holder == c.Holder // or already its own (an undo whose takeover never landed)
+	} else if ok && row.Until < nowS && row.Holder != legacyHolder && app(row.Holder) == app(c.Holder) {
+		take = true
+	}
+	if take {
+		row = leaseRow{Holder: c.Holder, Until: nowS + c.TTL}
+		a.leases[key] = row
+	}
+	status := 409
+	if row.Holder == c.Holder && (row.Holder == legacyHolder || row.Until > nowS) {
+		status = 200
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(row)
+}
+
 func (a *StateAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if name, ok := strings.CutPrefix(r.URL.Path, "/api/vm/lease/"); ok {
+		now := time.Now
+		if a.Now != nil {
+			now = a.Now
+		}
+		a.serveLease(w, r, name, now())
+		return
+	}
 	name, ok := strings.CutPrefix(r.URL.Path, "/api/vm/state/")
 	if !ok || !sealstate.ValidName(name) || (r.Method != "GET" && r.Method != "PUT") {
 		w.WriteHeader(404)
@@ -136,6 +218,23 @@ func (a *StateAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p, perr := strconv.ParseUint(prev, 10, 64)
 	if err != nil || perr != nil || n != name || gen != strconv.FormatUint(g, 10) || g != p+1 {
 		w.WriteHeader(400)
+		return
+	}
+	// The writer lease's fence (the Worker's vm-lease.ts): once the app has a lease row, only its holder saves; a VM
+	// built before the lease (no X-Tacy-Writer) makes the legacy row with its first save.
+	writer := r.Header.Get("X-Tacy-Writer")
+	leased := strings.HasSuffix(ns, "/state") // agentd's state only, never vaultd's connections (go-live review L1)
+	if a.leases == nil {
+		a.leases = map[string]leaseRow{}
+	}
+	lr, has := a.leaseOf(ns)
+	if leased && writer == "" && !has {
+		lr, has = leaseRow{Holder: legacyHolder}, true
+		a.leases[ns+"/"+LeaseAllName] = lr
+	}
+	if leased && has && lr.Holder != writer && !(writer == "" && lr.Holder == legacyHolder) {
+		w.WriteHeader(409)
+		json.NewEncoder(w).Encode(map[string]string{"error": "not_writer"})
 		return
 	}
 	var cur uint64

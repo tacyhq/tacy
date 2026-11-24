@@ -125,7 +125,7 @@ func TestScheduleSearchMemoryAndQuiet(t *testing.T) {
 		t.Fatalf("searches %v", e.fs.queries)
 	}
 	b0 := e.modelBody(0)
-	if strings.Contains(b0, guard.NoChangeTool) || !strings.Contains(b0, "first run") || !strings.Contains(b0, "at most 6 searches") || strings.Contains(b0, "earlier_run") {
+	if strings.Contains(b0, guard.NoChangeTool) || !strings.Contains(b0, "first run") || !strings.Contains(b0, "at most 15 searches") || strings.Contains(b0, "earlier_run") {
 		t.Fatalf("run 1's first model call: %s", b0)
 	}
 	m, _ := mem.Memories(e.me.Space, d.Agent, time.Time{})

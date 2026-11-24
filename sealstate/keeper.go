@@ -28,6 +28,10 @@ type Keeper struct {
 	// OnFatal is called once when the Store stops (ErrFailed: another instance has the state, or the lease is
 	// gone); the process must stop serving. nil: log.Fatalf.
 	OnFatal func(error)
+	// Writer says whether this process may save now: it holds the state's writer lease (app/lease.go), renewed
+	// lately enough. Asked only when something changed; false: nothing is saved (Flush skips, SaveNow fails with
+	// ErrNotWriter), and the change waits in memory. nil: always (no lease: one VM per state, as before the lease).
+	Writer func(context.Context) bool
 
 	// saving is held for a whole Flush or SaveNow, so two saves of one name never overlap.
 	saving    sync.Mutex
@@ -57,10 +61,36 @@ func (k *Keeper) Add(name string, src Source) error {
 	return nil
 }
 
+// ErrNotWriter: a save asked of a process that doesn't hold the state's writer lease (Keeper.Writer).
+var ErrNotWriter = errors.New("sealstate: not the state's writer (another VM holds its lease)")
+
+// Names are the kept states' names, in the order they were added.
+func (k *Keeper) Names() []string {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	return append([]string(nil), k.order...)
+}
+
+// changed says whether any source changed since its last save.
+func (k *Keeper) changed() bool {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	for _, n := range k.order {
+		if k.srcs[n].Version() != k.saved[n] {
+			return true
+		}
+	}
+	return false
+}
+
 // Flush saves every source that changed since its last save. It returns the first error (the others are tried).
+// Without the writer lease (Writer false) it saves nothing and returns nil: the changes wait in memory.
 func (k *Keeper) Flush(ctx context.Context) error {
 	k.saving.Lock()
 	defer k.saving.Unlock()
+	if k.Writer != nil && k.changed() && !k.Writer(ctx) {
+		return nil
+	}
 	k.mu.Lock()
 	names := append([]string(nil), k.order...)
 	k.mu.Unlock()
@@ -80,10 +110,14 @@ func (k *Keeper) SaveNow(ctx context.Context, name string) error {
 	k.saving.Lock()
 	defer k.saving.Unlock()
 	k.mu.Lock()
-	_, ok := k.srcs[name]
+	src, ok := k.srcs[name]
+	last := k.saved[name]
 	k.mu.Unlock()
 	if !ok {
 		return fmt.Errorf("sealstate: %s isn't kept", name)
+	}
+	if k.Writer != nil && src.Version() != last && !k.Writer(ctx) {
+		return ErrNotWriter
 	}
 	err := k.save(ctx, name)
 	if errors.Is(err, ErrFailed) {

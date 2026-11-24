@@ -108,7 +108,7 @@ func TestFirstPolicyApps(t *testing.T) {
 
 	// approve -dry-run: the next seq with the release pinned, unsigned, on stdout; nothing written, no key needed.
 	ac, cy := filepath.Join(dir, "app-compose.json"), filepath.Join(dir, "compose.yaml")
-	os.WriteFile(ac, []byte(`{"name":"agent-vm"}`), 0o644)
+	os.WriteFile(ac, []byte(`{"name":"agent-vm","docker_compose_file":"services: {}\n"}`), 0o644)
 	os.WriteFile(cy, []byte("services: {}\n"), 0o644)
 	rel := "app=agent-vm,version=v1.0.0,app-compose=" + ac + ",compose=" + cy
 	outDir := filepath.Join(dir, "signed")
@@ -255,7 +255,7 @@ func newApproveFixture(t *testing.T) *approveFixture {
 	base := filepath.Join(dir, "U.json")
 	os.WriteFile(base, []byte(out), 0o644)
 	ac, cy := filepath.Join(dir, "app-compose.json"), filepath.Join(dir, "compose.yaml")
-	os.WriteFile(ac, []byte(`{"name":"agent-vm"}`), 0o644)
+	os.WriteFile(ac, []byte(`{"name":"agent-vm","docker_compose_file":"services: {}\n"}`), 0o644)
 	os.WriteFile(cy, []byte("services: {}\n"), 0o644)
 	tl := writeJSONFile(t, filepath.Join(dir, "T.json"), safety.TrustList{Type: safety.TrustListType, Seq: 3, IssuedAt: now.Add(-24 * time.Hour)})
 	entry := safety.TrustRelease{Version: "v1.0.0", Commit: strings.Repeat("3", 40), ComposeSHA256: fileSHA256(cy), Bundle: []byte(`{}`)}
@@ -336,9 +336,9 @@ func TestApproveSignsTheDryRun(t *testing.T) {
 			t.Fatalf("%s: written", name)
 		}
 	}
-	os.WriteFile(ac, []byte(`{"name":"agent-vm-2"}`), 0o644) // the app-compose
+	os.WriteFile(ac, []byte(`{"name":"agent-vm-2","docker_compose_file":"services: {}\n"}`), 0o644) // the app-compose
 	refused("changed-app-compose", "the unlock policy")
-	os.WriteFile(ac, []byte(`{"name":"agent-vm"}`), 0o644)
+	os.WriteFile(ac, []byte(`{"name":"agent-vm","docker_compose_file":"services: {}\n"}`), 0o644)
 	entry.Commit = strings.Repeat("4", 40) // the trust entry
 	writeJSONFile(t, tr, entry)
 	refused("changed-entry", "the trust list")
@@ -445,7 +445,7 @@ func TestApproveEmergencySignsTheDryRun(t *testing.T) {
 		t.Fatal("approve -emergency without -expect: written")
 	}
 	// An input changed after the dry run: refused before the override is signed, nothing written.
-	os.WriteFile(f.ac, []byte(`{"name":"agent-vm-2"}`), 0o644)
+	os.WriteFile(f.ac, []byte(`{"name":"agent-vm-2","docker_compose_file":"services: {}\n"}`), 0o644)
 	changed := filepath.Join(f.dir, "changed")
 	stdout, errOut, err := f.sign(t, wouldSign, changed, em...)
 	if err == nil || !strings.Contains(errOut, "nothing signed") || strings.Contains(stdout, "EMERGENCY override") {
@@ -454,7 +454,7 @@ func TestApproveEmergencySignsTheDryRun(t *testing.T) {
 	if _, err := os.Stat(changed); !os.IsNotExist(err) {
 		t.Fatal("approve -emergency, app-compose changed: written")
 	}
-	os.WriteFile(f.ac, []byte(`{"name":"agent-vm"}`), 0o644)
+	os.WriteFile(f.ac, []byte(`{"name":"agent-vm","docker_compose_file":"services: {}\n"}`), 0o644)
 
 	// The same inputs: signed, with the dry run's digests, and the override in both documents.
 	outDir := filepath.Join(f.dir, "signed")

@@ -54,8 +54,11 @@ func documentDefs(docs bool) []harness.Tool {
 // ErrUnknownTool: a definition names a tool this release doesn't have.
 var ErrUnknownTool = errors.New("the definition names a tool this release doesn't have")
 
-// searchNote is added to a scheduled run's note when its definition lets it search (schedule upgrades).
-const searchNote = "\n\nYou can search the web (%s): short, generic queries made from the instructions, never personal details; at most %d searches this run. Open a result by its number, like [3]."
+// searchNote is added to a scheduled run's note when its definition lets it search (schedule upgrades). Since
+// 2026-11-23 it asks the run to pace its searches (a digest spent all of them in its first round).
+const searchNote = "\n\nYou can search the web (%s): short, generic queries made from the instructions, never personal details; at most %d searches this run. " +
+	"Pace them: start with two or three broad searches, read what they found, then spend the rest on follow-ups where coverage is thin or rests on a single source, " +
+	"not all in the first round. Open a result by its number, like [3]."
 
 // scheduledMailNote is added to a scheduled run's note when its definition lets it read the sponsor's email.
 const scheduledMailNote = "\n\nYou can read the sponsor's connected email, read-only (mail_search, mail_read, mail_folders): at most %d searches and %d message reads this run. " +
@@ -203,7 +206,7 @@ func TriggeredStartFor(f trigger.Fire, firm string, now time.Time, mem []trigger
 	// open and link what it lists without the model ever writing an address.
 	// Its activity records are sealed to the definition's seal key (the space's chain; docs/27 section 12),
 	// with the sponsor as the member who started it; its budget is the schedule's own bucket (ScheduleMember), its
-	// run budget a_scheduled's ($0.25, 20 steps).
+	// run budget a_scheduled's ($0.40, 20 steps).
 	opts := TaskOptions{User: d.Sponsor, Space: d.Space, Via: ViaTrigger, Firm: firm, Question: capRunes(d.Instructions, maxQuestionRunes),
 		RecordTo: d.Seal, Identity: d.Sponsor, Member: ScheduleMember(d.Agent), DefVersion: d.Version, TriggerKind: f.Trigger.Kind,
 		Slot: f.Slot, Due: f.Due,

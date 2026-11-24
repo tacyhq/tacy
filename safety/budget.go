@@ -49,6 +49,8 @@ type ledgerRun struct {
 	asks, inflight int
 	waited         time.Duration
 	since          time.Time
+	// settled is closed (and dropped) when one of the run's reservations settles, for requests ReserveKeeping held.
+	settled chan struct{}
 }
 
 // elapsed is the run's running time at now: from its start, less the time it only waited for its person.
@@ -241,6 +243,43 @@ func (l *Ledger) Reserve(task string, want Usage, b Budgets) (commit func(used U
 	if r == nil {
 		return nil, errUnknownRun
 	}
+	return l.reserveLocked(r, want, b)
+}
+
+// KeepHeld is ReserveKeeping's answer when a reservation would leave less than its keep: Left is the cost the run
+// may still reserve (CostLeft), Held what the run's own requests in flight hold of its cost budget (what their
+// settling can give back: their real cost is usually far below what they reserved), and Settled is closed when one of
+// them settles.
+type KeepHeld struct {
+	Left, Held int64
+	Settled    <-chan struct{}
+}
+
+// ReserveKeeping is Reserve for a request that must leave keep of the cost budget unreserved (a built-in agent's
+// reserve for its answer, guard.FinalReserve): the check and the reservation are made under one lock, so parallel
+// requests can't each see room for the keep that only one of them leaves. A request that would eat into it gets held
+// instead of a reservation (and no error); keep 0 is Reserve.
+func (l *Ledger) ReserveKeeping(task string, want Usage, b Budgets, keep int64) (commit func(used Usage), held *KeepHeld, err error) {
+	l.init()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	r := l.runs[task]
+	if r == nil {
+		return nil, nil, errUnknownRun
+	}
+	if keep > 0 {
+		if left := l.costLeftLocked(r, b); left >= 0 && left-want.CostMicros < keep {
+			if r.settled == nil {
+				r.settled = make(chan struct{})
+			}
+			return nil, &KeepHeld{Left: left, Held: r.reserved.CostMicros, Settled: r.settled}, nil
+		}
+	}
+	commit, err = l.reserveLocked(r, want, b)
+	return commit, nil, err
+}
+
+func (l *Ledger) reserveLocked(r *ledgerRun, want Usage, b Budgets) (commit func(used Usage), err error) {
 	held := r.used
 	held.add(r.reserved, 1)
 	if what := over(b.Run, held, want, r.elapsed(l.Now())); what != "" {
@@ -273,6 +312,10 @@ func (l *Ledger) Reserve(task string, want Usage, b Budgets) (commit func(used U
 			}
 			r.inflight--
 			r.clock(l.Now())
+			if r.settled != nil { // requests held for the keep look again (ReserveKeeping)
+				close(r.settled)
+				r.settled = nil
+			}
 			l.save()
 		})
 	}, nil
@@ -314,6 +357,10 @@ func (l *Ledger) CostLeft(task string, b Budgets) int64 {
 	if r == nil {
 		return 0
 	}
+	return l.costLeftLocked(r, b)
+}
+
+func (l *Ledger) costLeftLocked(r *ledgerRun, b Budgets) int64 {
 	left := int64(-1)
 	take := func(lim, used, res int64) {
 		if lim > 0 {

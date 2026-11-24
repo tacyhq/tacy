@@ -53,7 +53,7 @@ func TestTriggeredStartUpgrades(t *testing.T) {
 
 	// Search: the tool and its cap in the note.
 	names, note, _ = toolNamesOf(upgradeFire(func(d *trigger.Definition) { d.Tools = []string{"web.fetch", "web.search"} }), nil)
-	if !slices.Equal(names, []string{"web.fetch", "web.search"}) || !strings.Contains(note, "at most 6 searches") || !strings.Contains(note, "web_search") {
+	if !slices.Equal(names, []string{"web.fetch", "web.search"}) || !strings.Contains(note, "at most 15 searches") || !strings.Contains(note, "Pace them") || !strings.Contains(note, "web_search") {
 		t.Fatalf("search: %v %q", names, note)
 	}
 

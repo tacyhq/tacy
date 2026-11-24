@@ -70,8 +70,10 @@ func TestTunnelSlot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s, err := committedSlot(cur); err != nil || s != "a" {
-		t.Fatalf("compose.yaml's slot: %q, %v (v1's first release is on slot a)", s, err)
+	// Exactly one slot, a or b: v1's first release is on slot a, and a release on Google goes on the slot the live
+	// release isn't on (RUNBOOK-gcp.md R2), so a release tree may name either.
+	if s, err := committedSlot(cur); err != nil || (s != "a" && s != "b") {
+		t.Fatalf("compose.yaml's slot: %q, %v", s, err)
 	}
 }
 

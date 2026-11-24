@@ -88,7 +88,16 @@ func main() {
 		if *cacheDir == "" {
 			log.Fatal("unlockd: -cache-dir is required on dstack (the memory-root marker is there)")
 		}
-		ev = dstackev.New(*dstackSock).Evidence
+		// On Google Cloud, the instance id and zone hints a registry-mode machine certificate needs (gateway/gce.go);
+		// any other info is sent as the guest agent gave it.
+		src, hint := dstackev.New(*dstackSock), &gateway.GCEHinter{D: cfg.Fixed}
+		ev = func(ctx context.Context, rd []byte) (json.RawMessage, json.RawMessage, error) {
+			q, info, err := src.Evidence(ctx, rd)
+			if err != nil {
+				return nil, nil, err
+			}
+			return q, hint.Augment(ctx, info), nil
+		}
 		if cfg.RequireMemoryRoot, err = requireMemoryRoot(*keyMode); err != nil {
 			log.Fatalf("unlockd: %v", err)
 		}

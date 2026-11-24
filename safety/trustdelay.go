@@ -8,6 +8,7 @@ import (
 	"encoding/json/v2"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"sort"
 	"strconv"
@@ -163,6 +164,11 @@ type TrustSeen struct {
 	// OverlapEnded: a list this verifier took ended the KMS-fallback overlap (overlapend.go). Kept for good, from
 	// any verified list, older ones too: no later list, and no missing one, brings the overlap back.
 	OverlapEnded bool `json:"overlap_ended,omitzero"`
+	// MinUnlockEpoch is the highest min_unlock_epoch (unlockepoch.go) of any list this verifier took, older ones too:
+	// kept for good, like a machine revocation, so a later list that leaves the member out or names a lower epoch
+	// (a stolen admin key, or a server serving an older list beside a newer one) brings no retired epoch back. A
+	// retired epoch narrows trust, so it counts at once; raising it again needs no item.
+	MinUnlockEpoch uint32 `json:"min_unlock_epoch,omitzero"`
 }
 
 // MaxTrustSeen bounds a record (a list has at most a few hundred items; withdrawn ones are kept TrustDelay).
@@ -197,6 +203,12 @@ func ParseTrustSeen(b []byte) TrustSeen {
 	if v, ok := raw["overlap_ended"]; ok {
 		_ = json.Unmarshal(v, &s.OverlapEnded)
 	}
+	if v, ok := raw["min_unlock_epoch"]; ok {
+		var e uint32
+		if json.Unmarshal(v, &e) == nil {
+			s.MinUnlockEpoch = e
+		}
+	}
 	if v, ok := raw["revoked_releases"]; ok && json.Unmarshal(v, &releases) == nil {
 		releases = slices.DeleteFunc(releases, func(r string) bool { return !versionRe.MatchString(r) })
 		slices.Sort(releases)
@@ -220,7 +232,12 @@ func (s TrustSeen) Marshal() []byte {
 // Withdrawn items are forgotten after TrustDelay (listed again, they are new).
 func (s TrustSeen) Observe(l *TrustList, expedite []string, now time.Time) TrustSeen {
 	out := TrustSeen{Seq: s.Seq, Items: make(map[string]TrustItemState, len(s.Items)), RevokedMachines: slices.Clone(s.RevokedMachines),
-		RevokedReleases: slices.Clone(s.RevokedReleases), OverlapEnded: s.OverlapEnded || l.OverlapEnded()}
+		RevokedReleases: slices.Clone(s.RevokedReleases), OverlapEnded: s.OverlapEnded || l.OverlapEnded(), MinUnlockEpoch: s.MinUnlockEpoch}
+	if l != nil {
+		if e, err := l.MinUnlockEpoch(); err == nil {
+			out.MinUnlockEpoch = max(out.MinUnlockEpoch, e)
+		}
+	}
 	for k, v := range s.Items {
 		out.Items[k] = v
 	}
@@ -389,6 +406,11 @@ func (s TrustSeen) InForce(l *TrustList, now time.Time) (*TrustList, []TrustPend
 	// The overlap's end (overlapend.go): l's, or any this verifier kept, at once.
 	if s.OverlapEnded && !in.OverlapEnded() {
 		in.SetOverlapEnded()
+	}
+	// The highest retired key epoch this verifier kept (MinUnlockEpoch), l's own if higher, at once.
+	if e, err := in.MinUnlockEpoch(); err == nil && s.MinUnlockEpoch > e {
+		in.Optional = maps.Clone(in.Optional)
+		_ = in.SetMinUnlockEpoch(s.MinUnlockEpoch)
 	}
 	sort.Slice(pending, func(i, j int) bool { return pending[i].Item < pending[j].Item })
 	return &in, pending

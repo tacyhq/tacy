@@ -377,9 +377,37 @@ func (s *Store) Save(ctx context.Context, name string, plaintext []byte) error {
 	return nil
 }
 
+// Stale says whether any of names is stored at the backend at another generation than the one this Store loaded or
+// saved last: another instance saved it since (a standby VM taking the writer lease must load again first,
+// app/lease.go). An error (the backend didn't answer, a blob out of form): unknown, don't take over.
+func (s *Store) Stale(ctx context.Context, names []string) (bool, error) {
+	for _, name := range names {
+		blob, err := s.b.Get(ctx, name)
+		var gen uint64
+		switch {
+		case errors.Is(err, ErrNotFound):
+		case err != nil:
+			return false, fmt.Errorf("sealstate: %s: %w", name, err)
+		default:
+			n, g, err := Header(blob)
+			if err != nil || n != name {
+				return false, fmt.Errorf("sealstate: %s: a blob out of form", name)
+			}
+			gen = g
+		}
+		if gen != s.Gen(name) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // Pending is how many saves are stored but not yet marked stored at the register.
 func (s *Store) Pending() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.pending)
 }
+
+// Backend is where s keeps its blobs (tests: a second Store on the same backend).
+func (s *Store) Backend() Backend { return s.b }

@@ -269,11 +269,11 @@ func (g FixedGate) Fixed(ctx context.Context, call *FixedCall) *FixedAnswer {
 
 func statePath(c *FixedCall) string { p, _, _ := strings.Cut(c.Path, "?"); return p }
 
-// AgentCalls: agentd's socket: its sealed state and its schedule ownership rows at the Worker. Never a holder,
-// never the unlock routes, never the key service.
+// AgentCalls: agentd's socket: its sealed state, its schedule ownership rows and its state's writer lease at the
+// Worker, and the Google Cloud hints (gce.go). Never a holder, never the unlock routes, never the key service.
 func AgentCalls(c *FixedCall) bool {
 	p := statePath(c)
-	return c.Target == TargetState && (stateName.MatchString(p) || ownerName.MatchString(p))
+	return c.Target == TargetGCE || c.Target == TargetState && (stateName.MatchString(p) || ownerName.MatchString(p) || leaseName.MatchString(p))
 }
 
 // VaultCalls: vaultd's ops socket: its sealed connections at the Worker.
@@ -281,10 +281,10 @@ func VaultCalls(c *FixedCall) bool {
 	return c.Target == TargetState && stateName.MatchString(statePath(c))
 }
 
-// UnlockCalls: unlockd's socket: the holders, and the Worker's unlock routes (policy, secrets.sealed, report).
-// Never anyone's sealed state.
+// UnlockCalls: unlockd's socket: the holders, the Worker's unlock routes (policy, secrets.sealed, report) and the
+// Google Cloud hints (gce.go). Never anyone's sealed state.
 func UnlockCalls(c *FixedCall) bool {
-	if c.Target == TargetUnlock {
+	if c.Target == TargetUnlock || c.Target == TargetGCE {
 		return true
 	}
 	_, ok := unlockState[statePath(c)]

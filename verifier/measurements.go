@@ -1,12 +1,18 @@
 package verifier
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
+	"time"
 
+	"github.com/google/go-tdx-guest/verify/trust"
+
+	"github.com/tacyhq/tacy/internal/gcetcb"
 	"github.com/tacyhq/tacy/internal/tdx"
 )
 
@@ -15,7 +21,9 @@ import (
 //   - MRTD is the firmware (dstack's OVMF/TDVF), and with QEMU 8.x how its pages are added.
 //   - RTMR0 is the firmware's configuration: the TD HOB (memory size), ACPI tables (vCPUs, devices, hotplug,
 //     PCI layout, QEMU version) and the boot variables. It changes with the VM size, not only the image.
-//   - RTMR1 is the kernel (bzImage, with the setup header the firmware patches; it depends on memory size too).
+//   - RTMR1 is the kernel (bzImage, with the setup header the firmware patches). For an image whose metadata.json
+//     says kernel_header_normalized (0.6.4 and 0.6.5) it is the same on every shape (dstack-mr; 0.6.5 also observed
+//     on tdx.small, medium and large, 2026-11-23); for one without it, RTMR1 can depend on the memory size too.
 //   - RTMR2 is the kernel command line (which carries the dm-verity root hash of the root filesystem) and the
 //     initramfs.
 //
@@ -24,11 +32,128 @@ import (
 type BootMeasurement struct {
 	Name    string // the image and VM shape, e.g. "dstack-0.5.9, 1 vCPU, 2 GiB"
 	OSImage string // dstack os-image-hash: sha256 of the image's sha256sum.txt (RTMR3 os-image-hash event)
-	MRTD    string // hex, 48 bytes each
+	MRTD    string // hex, 48 bytes each; MRTDGoogleEndorsed for a Google Cloud set (GCPBootMeasurements)
 	RTMR0   string
 	RTMR1   string
 	RTMR2   string
 	Source  string // how the values were obtained: computed, observed, or both
+	// Google Cloud sets only (MRTD MRTDGoogleEndorsed):
+	UKI            string   // the dstack UKI's Authenticode SHA-384, which RTMR1's boot applications must hold
+	MinFirmwareSVN uint32   // the lowest firmware SVN Google's endorsement may state
+	GoogleMRTDs    []string // the Google firmware builds we reviewed (hex MRTDs); the quote's must be one AND endorsed
+}
+
+// MRTDGoogleEndorsed as a set's MRTD: the quote's MRTD is checked by gcpBoot, not matched literally. It must be
+// both:
+//   - one of the set's GoogleMRTDs, the Google firmware builds we reviewed (independent review H1, 2026-11-21:
+//     with Google as the adversary, "any build Google signs" would trust future builds we never saw, and the
+//     firmware is what measures RTMR0-2), and
+//   - in Google's signed TDX launch endorsement (internal/gcetcb: fetched from Google's gce_tcb_integrity bucket,
+//     checked offline against the compiled-in GCE-cc-tcb-root), listing that MRTD, with at least the set's
+//     MinFirmwareSVN. The endorsement stays required evidence that the pinned value is Google's build.
+//
+// So a Google firmware rotation (the MRTD changed between 2026-10-13 and 2026-11-20) needs a client and holder
+// release: boot a throwaway per shape on the new build, check its endorsement (build date, changelist, SVN) and
+// which RTMR0 events changed, then add the new MRTD to GoogleMRTDs with the new RTMR0 as new sets (README.md,
+// "Google Cloud boot sets"). RTMR0 already forces that release (the configuration volume is part of the build),
+// so pinning the MRTD adds no release of its own. Until then the new build's VMs are refused.
+const MRTDGoogleEndorsed = "google-endorsed"
+
+// GCPImages are the dstack OS images accepted on Google Cloud, by os-image-hash: only with key provider none, where
+// the label is the one of the GCP set the measurements match. Not in ProdImages: a Policy accepts them only through
+// WithGCP.
+var GCPImages = map[string]string{
+	"5aa762ee7cddc62174c13e1081d56f7ab2a9aebc513973a1d63b3775fda250ec": "dstack-0.6.6 (GCP UKI)",
+}
+
+// GCPBootMeasurements are the boot sets of dstack on Google Cloud TDX (Google's firmware, dstack's UKI booted from
+// the disk), one per machine shape. Off by default: a Policy accepts them only through WithGCP, so every Phala
+// verifier (clients, holders, kmsd, the chat) behaves as before.
+//
+//   - MRTD: Google's firmware, a build we reviewed (GoogleMRTDs) that Google's signed endorsement also lists
+//     (MRTDGoogleEndorsed), SVN at least MinFirmwareSVN.
+//   - RTMR0: the firmware's configuration: the TD HOB (memory), the configuration firmware volume (CFV, part of the
+//     firmware build: it changed with Google's 2026 firmware update), the Secure Boot variables, the ACPI tables
+//     (machine shape) and the boot variables. So it is pinned per shape, and changes when Google's firmware does.
+//   - RTMR1: the GPT of the boot disk and the boot applications: the dstack UKI (its Authenticode hash, UKI, which
+//     covers the kernel, the initramfs and the command line with the root filesystem's dm-verity hash) and the
+//     kernel it loads. The exact RTMR1 is what binds them. The verifier also replays the firmware log and requires
+//     UKI among the boot applications, but the log's event types aren't measured, so that check is defense in depth
+//     and a clearer error, not a binding of its own (review L1).
+//   - RTMR2: the UKI's sections as its stub measures them (command line, initramfs, kernel, os-release).
+//
+// Every set requires key provider none (keys made in the TD) and the none-mode app-compose rules (ephemeral data
+// disk and the rest, appcompose.go).
+// mrtdGoogle20260731 is Google's TDX firmware of 2026-07-31 (cl 957008435, SVN 2), the MRTD of every recorded GCP
+// quote (testdata/gcp-066-*.json, 2026-11-20 and -21) and listed in its endorsement
+// (internal/gcetcb/testdata/f21e6b48….binarypb). Google's older build c1ee9c16… (2026-05-21) is still endorsed but not
+// pinned: no set's RTMR0 is its configuration, and we never reviewed it for dstack.
+const mrtdGoogle20260731 = "f21e6b48743fe14c2d090078ca1197f09ae4c99438677f2c79901ef80e2aeefe2f9a7eb6e3eb3b5047c4f1511731e5d3"
+
+var GCPBootMeasurements = []BootMeasurement{
+	{
+		Name:    "dstack-0.6.6, GCP c3-standard-4 TDX (4 vCPU, 16 GB)",
+		OSImage: "5aa762ee7cddc62174c13e1081d56f7ab2a9aebc513973a1d63b3775fda250ec",
+		MRTD:    MRTDGoogleEndorsed,
+		RTMR0:   "4b08605d192148837400c4eee71f46b65ff960eaaf63494c472c4ddc4482d7c23d8671913ebec4b85c6edb89aa232662",
+		RTMR1:   "09328a31bcc05f3c0f1f40a52f822b3a19fb987f67179f569cecef0500e9444a3387518849b0e231b12173371dfdac1a",
+		RTMR2:   "97c2b630118d3b027eb2ed399df39d10be6d03a502ebeaf14a40459ff0789ffa2e7ef4d657265c01ec0497df19d2fefc",
+		UKI:     "440fa6cac8d3fc19d6f7dbd1340fc7fc1a847539d2c41a8da82de5d38e8ec008c27ae889df05561732043cb9f748515a",
+		Source: "observed on 61 fresh throwaway VMs in sealowl (41 in us-central1-a, -b, -c, 2026-11-20 and -21; 20 in " +
+			"us-east1-c and -d, 2026-11-21, G3; testdata/gcp-066-c3-*.json), dstack 0.6.6 (mkosi-os-v0.6.6, disk.raw of dstack-0.6.6-uki.tar.gz, sha256 " +
+			"cd54e641…; its sha256sum.txt hashes to the os-image-hash), 10 GiB pd-balanced boot disk; MRTD f21e6b48… " +
+			"(Google's firmware of 2026-07-31, cl 957008435, SVN 2, endorsed); UKI = the Authenticode SHA-384 of the " +
+			"image's UKI, whose SHA-256 is the release's GCP uki_auth 19eaec30…",
+		MinFirmwareSVN: 2,
+		GoogleMRTDs:    []string{mrtdGoogle20260731},
+	},
+	{
+		Name:    "dstack-0.6.6, GCP c4-standard-2 TDX (2 vCPU, 7 GB)",
+		OSImage: "5aa762ee7cddc62174c13e1081d56f7ab2a9aebc513973a1d63b3775fda250ec",
+		MRTD:    MRTDGoogleEndorsed,
+		RTMR0:   "224971ff25a3565a3b5153517025b40a192f68e1a8d6d30e4504e339fd901acbbcfca375a81b3894e4ba8820b6c8294b",
+		RTMR1:   "09328a31bcc05f3c0f1f40a52f822b3a19fb987f67179f569cecef0500e9444a3387518849b0e231b12173371dfdac1a",
+		RTMR2:   "97c2b630118d3b027eb2ed399df39d10be6d03a502ebeaf14a40459ff0789ffa2e7ef4d657265c01ec0497df19d2fefc",
+		UKI:     "440fa6cac8d3fc19d6f7dbd1340fc7fc1a847539d2c41a8da82de5d38e8ec008c27ae889df05561732043cb9f748515a",
+		Source: "observed on all 24 c4-standard-2 throwaway VMs of G3 in sealowl (us-east4-c 10, us-central1-f 14, " +
+			"2026-11-21; the only two of 14 zones tried with stock; testdata/gcp-066-c4-*.json), dstack 0.6.6 as the c3 " +
+			"set, 10 GiB hyperdisk-balanced boot disk; MRTD, RTMR1 and RTMR2 equal the c3 set's (the same firmware and " +
+			"UKI), RTMR0 is the shape's",
+		MinFirmwareSVN: 2,
+		GoogleMRTDs:    []string{mrtdGoogle20260731},
+	},
+	// The bigger C3 shapes (2026-11-23): only RTMR0 differs from c3-standard-4's set, in its TD HOB (memory) and ACPI
+	// table events.
+	{
+		Name:    "dstack-0.6.6, GCP c3-standard-8 TDX (8 vCPU, 32 GB)",
+		OSImage: "5aa762ee7cddc62174c13e1081d56f7ab2a9aebc513973a1d63b3775fda250ec",
+		MRTD:    MRTDGoogleEndorsed,
+		RTMR0:   "2074615297d6e87ec1dbbb764635ee3bb06b00b0fbc13f35bead969b811355f749156b1a88f9716300db68b1ddae1f71",
+		RTMR1:   "09328a31bcc05f3c0f1f40a52f822b3a19fb987f67179f569cecef0500e9444a3387518849b0e231b12173371dfdac1a",
+		RTMR2:   "97c2b630118d3b027eb2ed399df39d10be6d03a502ebeaf14a40459ff0789ffa2e7ef4d657265c01ec0497df19d2fefc",
+		UKI:     "440fa6cac8d3fc19d6f7dbd1340fc7fc1a847539d2c41a8da82de5d38e8ec008c27ae889df05561732043cb9f748515a",
+		Source: "observed on all 12 c3-standard-8 throwaway VMs in tacy-test (us-central1-a 4, -b 3, -c 3, us-east1-c 2; " +
+			"2026-11-23; testdata/gcp-066-c3s8-*.json), each verified in full with Intel and Google live, dstack 0.6.6 as " +
+			"the c3-standard-4 set, 10 GiB pd-balanced boot disk; MRTD, RTMR1 and RTMR2 equal the c3-standard-4 set's (the " +
+			"same firmware and UKI), RTMR0 is the shape's (its TD HOB and ACPI table events differ)",
+		MinFirmwareSVN: 2,
+		GoogleMRTDs:    []string{mrtdGoogle20260731},
+	},
+	{
+		Name:    "dstack-0.6.6, GCP c3-standard-22 TDX (22 vCPU, 88 GB)",
+		OSImage: "5aa762ee7cddc62174c13e1081d56f7ab2a9aebc513973a1d63b3775fda250ec",
+		MRTD:    MRTDGoogleEndorsed,
+		RTMR0:   "b1a5e2e167a01af91a68edf14fe9b9845127502b1a58117f4fa13eb55883b5073d8bb36f784fa2d1e2d2e40fc7812b0a",
+		RTMR1:   "09328a31bcc05f3c0f1f40a52f822b3a19fb987f67179f569cecef0500e9444a3387518849b0e231b12173371dfdac1a",
+		RTMR2:   "97c2b630118d3b027eb2ed399df39d10be6d03a502ebeaf14a40459ff0789ffa2e7ef4d657265c01ec0497df19d2fefc",
+		UKI:     "440fa6cac8d3fc19d6f7dbd1340fc7fc1a847539d2c41a8da82de5d38e8ec008c27ae889df05561732043cb9f748515a",
+		Source: "observed on all 5 c3-standard-22 throwaway VMs in tacy-test (us-central1-a 2, -b 2, -c 1; 2026-11-23; " +
+			"testdata/gcp-066-c3s22-us-central1-a.json), each verified in full with Intel and Google live, dstack 0.6.6 as " +
+			"the c3-standard-4 set, 10 GiB pd-balanced boot disk; MRTD, RTMR1 and RTMR2 equal the c3-standard-4 set's, " +
+			"RTMR0 is the shape's (its TD HOB and ACPI table events differ)",
+		MinFirmwareSVN: 2,
+		GoogleMRTDs:    []string{mrtdGoogle20260731},
+	},
 }
 
 // BootMeasurements are the measurement sets a VM may boot with. Add a set when the dstack image or the VM size
@@ -49,6 +174,38 @@ var BootMeasurements = []BootMeasurement{
 			"recomputed by hand from the command line and initramfs (TestDstack065CmdlineFix). Equal to two genuine 0.6.5 " +
 			"quotes of key_provider none throwaways on Phala prod2 (tdx.small), 2026-11-21, the second after a restart, " +
 			"with Intel's collateral (testdata/attest-065-none.json, attest-065-none-restart.json; TestRecorded065None)",
+	},
+	// The bigger Phala shapes: the same image, firmware, kernel, command line and initramfs as tdx.small,
+	// so MRTD, RTMR1 and RTMR2 are its; only RTMR0 (the TD HOB's memory, the ACPI tables' vCPUs) is the shape's.
+	{
+		Name:    "dstack-0.6.5, 2 vCPU, 4 GiB (Phala tdx.medium, QEMU 8.2.2)",
+		OSImage: "4771a29e03e93f0e2d5e37174cd8bb1112942c9689deb36b16c5df9e183d8623",
+		MRTD:    "2a674327c50218dba880066b349b8d559d749ed68dce33fd651c184a877d084b07a9e583767a7ad5da13ed91deec2b70",
+		RTMR0:   "027b610ab0555482f8a3868524093bdf3cdbe2539f81dfeeb886864654cb2fe3422f7fc36d4bab6fa46683aad11d1ba7",
+		RTMR1:   "2f72a4db2f7de90adeabe55607b0c1cf209fc243bc773f5862d1b00d3bb198e835e99d502e90a24005f0d1368dd24f29",
+		RTMR2:   "3d9910a33a26a769c5146dea31bea0d2924a7746ad09e121dabe709eddd5c647716f4d89279e0e24d8dbb93f9cdb605b",
+		Source: "computed with dstack-mr (the tdx.small set's build: mkosi-os-v0.6.5, commit 350a0a7; dstack-0.6.5.tar.gz, " +
+			"sha256 f33965e0…) from the tdx.small set's vm_config with cpu_count 2 and memory_size 4 GiB, nothing else " +
+			"changed (2026-11-23); MRTD, RTMR1 and RTMR2 equal the tdx.small set's. Equal to Phala's tcb_info of a " +
+			"tdx.medium throwaway on prod5 (2026-11-23), and to genuine key_provider none quotes of the release on tdx.medium " +
+			"(prod5, 2026-11-23, a boot and a restart) with Intel's collateral" +
+			" (testdata/quote-shape-medium.hex, quote-shape-medium-restart.hex; TestShapeQuotes)" +
+			"",
+	},
+	{
+		Name:    "dstack-0.6.5, 4 vCPU, 8 GiB (Phala tdx.large, QEMU 8.2.2)",
+		OSImage: "4771a29e03e93f0e2d5e37174cd8bb1112942c9689deb36b16c5df9e183d8623",
+		MRTD:    "2a674327c50218dba880066b349b8d559d749ed68dce33fd651c184a877d084b07a9e583767a7ad5da13ed91deec2b70",
+		RTMR0:   "fb14dc139f33d6fcf474bc8332cac001259fb31cfbcb6b34d4ceeb552a2c4466884a0cbde45ad98a05c5c060c23ad65a",
+		RTMR1:   "2f72a4db2f7de90adeabe55607b0c1cf209fc243bc773f5862d1b00d3bb198e835e99d502e90a24005f0d1368dd24f29",
+		RTMR2:   "3d9910a33a26a769c5146dea31bea0d2924a7746ad09e121dabe709eddd5c647716f4d89279e0e24d8dbb93f9cdb605b",
+		Source: "computed with dstack-mr (the tdx.small set's build: mkosi-os-v0.6.5, commit 350a0a7; dstack-0.6.5.tar.gz, " +
+			"sha256 f33965e0…) from the tdx.small set's vm_config with cpu_count 4 and memory_size 8 GiB, nothing else " +
+			"changed (2026-11-23); MRTD, RTMR1 and RTMR2 equal the tdx.small set's. Equal to Phala's tcb_info of a " +
+			"tdx.large throwaway on prod5 (2026-11-23), and to genuine key_provider none quotes of the release on tdx.large " +
+			"(prod5, 2026-11-23, two CVMs, the second after a restart) with Intel's collateral" +
+			" (testdata/quote-shape-large.hex, quote-shape-large-restart.hex; TestShapeQuotes)" +
+			"",
 	},
 }
 
@@ -164,9 +321,14 @@ func matchBoot(q *tdx.Quote, osImage string, sets []BootMeasurement) (*BootMeasu
 		s := &sets[i]
 		var diff []string
 		for j, want := range [4]string{s.MRTD, s.RTMR0, s.RTMR1, s.RTMR2} {
-			if !strings.EqualFold(want, got[j]) {
+			// A Google Cloud set's MRTD is checked by gcpBoot (which then sets it to the quote's), so an unresolved
+			// MRTDGoogleEndorsed isn't named as a difference, but it never matches either (below).
+			if !strings.EqualFold(want, got[j]) && !(j == 0 && want == MRTDGoogleEndorsed) {
 				diff = append(diff, names[j])
 			}
+		}
+		if len(diff) == 0 && s.MRTD == MRTDGoogleEndorsed {
+			diff = []string{"MRTD (no Google endorsement checked)"}
 		}
 		if len(diff) == 0 {
 			if s.OSImage != osImage {
@@ -186,7 +348,118 @@ func matchBoot(q *tdx.Quote, osImage string, sets []BootMeasurement) (*BootMeasu
 	if !slices.Contains(closestDiff, "MRTD") && !slices.Contains(closestDiff, "RTMR2") {
 		hint = " (another VM size or VM configuration?)"
 	}
+	// On Google Cloud RTMR1 is the UKI (the same on every shape), and RTMR0 changes with the shape and with Google's
+	// firmware (its configuration volume).
+	if closest.MRTD == MRTDGoogleEndorsed {
+		hint = " (another OS image?)"
+		if slices.Equal(closestDiff, []string{"RTMR0"}) {
+			hint = " (another machine shape, or a Google firmware update?)"
+		}
+	}
 	return nil, fmt.Errorf("MRTD/RTMR0-2 (MRTD %s, RTMR0 %s, RTMR1 %s, RTMR2 %s) match no pinned set; closest is %s, "+
 		"which differs in %s%s", short(got[0]), short(got[1]), short(got[2]), short(got[3]), closest.Name,
 		strings.Join(closestDiff, ", "), hint)
+}
+
+// GCPBootCheck is the check a quote gets when its RTMR0-2 match a Google Cloud set (GCPBootMeasurements); a Phala
+// quote never gets it, so Phala's checks are as before.
+const GCPBootCheck = "Google Cloud boot chain: firmware (MRTD) a reviewed build that Google's signed launch endorsement lists, the pinned dstack UKI in RTMR1, keys made in the VM"
+
+// PlatformDstackGCP is the platform name that turns the Google Cloud sets on from a signed document, with no app or
+// holder release: a client's trust list (safety.TrustList.Platforms, WithTrustList) or the holders' unlock policy
+// (split.UnlockPolicy.Platforms, as an extra name beside "dstack": the VM's attestation still says "dstack"). Off
+// unless one names it (since 2026-11-21: the Google host fallback ready to run, not running).
+const PlatformDstackGCP = "dstack-gcp"
+
+// FactPlatformSet is the fact a verification sets to PlatformDstackGCP when the quote matched a Google Cloud set (so
+// a holder can require the policy's platform item for it, pin delay included); unset for every Phala quote.
+const FactPlatformSet = "platform set"
+
+// GCPShaped says why b looks like a Google Cloud set ("" if it doesn't): Google's firmware (MRTDGoogleEndorsed, or
+// an MRTD in any GCP set's GoogleMRTDs), a GCP set's RTMR1 (the dstack UKI as Google's firmware boots it), or a GCP
+// image (review L2, 2026-11-21). Such a set matched literally would skip gcpBoot (the endorsement, the UKI check,
+// FactPlatformSet), so a signed trust list or unlock policy can't add one as an ordinary set: Google is on only
+// through PlatformDstackGCP (WithGCP), with Google's checks.
+func GCPShaped(b BootMeasurement) string {
+	if strings.EqualFold(b.MRTD, MRTDGoogleEndorsed) {
+		return "MRTD " + MRTDGoogleEndorsed
+	}
+	if _, ok := GCPImages[b.OSImage]; ok {
+		return "a Google Cloud OS image " + short(b.OSImage)
+	}
+	for _, g := range GCPBootMeasurements {
+		for _, m := range g.GoogleMRTDs {
+			if strings.EqualFold(b.MRTD, m) {
+				return "Google's firmware MRTD " + short(m)
+			}
+		}
+		if strings.EqualFold(b.RTMR1, g.RTMR1) {
+			return "the RTMR1 of " + g.Name
+		}
+	}
+	return ""
+}
+
+// WithGCP returns p accepting dstack on Google Cloud too: GCPBootMeasurements and GCPImages are added to what p uses
+// (its own, or the built-in ones). Nothing Phala's quotes are checked against changes.
+func (p Policy) WithGCP() Policy {
+	images := maps.Clone(cmpOr(p.ProdImages, ProdImages))
+	maps.Copy(images, GCPImages)
+	boot := slices.Clone(p.Boot)
+	if boot == nil {
+		boot = slices.Clone(BootMeasurements)
+	}
+	p.ProdImages, p.Boot = images, append(boot, GCPBootMeasurements...)
+	return p
+}
+
+// gcpBoot checks a quote against the Google Cloud set (MRTD MRTDGoogleEndorsed) whose RTMR0, RTMR1 and RTMR2 it
+// matches, if any: keys made in the VM (key provider none, no os-image-hash event), the firmware log replays to
+// RTMR0-2 and RTMR1's boot applications hold the set's UKI, the quote's MRTD is one of the set's GoogleMRTDs (checked
+// before anything is fetched), and Google's signed endorsement lists it with at least the set's firmware SVN. On success it returns sets with that set's MRTD set to the quote's, so
+// osImageFromBoot and matchBoot then treat it like a pinned one. With no GCP set matching (every Phala quote) it
+// returns sets unchanged, nil and no error, and fetches nothing.
+func gcpBoot(ctx context.Context, q *tdx.Quote, ev []tdx.Event, sets []BootMeasurement, keyProvider []byte,
+	hasOSEvent bool, getter trust.HTTPSGetter, now time.Time) ([]BootMeasurement, *BootMeasurement, string, error) {
+	got := [3]string{hex.EncodeToString(q.Rtmrs[0]), hex.EncodeToString(q.Rtmrs[1]), hex.EncodeToString(q.Rtmrs[2])}
+	for i := range sets {
+		s := &sets[i]
+		if s.MRTD != MRTDGoogleEndorsed || !strings.EqualFold(s.RTMR0, got[0]) || !strings.EqualFold(s.RTMR1, got[1]) ||
+			!strings.EqualFold(s.RTMR2, got[2]) {
+			continue
+		}
+		if hasOSEvent || !keysMadeInVM(keyProvider) {
+			return sets, s, "", fmt.Errorf("%s needs key provider none (keys made in the VM, no os-image-hash event); key provider %q",
+				s.Name, keyProvider)
+		}
+		apps, err := tdx.ReplayFirmware(q, ev)
+		if err != nil {
+			return sets, s, "", fmt.Errorf("firmware event log: %w", err)
+		}
+		if s.UKI == "" || !slices.ContainsFunc(apps, func(a string) bool { return strings.EqualFold(a, s.UKI) }) {
+			return sets, s, "", fmt.Errorf("RTMR1's boot applications don't include %s's UKI %s", s.Name, short(s.UKI))
+		}
+		mrtd := hex.EncodeToString(q.MrTd)
+		if !slices.ContainsFunc(s.GoogleMRTDs, func(m string) bool { return strings.EqualFold(m, mrtd) }) {
+			pinned := make([]string, len(s.GoogleMRTDs))
+			for j, m := range s.GoogleMRTDs {
+				pinned[j] = short(m)
+			}
+			return sets, s, "", fmt.Errorf("MRTD %s isn't a Google firmware build we reviewed for %s (pinned: %s); "+
+				"Google's endorsement alone isn't enough: a new build needs a reviewed set and a client release",
+				short(mrtd), s.Name, strings.Join(pinned, ", "))
+		}
+		fw, m, err := gcetcb.Check(ctx, getter, q.MrTd, now)
+		if err != nil {
+			return sets, s, "", err
+		}
+		if fw.SVN < s.MinFirmwareSVN {
+			return sets, s, "", fmt.Errorf("Google's firmware for MRTD %s has SVN %d, %s needs at least %d",
+				short(mrtd), fw.SVN, s.Name, s.MinFirmwareSVN)
+		}
+		out := slices.Clone(sets)
+		out[i].MRTD = mrtd
+		return out, &out[i], fw.Describe(m) + "; UKI " + short(s.UKI) + " in RTMR1", nil
+	}
+	return sets, nil, "", nil
 }

@@ -23,40 +23,51 @@ import (
 // its recurring runs a week, over 7, rounded up (a daily trigger runs 7 times a week, a weekday trigger on its days).
 // once: its one-time runs' cost together. until: its not_after's UTC date. A run's expected cost is scheduleRunCost:
 // how many runs, which models, whether it may search and whether it reads stored files are folded into the two
-// prices, never sent. A mismatch is 400
+// prices, never sent. A header that matches none of the tables this release accepts (scheduleTables) is 400
 // charge_mismatch (inside the encrypted answer); a call that matches says so in a plaintext answer header,
-// X-Schedule-Priced: 1 (an older VM never does, and the relay then charges one run a day at the $0.25 cap).
+// X-Schedule-Priced: 1 (an older VM never does, and the relay then charges one run a day at the run budget's cap:
+// $0.40 since this release, $0.25 before).
 //
-// The price table is the chat's too (the chat's src/shared/schedule-charge.ts scheduleRunCost); both are tested against the
-// same vectors (schedule_charge_test.go, test/unit/agent-charge.test.ts).
+// The price tables are the chat's too (packages/client-core shared/schedule-charge.ts); both are tested against the
+// same vectors (schedule_charge_test.go and the chat's own test).
 const (
 	scheduleChargeHeader = "X-Schedule-Charge"
 	scheduleAgentHeader  = "X-Schedule-Agent"
 	schedulePricedHeader = "X-Schedule-Priced"
 )
 
-// A scheduled run's typical cost on scheduleMeasuredModel, µ$: the acting model's share (scaled to the schedule's
-// dearest model by scheduleWeight) and the reader's and searches' share (fixed). cmd/digestlab measured a page-read
-// digest at $0.070 a run (2026-10-20); one that may search adds up to 6 searches with the reader. Never past the run
-// budget (scheduledDef: $0.25).
-const (
-	scheduleMeasuredModel = "deepseek-v4-1-flash"
-	scheduleReadModel     = 30_000
-	scheduleReadFixed     = 40_000
-	scheduleSearchModel   = 50_000
-	scheduleSearchFixed   = 100_000
-	scheduleRunCap        = 250_000
-	// A definition with stored files (v0.17.0) adds the quarantined reader on its files and the acting model
-	// reading what it found. An estimate from the scheduled run's cap of 24 parts (about 96,000 characters; at most
-	// about $0.08 of reader calls), not yet measured on real scheduled runs: re-measure with cmd/digestlab once a
-	// digest with files runs there.
-	scheduleFilesModel = 10_000
-	scheduleFilesFixed = 40_000
-	// A definition that reads the sponsor's email (v0.19.0, the connections contract "Scheduled tasks": any mail tool allowed
-	// always) adds the quarantined reader on the mail it opens (at most 6 searches' headers and 12 messages) and the
-	// acting model reading what it found: the same estimate as stored files, on top of them.
-	scheduleMailModel = 10_000
-	scheduleMailFixed = 40_000
+// A price table for one scheduled run, µ$: per kind of run, the acting model's share on scheduleMeasuredModel (scaled
+// to the schedule's dearest model by scheduleWeight) and the reader's and searches' share (fixed); stored files and
+// email add theirs on top; cap is the most one run is priced at. The chat's tables are the same
+// (packages/client-core shared/schedule-charge.ts SCHEDULE_PRICES_V1, SCHEDULE_PRICES_V2).
+//
+//   - read: cmd/digestlab measured a page-read digest at $0.070 a run (2026-10-20), and $0.065 to $0.089 at this
+//     release's limits (2026-11-23): $0.07.
+//   - files (v0.17.0): the quarantined reader on its files and the acting model reading what it found. An
+//     estimate from the scheduled run's cap of 24 parts (about 96,000 characters; at most about $0.08 of reader
+//     calls), not yet measured on real scheduled runs: re-measure with cmd/digestlab once a digest with files runs there.
+//   - mail (v0.19.0, the connections contract "Scheduled tasks": any mail tool allowed always): the quarantined reader
+//     on the mail it opens and the acting model reading what it found: the same estimate as stored files, on top.
+type scheduleTable struct {
+	readModel, readFixed, searchModel, searchFixed, filesModel, filesFixed, mailModel, mailFixed, cap int64
+}
+
+const scheduleMeasuredModel = "deepseek-v4-1-flash"
+
+var (
+	// schedulePricesV1 is v0.16.0 to v0.22.0's (at most 6 searches and $0.25 a run; one that may search $0.15): what
+	// every shipped client sends, so this release accepts it beside V2. Drop it once the clients send V2 and no VM
+	// they reach is older than this release (the no-downtime plan row 77).
+	schedulePricesV1 = scheduleTable{readModel: 30_000, readFixed: 40_000, searchModel: 50_000, searchFixed: 100_000,
+		filesModel: 10_000, filesFixed: 40_000, mailModel: 10_000, mailFixed: 40_000, cap: 250_000}
+	// schedulePricesV2 is this release's (15 searches and $0.40 a run, guard/agents.go scheduledDef): one that may
+	// search $0.235. cmd/digestlab news (2026-11-23, 4 news digests on deepseek-v4-1-flash) measured $0.22 to $0.25 a
+	// run, about $0.06 of it the acting model's and the rest the reader's and the searches'. Its cap is the run budget.
+	schedulePricesV2 = scheduleTable{readModel: 30_000, readFixed: 40_000, searchModel: 60_000, searchFixed: 175_000,
+		filesModel: 10_000, filesFixed: 40_000, mailModel: 10_000, mailFixed: 40_000, cap: 400_000}
+	// schedulePrices is the table scheduleCharge prices by; scheduleTables are all an install's header may match.
+	schedulePrices = schedulePricesV2
+	scheduleTables = []scheduleTable{schedulePricesV2, schedulePricesV1}
 )
 
 // scheduleMailActions are the tools that count as reading email.
@@ -69,25 +80,32 @@ func scheduleWeight(model string) int64 {
 	return 2048*in + 1500*out
 }
 
-// scheduleRunCost is one run's expected cost on model (the dearest the schedule names), µ$, in integers: whether it
-// may search, whether it reads stored files (files), and whether it reads email (mail).
+// scheduleRunCost is one run's expected cost on model (the dearest the schedule names), µ$, in integers, on this
+// release's table: whether it may search, whether it reads stored files (files), and whether it reads email (mail).
 func scheduleRunCost(model string, search, files, mail bool) int64 {
-	share, fixed := int64(scheduleReadModel), int64(scheduleReadFixed)
-	if search {
-		share, fixed = scheduleSearchModel, scheduleSearchFixed
-	}
-	if files {
-		share, fixed = share+scheduleFilesModel, fixed+scheduleFilesFixed
-	}
-	if mail {
-		share, fixed = share+scheduleMailModel, fixed+scheduleMailFixed
-	}
-	w, base := scheduleWeight(model), scheduleWeight(scheduleMeasuredModel)
-	return min(scheduleRunCap, fixed+(share*w+base-1)/base)
+	return schedulePrices.runCost(model, search, files, mail)
 }
 
-// scheduleCharge is the X-Schedule-Charge value d's install must carry.
-func scheduleCharge(d *trigger.Definition) string {
+func (p scheduleTable) runCost(model string, search, files, mail bool) int64 {
+	share, fixed := p.readModel, p.readFixed
+	if search {
+		share, fixed = p.searchModel, p.searchFixed
+	}
+	if files {
+		share, fixed = share+p.filesModel, fixed+p.filesFixed
+	}
+	if mail {
+		share, fixed = share+p.mailModel, fixed+p.mailFixed
+	}
+	w, base := scheduleWeight(model), scheduleWeight(scheduleMeasuredModel)
+	return min(p.cap, fixed+(share*w+base-1)/base)
+}
+
+// scheduleCharge is the X-Schedule-Charge value of d's install on this release's table.
+func scheduleCharge(d *trigger.Definition) string { return scheduleChargeOn(d, schedulePrices) }
+
+// scheduleChargeOn is the X-Schedule-Charge value of d's install on table p.
+func scheduleChargeOn(d *trigger.Definition, p scheduleTable) string {
 	week, once := int64(0), int64(0)
 	for _, t := range d.Triggers {
 		switch {
@@ -111,15 +129,25 @@ func scheduleCharge(d *trigger.Definition) string {
 	}
 	search := slices.Contains(d.Tools, "web.search") && d.Allow["web.search"] == "always"
 	mail := slices.ContainsFunc(scheduleMailActions, func(a string) bool { return slices.Contains(d.Tools, a) && d.Allow[a] == "always" })
-	run := scheduleRunCost(model, search, len(d.Files) > 0, mail)
+	run := p.runCost(model, search, len(d.Files) > 0, mail)
 	return fmt.Sprintf("v1 %s daily=%d once=%d until=%s", d.Agent, (run*week+6)/7, run*once, d.NotAfter.UTC().Format(time.DateOnly))
 }
 
-// checkScheduleCharge: an install's X-Schedule-Charge, when sent, is what d says ("" and true when none was sent).
+// checkScheduleCharge: an install's X-Schedule-Charge, when sent, is what d says on one of the tables this release
+// accepts ("" and true when none was sent). Either is a price the chat computed from the same signed definition: V1 is
+// what shipped clients send, V2 what they send once they switch (add, switch, remove; the no-downtime plan row 77).
 func checkScheduleCharge(r *http.Request, d *trigger.Definition, decoded bool) (sent, ok bool) {
 	h := r.Header.Get(scheduleChargeHeader)
 	if h == "" {
 		return false, true
 	}
-	return true, decoded && h == scheduleCharge(d)
+	if !decoded {
+		return true, false
+	}
+	for _, p := range scheduleTables {
+		if h == scheduleChargeOn(d, p) {
+			return true, true
+		}
+	}
+	return true, false
 }

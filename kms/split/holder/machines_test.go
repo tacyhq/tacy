@@ -8,6 +8,7 @@ import (
 
 	"github.com/tacyhq/tacy/kms/split"
 	"github.com/tacyhq/tacy/safety"
+	"github.com/tacyhq/tacy/verifier"
 )
 
 // The machine allowlist at a holder (V1-DESIGN §3.3). The rig's VM is the recorded prod5 quote.
@@ -103,13 +104,19 @@ func TestHolderMachineCertNeedsKMSID(t *testing.T) {
 	r.wantOutcome(t, "isn't signed by the KMS id")
 }
 
-// Fail closed on platforms (the v1 Google host removal): a policy naming one this holder has no checks for (Config.Platforms,
-// "dstack" by default) is refused whole, at the push and at an unlock, so "dstack-gcp" (the Google Cloud host fallback
-// taken out of v1) is refused as unknown and nothing is unlocked; the same policy without it unlocks. Before the
-// change, dstack-gcp was taken (and turned Google Cloud's boot sets on at this holder after the pin delay).
+// The split package's fallback platform name is the verifier's.
+func TestPlatformGCPName(t *testing.T) {
+	if split.PlatformGCP != verifier.PlatformDstackGCP {
+		t.Fatalf("%q != %q", split.PlatformGCP, verifier.PlatformDstackGCP)
+	}
+}
+
+// Fail closed on platforms (kept from the v1 Google host removal, dstack-gcp known again): a policy naming a platform this holder
+// has no checks for is refused whole, at the push and at an unlock; dstack-gcp is taken (Google's sets come on only
+// after its pin delay: gcp_test.go).
 func TestHolderRefusesUnknownPlatform(t *testing.T) {
 	r := newRig(t, twoOfTwo, 2)
-	for _, plats := range [][]string{{"dstack", "dstack-gcp"}, {"dstack-gcp"}, {"dstack", "tdx-other"}} {
+	for _, plats := range [][]string{{"dstack", "tdx-other"}, {"tdx-other"}, {"dstack", "dstack-gcp", "tdx-other"}} {
 		r.pol.Seq++
 		r.pol.Platforms = plats
 		r.wantOutcome(t, "which this holder has no checks for")
@@ -119,9 +126,26 @@ func TestHolderRefusesUnknownPlatform(t *testing.T) {
 			t.Fatalf("push, platforms %v: %v", plats, err)
 		}
 	}
+	for _, plats := range [][]string{{"dstack"}, {"dstack", "dstack-gcp"}} {
+		r.pol.Seq++
+		r.pol.Platforms = plats
+		if _, rep, err := r.unlock(r.transports(nil), nil); err != nil {
+			t.Fatalf("platforms %v: %v %v", plats, err, rep.Outcome)
+		}
+	}
+}
+
+// gcp-host review M4, end to end: a policy naming dstack-gcp beside a Google-run holder (the VM's host would hold a
+// share) is refused by the VM's unlock before any holder is asked, and by a holder at the push.
+func TestHolderRefusesGoogleHostAndHolder(t *testing.T) {
+	r := newRig(t, twoOfTwo, 2)
 	r.pol.Seq++
-	r.pol.Platforms = []string{"dstack"}
-	if _, rep, err := r.unlock(r.transports(nil), nil); err != nil {
-		t.Fatalf("a dstack-only policy: %v %v", err, rep.Outcome)
+	r.pol.Platforms = []string{"dstack", "dstack-gcp"}
+	r.pol.Holders = append(r.pol.Holders, split.HolderURL{Holder: "gcp", URL: "https://keys-g.tacy.io"})
+	if _, rep, err := r.unlock(r.transports(nil), nil); err == nil || !strings.Contains(err.Error(), "may not hold a share") || len(rep.Outcome) != 0 {
+		t.Fatalf("unlock: %v %v", err, rep.Outcome)
+	}
+	if _, err := r.holders["cloudflare"].PushPolicy(context.Background(), r.policyEnv()); err == nil || !strings.Contains(err.Error(), "may not hold a share") {
+		t.Fatalf("push: %v", err)
 	}
 }

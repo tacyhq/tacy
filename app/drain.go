@@ -10,7 +10,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/tacyhq/tacy/unlock"
 )
 
 // Drain (V1-DESIGN §4.5; the chat Worker's blue/green switch, the chat Worker's vm-switch.ts). Before the Worker
@@ -43,10 +46,33 @@ type drainState struct {
 	mu    sync.Mutex
 	until time.Time // zero: not drained
 	dir   string    // the task queue's host tmpfs ("": memory only)
+	// standby: this VM doesn't hold the sealed state's writer lease (lease.go: another VM does, it was released, or
+	// it is close to its end): drained to every route as if by the Worker, and the routes that change sealed state
+	// refused too (standbyPasses).
+	standby atomic.Bool
+	// admitting counts new-work requests past the drain check and not yet answered (gate): a drain's release waits
+	// for them (design review M2: a task start admitted just before the drain counts as open once it is queued).
+	admitting atomic.Int64
 }
 
-// on says whether the VM is drained at now.
+// on says whether the VM is drained at now: by the Worker, or as a standby without the writer lease.
 func (d *drainState) on(now time.Time) bool {
+	if d.standby.Load() {
+		return true
+	}
+	return d.byWorker(now)
+}
+
+// settle waits up to d for the new-work requests admitted before the drain to be answered (a task start is then
+// open, or refused).
+func (d *drainState) settle(limit time.Duration) {
+	for t0 := time.Now(); d.admitting.Load() > 0 && time.Since(t0) < limit; {
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// byWorker says whether the Worker drained this VM (its /drain, not yet ended or undone).
+func (d *drainState) byWorker(now time.Time) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return now.Before(d.until)
@@ -116,6 +142,20 @@ func drainPasses(r *http.Request) bool {
 	return r.Method == http.MethodGet || r.Method == http.MethodHead || drainPassing[r.URL.Path]
 }
 
+// standbyPassing are the POST routes a VM without the writer lease still serves: reading a task's status and events,
+// the signed safety documents (their floors stay in memory), and the drain itself. Everything else changes sealed
+// state, which this VM can no longer save (design review M2: a delete, a handoff or an approval answered here would
+// be lost); with nothing open after the release, there is nothing else to follow.
+var standbyPassing = map[string]bool{
+	"/drain": true, "/undrain": true,
+	"/tasks/status": true, "/tasks/events": true,
+	"/safety": true, "/keylog": true,
+}
+
+func standbyPasses(r *http.Request) bool {
+	return r.Method == http.MethodGet || r.Method == http.MethodHead || standbyPassing[r.URL.Path]
+}
+
 // drainRoutes serves POST /drain and /undrain (the relay's envelope; plaintext JSON inside it).
 func (s *server) drainRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /drain", s.drainIn)
@@ -129,6 +169,9 @@ func (s *server) drainIn(w http.ResponseWriter, r *http.Request) {
 	}
 	var b struct {
 		Until int64 `json:"until"`
+		// Handoff "legacy": the switch goes to a VM built before the lease; once released, the row goes to the
+		// legacy holder (lease.go toLegacy).
+		Handoff string `json:"handoff,omitempty"`
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1024))
 	dec := json.NewDecoder(bytes.NewReader(body))
@@ -148,7 +191,19 @@ func (s *server) drainIn(w http.ResponseWriter, r *http.Request) {
 	}
 	s.drain.set(u)
 	log.Printf("drain: drained until %s (%d tasks open)", u.UTC().Format(time.RFC3339), s.tasks().Open())
-	writeJSON(w, 200, map[string]any{"drained": true, "until": u.Unix(), "open": s.tasks().Open()})
+	out := map[string]any{"drained": true, "until": u.Unix(), "open": s.tasks().Open()}
+	// The writer lease (lease.go): released now if nothing is open or being admitted (a last save first), else once
+	// they end; the Worker's switch asks again (drain is idempotent) until it says so.
+	if s.lease != nil {
+		s.drain.settle(5 * time.Second)
+		out["lease"] = s.lease.drainedNow(r.Context())
+		if b.Handoff == unlock.LegacyHolder {
+			out["lease"] = s.lease.toLegacy(r.Context())
+		}
+		out["holder"] = s.lease.holder
+		out["open"] = s.tasks().Open()
+	}
+	writeJSON(w, 200, out)
 }
 
 func (s *server) undrainIn(w http.ResponseWriter, r *http.Request) {
@@ -156,7 +211,23 @@ func (s *server) undrainIn(w http.ResponseWriter, r *http.Request) {
 		fail(w, 401, "unauthorized")
 		return
 	}
+	// {} or {"take": "<holder>"}: the switch gives this VM the writer lease from that holder (lease.go undrained).
+	var b struct {
+		Take string `json:"take,omitempty"`
+	}
+	if body, err := io.ReadAll(io.LimitReader(r.Body, 1024)); err != nil || (len(bytes.TrimSpace(body)) > 0 && json.Unmarshal(body, &b) != nil) || len(b.Take) > 160 {
+		fail(w, 400, `body must be {} or {"take": "<holder>"}`)
+		return
+	}
 	s.drain.set(time.Time{})
 	log.Printf("drain: undrained")
-	writeJSON(w, 200, map[string]any{"drained": false, "open": s.tasks().Open()})
+	out := map[string]any{"drained": false, "open": s.tasks().Open()}
+	// The VM a switch moves to claims the writer lease now: held, standby (the old VM hasn't released it yet: ask
+	// again), or reloading (another VM saved since this one loaded: it restarts to load that; ask again).
+	if s.lease != nil {
+		out["lease"] = s.lease.undrained(r.Context(), b.Take)
+		out["holder"] = s.lease.holder
+		out["row"] = s.lease.RowHolder()
+	}
+	writeJSON(w, 200, out)
 }

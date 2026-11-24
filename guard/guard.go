@@ -23,6 +23,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tacyhq/tacy/harness"
@@ -258,6 +259,9 @@ type task struct {
 
 	reads   readCache   // the reader's answers for this task (readcache.go)
 	sources taskSources // the sources the reader read in this task, for the verbatim cut (reader.go)
+	// voids: the grouped reads of this task that were void (reader_group.go); from maxGroupVoids on, its later searches
+	// are read one result per call, so a result that voids every group can't make each search cost a group call more.
+	voids atomic.Int32
 
 	// def is the task's built-in agent (agents.go); sent counts the searches ("web.search") and page reads
 	// ("web.fetch") that went out, against its caps (guarded by mu; rebuilt from the journal after a restart).

@@ -17,6 +17,7 @@ package unlock
 
 import (
 	"crypto/ed25519"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -73,6 +74,9 @@ type Keyring struct {
 	Floors map[string]uint64 `json:"floors,omitempty"`
 	// Boot is the kernel's boot id when it was derived: a cached keyring serves only the same boot.
 	Boot string `json:"boot"`
+	// EpochCert is the KMS id's signed certificate of the epoch that unlocked (split.SignedEpochCert JSON, public):
+	// agentd puts it in its unlock proof (NewUnlockProof). Absent for a development root.
+	EpochCert json.RawMessage `json:"epoch_cert,omitempty"`
 }
 
 // Grant is the app's grant and pin as the unlock policy gives them.
@@ -151,6 +155,9 @@ func (k *Keyring) For(role string) (*Keys, error) {
 	}
 	out := &Keys{KMSID: k.KMSID, Epoch: k.Epoch, App: k.App, Firm: k.Firm, Release: k.Release, Keys: map[string][]byte{},
 		Certs: map[string]kms.StoreCert{}}
+	if role == RoleAgent {
+		out.EpochCert = k.EpochCert // agentd's unlock proof (public)
+	}
 	for p, v := range k.Keys {
 		if slices.Contains(allowed, p) {
 			out.Keys[p] = slices.Clone(v)
@@ -189,4 +196,16 @@ func (k *Keyring) Wipe() {
 		clear(v)
 	}
 	k.Keys, k.Secrets = nil, nil
+}
+
+// EpochCertFor is the policy's signed certificate of epoch (JSON), opened under kmsID; nil when none checks.
+func EpochCertFor(pol *split.UnlockPolicy, kmsID ed25519.PublicKey, epoch uint32) json.RawMessage {
+	for _, sc := range pol.EpochCerts {
+		if c, err := sc.Open(kmsID); err == nil && c.Epoch == epoch {
+			if b, err := json.Marshal(sc); err == nil {
+				return b
+			}
+		}
+	}
+	return nil
 }

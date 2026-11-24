@@ -4,6 +4,8 @@ import (
 	"context"
 	"strings"
 	"testing"
+
+	"github.com/tacyhq/tacy/safety"
 )
 
 // The release compose (compose.yaml) edited one way each: what a production verifier must refuse (review L1,
@@ -81,6 +83,47 @@ func TestGatewaydLaunchException(t *testing.T) {
 	root := "services:\n  agentvm:\n    image: ghcr.io/a/b" + d + "\n    user: \"0:0\"\n    cap_drop: [ALL]\n"
 	if _, err := ComposeImages(root); err == nil {
 		t.Error("gatewayd as root without the launcher: accepted")
+	}
+}
+
+// Review L2: a signed trust list or policy can't add a Google-shaped boot set as an ordinary one (it would match
+// literally, without gcpBoot's endorsement and UKI checks or FactPlatformSet).
+func TestGCPShapedBootSetsRefused(t *testing.T) {
+	g := GCPBootMeasurements[0]
+	phala := BootMeasurements[len(BootMeasurements)-1]
+	if why := GCPShaped(phala); why != "" {
+		t.Fatalf("a Phala set is %s", why)
+	}
+	for _, b := range GCPBootMeasurements {
+		if GCPShaped(b) == "" {
+			t.Fatalf("%s isn't GCP-shaped", b.Name)
+		}
+	}
+	cases := map[string]safety.TrustBoot{
+		"Google's MRTD":  {Name: "x", OSImage: phala.OSImage, MRTD: strings.ToUpper(g.GoogleMRTDs[0]), RTMR0: g.RTMR0, RTMR1: phala.RTMR1, RTMR2: phala.RTMR2},
+		"GCP RTMR1":      {Name: "x", OSImage: phala.OSImage, MRTD: phala.MRTD, RTMR0: phala.RTMR0, RTMR1: g.RTMR1, RTMR2: g.RTMR2},
+		"endorsed label": {Name: "x", OSImage: phala.OSImage, MRTD: MRTDGoogleEndorsed, RTMR0: g.RTMR0, RTMR1: phala.RTMR1, RTMR2: g.RTMR2},
+	}
+	for name, b := range cases {
+		if _, err := (Policy{}).WithTrustList(&safety.TrustList{Seq: 1, BootMeasurements: []safety.TrustBoot{b}}); err == nil ||
+			!strings.Contains(err.Error(), "Google Cloud's") {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	// A GCP image under OSImages plus the set: refused too (the image alone stays a value WithGCP brings).
+	var gcpImage string
+	for h := range GCPImages {
+		gcpImage = h
+	}
+	l := &safety.TrustList{Seq: 1, OSImages: map[string]string{gcpImage: "gcp"}, BootMeasurements: []safety.TrustBoot{{Name: "x",
+		OSImage: gcpImage, MRTD: phala.MRTD, RTMR0: phala.RTMR0, RTMR1: phala.RTMR1, RTMR2: phala.RTMR2}}}
+	if _, err := (Policy{}).WithTrustList(l); err == nil {
+		t.Error("a set for the GCP image: accepted")
+	}
+	// The same Google sets through the platform name: on, with Google's checks.
+	p, err := (Policy{}).WithTrustList(&safety.TrustList{Seq: 1, Platforms: []string{PlatformDstackGCP}})
+	if err != nil || len(p.Boot) != len(BootMeasurements)+len(GCPBootMeasurements) {
+		t.Fatalf("platforms dstack-gcp: %v", err)
 	}
 }
 

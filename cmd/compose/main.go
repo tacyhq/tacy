@@ -1067,6 +1067,9 @@ type Manifest struct {
 	// TunnelSlot is the slot (a: vm-a, b: vm-b) whose tunnel token gatewayd leases (--tunnel-slot; since v1). The next
 	// release takes the other one.
 	TunnelSlot string `json:"tunnel_slot,omitempty"`
+	// GCP is the Google Cloud part (--gcp-out, gcp.go): the guest image files and the boot sets a Google VM of this
+	// release must match. Absent: the release runs on Phala only.
+	GCP *GCPRelease `json:"gcp,omitempty"`
 }
 
 // GVisor is the third-party release an image carries: Google's tarball and the binaries taken from it.
@@ -1123,8 +1126,28 @@ func main() {
 	cfdNoListen := flag.Bool("no-listen", false, "with --cloudflared (in-container): no gatewayd -listen and no published 8080 (the release always has none)")
 	slotFlag := flag.String("tunnel-slot", "", "the release's tunnel slot, a (vm-a) or b (vm-b): required to write the release compose; "+
 		"--check and --dev-out take the committed compose.yaml's")
+	gcpOut := flag.String("gcp-out", "", "with --manifest: also build the Google Cloud files into this directory and add release.json's gcp section (gcp.go)")
+	gcpEndorse := flag.String("gcp-endorsements", "", "only check a release.json's Google Cloud firmware pins against Google's signed endorsements and print them (scripts/reproduce.sh)")
+	gcpFetch := flag.String("gcp-fetch", "", "only download dstack's image for Google Cloud into this directory and check its pinned sha256, then exit (release.yml, scripts/reproduce.sh)")
 	listen := flag.Bool("listen", false, "development (--dev-out): keep gatewayd's -listen :8080 and the published port beside the release's tunnel, for harnesses that still reach the VM through Phala's gateway")
 	flag.Parse()
+	if *gcpEndorse != "" {
+		if err := gcpEndorsements(*gcpEndorse); err != nil {
+			fail(err)
+		}
+		return
+	}
+	if *gcpFetch != "" {
+		p, err := gcpSource(*gcpFetch)
+		if err != nil {
+			fail(err)
+		}
+		fmt.Println(p)
+		return
+	}
+	if *gcpOut != "" && (*manifest == "" || *kmsMode || *devOut != "") {
+		fail(fmt.Errorf("--gcp-out goes with --manifest (the agent VM release), not --kms or --dev-out"))
+	}
 	if *cfdNoListen && (*cfdBin == "" || *cfdConfined) {
 		fail(fmt.Errorf("--no-listen needs --cloudflared (in-container); the release has no -listen anyway"))
 	}
@@ -1311,6 +1334,20 @@ func main() {
 		}
 		sort.Strings(names)
 		fmt.Printf("wrote OCI layouts %s/{%s}\n", *ociDir, strings.Join(names, ","))
+	}
+	if *gcpOut != "" {
+		src, err := gcpSource("")
+		if err != nil {
+			fail(err)
+		}
+		if m.GCP, err = gcpRelease(src, *gcpOut, ""); err != nil {
+			fail(err)
+		}
+		for _, f := range []string{"gcp-boot.tar.gz", "gcp-data.tar.gz", "gcp-sys-config.json"} {
+			fmt.Printf("%-20s sha256 %s\n", f, m.GCP.Guest.Files[f])
+		}
+		fmt.Printf("Google Cloud: RTMR1 %s RTMR2 %s (computed from dstack %s's image, = the verifier's sets)\n",
+			short(m.GCP.Guest.Boot.RTMR1), short(m.GCP.Guest.Boot.RTMR2), m.GCP.Guest.Dstack)
 	}
 	if *manifest != "" {
 		j, _ := json.MarshalIndent(m, "", "  ")

@@ -68,6 +68,8 @@ type Keys struct {
 	Secrets map[string]string        `json:"secrets,omitempty"`
 	// Floors: this process's sealed state names and the lowest generation of each it may open (none set yet: Keyring.Floors).
 	Floors map[string]uint64 `json:"floors,omitempty"`
+	// EpochCert (agentd only): the unlock's epoch certificate, for its unlock proof (Keyring.EpochCert).
+	EpochCert json.RawMessage `json:"epoch_cert,omitempty"`
 }
 
 // Key is a copy of purpose's key.

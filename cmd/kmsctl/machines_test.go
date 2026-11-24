@@ -8,18 +8,17 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tacyhq/tacy/kms"
 	"github.com/tacyhq/tacy/kms/split/splitdev"
 	"github.com/tacyhq/tacy/safety"
 	"github.com/tacyhq/tacy/verifier"
 )
 
 // machine-cert -builtin signs exactly the built-in document, so the ceremony's certificate has the built-in hash (one
-// revocation covers both); the flags' form is checked; every document is one Phala machine (the v1 Google host removal).
+// revocation covers both); the flags' form is checked; a Google certificate needs the fallback named.
 func TestMachineCertCommand(t *testing.T) {
 	now := time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC)
 	for i, node := range []string{"prod5", "prod9"} {
-		d, err := machineDoc(node, "", "", "", "", now)
+		d, err := machineDoc(node, "", "", "", "phala", "ppid", "", "", now)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -30,33 +29,25 @@ func TestMachineCertCommand(t *testing.T) {
 		}
 	}
 	for name, args := range map[string][]string{
-		"unknown node":      {"prod7", "", "", "", ""},
-		"builtin and flags": {"prod5", "3e306e133b7fdaa7bb79f67634cb520c", "", "", ""},
-		"short ppid":        {"", "3e30", "20a06f000000", "phala x", ""},
-		"no ppid":           {"", "", "00806f050000", "gcp c3", ""},
+		"unknown node":         {"prod7", "", "", "", "phala", "ppid", "", ""},
+		"builtin and flags":    {"prod5", "3e306e133b7fdaa7bb79f67634cb520c", "", "", "phala", "ppid", "", ""},
+		"short ppid":           {"", "3e30", "20a06f000000", "phala x", "phala", "ppid", "", ""},
+		"registry, no project": {"", "", "00806f050000", "gcp c3", "google", "gcp-registry", "", ""},
+		"registry on phala":    {"", "", "00806f050000", "gcp c3", "phala", "gcp-registry", "123", ""},
 	} {
-		if _, err := machineDoc(args[0], args[1], args[2], args[3], args[4], now); err == nil {
+		if _, err := machineDoc(args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], now); err == nil {
 			t.Fatalf("%s: accepted", name)
 		}
 	}
-	if d, err := machineDoc("", strings.Repeat("ab", 16), "20a06f000000", "phala prod7", "", now); err != nil ||
-		d.Host != safety.MachineHostPhala || d.Mode != safety.MachineModePPID {
-		t.Fatalf("a Phala document from the flags: %+v, %v", d, err)
-	}
-	// Signing a non-Phala document is refused (what -host google -mode gcp-registry made before the v1 Google host removal).
-	for _, d := range []safety.MachineDoc{
-		{Type: safety.MachineType, Platform: "dstack", Host: "google", Mode: "ppid", PPID: strings.Repeat("ab", 16), FMSPC: "00806f050000", Label: "gcp host", IssuedAt: now},
-		{Type: safety.MachineType, Platform: "dstack", Host: "google", Mode: "gcp-registry", FMSPC: "00806f050000", Label: "gcp c3", IssuedAt: now},
-	} {
-		if _, err := safety.MarshalMachineDoc(d); err == nil {
-			t.Fatalf("a %s/%s document: accepted", d.Host, d.Mode)
-		}
+	if d, err := machineDoc("", "", "00806f050000", "gcp c3", "google", "gcp-registry", "123456789012", "", now); err != nil || d.PPID != "" {
+		t.Fatalf("registry document: %v", err)
 	}
 }
 
 // approve -machine-cert / -revoke-machine: the admin key adds a KMS-signed certificate or revokes one in both
 // documents; a revocation stays in every later policy and trust list approve makes, the certificate leaves
-// machine_certs, and the same certificate can't be added back (a new one is needed). A Google certificate is refused.
+// machine_certs, and the same certificate can't be added back (a new one is needed). A Google certificate is refused
+// while the policy doesn't name the fallback.
 func TestApproveMachines(t *testing.T) {
 	now := time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC)
 	d, err := splitdev.New([]string{"cloudflare", "vercel"}, 2, now.Add(-time.Hour))
@@ -110,14 +101,12 @@ func TestApproveMachines(t *testing.T) {
 	if _, revoked, _, _ = ntl5.TrustMachines(); len(revoked) != 2 {
 		t.Fatalf("the trust list dropped a revocation: %v", revoked)
 	}
-	// A Google certificate (the old -host google, KMS-signed over its exact bytes): refused (the v1 Google host removal).
-	k, _ := kms.DeriveID(d.Master)
-	gdoc := []byte(`{"type":"tacy.machine/v1","kms_id":"` + d.KMSID + `","platform":"dstack","host":"google","mode":"ppid","ppid":"` +
-		strings.Repeat("cd", 16) + `","fmspc":"00806f050000","label":"gcp host","issued_at":"` + now.Format(time.RFC3339) + `"}`)
-	reg := safety.SignedMachineCert{Doc: gdoc, Sig: ed25519.Sign(k, append([]byte("tacy-split/machine/v1\x00"), gdoc...))}
+	// A Google certificate on Phala.
+	reg, _ := d.MachineCert(safety.MachineDoc{Type: safety.MachineType, Platform: "dstack", Host: "google", Mode: "gcp-registry",
+		FMSPC: "00806f050000", ProjectNumber: "123456789012", Label: "gcp c3", IssuedAt: now})
 	np6, ntl6, _ := nextSeqs(*np3, ntl3, now)
-	if err := changeMachines(np6, ntl6, []safety.SignedMachineCert{reg}, nil); err == nil || !strings.Contains(err.Error(), "unknown host") {
-		t.Fatalf("a Google certificate: %v", err)
+	if err := changeMachines(np6, ntl6, []safety.SignedMachineCert{*reg}, nil); err == nil || !strings.Contains(err.Error(), "Google fallback") {
+		t.Fatalf("a registry certificate while on Phala: %v", err)
 	}
 	// A certificate the admin key signed isn't accepted.
 	_, admin, _ := ed25519.GenerateKey(rand.Reader)
@@ -129,9 +118,8 @@ func TestApproveMachines(t *testing.T) {
 	}
 }
 
-// Fail closed on platforms (the v1 Google host removal): kmsctl doesn't make an unlock policy or a trust list naming a platform
-// other than dstack ("dstack-gcp" included), since holders and clients built from this tree refuse either whole.
-// Before the change, both were made, and turned the Google Cloud host fallback on.
+// Fail closed on platforms (kept from the v1 Google host removal, dstack-gcp known again): kmsctl doesn't make an unlock policy or
+// a trust list naming a platform holders and clients have no checks for.
 func TestApproveRefusesUnknownPlatform(t *testing.T) {
 	now := time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC)
 	d, err := splitdev.New([]string{"cloudflare", "vercel"}, 2, now.Add(-time.Hour))
@@ -139,24 +127,26 @@ func TestApproveRefusesUnknownPlatform(t *testing.T) {
 		t.Fatal(err)
 	}
 	tl := &safety.TrustList{Type: safety.TrustListType, Seq: 3, IssuedAt: now.Add(-24 * time.Hour)}
-	for _, plats := range [][]string{{"dstack", "dstack-gcp"}, {"dstack-gcp"}} {
+	for _, plats := range [][]string{{"dstack", "tdx-other"}, {"tdx-other"}, {"dstack", "dstack-gcp", "tdx-other"}} {
 		np, ntl, err := nextSeqs(d.Policy, tl, now)
 		if err != nil {
 			t.Fatal(err)
 		}
 		np.Platforms = plats
-		if err := checkUnlockPolicy(np); err == nil || !strings.Contains(err.Error(), `unknown platform "dstack-gcp"`) {
+		if err := checkUnlockPolicy(np); err == nil || !strings.Contains(err.Error(), `unknown platform "tdx-other"`) {
 			t.Fatalf("policy, platforms %v: %v", plats, err)
 		}
 		np.Platforms = nil
 		ntl.Platforms = plats
-		if err := changeMachines(np, ntl, nil, nil); err == nil || !strings.Contains(err.Error(), `unknown platform "dstack-gcp"`) {
+		if err := changeMachines(np, ntl, nil, nil); err == nil || !strings.Contains(err.Error(), `unknown platform "tdx-other"`) {
 			t.Fatalf("trust list, platforms %v: %v", plats, err)
 		}
 	}
-	np, ntl, _ := nextSeqs(d.Policy, tl, now)
-	np.Platforms, ntl.Platforms = []string{"dstack"}, []string{"dstack"}
-	if err := changeMachines(np, ntl, nil, nil); err != nil {
-		t.Fatalf("dstack only: %v", err)
+	for _, plats := range [][]string{{"dstack"}, {"dstack", "dstack-gcp"}} {
+		np, ntl, _ := nextSeqs(d.Policy, tl, now)
+		np.Platforms, ntl.Platforms = plats, plats
+		if err := changeMachines(np, ntl, nil, nil); err != nil {
+			t.Fatalf("platforms %v: %v", plats, err)
+		}
 	}
 }
